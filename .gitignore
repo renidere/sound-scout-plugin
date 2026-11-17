@@ -1,0 +1,46 @@
+# Private: recordings, runs, local handoff, operator config
+data/
+runs/
+local/
+sound-scout.toml
+.env
+.env.*
+!.env.example
+
+# Agent tooling state
+.work-task/
+.revmux/
+backlog-run.md
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+coverage/
+.coverage*
+
+# Media never enters git; tests synthesize their fixtures
+*.wav
+*.WAV
+*.mp3
+*.ogg
+*.oga
+*.opus
+*.m4a
+*.aac
+*.flac
+*.webm
+*.mp4
+*.mov
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

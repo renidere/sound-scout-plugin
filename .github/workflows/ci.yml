@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Detect the package
+        id: pkg
+        run: |
+          if [ -f pyproject.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: No package yet
+        if: steps.pkg.outputs.present == 'false'
+        run: echo "pyproject.toml is not there yet: nothing to check until the scaffold task lands."
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        if: steps.pkg.outputs.present == 'true'
+        with:
+          enable-cache: true
+
+      - name: Install ffmpeg
+        if: steps.pkg.outputs.present == 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Sync
+        if: steps.pkg.outputs.present == 'true'
+        run: uv sync --locked --all-groups
+
+      - name: Lint
+        if: steps.pkg.outputs.present == 'true'
+        run: uv run ruff check .
+
+      - name: Format
+        if: steps.pkg.outputs.present == 'true'
+        run: uv run ruff format --check .
+
+      - name: Test
+        if: steps.pkg.outputs.present == 'true'
+        env:
+          HF_HUB_OFFLINE: "1"
+          SOUND_SCOUT_NO_NETWORK: "1"
+        run: uv run pytest

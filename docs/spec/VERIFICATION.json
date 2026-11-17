@@ -1,0 +1,59 @@
+{
+  "kind": "document-package-verification",
+  "verified_at": "2026-11-17T08:53:51.645670+00:00",
+  "requirements": [
+    "R01",
+    "R02",
+    "R03",
+    "R04",
+    "R05",
+    "R06",
+    "R07",
+    "R08",
+    "R09",
+    "R10",
+    "R11",
+    "R12"
+  ],
+  "acceptance_tests": [
+    "T01",
+    "T02",
+    "T03",
+    "T04",
+    "T05",
+    "T06",
+    "T07",
+    "T08",
+    "T09",
+    "T10"
+  ],
+  "handoff_paths_verified": 11,
+  "review_findings_addressed": 6,
+  "documents": {
+    "README.md": {
+      "sha256": "12a9bc4929c4b3414a2404b4712976cca202efa3e3581c653371529348b7dc58",
+      "bytes": 6590
+    },
+    "REQUIREMENTS.md": {
+      "sha256": "1b269323b9d4c3b3d911f5ac4b8216c152037ed19f02d34e10ce7e17bff5c182",
+      "bytes": 42891
+    },
+    "AGENT_PROMPT.md": {
+      "sha256": "113c71ec66d7dd4be832c04dc70a01b1f333ee9de97c694e1555ba76e3f62866",
+      "bytes": 14139
+    },
+    "AUDIO_REVIEW_PROMPT.md": {
+      "sha256": "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca",
+      "bytes": 9662
+    }
+  },
+  "claims": {
+    "document_checks_passed": true,
+    "audio_files_in_package": false,
+    "implementation_built": false,
+    "model_qualified": false,
+    "repository_created": false,
+    "hermes_connection_modified": false
+  },
+  "privacy_note": "README contains local handoff paths; remove that section before public publication. No recordings or transcripts bundled."
+}
