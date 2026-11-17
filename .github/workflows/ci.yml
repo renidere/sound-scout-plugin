@@ -23,7 +23,7 @@ jobs:
 
       - name: No package yet
         if: steps.pkg.outputs.present == 'false'
-        run: echo "pyproject.toml is not there yet: nothing to check until the scaffold task lands."
+        run: echo "pyproject.toml is not there yet - nothing to check until the scaffold task lands"
 
       - uses: astral-sh/setup-uv@v10.3.3
         if: steps.pkg.outputs.present == 'true'
