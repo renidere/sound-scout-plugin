@@ -86,6 +86,7 @@
 | Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
 | Приём входа: probe/decode через ffprobe/ffmpeg, лимиты R02, SHA-256, `source.json` и `work/decoded.f32` в run-каталоге | `src/sound_scout/ingest.py` |
 | `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
+| Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |
