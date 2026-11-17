@@ -1,12 +1,17 @@
 """Intake of one recording: probe, check the limits, decode into the run directory (R02, T01).
 
 `probe` answers what the container declares: format, codec, sample rate, channels, duration and
-size, through `ffprobe`. `decode` writes two files into the run directory and nothing else:
-`source.json` (SHA-256 of the original, its metadata, the source ID, the limits applied and the
-declared-vs-actual duration check) and `work/decoded.f32` — the first audio stream as raw
-little-endian float32 PCM, interleaved, at the native sample rate and channel count. Nothing is
-resampled, normalised or trimmed: sample `i` of channel `c` is time `i / sample_rate` of the
-original, and a copy for ASR or listening is a separate derivative with its own record.
+size, through `ffprobe`. The input is judged by its content, never by its extension: the
+container and codec `ffprobe` finds must be a row of `SUPPORTED_FORMATS` (R02: WAV PCM, MP3,
+OGG/Opus, M4A/AAC) and the file must hold exactly one audio stream and nothing else; anything
+else is refused as `unsupported_format` with the container, codec or stream named. `decode`
+writes two files into the run directory and nothing else: `source.json` (SHA-256 of the
+original, its metadata, the source ID, the limits applied and the declared-vs-actual duration
+check) and `work/decoded.f32` — the audio stream as raw little-endian float32 PCM, interleaved,
+at the native sample rate and channel count. Nothing is resampled, normalised or trimmed:
+sample `i` of channel `c` is time `i / sample_rate` of the original, and a copy for ASR or
+listening is a separate derivative with its own record. A lossy codec pads the signal to whole
+frames; that padding shows as `duration_mismatch_s` (decoded minus declared) in `limits`.
 
 A path outside the policy (not under an allowed root, a denied name, a symlink) is refused by
 `paths` with `PathDenied` and its `reason`; every refusal of the input itself or of the decoder
@@ -54,8 +59,16 @@ _HASH_CHUNK = MIB
 _RIFF_UNKNOWN_SIZES = (0, 0xFFFFFFFF)
 _RIFF_MAX_CHUNKS = 64
 
+SUPPORTED_FORMATS: dict[str, frozenset[str]] = {
+    "wav": frozenset({"pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le"}),
+    "mp3": frozenset({"mp3"}),
+    "ogg": frozenset({"opus"}),
+    "mov,mp4,m4a,3gp,3g2,mj2": frozenset({"aac"}),
+}
+
 INPUT_TOO_LARGE = "input_too_large"
 NOT_AUDIO = "not_audio"
+UNSUPPORTED_FORMAT = "unsupported_format"
 CORRUPTED = "corrupted"
 TRUNCATED = "truncated"
 EMPTY = "empty"
@@ -69,6 +82,7 @@ DERIVATIVES_EXIST = "derivatives_exist"
 REASON_CODES = (
     INPUT_TOO_LARGE,
     NOT_AUDIO,
+    UNSUPPORTED_FORMAT,
     CORRUPTED,
     TRUNCATED,
     EMPTY,
@@ -183,8 +197,6 @@ def _probe_open(file: BinaryIO, resolved: Path, config: Config) -> Probe:
             "json",
             "-show_format",
             "-show_streams",
-            "-select_streams",
-            "a",
             str(resolved),
         ),
         config,
@@ -215,23 +227,51 @@ def _probe_open(file: BinaryIO, resolved: Path, config: Config) -> Probe:
 
 
 def _parse_probe(data: dict[str, object], size: int) -> Probe | None:
-    streams = data.get("streams") or []
-    if not isinstance(streams, list) or not streams:
+    """The one audio stream as a `Probe`, None without audio, `unsupported_format` off the table."""
+    streams, container = data.get("streams") or [], data["format"]
+    assert isinstance(streams, list) and isinstance(container, dict)
+    audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    if not audio:
         return None
-    stream, container = streams[0], data["format"]
-    assert isinstance(stream, dict) and isinstance(container, dict)
+    stream = audio[0]
+    name, codec = str(container["format_name"]), str(stream["codec_name"])
+    _require_supported(name, codec, streams, len(audio))
     sample_rate, channels = int(stream["sample_rate"]), int(stream["channels"])
     if sample_rate <= 0 or channels <= 0:
         raise ValueError(f"sample_rate {sample_rate}, channels {channels}")
     duration = stream.get("duration", container.get("duration"))
     return Probe(
-        container=str(container["format_name"]),
-        codec=str(stream["codec_name"]),
+        container=name,
+        codec=codec,
         sample_rate=sample_rate,
         channels=channels,
         declared_duration_s=None if duration is None else float(duration),
         size_bytes=size,
     )
+
+
+def _require_supported(container: str, codec: str, streams: list, audio_streams: int) -> None:
+    codecs = SUPPORTED_FORMATS.get(container)
+    if codecs is None:
+        raise IngestError(UNSUPPORTED_FORMAT, f"container {container!r} is not supported")
+    if codec not in codecs:
+        raise IngestError(
+            UNSUPPORTED_FORMAT, f"codec {codec!r} in container {container!r} is not supported"
+        )
+    if audio_streams != 1:
+        raise IngestError(UNSUPPORTED_FORMAT, f"{audio_streams} audio streams, one is required")
+    for stream in streams:
+        if stream.get("codec_type") != "audio" and not _is_cover_art(stream):
+            raise IngestError(
+                UNSUPPORTED_FORMAT,
+                f"{stream.get('codec_type')} stream ({stream.get('codec_name')}) "
+                "next to the audio, one audio stream is required",
+            )
+
+
+def _is_cover_art(stream: dict) -> bool:
+    """An attached picture (album cover in MP3/M4A tags) is not a video stream."""
+    return (stream.get("disposition") or {}).get("attached_pic") == 1
 
 
 def _riff_check(file: BinaryIO, size: int) -> bool:

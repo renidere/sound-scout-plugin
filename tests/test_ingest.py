@@ -17,6 +17,7 @@ from sound_scout.config import MAX_CHANNELS, MIB, Budgets, Config
 from sound_scout.ingest import IngestError, Probe, decode, probe
 from sound_scout.paths import PathDenied
 from sound_scout.runs import Run, open_run
+from tests.conftest import Encoder, require_encoders
 from tests.test_proc import process_gone
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -304,6 +305,97 @@ def test_original_is_opened_read_only_and_left_unchanged(
     assert stat.S_IMODE(tone.stat().st_mode) == 0o444
 
 
+# the formats of R02: judged by content, one audio stream, padding within 30 ms
+
+
+ENCODED_FORMATS = [
+    pytest.param("mp3", "libmp3lame", "mp3", "mp3", SAMPLE_RATE, id="mp3"),
+    pytest.param("ogg", "libopus", "ogg", "opus", 48_000, id="ogg-opus"),
+    pytest.param("m4a", "aac", "mov,mp4,m4a,3gp,3g2,mj2", "aac", SAMPLE_RATE, id="m4a-aac"),
+]
+
+
+@pytest.mark.parametrize(("suffix", "encoder", "container", "codec", "rate"), ENCODED_FORMATS)
+def test_encoded_formats_decode_within_30_ms_of_the_wav_original(
+    tone: Path,
+    encode: Encoder,
+    run: Run,
+    config: Config,
+    suffix: str,
+    encoder: str,
+    container: str,
+    codec: str,
+    rate: int,
+) -> None:
+    """Opus is always carried at 48 kHz; the AAC decoder pads the signal to whole frames."""
+    encoded = encode(tone, tone.with_suffix(f".{suffix}"), encoder)
+    probed = probe(encoded, config)
+    assert (probed.container, probed.codec, probed.sample_rate, probed.channels) == (
+        container,
+        codec,
+        rate,
+        1,
+    )
+    assert probed.declared_duration_s is not None
+
+    source = decode(encoded, run, config)
+
+    assert source.sha256 == sha256_of(encoded)
+    assert source.duration_s == source.frames / rate
+    with wave.open(str(tone), "rb") as original:
+        original_duration_s = original.getnframes() / original.getframerate()
+    assert abs(source.frames / rate - original_duration_s) <= 0.03
+    assert source.decoded_path.stat().st_size == source.frames * 4
+    assert source.duration_mismatch_s == pytest.approx(
+        source.duration_s - probed.declared_duration_s
+    )
+    assert source.duration_mismatch is False
+    record = json.loads(source.record_path.read_text(encoding="utf-8"))
+    assert (record["container"], record["codec"]) == (container, codec)
+    assert (record["sample_rate"], record["duration_s"]) == (rate, source.duration_s)
+    assert record["limits"]["duration_mismatch_s"] == source.duration_mismatch_s
+    assert record["limits"]["duration_mismatch"] is False
+    assert abs(record["limits"]["duration_mismatch_s"]) <= 0.03
+
+
+def test_supported_formats_is_the_r02_list() -> None:
+    assert set(ingest.SUPPORTED_FORMATS) == {"wav", "mp3", "ogg", "mov,mp4,m4a,3gp,3g2,mj2"}
+    assert ingest.SUPPORTED_FORMATS["mp3"] == {"mp3"}
+    assert ingest.SUPPORTED_FORMATS["ogg"] == {"opus"}
+    assert ingest.SUPPORTED_FORMATS["mov,mp4,m4a,3gp,3g2,mj2"] == {"aac"}
+    assert all(codec.startswith("pcm_") for codec in ingest.SUPPORTED_FORMATS["wav"])
+    assert "pcm_s16le" in ingest.SUPPORTED_FORMATS["wav"]
+
+
+def test_the_extension_is_not_the_source_of_truth(
+    root: Path, data_root: Path, config: Config, encode: Encoder
+) -> None:
+    """A WAV named `.mp3` is decoded as the WAV it is; an MP3 named `.wav` as an MP3."""
+    wav_as_mp3 = write_wav(root / "voice.mp3", sine(1.0))
+    assert (probe(wav_as_mp3, config).container, probe(wav_as_mp3, config).codec) == (
+        "wav",
+        "pcm_s16le",
+    )
+    source = decode(wav_as_mp3, open_run("req-wav", IDENTITY, data_root), config)
+    assert (source.probe.container, source.probe.codec, source.frames) == (
+        "wav",
+        "pcm_s16le",
+        SAMPLE_RATE,
+    )
+    record = json.loads(source.record_path.read_text(encoding="utf-8"))
+    assert (record["container"], record["codec"]) == ("wav", "pcm_s16le")
+
+    mp3_as_wav = encode(wav_as_mp3, root / "encoded.mp3", "libmp3lame").rename(root / "voice.wav")
+    source = decode(mp3_as_wav, open_run("req-mp3", IDENTITY, data_root), config)
+    assert (source.probe.container, source.probe.codec, source.frames) == (
+        "mp3",
+        "mp3",
+        SAMPLE_RATE,
+    )
+    record = json.loads(source.record_path.read_text(encoding="utf-8"))
+    assert (record["container"], record["codec"]) == ("mp3", "mp3")
+
+
 # refusals: a reason code, nothing written
 
 
@@ -415,6 +507,97 @@ def test_refuses_an_mp3_damaged_in_the_middle_instead_of_skipping_the_damage(
     assert probe(path, config).codec == "mp3"
 
     assert_refused(path, run, config, "corrupted", "ffmpeg failed: .*Invalid data")
+
+
+@pytest.mark.parametrize(
+    ("name", "encoder", "reason"),
+    [
+        pytest.param("tone.flac", "flac", "container 'flac' is not supported", id="flac"),
+        pytest.param("tone.webm", "libopus", "container 'matroska,webm' is not", id="webm"),
+        pytest.param("tone.ogg", "libvorbis", "codec 'vorbis' in container 'ogg'", id="ogg-vorbis"),
+        pytest.param("tone.wav", "adpcm_ms", "codec 'adpcm_ms' in container 'wav'", id="wav-adpcm"),
+    ],
+)
+def test_refuses_a_container_or_codec_outside_the_table(
+    root: Path, run: Run, config: Config, encode: Encoder, name: str, encoder: str, reason: str
+) -> None:
+    path = encode(write_wav(root / "original.wav", sine(1.0)), root / name, encoder)
+
+    with pytest.raises(IngestError, match=reason) as info:
+        probe(path, config)
+    assert info.value.code == "unsupported_format"
+    assert_refused(path, run, config, "unsupported_format", reason)
+
+
+def test_refuses_two_audio_streams(root: Path, run: Run, config: Config, encode: Encoder) -> None:
+    wav = write_wav(root / "original.wav", sine(1.0))
+    path = encode(wav, root / "two.m4a", "aac", "-i", str(wav), "-map", "0:a", "-map", "1:a")
+
+    assert_refused(path, run, config, "unsupported_format", "2 audio streams, one is required")
+
+
+def test_refuses_a_video_container_with_audio(
+    root: Path, run: Run, config: Config, encode: Encoder
+) -> None:
+    require_encoders("mpeg4")
+    wav = write_wav(root / "original.wav", sine(1.0))
+    path = encode(
+        wav, root / "clip.mp4", "aac",
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1",
+        "-map", "0:a", "-map", "1:v", "-c:v", "mpeg4", "-shortest",
+    )  # fmt: skip
+
+    assert_refused(
+        path, run, config, "unsupported_format", r"video stream \(mpeg4\) next to the audio"
+    )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "encoder", "codec"), [("mp3", "libmp3lame", "mp3"), ("m4a", "aac", "aac")]
+)
+def test_embedded_cover_art_is_not_a_video_stream(
+    root: Path, run: Run, config: Config, encode: Encoder, suffix: str, encoder: str, codec: str
+) -> None:
+    """Opus carries its cover in a tag, not a stream, so only MP3 and M4A can have this picture."""
+    require_encoders("mjpeg")
+    wav = write_wav(root / "original.wav", sine(1.0))
+    path = encode(
+        wav, root / f"with-cover.{suffix}", encoder,
+        "-f", "lavfi", "-i", "color=c=red:s=16x16:r=1", "-map", "0:a", "-map", "1:v",
+        "-frames:v", "1", "-c:v", "mjpeg", "-disposition:v", "attached_pic",
+    )  # fmt: skip
+    streams = json.loads(
+        subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )["streams"]
+    assert [stream["codec_type"] for stream in streams] == ["audio", "video"]
+
+    probed = probe(path, config)
+    source = decode(path, run, config)
+
+    assert (probed.codec, probed.channels) == (codec, 1)
+    assert abs(source.duration_s - 1.0) <= 0.03
+    record = json.loads(source.record_path.read_text(encoding="utf-8"))
+    assert record["codec"] == codec
+
+
+def test_a_video_only_file_is_not_audio(root: Path, run: Run, config: Config) -> None:
+    require_encoders("mpeg4")
+    path = root / "silent.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1",
+            "-c:v", "mpeg4", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+
+    assert_refused(path, run, config, "not_audio", "no audio stream")
 
 
 def test_refuses_a_wav_of_empty_chunks_without_walking_it_byte_by_byte(
