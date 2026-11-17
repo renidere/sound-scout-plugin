@@ -73,6 +73,7 @@ def validation_errors(result: object) -> list[str]:
         + _cost_errors(result)
         + _limits_errors(result)
         + _artifact_errors(result)
+        + _measurement_errors(result)
     )
 
 
@@ -100,6 +101,12 @@ def _timecode_errors(result: dict) -> list[str]:
         (f"$.transcript.corrections[{i}]", c["start"], c["end"])
         for i, c in enumerate(result["transcript"]["corrections"])
     ]
+    for i, measurement in enumerate(result["measurements"]):
+        if isinstance(measurement["value"], list):
+            spans += [
+                (f"$.measurements[{i}].value[{j}]", r["start"], r["end"])
+                for j, r in enumerate(measurement["value"])
+            ]
     errors = []
     for i, artifact in enumerate(result["artifacts"]):
         start, end = artifact["source_start"], artifact["source_end"]
@@ -366,6 +373,15 @@ def _artifact_errors(result: dict) -> list[str]:
                 f"$.artifacts[{i}]: kind {artifact['kind']!r} requires source_start and source_end"
             )
     return errors
+
+
+def _measurement_errors(result: dict) -> list[str]:
+    """A value not obtained is null with a reason, never a bare null (spec § 4, R11)."""
+    return [
+        f"$.measurements[{i}].reason: a reason is required when value is null"
+        for i, measurement in enumerate(result["measurements"])
+        if measurement["value"] is None and not _text(measurement["reason"])
+    ]
 
 
 def _text(value: object) -> bool:

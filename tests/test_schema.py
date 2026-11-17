@@ -216,8 +216,29 @@ def test_nan_and_infinity_are_rejected_but_null_passes(doc: dict, value: float) 
         doc, "$.measurements[1].settings.threshold[1].depth: NaN/Infinity is not allowed"
     )
     doc = deepcopy(EXAMPLE_DOC)
-    doc["measurements"][0]["value"] = None
+    doc["measurements"][0].update(value=None, reason="synthetic: not obtained")
     validate(doc)
+
+
+def test_measurement_null_value_needs_a_reason_and_other_value_shapes_pass(doc: dict) -> None:
+    doc["measurements"][0].update(value=None, reason=None)
+    assert_rejected(doc, "$.measurements[0].reason: a reason is required when value is null")
+    doc["measurements"][0]["reason"] = "  "
+    assert_rejected(doc, "$.measurements[0].reason: a reason is required when value is null")
+    doc = deepcopy(EXAMPLE_DOC)
+    doc["measurements"][0]["value"] = {"p10": 100.0, "p50": 120.5, "p90": 140.0}
+    doc["measurements"][1].update(value=[{"start": 0.5, "end": 3.0}], reason=None)
+    validate(doc)
+    doc["measurements"][0]["value"] = {}
+    assert_rejected(doc, "$.measurements[0].value: {} is not valid under any of the given schemas")
+    doc = deepcopy(EXAMPLE_DOC)
+    doc["measurements"][1].update(value=[{"start": 3.0, "end": 3.0}], reason=None)
+    assert_rejected(doc, "$.measurements[1].value[0]: start must be less than end, got 3.0 >= 3.0")
+    doc["measurements"][1]["value"] = [{"start": 1.0, "end": 12.5}]
+    assert_rejected(doc, "$.measurements[1].value[0].end: exceeds source duration 12.0, got 12.5")
+    doc = deepcopy(EXAMPLE_DOC)
+    del doc["measurements"][0]["limitations"]
+    assert_rejected(doc, "$.measurements[0]: 'limitations' is a required property")
 
 
 def test_evidence_basis_outside_the_enumeration_is_rejected(doc: dict) -> None:

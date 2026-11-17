@@ -45,7 +45,7 @@
     "input_modalities": ["text"],
     "audio_payload_sha256": null,
     "prompt_sha256": null,
-    "schema_sha256": "0aa1f80d6e91639c612aa973e1ff2eeccffa1d5ebc829f22e0fdcdcf3ab6dc50",
+    "schema_sha256": "eee8ec6ac7d1cc9c784247edcf0d8df876c92b8492489258634f96f755be1457",
     "transformations": [
       { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
     ],
@@ -76,14 +76,18 @@
       "value": 4.6,
       "unit": "syllables/s",
       "method": "asr_word_timestamps",
-      "settings": { "window_s": 12.0 }
+      "settings": { "window_s": 12.0 },
+      "limitations": ["synthetic: a rate over one window of a synthetic fragment, not a norm"],
+      "reason": null
     },
     {
       "name": "f0_median",
       "value": null,
       "unit": "Hz",
       "method": "praat_parselmouth",
-      "settings": { "pitch_floor_hz": 75, "pitch_ceiling_hz": 500 }
+      "settings": { "pitch_floor_hz": 75, "pitch_ceiling_hz": 500 },
+      "limitations": ["synthetic: octave errors are possible; F0 is not expressiveness"],
+      "reason": "synthetic: no voiced frames inside speech spans"
     }
   ],
   "findings": [

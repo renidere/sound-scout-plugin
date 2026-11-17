@@ -309,13 +309,21 @@
     "measurement": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "value", "unit", "method", "settings"],
+      "required": ["name", "value", "unit", "method", "settings", "limitations", "reason"],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
-        "value": { "$ref": "#/$defs/nullable_number" },
+        "value": {
+          "oneOf": [
+            { "$ref": "#/$defs/nullable_number" },
+            { "type": "array", "items": { "$ref": "#/$defs/range" } },
+            { "type": "object", "minProperties": 1, "additionalProperties": { "type": "number" } }
+          ]
+        },
         "unit": { "type": "string" },
         "method": { "type": "string" },
-        "settings": { "type": "object" }
+        "settings": { "type": "object" },
+        "limitations": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "reason": { "$ref": "#/$defs/nullable_string" }
       }
     },
     "evidence_ref": {
