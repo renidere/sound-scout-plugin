@@ -1,0 +1,168 @@
+{
+  "schema_version": "1.0",
+  "request_id": "req-synthetic-0001",
+  "run_id": "run-synthetic-0001",
+  "status": "partial",
+  "source": {
+    "id": "synthetic-tone-12s",
+    "sha256": "b3cc0475bb78a5026098858e9889acf666d31062d513d303314eca31d36e72f2",
+    "duration_s": 12.0,
+    "channels": 1
+  },
+  "capabilities": {
+    "layers": {
+      "content": { "available": true, "reason": null },
+      "measurements": { "available": true, "reason": null },
+      "sound": { "available": false, "reason": "audio backend is not selected (Gate 0)" }
+    },
+    "audio_backend": null,
+    "validated_ru": false,
+    "diction_validated_ru": false,
+    "prosody_validated_ru": false
+  },
+  "stages": {
+    "prepare": { "requested": true, "status": "completed", "reason": null, "elapsed_ms": 40 },
+    "asr": { "requested": true, "status": "completed", "reason": null, "elapsed_ms": 900 },
+    "acoustics": { "requested": true, "status": "completed", "reason": null, "elapsed_ms": 120 },
+    "audio_review": {
+      "requested": true,
+      "status": "unavailable",
+      "reason": "audio backend is not selected (Gate 0)",
+      "elapsed_ms": null
+    },
+    "report": { "requested": true, "status": "completed", "reason": null, "elapsed_ms": 15 }
+  },
+  "coverage": {
+    "requested": [{ "start": 0.0, "end": 12.0 }],
+    "reviewed": [],
+    "unreviewed": [{ "start": 0.0, "end": 12.0 }]
+  },
+  "provenance": {
+    "versions": { "sound_scout": "0.1.0" },
+    "backend": "none",
+    "model": null,
+    "revision": null,
+    "input_modalities": ["text"],
+    "audio_payload_sha256": null,
+    "prompt_sha256": null,
+    "schema_sha256": "e9d67513f78ed76cf5ebde2a7ad1c28bbd29e830503b420c684a35284bacd853",
+    "transformations": [
+      { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
+    ],
+    "limitations": [
+      "слой sound не выполнен: audio backend не выбран, дикция и просодия не оценивались"
+    ],
+    "synthetic": true,
+    "note": "synthetic: синтетический пример для тестов схемы результата, не результат анализа какой-либо записи; значения вымышлены"
+  },
+  "transcript": {
+    "raw": { "artifact_ref": "transcript-raw" },
+    "corrections": [
+      {
+        "start": 3.2,
+        "end": 3.9,
+        "original": "приме",
+        "corrected": "пример",
+        "source": "transcript",
+        "evidence_refs": [{ "type": "transcript", "ref": "transcript-raw" }],
+        "certainty": "uncertain",
+        "note": "обрезанное слово на границе сегмента ASR; raw не изменён"
+      }
+    ]
+  },
+  "measurements": [
+    {
+      "name": "speech_rate",
+      "value": 4.6,
+      "unit": "syllables/s",
+      "method": "asr_word_timestamps",
+      "settings": { "window_s": 12.0 }
+    },
+    {
+      "name": "f0_median",
+      "value": null,
+      "unit": "Hz",
+      "method": "praat_parselmouth",
+      "settings": { "pitch_floor_hz": 75, "pitch_ceiling_hz": 500 }
+    }
+  ],
+  "findings": [
+    {
+      "id": "f-001",
+      "category": "tempo",
+      "observation": "Темп речи выше ориентира для публичного выступления",
+      "start": 0.0,
+      "end": 12.0,
+      "evidence_basis": "measurement",
+      "evidence_refs": [{ "type": "measurement", "ref": "speech_rate" }],
+      "confidence_note": "одно окно измерения на весь синтетический фрагмент",
+      "impact": "слушателю труднее следить за мыслью",
+      "correction": "делать паузы между смысловыми блоками"
+    },
+    {
+      "id": "f-002",
+      "category": "filler_words",
+      "observation": "Слово-паразит на границе фразы",
+      "start": 7.5,
+      "end": 8.1,
+      "evidence_basis": "transcript",
+      "evidence_refs": [{ "type": "transcript", "ref": "transcript-raw" }],
+      "confidence_note": "по тексту ASR; звучание не проверялось",
+      "impact": "снижает уверенность звучания",
+      "correction": null
+    }
+  ],
+  "assessment_status": {
+    "diction": { "status": "not_assessed", "reason": "audio review не выполнен: backend не выбран" },
+    "prosody": { "status": "not_assessed", "reason": "audio review не выполнен: backend не выбран" },
+    "content": { "status": "assessed", "reason": null }
+  },
+  "artifacts": [
+    {
+      "id": "transcript-raw",
+      "kind": "transcript_raw",
+      "path": "transcript.raw.json",
+      "sha256": "3b5d5030efa35e40b55b7c1c2ca5077f778de7149fca858bbca1a2b589068591",
+      "source_start": null,
+      "source_end": null
+    },
+    {
+      "id": "result-json",
+      "kind": "result_json",
+      "path": "result.json",
+      "sha256": null,
+      "source_start": null,
+      "source_end": null
+    },
+    {
+      "id": "report-md",
+      "kind": "report_md",
+      "path": "report.md",
+      "sha256": null,
+      "source_start": null,
+      "source_end": null
+    },
+    {
+      "id": "measurements",
+      "kind": "measurements",
+      "path": "measurements.json",
+      "sha256": null,
+      "source_start": null,
+      "source_end": null
+    }
+  ],
+  "limits": {
+    "max_duration_seconds": 180,
+    "max_input_bytes": 104857600,
+    "max_channels": 2,
+    "worker_deadline_seconds": 180
+  },
+  "errors": [],
+  "cost": {
+    "kind": "actual",
+    "amount": 0,
+    "currency": null,
+    "provider": "local",
+    "note": "local only"
+  }
+}

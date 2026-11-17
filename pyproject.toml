@@ -5,6 +5,7 @@ description = "Sound analysis of Russian speech for the Hermes agent: CLI and lo
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "jsonschema>=4.26.0",
     "numpy>=2.5.5",
 ]
 

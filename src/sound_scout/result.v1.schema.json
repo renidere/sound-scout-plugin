@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/renidere/sound-scout-plugin/schema/result.v1.schema.json",
+  "title": "Sound Scout analysis result, contract version 1",
+  "description": "Документ результата анализа (ТЗ, раздел 4): общий контракт CLI и MCP. Кросс-проверки (таймкоды, ссылки evidence, согласованность статусов) делает sound_scout.schema.validate поверх этой схемы.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "run_id",
+    "status",
+    "source",
+    "capabilities",
+    "stages",
+    "coverage",
+    "provenance",
+    "transcript",
+    "measurements",
+    "findings",
+    "assessment_status",
+    "artifacts",
+    "limits",
+    "errors",
+    "cost"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "request_id": { "$ref": "#/$defs/identifier_string" },
+    "run_id": { "$ref": "#/$defs/identifier_string" },
+    "status": { "enum": ["complete", "partial", "blocked", "failed"] },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "duration_s", "channels"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "duration_s": { "type": "number", "minimum": 0 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "path": { "type": "string" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "layers",
+        "audio_backend",
+        "validated_ru",
+        "diction_validated_ru",
+        "prosody_validated_ru"
+      ],
+      "properties": {
+        "layers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["content", "measurements", "sound"],
+          "properties": {
+            "content": { "$ref": "#/$defs/layer" },
+            "measurements": { "$ref": "#/$defs/layer" },
+            "sound": { "$ref": "#/$defs/layer" }
+          }
+        },
+        "audio_backend": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "model", "revision"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "model": { "$ref": "#/$defs/nullable_string" },
+                "revision": { "$ref": "#/$defs/nullable_string" }
+              }
+            }
+          ]
+        },
+        "validated_ru": { "type": "boolean" },
+        "diction_validated_ru": { "type": "boolean" },
+        "prosody_validated_ru": { "type": "boolean" }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prepare", "asr", "acoustics", "audio_review", "report"],
+      "properties": {
+        "prepare": { "$ref": "#/$defs/stage" },
+        "asr": { "$ref": "#/$defs/stage" },
+        "acoustics": { "$ref": "#/$defs/stage" },
+        "audio_review": { "$ref": "#/$defs/stage" },
+        "report": { "$ref": "#/$defs/stage" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "reviewed", "unreviewed"],
+      "properties": {
+        "requested": { "type": "array", "items": { "$ref": "#/$defs/range" } },
+        "reviewed": { "type": "array", "items": { "$ref": "#/$defs/range" } },
+        "unreviewed": { "type": "array", "items": { "$ref": "#/$defs/range" } }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "versions",
+        "backend",
+        "model",
+        "revision",
+        "input_modalities",
+        "audio_payload_sha256",
+        "prompt_sha256",
+        "schema_sha256",
+        "transformations",
+        "limitations",
+        "synthetic",
+        "note"
+      ],
+      "properties": {
+        "versions": {
+          "type": "object",
+          "required": ["sound_scout"],
+          "additionalProperties": { "type": "string" }
+        },
+        "backend": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "#/$defs/nullable_string" },
+        "revision": { "$ref": "#/$defs/nullable_string" },
+        "input_modalities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["audio", "text"] }
+        },
+        "audio_payload_sha256": { "$ref": "#/$defs/nullable_sha256" },
+        "prompt_sha256": { "$ref": "#/$defs/nullable_sha256" },
+        "schema_sha256": { "$ref": "#/$defs/sha256" },
+        "transformations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "settings"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "settings": { "type": "object" }
+            }
+          }
+        },
+        "limitations": { "type": "array", "items": { "type": "string" } },
+        "synthetic": { "type": "boolean" },
+        "note": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "transcript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "corrections"],
+      "properties": {
+        "raw": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["artifact_ref"],
+              "properties": {
+                "artifact_ref": { "$ref": "#/$defs/identifier" }
+              }
+            }
+          ]
+        },
+        "corrections": { "type": "array", "items": { "$ref": "#/$defs/correction" } }
+      }
+    },
+    "measurements": { "type": "array", "items": { "$ref": "#/$defs/measurement" } },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "assessment_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diction", "prosody", "content"],
+      "properties": {
+        "diction": { "$ref": "#/$defs/assessment" },
+        "prosody": { "$ref": "#/$defs/assessment" },
+        "content": { "$ref": "#/$defs/assessment" }
+      }
+    },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_duration_seconds",
+        "max_input_bytes",
+        "max_channels",
+        "worker_deadline_seconds"
+      ],
+      "properties": {
+        "max_duration_seconds": { "type": "integer", "minimum": 1 },
+        "max_input_bytes": { "type": "integer", "minimum": 1 },
+        "max_channels": { "type": "integer", "minimum": 1 },
+        "worker_deadline_seconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage", "code", "message"],
+        "properties": {
+          "stage": {
+            "oneOf": [
+              { "type": "null" },
+              { "enum": ["prepare", "asr", "acoustics", "audio_review", "report"] }
+            ]
+          },
+          "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "amount", "currency", "provider", "note"],
+      "properties": {
+        "kind": { "enum": ["actual", "estimated", "unknown"] },
+        "amount": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": 0 }] },
+        "currency": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[A-Z]{3}$" }] },
+        "provider": { "$ref": "#/$defs/nullable_string" },
+        "note": { "$ref": "#/$defs/nullable_string" }
+      }
+    }
+  },
+  "$defs": {
+    "identifier_string": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "identifier": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullable_sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+    "nullable_string": { "type": ["string", "null"] },
+    "nullable_number": { "type": ["number", "null"] },
+    "layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "status", "reason", "elapsed_ms"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "status": { "enum": ["completed", "skipped", "unavailable", "failed"] },
+        "reason": { "$ref": "#/$defs/nullable_string" },
+        "elapsed_ms": { "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0 }] }
+      }
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number" }
+      }
+    },
+    "correction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end",
+        "original",
+        "corrected",
+        "source",
+        "evidence_refs",
+        "certainty",
+        "note"
+      ],
+      "properties": {
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number" },
+        "original": { "type": "string" },
+        "corrected": { "type": "string" },
+        "source": { "enum": ["transcript", "audio_model_observation", "human_verified"] },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        },
+        "certainty": { "enum": ["clear", "uncertain"] },
+        "note": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit", "method", "settings"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "$ref": "#/$defs/nullable_number" },
+        "unit": { "type": "string" },
+        "method": { "type": "string" },
+        "settings": { "type": "object" }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "ref"],
+      "properties": {
+        "type": {
+          "enum": ["measurement", "transcript", "audio_model_observation", "human_label", "artifact"]
+        },
+        "ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "observation",
+        "start",
+        "end",
+        "evidence_basis",
+        "evidence_refs",
+        "confidence_note",
+        "impact",
+        "correction"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "category": { "type": "string", "minLength": 1 },
+        "observation": { "type": "string" },
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number" },
+        "evidence_basis": {
+          "enum": ["measurement", "transcript", "audio_model_observation", "human_verified"]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        },
+        "confidence_note": { "type": "string" },
+        "impact": { "type": "string" },
+        "correction": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "enum": ["assessed", "not_assessed"] },
+        "reason": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path", "sha256", "source_start", "source_end"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "kind": {
+          "enum": [
+            "report_md",
+            "result_json",
+            "clip",
+            "listening_copy",
+            "transcript_raw",
+            "review_response",
+            "review_provenance",
+            "human_label",
+            "measurements",
+            "other"
+          ]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/nullable_sha256" },
+        "source_start": { "$ref": "#/$defs/nullable_number" },
+        "source_end": { "$ref": "#/$defs/nullable_number" }
+      }
+    }
+  }
+}

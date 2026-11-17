@@ -82,6 +82,7 @@
 |---|---|
 | Требования, контракт результата, приёмка | `docs/spec/REQUIREMENTS.md` |
 | Поручение агенту и границы полномочий | `docs/spec/AGENT_PROMPT.md` |
+| Контракт результата (JSON Schema), пример | `schema/` (упакованная копия — `src/sound_scout/result.v1.schema.json`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |
