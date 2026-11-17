@@ -29,5 +29,28 @@ Development-данные и существующий акустический с
 
 ## Установка и запуск
 
-Появятся вместе с каркасом пакета (первая задача бэклога). Планируемый минимум: Python 3.13,
-`uv sync`, системный FFmpeg.
+Нужны Python 3.13, [`uv`](https://docs.astral.sh/uv/) и системный FFmpeg (`ffmpeg` в `PATH`:
+`apt install ffmpeg`, `brew install ffmpeg`). Установка из корня репозитория:
+
+```sh
+uv sync            # создаёт .venv и ставит пакет с dev-инструментами по uv.lock
+uv run sound-scout --version
+uv run sound-scout --help
+```
+
+Подкоманды `doctor`, `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
+`not implemented`. Локальная конфигурация — `sound-scout.toml` (копия `sound-scout.example.toml`,
+в git не входит).
+
+Для pre-commit-хуков установите [lefthook](https://github.com/evilmartians/lefthook) и выполните
+`lefthook install`: перед коммитом по staged-файлам пройдут `ruff check` и `ruff format --check`.
+
+## Проверки
+
+```sh
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest             # -m "not slow" пропускает тесты с реальными моделями
+```
+
+Те же проверки запускает CI (`.github/workflows/ci.yml`) на каждый push в `main`.
