@@ -32,11 +32,13 @@
 # (`config.decoded_samples_limit`). `worker_deadline_seconds` — весь worker анализа;
 # `max_subprocess_seconds` — wall time одного вызова ffmpeg/ffprobe, по истечении убивается вся
 # его группа процессов; `max_subprocess_memory_mib` — адресное пространство (RLIMIT_AS) такого
-# процесса на Linux, на других платформах не применяется.
+# процесса на Linux, на других платформах не применяется. `max_channels` — 1 или 2: версия
+# обрабатывает не больше двух каналов (R02, `config.MAX_CHANNELS`), большее значение
+# отвергается при загрузке конфигурации.
 # [budgets]
 # max_duration_seconds = 180
 # max_input_bytes = 104857600
-# max_channels = 2
+# max_channels = 2  # 1 или 2
 # worker_deadline_seconds = 180
 # max_subprocess_seconds = 60
 # max_subprocess_memory_mib = 2048

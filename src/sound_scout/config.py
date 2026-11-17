@@ -20,6 +20,10 @@ CONFIG_FILE_NAME = "sound-scout.toml"
 EXAMPLE_FILE_NAME = "sound-scout.example.toml"
 CONFIG_PATH_ENV = "SOUND_SCOUT_CONFIG"
 KNOWN_BACKENDS = ("none",)
+# Самое большее число каналов, которое версия обрабатывает (R02): `channels` работает
+# с одним или двумя; `budgets.max_channels` не может поднять этот предел. Константа здесь,
+# а не в `channels`, потому что `channels` импортирует `ingest`, а тот — `config`.
+MAX_CHANNELS = 2
 MIB = 1024 * 1024
 MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*")
 MODEL_REVISION = re.compile(r"[0-9a-f]{7,40}")
@@ -58,7 +62,7 @@ class Budgets:
 
     max_duration_seconds: int = 180
     max_input_bytes: int = 100 * MIB
-    max_channels: int = 2
+    max_channels: int = MAX_CHANNELS
     worker_deadline_seconds: int = 180
     max_subprocess_seconds: int = 60
     max_subprocess_memory_mib: int = 2048
@@ -166,7 +170,15 @@ def is_denied_name(name: str) -> bool:
 def _budgets(value: object) -> Budgets:
     table = _table(value, "budgets")
     _reject_unknown(table, {field.name for field in fields(Budgets)}, prefix="budgets")
-    return Budgets(**{name: _positive_int(item, f"budgets.{name}") for name, item in table.items()})
+    budgets = Budgets(
+        **{name: _positive_int(item, f"budgets.{name}") for name, item in table.items()}
+    )
+    if budgets.max_channels > MAX_CHANNELS:
+        raise ConfigError(
+            f"budgets.max_channels: the version handles at most {MAX_CHANNELS} channels, "
+            f"got {budgets.max_channels}"
+        )
+    return budgets
 
 
 def _network(value: object) -> Network:

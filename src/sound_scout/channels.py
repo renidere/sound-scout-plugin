@@ -6,7 +6,8 @@ rather than two, and a zero signal or phase cancellation stops the analysis inst
 invented numbers. `load` reads the `work/decoded.f32` that `ingest.decode` wrote into a
 frames × channels float32 array; `report` measures every channel on that original signal (peak
 and RMS in dBFS, share of zero samples, inter-channel correlation) and gives one verdict. The
-version is bounded at two channels (spec § 2, `budgets.max_channels`); more raise `ValueError`
+version is bounded at `config.MAX_CHANNELS` (spec § 2); `budgets.max_channels` cannot exceed it
+and `ingest.probe` refuses a wider file, so more channels here raise `ValueError`
 rather than averaging channels the checks below do not cover:
 
 - `zero`: every channel is digital silence;
@@ -30,9 +31,9 @@ import math
 
 import numpy as np
 
+from sound_scout.config import MAX_CHANNELS
 from sound_scout.ingest import BYTES_PER_SAMPLE, Source
 
-MAX_CHANNELS = 2
 ZERO_SIGNAL = "zero_signal"
 CANCELLATION = "cancellation"
 REASON_CODES = (ZERO_SIGNAL, CANCELLATION)

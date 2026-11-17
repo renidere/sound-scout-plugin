@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import config, paths
+from sound_scout import channels, config, paths
 from sound_scout.config import (
+    MAX_CHANNELS,
     Asr,
     Budgets,
     Config,
@@ -319,6 +320,27 @@ def test_wrong_types_and_values_are_named(
         load()
 
 
+def test_max_channels_above_the_version_limit_is_refused_at_load(
+    write_config, minimal_toml: str
+) -> None:
+    write_config(minimal_toml + "[budgets]\nmax_channels = 3\n")
+    with pytest.raises(ConfigError, match=r"budgets\.max_channels: .*at most 2 channels, got 3"):
+        load()
+
+
+@pytest.mark.parametrize("value", [1, 2])
+def test_max_channels_up_to_the_version_limit_loads(
+    write_config, minimal_toml: str, value: int
+) -> None:
+    write_config(minimal_toml + f"[budgets]\nmax_channels = {value}\n")
+    assert load().budgets.max_channels == value
+
+
+def test_max_channels_limit_is_the_one_constant_channels_checks() -> None:
+    assert MAX_CHANNELS == channels.MAX_CHANNELS == 2
+    assert Budgets().max_channels == MAX_CHANNELS
+
+
 @pytest.mark.parametrize(
     ("seconds", "sample_rate", "channels", "expected"),
     [(180, 16_000, 1, 2_880_000), (30, 48_000, 2, 2_880_000), (1, 8_000, 1, 8_000)],
@@ -370,6 +392,15 @@ def test_example_config_loads_after_substituting_paths(
     assert loaded.backend == "none"
     assert loaded.asr.model == Asr().model
     assert re.fullmatch(r"[0-9a-f]{40}", loaded.asr.revision or "")
+
+
+def test_example_names_the_allowed_range_next_to_max_channels() -> None:
+    lines = EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+    (field_line,) = [
+        line for line in lines if COMMENTED_FIELD_LINE.fullmatch(line) and "max_channels" in line
+    ]
+    assert re.search(r"1 или 2", field_line), field_line
+    assert str(MAX_CHANNELS) in field_line
 
 
 def test_example_config_documents_every_field() -> None:

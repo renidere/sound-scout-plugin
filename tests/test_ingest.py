@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from sound_scout import ingest, schema
-from sound_scout.config import MIB, Budgets, Config
+from sound_scout.config import MAX_CHANNELS, MIB, Budgets, Config
 from sound_scout.ingest import IngestError, Probe, decode, probe
 from sound_scout.paths import PathDenied
 from sound_scout.runs import Run, open_run
@@ -362,6 +362,19 @@ def test_refuses_more_than_two_channels(root: Path, run: Run, config: Config) ->
     path = write_wav(root / "three.wav", three)
 
     assert_refused(path, run, config, "too_many_channels", "3 channels, the limit is 2")
+
+
+def test_three_channels_are_refused_at_ingest_before_the_channel_report(
+    root: Path, run: Run, config: Config
+) -> None:
+    """#49: with `max_channels` at the version limit a wider file never reaches `channels`."""
+    at_limit = Config(config.allowed_roots, config.data_root, Budgets(max_channels=MAX_CHANNELS))
+    path = write_wav(root / "three.wav", np.column_stack([sine(0.1)] * 3))
+
+    assert_refused(
+        path, run, at_limit, "too_many_channels", f"3 channels, the limit is {MAX_CHANNELS}"
+    )
+    assert not (run.path / "work").exists()
 
 
 def test_refuses_a_file_that_is_not_audio(root: Path, run: Run, config: Config) -> None:
