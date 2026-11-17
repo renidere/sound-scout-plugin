@@ -3,8 +3,13 @@
 Allowed roots, the data root, budgets, the network policy and the backend are set by the
 operator here, never by arguments of a tool call (R09, R10, R12). Secrets do not belong in
 this file: an unknown field is rejected.
+
+`DENIED_NAME_PATTERNS` lives here rather than in `paths` because both modules need it and
+`paths` imports `config`: the loader rejects an allowed root that has a denied component in its
+resolved path, and `paths` refuses every input path whose component below the root matches.
 """
 
+import fnmatch
 import os
 import tomllib
 from dataclasses import dataclass, fields
@@ -15,6 +20,23 @@ EXAMPLE_FILE_NAME = "sound-scout.example.toml"
 CONFIG_PATH_ENV = "SOUND_SCOUT_CONFIG"
 KNOWN_BACKENDS = ("none",)
 MIB = 1024 * 1024
+
+# Names never read as input, in any position of the path, even inside an allowed root:
+# operator secrets and config, credential and agent-profile directories, playlist and script
+# sources. Matched case-insensitively against each path component.
+DENIED_NAME_PATTERNS = (
+    ".env*",
+    CONFIG_FILE_NAME,
+    ".ssh",
+    ".hermes",
+    "*.m3u",
+    "*.m3u8",
+    "*.pls",
+    "*.xspf",
+    "*.cue",
+    "*.ffconcat",
+    "*.sdp",
+)
 
 
 class ConfigError(Exception):
@@ -95,6 +117,14 @@ def _parse(data: dict[str, object]) -> Config:
     allowed_roots = _directories(_require(data, "allowed_roots"), "allowed_roots")
     data_root = _directory(_require(data, "data_root"), "data_root")
     for index, root in enumerate(allowed_roots):
+        # Запрещённые имена — про чтение входа (R10): корень с таким компонентом не поддерживается
+        # `paths` (каждый путь под ним отвечает ROOT_HAS_DENIED_NAME), поэтому отказ здесь, при
+        # загрузке. `data_root` не проверяется: оттуда не читают, туда только пишут.
+        denied = next((part for part in root.parts if is_denied_name(part)), None)
+        if denied is not None:
+            raise ConfigError(
+                f"allowed_roots[{index}]: contains the denied name {denied!r}: {root}"
+            )
         if data_root.is_relative_to(root) or root.is_relative_to(data_root):
             raise ConfigError(
                 f"data_root and allowed_roots[{index}] must not contain each other: "
@@ -107,6 +137,11 @@ def _parse(data: dict[str, object]) -> Config:
         network=_network(data.get("network", {})),
         backend=_backend(data.get("backend", "none")),
     )
+
+
+def is_denied_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in DENIED_NAME_PATTERNS)
 
 
 def _budgets(value: object) -> Budgets:

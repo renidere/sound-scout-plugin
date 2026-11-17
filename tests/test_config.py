@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import config
+from sound_scout import config, paths
 from sound_scout.config import Budgets, Config, ConfigError, Network, decoded_samples_limit, load
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -209,6 +209,58 @@ def test_symlinked_roots_are_compared_resolved(
     write_config(f"allowed_roots = [{toml_string(link)}]\ndata_root = {toml_string(inside)}\n")
     with pytest.raises(ConfigError, match=r"data_root and allowed_roots\[0\]"):
         load()
+
+
+@pytest.mark.parametrize(
+    ("relative", "denied"),
+    [
+        (Path(".hermes") / "audio", ".hermes"),
+        (Path(".ssh"), ".ssh"),
+        (Path("home") / ".env.local" / "recordings", ".env.local"),
+    ],
+)
+def test_allowed_root_with_a_denied_component_is_rejected_at_load(
+    write_config, roots: tuple[Path, Path], tmp_path: Path, relative: Path, denied: str
+) -> None:
+    bad = tmp_path / relative
+    bad.mkdir(parents=True)
+    write_config(
+        f"allowed_roots = [{toml_string(roots[0])}, {toml_string(bad)}]\n"
+        f"data_root = {toml_string(roots[1])}\n"
+    )
+    with pytest.raises(ConfigError) as error:
+        load()
+    message = str(error.value)
+    assert "allowed_roots[1]" in message
+    assert repr(denied) in message
+    assert str(bad.resolve()) in message
+
+
+def test_allowed_root_with_an_ordinary_name_loads(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    ordinary = tmp_path / "hermes-env" / "ssh-recordings.m3u-backup"
+    ordinary.mkdir(parents=True)
+    write_config(
+        f"allowed_roots = [{toml_string(ordinary)}]\ndata_root = {toml_string(roots[1])}\n"
+    )
+    assert load().allowed_roots == (ordinary.resolve(),)
+
+
+def test_data_root_with_a_denied_component_is_not_checked(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    data = tmp_path / ".hermes" / "sound-scout-data"
+    data.mkdir(parents=True)
+    write_config(f"allowed_roots = [{toml_string(roots[0])}]\ndata_root = {toml_string(data)}\n")
+    assert load().data_root == data.resolve()
+
+
+def test_denied_names_are_shared_with_paths() -> None:
+    assert paths.DENIED_NAME_PATTERNS is config.DENIED_NAME_PATTERNS
+    assert paths.is_denied_name is config.is_denied_name
+    assert config.is_denied_name(".HERMES") and config.is_denied_name(config.CONFIG_FILE_NAME)
+    assert not config.is_denied_name("recordings")
 
 
 @pytest.mark.parametrize(

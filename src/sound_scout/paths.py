@@ -7,14 +7,15 @@ The path is resolved with its `..` components intact (collapsing them lexically 
 different file through a symlinked directory); the resolved path must lie inside one of
 `Config.allowed_roots`, which the loader stores resolved too, so a root spelled through a
 symlink still matches. It must be a regular file (no directory, device or FIFO), and no
-component below the root may be a denied name: `.env*` and the operator config, `.ssh` and
-`.hermes` directories, and — by file name only, a first filter before the decoder's own format
-and protocol whitelists — playlist and script files that would make the decoder pull in other
-files or the network. A denied name is denied in any position, so `~/.ssh/*` and `~/.hermes/*`
-are rejected wherever the home directory is, even inside an allowed root. An allowed root that
-itself contains a denied component is not a supported configuration: every path under it is
-refused loudly with `ROOT_HAS_DENIED_NAME` instead of looking like a denied file. A path from a
-transcript gets no exception: the caller resolves it like any other.
+component below the root may be a denied name (`config.DENIED_NAME_PATTERNS`): `.env*` and the
+operator config, `.ssh` and `.hermes` directories, and — by file name only, a first filter
+before the decoder's own format and protocol whitelists — playlist and script files that would
+make the decoder pull in other files or the network. A denied name is denied in any position,
+so `~/.ssh/*` and `~/.hermes/*` are rejected wherever the home directory is, even inside an
+allowed root. An allowed root that itself contains a denied component is not a supported
+configuration: `config.load()` rejects it, and a `Config` built by hand with such a root has
+every path under it refused loudly with `ROOT_HAS_DENIED_NAME` instead of looking like a denied
+file. A path from a transcript gets no exception: the caller resolves it like any other.
 
 `open_input` opens a resolved path by descriptor: every directory component is opened with
 `O_PATH` (search permission is enough, no read permission on ancestors) and `O_NOFOLLOW`
@@ -31,31 +32,16 @@ data root after symlink resolution. `open_output` creates that file exclusively 
 
 import errno
 import fcntl
-import fnmatch
 import os
 import re
 import stat
 from pathlib import Path
 from typing import BinaryIO
 
-from sound_scout.config import CONFIG_FILE_NAME, Config
+from sound_scout.config import DENIED_NAME_PATTERNS as DENIED_NAME_PATTERNS
+from sound_scout.config import Config
+from sound_scout.config import is_denied_name as is_denied_name
 
-# Names never read as input, in any position of the path, even inside an allowed root:
-# operator secrets and config, credential and agent-profile directories, playlist and script
-# sources. Matched case-insensitively against each path component.
-DENIED_NAME_PATTERNS = (
-    ".env*",
-    CONFIG_FILE_NAME,
-    ".ssh",
-    ".hermes",
-    "*.m3u",
-    "*.m3u8",
-    "*.pls",
-    "*.xspf",
-    "*.cue",
-    "*.ffconcat",
-    "*.sdp",
-)
 OUTPUT_NAME = re.compile(r"[A-Za-z0-9._-]+")
 FILE_MODE = 0o600
 
@@ -160,11 +146,6 @@ def open_output(run_dir: Path, name: str, config: Config) -> BinaryIO:
         os.close(fd)
         raise
     return os.fdopen(fd, "wb")
-
-
-def is_denied_name(name: str) -> bool:
-    lowered = name.lower()
-    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in DENIED_NAME_PATTERNS)
 
 
 def _is_file_path(source: str) -> bool:
