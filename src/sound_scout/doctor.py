@@ -57,6 +57,7 @@ VAD_PACKAGE = "faster_whisper"
 VAD_ASSET = re.compile(r"silero.*\.onnx$")
 DIR_MODE = 0o700
 GATE0_REASON = "audio backend is not selected or allowed (backend = none, Gate 0)"
+WEIGHTS_NOT_CACHED = "model weights not in the local cache"
 _VERSION_LINE = re.compile(r"^(ffmpeg|ffprobe) version (\S+)")
 _PLAIN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -336,13 +337,13 @@ def _tool_version(executable: str, tool: str, config: Config) -> tuple[str | Non
 
 
 def _probe_asr(config: Config) -> tuple[dict[str, object], str | None]:
-    versions, reason = _distribution_versions("asr")
-    model, model_reason = _snapshot(config.asr.model, config.asr.revision)
+    versions, reason = distribution_versions("asr")
+    model, model_reason = snapshot(config.asr.model, config.asr.revision)
     return {"versions": versions, "model": model}, reason or model_reason
 
 
 def _probe_acoustics() -> tuple[dict[str, object], str | None]:
-    versions, reason = _distribution_versions("acoustics")
+    versions, reason = distribution_versions("acoustics")
     vad: dict[str, object] = {"asset": None, "size": None}
     assets = package_dir(VAD_PACKAGE)
     if assets is not None:
@@ -355,20 +356,23 @@ def _probe_acoustics() -> tuple[dict[str, object], str | None]:
     return {"versions": versions, "vad": vad}, reason
 
 
-def _distribution_versions(component: str) -> tuple[dict[str, str | None], str | None]:
+def distribution_versions(component: str) -> tuple[dict[str, str | None], str | None]:
     versions = {name: installed_version(name) for name in DISTRIBUTIONS[component]}
     missing = next((name for name, found in versions.items() if found is None), None)
     return versions, None if missing is None else f"package {missing} is not installed"
 
 
-def _snapshot(repo: str, revision: str | None) -> tuple[dict[str, object], str | None]:
-    """Snapshot of the model in the local HF cache: `repo`, `revision`, `files`, read-only."""
+def snapshot(repo: str, revision: str | None) -> tuple[dict[str, object], str | None]:
+    """Snapshot of the model in the local HF cache: `repo`, `revision`, `files`, read-only.
+
+    The reason names what is missing; `asr.transcribe` turns it into the `unavailable` stage
+    without importing the model package, so nothing can reach for a download. A reason that
+    starts with `WEIGHTS_NOT_CACHED` means the weights themselves are absent.
+    """
     model: dict[str, object] = {"repo": repo, "revision": None, "files": {}}
-    model_dir = hf_hub_cache() / f"models--{repo.replace('/', '--')}"
+    model_dir = _model_dir(repo)
     snapshots = _subdirectories(model_dir / "snapshots")
-    not_cached = (
-        f"model weights not in the local cache: {repo}; downloading needs the owner's permission"
-    )
+    not_cached = f"{WEIGHTS_NOT_CACHED}: {repo}; downloading needs the owner's permission"
     if revision is not None:
         matching = [name for name in snapshots if name.startswith(revision)]
         if len(matching) != 1:
@@ -382,11 +386,20 @@ def _snapshot(repo: str, revision: str | None) -> tuple[dict[str, object], str |
         return model, not_cached
     else:
         return model, f"several snapshots of {repo} in the cache and no asr.revision set"
-    files = _regular_files(model_dir / "snapshots" / chosen)
+    files = _regular_files(snapshot_dir(repo, chosen))
     model = {"repo": repo, "revision": chosen, "files": files}
     if any(name not in files for name in WEIGHT_FILES):
         return model, not_cached
     return model, None
+
+
+def snapshot_dir(repo: str, revision: str) -> Path:
+    """Directory of one snapshot in the local HF cache; the model package is pointed here."""
+    return _model_dir(repo) / "snapshots" / revision
+
+
+def _model_dir(repo: str) -> Path:
+    return hf_hub_cache() / f"models--{repo.replace('/', '--')}"
 
 
 def _ref_main(model_dir: Path) -> str | None:
