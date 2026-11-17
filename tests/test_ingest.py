@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import ingest
+from sound_scout import ingest, schema
 from sound_scout.config import MIB, Budgets, Config
 from sound_scout.ingest import IngestError, Probe, decode, probe
 from sound_scout.paths import PathDenied
@@ -242,6 +242,21 @@ def test_decode_writes_source_json_and_decoded_f32(tone: Path, run: Run, config:
         "duration_mismatch": False,
     }
     assert str(tone) not in source.record_path.read_text(encoding="utf-8")
+
+
+def test_source_json_limits_share_their_names_with_the_result_contract(
+    root: Path, run: Run, config: Config
+) -> None:
+    """docs/decisions/0002: ingest-only limits are the per-subprocess budget and the sample cap."""
+    tone = write_wav(root / "tone.wav", sine(1.0))
+    source = decode(tone, run, config)
+    record = json.loads(source.record_path.read_text(encoding="utf-8"))
+    result_limits = schema.SCHEMA["properties"]["limits"]["properties"]
+    assert set(record["limits"]) - set(result_limits) == {
+        "decoded_samples_limit",
+        "max_subprocess_seconds",
+    }
+    assert set(result_limits) - set(record["limits"]) == {"worker_deadline_seconds"}
 
 
 def test_decode_keeps_the_time_scale_of_the_original(root: Path, run: Run, config: Config) -> None:

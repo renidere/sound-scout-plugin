@@ -196,13 +196,19 @@
         "max_duration_seconds",
         "max_input_bytes",
         "max_channels",
-        "worker_deadline_seconds"
+        "worker_deadline_seconds",
+        "duration_mismatch_tolerance_s",
+        "duration_mismatch_s",
+        "duration_mismatch"
       ],
       "properties": {
         "max_duration_seconds": { "type": "integer", "minimum": 1 },
         "max_input_bytes": { "type": "integer", "minimum": 1 },
         "max_channels": { "type": "integer", "minimum": 1 },
-        "worker_deadline_seconds": { "type": "integer", "minimum": 1 }
+        "worker_deadline_seconds": { "type": "integer", "minimum": 1 },
+        "duration_mismatch_tolerance_s": { "type": "number", "exclusiveMinimum": 0 },
+        "duration_mismatch_s": { "$ref": "#/$defs/nullable_number" },
+        "duration_mismatch": { "type": ["boolean", "null"] }
       }
     },
     "errors": {

@@ -2,7 +2,7 @@
 
 The schema (`schema/result.v1.schema.json`, packaged copy next to this module) checks shape
 and enumerations; the cross-field rules of spec § 4 — timecodes, evidence references, honest
-statuses, cost — are plain code here, because a schema cannot express them (R05, R09, R11).
+statuses, cost, limits — are plain code here, because a schema cannot express them (R05, R09, R11).
 """
 
 import hashlib
@@ -71,6 +71,7 @@ def validation_errors(result: object) -> list[str]:
         + _capability_errors(result)
         + _assessment_errors(result)
         + _cost_errors(result)
+        + _limits_errors(result)
         + _artifact_errors(result)
     )
 
@@ -319,6 +320,34 @@ def _cost_errors(result: dict) -> list[str]:
             f"{list(_LOCAL_PROVIDERS)}, got provider {cost['provider']!r}"
         )
     return errors
+
+
+def _limits_errors(result: dict) -> list[str]:
+    """`duration_mismatch` restates `|duration_mismatch_s| > tolerance`; null means undeclared."""
+    limits = result["limits"]
+    mismatch_s, flag = limits["duration_mismatch_s"], limits["duration_mismatch"]
+    tolerance = limits["duration_mismatch_tolerance_s"]
+    if mismatch_s is None:
+        if flag is not None:
+            return [
+                "$.limits.duration_mismatch: must be null when duration_mismatch_s is null "
+                f"(the container declared no duration), got {flag!r}"
+            ]
+        return []
+    if flag is None:
+        return [
+            "$.limits.duration_mismatch: must be a boolean when duration_mismatch_s is a number, "
+            f"got null for duration_mismatch_s {mismatch_s}"
+        ]
+    expected = abs(mismatch_s) > tolerance
+    if flag != expected:
+        relation = "exceeds" if expected else "is within"
+        return [
+            f"$.limits.duration_mismatch: must be {str(expected).lower()}, "
+            f"|duration_mismatch_s| = {abs(mismatch_s)} {relation} "
+            f"duration_mismatch_tolerance_s {tolerance}"
+        ]
+    return []
 
 
 def _artifact_errors(result: dict) -> list[str]:

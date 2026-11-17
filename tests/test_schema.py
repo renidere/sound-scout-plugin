@@ -527,6 +527,74 @@ def test_cost_rules(doc: dict) -> None:
     validate(doc)
 
 
+def test_limits_duration_mismatch_fields_are_in_the_schema() -> None:
+    limits = schema.SCHEMA["properties"]["limits"]
+    assert limits["additionalProperties"] is False
+    for key in ("duration_mismatch_tolerance_s", "duration_mismatch_s", "duration_mismatch"):
+        assert key in limits["required"], key
+    assert limits["properties"]["duration_mismatch_tolerance_s"] == {
+        "type": "number",
+        "exclusiveMinimum": 0,
+    }
+
+
+def test_limits_duration_mismatch_passes_when_flag_matches_the_measured_gap(doc: dict) -> None:
+    doc["limits"].update(duration_mismatch_s=-0.5, duration_mismatch=True)
+    validate(doc)
+    doc["limits"].update(duration_mismatch_s=0.5, duration_mismatch=True)
+    validate(doc)
+    doc["limits"].update(duration_mismatch_s=0.04, duration_mismatch=False)
+    validate(doc)
+    doc["limits"].update(duration_mismatch_s=0.05, duration_mismatch=False)
+    validate(doc)
+    doc["limits"].update(duration_mismatch_s=None, duration_mismatch=None)
+    validate(doc)
+    doc["limits"].update(duration_mismatch_tolerance_s=1.0, duration_mismatch_s=0.5)
+    doc["limits"].update(duration_mismatch=False)
+    validate(doc)
+
+
+def test_limits_duration_mismatch_flag_must_agree_with_the_measured_gap(doc: dict) -> None:
+    doc["limits"].update(duration_mismatch_s=-0.5, duration_mismatch=False)
+    assert_rejected(
+        doc,
+        "$.limits.duration_mismatch: must be true, |duration_mismatch_s| = 0.5 exceeds "
+        "duration_mismatch_tolerance_s 0.05",
+    )
+    doc["limits"].update(duration_mismatch_s=0.01, duration_mismatch=True)
+    assert_rejected(
+        doc,
+        "$.limits.duration_mismatch: must be false, |duration_mismatch_s| = 0.01 is within "
+        "duration_mismatch_tolerance_s 0.05",
+    )
+    doc["limits"].update(duration_mismatch_s=0.5, duration_mismatch=None)
+    assert_rejected(
+        doc, "$.limits.duration_mismatch: must be a boolean when duration_mismatch_s is a number"
+    )
+    doc["limits"].update(duration_mismatch_s=None, duration_mismatch=False)
+    assert_rejected(
+        doc, "$.limits.duration_mismatch: must be null when duration_mismatch_s is null"
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "fragment"),
+    [
+        ("duration_mismatch_tolerance_s", 0, "0 is less than or equal to the minimum of 0"),
+        ("duration_mismatch_tolerance_s", None, "None is not of type 'number'"),
+        ("duration_mismatch_s", "0.5", "'0.5' is not of type 'number', 'null'"),
+        ("duration_mismatch", 1, "1 is not of type 'boolean', 'null'"),
+    ],
+)
+def test_limits_duration_mismatch_shape_is_enforced_by_the_schema(
+    doc: dict, key: str, value: object, fragment: str
+) -> None:
+    doc["limits"][key] = value
+    assert_rejected(doc, f"$.limits.{key}: {fragment}")
+    del doc["limits"][key]
+    assert_rejected(doc, f"$.limits: '{key}' is a required property")
+
+
 def test_assessment_status_rules(doc: dict) -> None:
     doc["assessment_status"]["diction"]["reason"] = None
     assert_rejected(doc, "$.assessment_status.diction.reason: a reason is required")

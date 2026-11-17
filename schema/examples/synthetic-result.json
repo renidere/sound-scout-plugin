@@ -45,7 +45,7 @@
     "input_modalities": ["text"],
     "audio_payload_sha256": null,
     "prompt_sha256": null,
-    "schema_sha256": "e9d67513f78ed76cf5ebde2a7ad1c28bbd29e830503b420c684a35284bacd853",
+    "schema_sha256": "0aa1f80d6e91639c612aa973e1ff2eeccffa1d5ebc829f22e0fdcdcf3ab6dc50",
     "transformations": [
       { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
     ],
@@ -155,7 +155,10 @@
     "max_duration_seconds": 180,
     "max_input_bytes": 104857600,
     "max_channels": 2,
-    "worker_deadline_seconds": 180
+    "worker_deadline_seconds": 180,
+    "duration_mismatch_tolerance_s": 0.05,
+    "duration_mismatch_s": 0.0,
+    "duration_mismatch": false
   },
   "errors": [],
   "cost": {
