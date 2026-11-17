@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 from collections.abc import Iterator
 from pathlib import Path
@@ -12,6 +13,7 @@ from sound_scout import __version__, runs
 from sound_scout.runs import (
     RequestIndexCorrupt,
     RequestMismatch,
+    RequestRunMissing,
     Run,
     complete_run,
     identity_hash,
@@ -420,6 +422,40 @@ def test_index_entry_without_run_id_is_an_error_not_a_lookup_of_runs_dir(
     assert open_run("other", IDENTITY, data_root).created is True
 
 
+def test_index_entry_pointing_at_missing_run_dir_is_an_explicit_error(data_root: Path) -> None:
+    request_id = "REQ-zygote-7Q"
+    run = complete_run(open_run(request_id, IDENTITY, data_root))
+    other = open_run("other", IDENTITY, data_root)
+    shutil.rmtree(run.path)
+    runs_dir = data_root / "runs"
+    index_dir = runs_dir / "by-request"
+    entry_name = hashlib.sha256(request_id.encode()).hexdigest()
+    runs_before = sorted(p.name for p in runs_dir.iterdir())
+    index_before = contents_and_mtimes(index_dir)
+    other_before = contents_and_mtimes(other.path)
+
+    with pytest.raises(RequestRunMissing) as info:
+        open_run(request_id, IDENTITY, data_root)
+
+    assert isinstance(info.value, RequestIndexCorrupt)
+    assert not isinstance(info.value, FileNotFoundError)
+    assert run.run_id in str(info.value) and entry_name in str(info.value)
+    assert request_id not in str(info.value) and "zygote" not in str(info.value)
+    assert sorted(p.name for p in runs_dir.iterdir()) == runs_before
+    assert contents_and_mtimes(index_dir) == index_before
+    assert contents_and_mtimes(other.path) == other_before
+    assert not run.path.exists()
+
+    with pytest.raises(RequestRunMissing):
+        open_run(request_id, IDENTITY, data_root)
+    assert open_run("other", IDENTITY, data_root).path == other.path
+    fresh = open_run("fresh", IDENTITY, data_root)
+    assert fresh.created is True and fresh.run_id != run.run_id
+    assert sorted(p.name for p in index_dir.iterdir()) == sorted(
+        [entry_name, hashlib.sha256(b"other").hexdigest(), hashlib.sha256(b"fresh").hexdigest()]
+    )
+
+
 def test_symlinked_runs_or_index_directory_is_rejected(data_root: Path, tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir(mode=0o700)
@@ -465,3 +501,12 @@ def test_leftover_staging_file_does_not_block_or_bind_the_request(data_root: Pat
     assert sorted(p.name for p in index_dir.iterdir()) == sorted(
         [leftover.name, hashlib.sha256(b"req").hexdigest()]
     )
+
+
+def test_module_docstring_tells_operator_to_remove_entry_with_run_dir_and_not_expect_repair() -> (
+    None
+):
+    doc = runs.__doc__ or ""
+    assert "RequestRunMissing" in doc
+    assert re.search(r"operator removes the index entry together with the run directory", doc)
+    assert re.search(r"`open_run` does\s+not repair such an entry", doc)

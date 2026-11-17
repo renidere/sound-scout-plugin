@@ -12,6 +12,11 @@ request ID never becomes a path segment. Run directories are created exclusively
 overwritten; the index entry is published with a hard link, so it either names a run or does
 not exist. Symlinked `runs`, `by-request` and run directories are rejected: the data root is
 private, and a substituted directory must not pass as one.
+
+An index entry whose run directory is gone (for example, old runs were removed but the index was
+not) makes `open_run` raise `RequestRunMissing`; the entry stays and no new run is claimed, so a
+repeat of that request is rejected explicitly rather than charged again (R11). `open_run` does
+not repair such an entry: the operator removes the index entry together with the run directory.
 """
 
 import hashlib
@@ -44,6 +49,10 @@ class RequestMismatch(Exception):
 
 class RequestIndexCorrupt(Exception):
     """The request index entry does not name a run; the request cannot be opened safely."""
+
+
+class RequestRunMissing(RequestIndexCorrupt):
+    """The request index entry names a run whose directory no longer exists."""
 
 
 @dataclass(frozen=True)
@@ -141,7 +150,12 @@ def _existing_run(runs_dir: Path, index_path: Path, request_id: str, digest: str
     if not RUN_ID_PATTERN.match(run_id):
         raise RequestIndexCorrupt(f"index entry {index_path.name} does not name a run")
     run_dir = runs_dir / run_id
-    _require_private_dir(run_dir)
+    try:
+        _require_private_dir(run_dir)
+    except FileNotFoundError:
+        raise RequestRunMissing(
+            f"index entry {index_path.name} names run {run_id}, but its directory is missing"
+        ) from None
     request = _read_json(run_dir / REQUEST_FILE_NAME)
     if request["identity_hash"] != digest:
         raise RequestMismatch(
