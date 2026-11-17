@@ -17,6 +17,15 @@
 # Backend слухового анализа — один, выбирается после Gate 0 (R01). Пока только `none`.
 # backend = "none"
 
+# Модель ASR: уже установленная локальная модель из кэша Hugging Face (`~/.cache/huggingface/hub`
+# или `HF_HUB_CACHE`), только `local_files_only`. Загрузка новой модели или revision — отдельное
+# разрешение владельца (R09); `doctor` ничего не скачивает. `revision` — hex-коммит снапшота,
+# нужен, когда в кэше несколько снапшотов модели; по умолчанию не задан: берётся `refs/main` или
+# единственный снапшот. Значение ниже — иллюстрация формата, не умолчание.
+# [asr]
+# model = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+# revision = "0123456789abcdef0123456789abcdef01234567"
+
 # Инженерные пределы версии (R02, R10, R11): вход, время обработки и ресурсы дочерних процессов.
 # `max_duration_seconds` задаёт и предел decoded samples: не больше
 # max_duration_seconds × sample rate × channels интерливированных отсчётов на один вход

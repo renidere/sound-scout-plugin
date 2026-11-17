@@ -1,18 +1,49 @@
+import json
+import os
 import subprocess
 import sys
 from importlib.metadata import version
+from pathlib import Path
 
 import pytest
 
+from sound_scout import config, doctor
 from sound_scout.cli import SUBCOMMANDS, main
 
 EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve"]
+NOT_IMPLEMENTED_SUBCOMMANDS = ["analyze", "compare", "serve"]
 
 
-def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "sound_scout", *args], capture_output=True, text=True, check=False
+        [sys.executable, "-m", "sound_scout", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
     )
+
+
+def write_config(tmp_path: Path, *, allow_network: bool) -> Path:
+    recordings, data = tmp_path / "recordings", tmp_path / "data"
+    recordings.mkdir()
+    data.mkdir()
+    path = tmp_path / "sound-scout.toml"
+    path.write_text(
+        f"allowed_roots = [{json.dumps(str(recordings))}]\n"
+        f"data_root = {json.dumps(str(data))}\n"
+        f"[network]\nallow = {json.dumps(allow_network)}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def config_without_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """`network.allow = true`, so an in-process `doctor` installs no audit hook in this session."""
+    path = write_config(tmp_path, allow_network=True)
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    return path
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -32,7 +63,7 @@ def test_help_lists_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         assert name in out
 
 
-@pytest.mark.parametrize("command", EXPECTED_SUBCOMMANDS)
+@pytest.mark.parametrize("command", NOT_IMPLEMENTED_SUBCOMMANDS)
 def test_subcommand_exits_2_not_implemented(
     command: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -56,8 +87,113 @@ def test_unknown_subcommand_is_usage_error(capsys: pytest.CaptureFixture[str]) -
     assert "invalid choice" in capsys.readouterr().err
 
 
-def test_console_script_module_entry() -> None:
+def test_doctor_prints_a_table_and_exits_0(
+    config_without_guard: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["doctor"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    header = [cell.strip() for cell in lines[0].split(" | ")]
+    assert header == ["component", "status", "last smoke", "fingerprint", "reason"]
+    report = doctor.report(config.load())
+    for line, (name, component) in zip(lines[1:5], report["components"].items(), strict=True):
+        cells = [cell.strip() for cell in line.split(" | ")]
+        assert cells[0] == name
+        assert cells[1] == component["status"]
+        assert cells[2] == "-"
+        assert cells[3] == component["fingerprint"]["hash"][:12]
+        assert cells[4] == component["reason"]
+    assert lines[5:] == [
+        "validated_ru: false",
+        "diction_validated_ru: false",
+        "prosody_validated_ru: false",
+        "network_guard: inactive (network.allow = true)",
+    ]
+
+
+def test_doctor_json_matches_report(
+    config_without_guard: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["doctor", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    expected = doctor.report(config.load())
+    assert printed["components"] == expected["components"]
+    assert printed["sound_scout"] == version("sound-scout")
+    assert printed["network_guard"] == {
+        "active": False,
+        "network_allow": True,
+        "offline_env": expected["network_guard"]["offline_env"],
+    }
+    for flag in ("validated_ru", "diction_validated_ru", "prosody_validated_ru"):
+        assert printed[flag] is False
+
+
+@pytest.mark.parametrize("status", doctor.STATUSES)
+def test_doctor_exits_0_whatever_the_statuses(
+    status: str,
+    config_without_guard: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Diagnostics, not a check: `ready` and every other status alike end with exit code 0."""
+    real = doctor.report(config.load())
+    smoke_at = "2026-11-17T12:00:00+00:00" if status == "ready" else None
+    reason = None if status == "ready" else f"reason for {status}"
+    for component in real["components"].values():
+        component.update(status=status, reason=reason, last_smoke_at=smoke_at)
+    monkeypatch.setattr(doctor, "report", lambda loaded: real)
+
+    assert main(["doctor"]) == 0
+    table = capsys.readouterr().out.splitlines()
+    assert [line.split(" | ")[1].strip() for line in table[1:5]] == [status] * 4
+    assert table[1].split(" | ")[2].strip() == (smoke_at or "-")
+    assert table[1].split(" | ")[4].strip() == (reason or "-")
+
+    assert main(["doctor", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert {c["status"] for c in printed["components"].values()} == {status}
+
+
+def test_doctor_without_configuration_is_one_line_on_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(tmp_path / "missing.toml"))
+    assert main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("config error: ")
+    assert captured.err.count("\n") == 1
+    assert "missing.toml" in captured.err
+
+
+def test_doctor_with_invalid_configuration_names_the_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_config(tmp_path, allow_network=True)
+    path.write_text(path.read_text() + "[asr]\nmodel = 'x'\n")
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    assert main(["doctor"]) == 1
+    assert "asr.model" in capsys.readouterr().err
+
+
+def test_console_script_module_entry(tmp_path: Path) -> None:
     assert run_cli("--version").stdout.strip() == f"sound-scout {version('sound-scout')}"
-    result = run_cli("doctor")
-    assert result.returncode == 2
-    assert "not implemented" in result.stderr
+    path = write_config(tmp_path, allow_network=False)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    }
+    env[config.CONFIG_PATH_ENV] = str(path)
+    result = run_cli("doctor", "--json", env=env)
+    assert result.returncode == 0, result.stderr
+    printed = json.loads(result.stdout)
+    assert set(printed["components"]) == set(doctor.COMPONENTS)
+    assert printed["network_guard"] == {
+        "active": True,
+        "network_allow": False,
+        "offline_env": {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    }
+    assert not (tmp_path / "data" / "receipts").exists()
+    assert run_cli("analyze").returncode == 2

@@ -38,11 +38,18 @@ uv run sound-scout --version
 uv run sound-scout --help
 ```
 
-Подкоманды `doctor`, `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
-`not implemented`. Локальная конфигурация — `sound-scout.toml` (копия `sound-scout.example.toml`,
-в git не входит): CLI и MCP будут читать её через `sound_scout.config.load()` из текущего каталога
-или по пути в `SOUND_SCOUT_CONFIG` (загрузчик есть, подкоманды к нему пока не подключены); обязательны `allowed_roots` и `data_root`, остальное — безопасные
-умолчания из примера. Без файла — явная ошибка, не умолчания для путей.
+`uv run sound-scout doctor` печатает таблицу состояния компонентов (`decoder`, `asr`,
+`acoustics`, `audio_review`: `ready | unavailable | unvalidated | permission_required` с причиной,
+отпечатком и временем последнего smoke-теста), `--json` — тот же отчёт в JSON; код возврата 0 при
+любых статусах, это диагностика, а не проверка. `ready` требует smoke-receipt
+(`<data_root>/receipts/<компонент>.json`), который пишет smoke-тест компонента; `doctor` только
+читает его, ничего не скачивает и не запускает inference. Подкоманды `analyze`, `compare`, `serve`
+пока завершаются с кодом 2 и сообщением `not implemented`. Локальная конфигурация —
+`sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor` читает её через
+`sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; остальные
+подкоманды и MCP будут читать её так же. Обязательны
+`allowed_roots` и `data_root`, остальное — безопасные умолчания из примера. Без файла — явная
+ошибка (код 1), не умолчания для путей.
 
 Для pre-commit-хуков установите [lefthook](https://github.com/evilmartians/lefthook) и выполните
 `lefthook install`: перед коммитом по staged-файлам пройдут `ruff check` и `ruff format --check`.

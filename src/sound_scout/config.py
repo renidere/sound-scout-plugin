@@ -11,6 +11,7 @@ resolved path, and `paths` refuses every input path whose component below the ro
 
 import fnmatch
 import os
+import re
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -20,6 +21,8 @@ EXAMPLE_FILE_NAME = "sound-scout.example.toml"
 CONFIG_PATH_ENV = "SOUND_SCOUT_CONFIG"
 KNOWN_BACKENDS = ("none",)
 MIB = 1024 * 1024
+MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*")
+MODEL_REVISION = re.compile(r"[0-9a-f]{7,40}")
 
 # Names never read as input, in any position of the path, even inside an allowed root:
 # operator secrets and config, credential and agent-profile directories, playlist and script
@@ -76,12 +79,27 @@ class Network:
 
 
 @dataclass(frozen=True)
+class Asr:
+    """The ASR model as `owner/name` on the Hugging Face hub and, optionally, its snapshot.
+
+    Only an already installed local snapshot is used (`local_files_only`); the default is
+    the model installed on the owner's workstation. A new model or revision is a download
+    and needs the owner's permission (R09). `revision` picks the snapshot when the local
+    cache holds several.
+    """
+
+    model: str = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+    revision: str | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     allowed_roots: tuple[Path, ...]
     data_root: Path
     budgets: Budgets = Budgets()
     network: Network = Network()
     backend: str = "none"
+    asr: Asr = Asr()
 
 
 def config_path() -> Path:
@@ -136,6 +154,7 @@ def _parse(data: dict[str, object]) -> Config:
         budgets=_budgets(data.get("budgets", {})),
         network=_network(data.get("network", {})),
         backend=_backend(data.get("backend", "none")),
+        asr=_asr(data.get("asr", {})),
     )
 
 
@@ -154,6 +173,25 @@ def _network(value: object) -> Network:
     table = _table(value, "network")
     _reject_unknown(table, {field.name for field in fields(Network)}, prefix="network")
     return Network(**{name: _bool(item, f"network.{name}") for name, item in table.items()})
+
+
+def _asr(value: object) -> Asr:
+    table = _table(value, "asr")
+    _reject_unknown(table, {field.name for field in fields(Asr)}, prefix="asr")
+    asr = Asr()
+    if "model" in table:
+        model = table["model"]
+        if not isinstance(model, str) or not MODEL_ID.fullmatch(model):
+            raise ConfigError(f"asr.model: expected a model id like owner/name, got {model!r}")
+        asr = Asr(model=model, revision=asr.revision)
+    if "revision" in table:
+        revision = table["revision"]
+        if not isinstance(revision, str) or not MODEL_REVISION.fullmatch(revision):
+            raise ConfigError(
+                f"asr.revision: expected a hex commit of 7 to 40 characters, got {revision!r}"
+            )
+        asr = Asr(model=asr.model, revision=revision)
+    return asr
 
 
 def _backend(value: object) -> str:

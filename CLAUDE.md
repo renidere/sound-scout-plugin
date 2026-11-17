@@ -84,6 +84,7 @@
 | Поручение агенту и границы полномочий | `docs/spec/AGENT_PROMPT.md` |
 | Контракт результата (JSON Schema), пример | `schema/` (упакованная копия — `src/sound_scout/result.v1.schema.json`) |
 | Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
+| `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |

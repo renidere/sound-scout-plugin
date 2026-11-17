@@ -6,7 +6,15 @@ from pathlib import Path
 import pytest
 
 from sound_scout import config, paths
-from sound_scout.config import Budgets, Config, ConfigError, Network, decoded_samples_limit, load
+from sound_scout.config import (
+    Asr,
+    Budgets,
+    Config,
+    ConfigError,
+    Network,
+    decoded_samples_limit,
+    load,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_PATH = REPO_ROOT / "sound-scout.example.toml"
@@ -64,6 +72,7 @@ def test_loads_from_current_directory_with_defaults(
     )
     assert loaded.network == Network(allow=False)
     assert loaded.backend == "none"
+    assert loaded.asr == Asr(model="mobiuslabsgmbh/faster-whisper-large-v3-turbo", revision=None)
 
 
 def test_loads_from_env_path_over_current_directory(
@@ -85,10 +94,17 @@ def test_all_fields_are_read_with_explicit_types(write_config, minimal_toml: str
         + "max_channels = 1\nworker_deadline_seconds = 60\n"
         + "max_subprocess_seconds = 10\nmax_subprocess_memory_mib = 256\n"
         + "[network]\nallow = true\n"
+        + '[asr]\nmodel = "Systran/faster-whisper-small"\nrevision = "0a363e91abcdef0"\n'
     )
     loaded = load()
     assert loaded.budgets == Budgets(30, 1024, 1, 60, 10, 256)
     assert loaded.network.allow is True
+    assert loaded.asr == Asr(model="Systran/faster-whisper-small", revision="0a363e91abcdef0")
+
+
+def test_asr_model_alone_leaves_revision_unset(write_config, minimal_toml: str) -> None:
+    write_config(minimal_toml + '[asr]\nmodel = "owner/model.v2-ru"\n')
+    assert load().asr == Asr(model="owner/model.v2-ru", revision=None)
 
 
 def test_missing_file_names_example_and_env(write_config) -> None:
@@ -146,6 +162,7 @@ def test_required_field_missing_is_named(write_config, minimal_toml: str, missin
         ("[budgets]\nwall_time_seconds = 10\n", r"budgets\.wall_time_seconds"),
         ("[network]\nproxy = 'x'\n", r"network\.proxy"),
         ("[backend]\nname = 'x'\n", "backend"),
+        ("[asr]\ndevice = 'cuda'\n", r"asr\.device"),
     ],
 )
 def test_unknown_field_is_rejected_by_name(
@@ -281,6 +298,16 @@ def test_denied_names_are_shared_with_paths() -> None:
         ('[network]\nallow = "yes"\n', r"network\.allow: expected true or false"),
         ('backend = "whisper"\n', "backend: expected one of"),
         ("backend = 1\n", "backend: expected one of"),
+        ("asr = 1\n", "asr: expected a table"),
+        ('[asr]\nmodel = "x"\n', r"asr\.model: expected a model id like owner/name"),
+        ('[asr]\nmodel = "a/b/c"\n', r"asr\.model: expected a model id"),
+        ('[asr]\nmodel = "../etc/passwd"\n', r"asr\.model: expected a model id"),
+        ("[asr]\nmodel = 1\n", r"asr\.model: expected a model id"),
+        ('[asr]\nrevision = "zz"\n', r"asr\.revision: expected a hex commit"),
+        ('[asr]\nrevision = "abc123"\n', r"asr\.revision: expected a hex commit"),
+        ("[asr]\nrevision = 123456789\n", r"asr\.revision: expected a hex commit"),
+        ('[asr]\nmodel = "owner/name\\n"\n', r"asr\.model: expected a model id"),
+        ('[asr]\nrevision = "0123456789abcdef\\n"\n', r"asr\.revision: expected a hex commit"),
     ],
 )
 def test_wrong_types_and_values_are_named(
@@ -341,13 +368,15 @@ def test_example_config_loads_after_substituting_paths(
     assert loaded.budgets == Budgets()
     assert loaded.network == Network()
     assert loaded.backend == "none"
+    assert loaded.asr.model == Asr().model
+    assert re.fullmatch(r"[0-9a-f]{40}", loaded.asr.revision or "")
 
 
 def test_example_config_documents_every_field() -> None:
     text = example_config_text(Path("/a"), Path("/b"))
     for field in dataclasses.fields(Config):
         assert re.search(rf"^\[?{field.name}\b", text, re.MULTILINE), field.name
-    for section, dataclass_type in (("budgets", Budgets), ("network", Network)):
+    for section, dataclass_type in (("budgets", Budgets), ("network", Network), ("asr", Asr)):
         body = text.split(f"[{section}]", 1)[1]
         for field in dataclasses.fields(dataclass_type):
             assert re.search(rf"^{field.name} = ", body, re.MULTILINE), f"{section}.{field.name}"
