@@ -23,10 +23,29 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Budgets:
+    """Engineering limits of the version (R10, R11); every one is documented in the example file.
+
+    `max_duration_seconds` also bounds the decoded samples: `decoded_samples_limit` is this
+    many seconds at the stream's sample rate and channel count. `max_subprocess_seconds` and
+    `max_subprocess_memory_mib` bound one decoder child process (`proc.run`: wall time and
+    `RLIMIT_AS`), `worker_deadline_seconds` the whole analysis worker.
+    """
+
     max_duration_seconds: int = 180
     max_input_bytes: int = 100 * MIB
     max_channels: int = 2
     worker_deadline_seconds: int = 180
+    max_subprocess_seconds: int = 60
+    max_subprocess_memory_mib: int = 2048
+
+
+def decoded_samples_limit(budgets: Budgets, sample_rate: int, channels: int) -> int:
+    """Most interleaved samples a decoder may produce: `max_duration_seconds` at this format."""
+    if sample_rate <= 0 or channels <= 0:
+        raise ValueError(
+            f"sample_rate and channels must be positive, got {sample_rate}, {channels}"
+        )
+    return budgets.max_duration_seconds * sample_rate * channels
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from sound_scout import config
-from sound_scout.config import Budgets, Config, ConfigError, Network, load
+from sound_scout.config import Budgets, Config, ConfigError, Network, decoded_samples_limit, load
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_PATH = REPO_ROOT / "sound-scout.example.toml"
@@ -59,6 +59,8 @@ def test_loads_from_current_directory_with_defaults(
         max_input_bytes=100 * 1024 * 1024,
         max_channels=2,
         worker_deadline_seconds=180,
+        max_subprocess_seconds=60,
+        max_subprocess_memory_mib=2048,
     )
     assert loaded.network == Network(allow=False)
     assert loaded.backend == "none"
@@ -81,10 +83,11 @@ def test_all_fields_are_read_with_explicit_types(write_config, minimal_toml: str
         + 'backend = "none"\n'
         + "[budgets]\nmax_duration_seconds = 30\nmax_input_bytes = 1024\n"
         + "max_channels = 1\nworker_deadline_seconds = 60\n"
+        + "max_subprocess_seconds = 10\nmax_subprocess_memory_mib = 256\n"
         + "[network]\nallow = true\n"
     )
     loaded = load()
-    assert loaded.budgets == Budgets(30, 1024, 1, 60)
+    assert loaded.budgets == Budgets(30, 1024, 1, 60, 10, 256)
     assert loaded.network.allow is True
 
 
@@ -221,6 +224,8 @@ def test_symlinked_roots_are_compared_resolved(
         ("[budgets]\nmax_channels = true\n", r"budgets\.max_channels"),
         ('[budgets]\nworker_deadline_seconds = "60"\n', r"budgets\.worker_deadline_seconds"),
         ("[budgets]\nmax_duration_seconds = 1.5\n", r"budgets\.max_duration_seconds"),
+        ("[budgets]\nmax_subprocess_seconds = 0\n", r"budgets\.max_subprocess_seconds"),
+        ("[budgets]\nmax_subprocess_memory_mib = -5\n", r"budgets\.max_subprocess_memory_mib"),
         ('[network]\nallow = "yes"\n', r"network\.allow: expected true or false"),
         ('backend = "whisper"\n', "backend: expected one of"),
         ("backend = 1\n", "backend: expected one of"),
@@ -233,6 +238,23 @@ def test_wrong_types_and_values_are_named(
     write_config("".join(lines) + text)
     with pytest.raises(ConfigError, match=field):
         load()
+
+
+@pytest.mark.parametrize(
+    ("seconds", "sample_rate", "channels", "expected"),
+    [(180, 16_000, 1, 2_880_000), (30, 48_000, 2, 2_880_000), (1, 8_000, 1, 8_000)],
+)
+def test_decoded_samples_limit_is_duration_times_rate_times_channels(
+    seconds: int, sample_rate: int, channels: int, expected: int
+) -> None:
+    budgets = Budgets(max_duration_seconds=seconds)
+    assert decoded_samples_limit(budgets, sample_rate, channels) == expected
+
+
+@pytest.mark.parametrize(("sample_rate", "channels"), [(0, 1), (16_000, 0), (-1, 2)])
+def test_decoded_samples_limit_rejects_non_positive_format(sample_rate: int, channels: int) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        decoded_samples_limit(Budgets(), sample_rate, channels)
 
 
 def test_config_is_frozen(write_config, minimal_toml: str) -> None:

@@ -14,13 +14,24 @@
 # Backend слухового анализа — один, выбирается после Gate 0 (R01). Пока только `none`.
 # backend = "none"
 
-# Инженерные пределы версии (R02, R10, R11): вход и время обработки.
+# Инженерные пределы версии (R02, R10, R11): вход, время обработки и ресурсы дочерних процессов.
+# `max_duration_seconds` задаёт и предел decoded samples: не больше
+# max_duration_seconds × sample rate × channels интерливированных отсчётов на один вход
+# (`config.decoded_samples_limit`). `worker_deadline_seconds` — весь worker анализа;
+# `max_subprocess_seconds` — wall time одного вызова ffmpeg/ffprobe, по истечении убивается вся
+# его группа процессов; `max_subprocess_memory_mib` — адресное пространство (RLIMIT_AS) такого
+# процесса на Linux, на других платформах не применяется.
 # [budgets]
 # max_duration_seconds = 180
 # max_input_bytes = 104857600
 # max_channels = 2
 # worker_deadline_seconds = 180
+# max_subprocess_seconds = 60
+# max_subprocess_memory_mib = 2048
 
 # Сеть по умолчанию запрещена: без загрузок моделей, без внешнего inference, без телеметрии (R09).
+# При `allow = false` процесс ставит audit hook на сокеты (`guard.install_network_guard`, снять его
+# до конца процесса нельзя) и выставляет `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; у декодера
+# разрешены только протоколы `file,pipe`.
 # [network]
 # allow = false
