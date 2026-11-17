@@ -40,7 +40,9 @@ uv run sound-scout --help
 
 Подкоманды `doctor`, `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
 `not implemented`. Локальная конфигурация — `sound-scout.toml` (копия `sound-scout.example.toml`,
-в git не входит).
+в git не входит): CLI и MCP будут читать её через `sound_scout.config.load()` из текущего каталога
+или по пути в `SOUND_SCOUT_CONFIG` (загрузчик есть, подкоманды к нему пока не подключены); обязательны `allowed_roots` и `data_root`, остальное — безопасные
+умолчания из примера. Без файла — явная ошибка, не умолчания для путей.
 
 Для pre-commit-хуков установите [lefthook](https://github.com/evilmartians/lefthook) и выполните
 `lefthook install`: перед коммитом по staged-файлам пройдут `ruff check` и `ruff format --check`.

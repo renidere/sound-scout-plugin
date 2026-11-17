@@ -1,0 +1,279 @@
+import dataclasses
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from sound_scout import config
+from sound_scout.config import Budgets, Config, ConfigError, Network, load
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EXAMPLE_PATH = REPO_ROOT / "sound-scout.example.toml"
+COMMENTED_FIELD_LINE = re.compile(r"# ?(\[[\w.]+\]|[\w.]+ = .*)")
+
+
+def toml_string(path: Path) -> str:
+    return json.dumps(str(path))
+
+
+@pytest.fixture
+def roots(tmp_path: Path) -> tuple[Path, Path]:
+    recordings = tmp_path / "recordings"
+    data = tmp_path / "data"
+    recordings.mkdir()
+    data.mkdir()
+    return recordings, data
+
+
+@pytest.fixture
+def minimal_toml(roots: tuple[Path, Path]) -> str:
+    recordings, data = roots
+    return f"allowed_roots = [{toml_string(recordings)}]\ndata_root = {toml_string(data)}\n"
+
+
+@pytest.fixture
+def write_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Write the text as `sound-scout.toml` in a fresh current directory, env unset."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv(config.CONFIG_PATH_ENV, raising=False)
+
+    def _write(text: str) -> Path:
+        path = cwd / config.CONFIG_FILE_NAME
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    return _write
+
+
+def test_loads_from_current_directory_with_defaults(
+    write_config, minimal_toml: str, roots: tuple[Path, Path]
+) -> None:
+    write_config(minimal_toml)
+    loaded = load()
+    assert loaded == Config(allowed_roots=(roots[0].resolve(),), data_root=roots[1].resolve())
+    assert loaded.budgets == Budgets(
+        max_duration_seconds=180,
+        max_input_bytes=100 * 1024 * 1024,
+        max_channels=2,
+        worker_deadline_seconds=180,
+    )
+    assert loaded.network == Network(allow=False)
+    assert loaded.backend == "none"
+
+
+def test_loads_from_env_path_over_current_directory(
+    write_config, minimal_toml: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config("allowed_roots = 'broken'\n")
+    env_path = tmp_path / "elsewhere" / "custom.toml"
+    env_path.parent.mkdir()
+    env_path.write_text(minimal_toml + 'backend = "none"\n[budgets]\nmax_channels = 1\n')
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(env_path))
+    assert load().budgets.max_channels == 1
+
+
+def test_all_fields_are_read_with_explicit_types(write_config, minimal_toml: str) -> None:
+    write_config(
+        minimal_toml
+        + 'backend = "none"\n'
+        + "[budgets]\nmax_duration_seconds = 30\nmax_input_bytes = 1024\n"
+        + "max_channels = 1\nworker_deadline_seconds = 60\n"
+        + "[network]\nallow = true\n"
+    )
+    loaded = load()
+    assert loaded.budgets == Budgets(30, 1024, 1, 60)
+    assert loaded.network.allow is True
+
+
+def test_missing_file_names_example_and_env(write_config) -> None:
+    with pytest.raises(ConfigError) as error:
+        load()
+    message = str(error.value)
+    assert config.CONFIG_FILE_NAME in message
+    assert config.EXAMPLE_FILE_NAME in message
+    assert config.CONFIG_PATH_ENV in message
+
+
+def test_missing_env_file_names_that_path(
+    write_config, minimal_toml: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(minimal_toml)
+    missing = tmp_path / "missing.toml"
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(missing))
+    with pytest.raises(ConfigError, match=re.escape(str(missing))):
+        load()
+
+
+def test_directory_as_config_path_is_a_config_error(
+    write_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(tmp_path))
+    with pytest.raises(ConfigError, match=rf"{re.escape(str(tmp_path))}: cannot read"):
+        load()
+
+
+def test_non_utf8_content_is_a_config_error(write_config) -> None:
+    path = write_config("")
+    path.write_bytes(b"allowed_roots = [\xff]\n")
+    with pytest.raises(ConfigError, match=rf"{re.escape(str(path))}: cannot read"):
+        load()
+
+
+def test_invalid_toml_names_the_file(write_config) -> None:
+    path = write_config("allowed_roots = [\n")
+    with pytest.raises(ConfigError, match=rf"{re.escape(str(path))}: not valid TOML"):
+        load()
+
+
+@pytest.mark.parametrize("missing", ["allowed_roots", "data_root"])
+def test_required_field_missing_is_named(write_config, minimal_toml: str, missing: str) -> None:
+    text = "".join(line for line in minimal_toml.splitlines(True) if not line.startswith(missing))
+    write_config(text)
+    with pytest.raises(ConfigError, match=rf"{missing}: required field is missing"):
+        load()
+
+
+@pytest.mark.parametrize(
+    ("extra", "field"),
+    [
+        ('api_key = "sk-secret"\n', "api_key"),
+        ("[budgets]\nwall_time_seconds = 10\n", r"budgets\.wall_time_seconds"),
+        ("[network]\nproxy = 'x'\n", r"network\.proxy"),
+        ("[backend]\nname = 'x'\n", "backend"),
+    ],
+)
+def test_unknown_field_is_rejected_by_name(
+    write_config, minimal_toml: str, extra: str, field: str
+) -> None:
+    write_config(minimal_toml + extra)
+    with pytest.raises(ConfigError, match=field):
+        load()
+
+
+def test_relative_paths_are_rejected_by_field(write_config, roots: tuple[Path, Path]) -> None:
+    write_config(f'allowed_roots = ["recordings"]\ndata_root = {toml_string(roots[1])}\n')
+    with pytest.raises(ConfigError, match=r"allowed_roots\[0\]: expected an absolute path"):
+        load()
+    write_config(f'allowed_roots = [{toml_string(roots[0])}]\ndata_root = "data"\n')
+    with pytest.raises(ConfigError, match="data_root: expected an absolute path"):
+        load()
+
+
+def test_nonexistent_directory_is_rejected(write_config, roots: tuple[Path, Path]) -> None:
+    gone = roots[1] / "not-there"
+    write_config(f"allowed_roots = [{toml_string(roots[0])}]\ndata_root = {toml_string(gone)}\n")
+    with pytest.raises(ConfigError, match="data_root: not an existing directory"):
+        load()
+
+
+def test_data_root_inside_allowed_root_is_rejected(write_config, roots: tuple[Path, Path]) -> None:
+    inside = roots[0] / "runs"
+    inside.mkdir()
+    write_config(f"allowed_roots = [{toml_string(roots[0])}]\ndata_root = {toml_string(inside)}\n")
+    with pytest.raises(ConfigError, match=r"data_root and allowed_roots\[0\]"):
+        load()
+
+
+def test_allowed_root_inside_data_root_is_rejected(write_config, roots: tuple[Path, Path]) -> None:
+    inside = roots[1] / "incoming"
+    inside.mkdir()
+    write_config(
+        f"allowed_roots = [{toml_string(roots[0])}, {toml_string(inside)}]\n"
+        f"data_root = {toml_string(roots[1])}\n"
+    )
+    with pytest.raises(ConfigError, match=r"data_root and allowed_roots\[1\]"):
+        load()
+
+
+def test_same_directory_for_both_is_rejected(write_config, roots: tuple[Path, Path]) -> None:
+    write_config(
+        f"allowed_roots = [{toml_string(roots[0])}]\ndata_root = {toml_string(roots[0])}\n"
+    )
+    with pytest.raises(ConfigError, match=r"data_root and allowed_roots\[0\]"):
+        load()
+
+
+def test_symlinked_roots_are_compared_resolved(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    link = tmp_path / "link-to-recordings"
+    link.symlink_to(roots[0], target_is_directory=True)
+    inside = roots[0] / "runs"
+    inside.mkdir()
+    write_config(f"allowed_roots = [{toml_string(link)}]\ndata_root = {toml_string(inside)}\n")
+    with pytest.raises(ConfigError, match=r"data_root and allowed_roots\[0\]"):
+        load()
+
+
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ('allowed_roots = "/abs"\n', "allowed_roots: expected a non-empty list"),
+        ("allowed_roots = []\n", "allowed_roots: expected a non-empty list"),
+        ("allowed_roots = [1]\n", r"allowed_roots\[0\]: expected a path string"),
+        ("data_root = 1\n", "data_root: expected a path string"),
+        ("budgets = 1\n", "budgets: expected a table"),
+        ("[budgets]\nmax_duration_seconds = 0\n", r"budgets\.max_duration_seconds"),
+        ("[budgets]\nmax_input_bytes = -1\n", r"budgets\.max_input_bytes"),
+        ("[budgets]\nmax_channels = true\n", r"budgets\.max_channels"),
+        ('[budgets]\nworker_deadline_seconds = "60"\n', r"budgets\.worker_deadline_seconds"),
+        ("[budgets]\nmax_duration_seconds = 1.5\n", r"budgets\.max_duration_seconds"),
+        ('[network]\nallow = "yes"\n', r"network\.allow: expected true or false"),
+        ('backend = "whisper"\n', "backend: expected one of"),
+        ("backend = 1\n", "backend: expected one of"),
+    ],
+)
+def test_wrong_types_and_values_are_named(
+    write_config, minimal_toml: str, text: str, field: str
+) -> None:
+    lines = [line for line in minimal_toml.splitlines(True) if line.split(" ")[0] not in text]
+    write_config("".join(lines) + text)
+    with pytest.raises(ConfigError, match=field):
+        load()
+
+
+def test_config_is_frozen(write_config, minimal_toml: str) -> None:
+    loaded = write_config(minimal_toml) and load()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        loaded.backend = "other"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        loaded.budgets.max_duration_seconds = 1  # type: ignore[misc]
+
+
+def example_config_text(allowed_root: Path, data_root: Path) -> str:
+    """Uncomment the field lines of the example and substitute the illustrative paths."""
+    field_lines = []
+    for line in EXAMPLE_PATH.read_text(encoding="utf-8").splitlines():
+        if match := COMMENTED_FIELD_LINE.fullmatch(line):
+            field_lines.append(match.group(1))
+    text = "\n".join(field_lines) + "\n"
+    return text.replace('"/path/to/recordings"', toml_string(allowed_root)).replace(
+        '"/path/to/sound-scout-data"', toml_string(data_root)
+    )
+
+
+def test_example_config_loads_after_substituting_paths(
+    write_config, roots: tuple[Path, Path]
+) -> None:
+    text = example_config_text(*roots)
+    assert "/path/to/" not in text
+    write_config(text)
+    loaded = load()
+    assert loaded.allowed_roots == (roots[0].resolve(),)
+    assert loaded.data_root == roots[1].resolve()
+    assert loaded.budgets == Budgets()
+    assert loaded.network == Network()
+    assert loaded.backend == "none"
+
+
+def test_example_config_documents_every_field() -> None:
+    text = example_config_text(Path("/a"), Path("/b"))
+    for field in dataclasses.fields(Config):
+        assert re.search(rf"^\[?{field.name}\b", text, re.MULTILINE), field.name
+    for section, dataclass_type in (("budgets", Budgets), ("network", Network)):
+        body = text.split(f"[{section}]", 1)[1]
+        for field in dataclasses.fields(dataclass_type):
+            assert re.search(rf"^{field.name} = ", body, re.MULTILINE), f"{section}.{field.name}"
