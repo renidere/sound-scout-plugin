@@ -69,6 +69,7 @@ def write_two_bitrate_mp3(path: Path, head_seconds: float, tail_seconds: float) 
     Without a Xing/Info frame ffprobe estimates the duration from the bitrate of the first
     frames and the file size, so the head makes the estimate fall short of the audio present.
     """
+    require_encoders("libmp3lame")
     parts = []
     for name, seconds, bitrate in (("head", head_seconds, "64k"), ("tail", tail_seconds, "8k")):
         part = path.with_suffix(f".{name}.mp3")
@@ -90,6 +91,7 @@ def write_two_bitrate_mp3(path: Path, head_seconds: float, tail_seconds: float) 
 
 def write_damaged_mp3(path: Path) -> Path:
     """A 2 s MP3 with 600 bytes of garbage in the middle: frames before and after still decode."""
+    require_encoders("libmp3lame")
     subprocess.run(
         [
             "ffmpeg", "-v", "error", "-y", "-f", "lavfi",

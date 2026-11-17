@@ -1,12 +1,13 @@
 import shutil
 import subprocess
 import wave
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from tests import conftest
+from tests import conftest, test_ingest
 from tests.conftest import Encoder, WavFactory
 
 
@@ -54,6 +55,23 @@ def test_encode_skips_by_name_when_the_encoder_is_missing(
     with pytest.raises(pytest.skip.Exception, match="libmp3lame"):
         encode(wav_file, wav_file.with_suffix(".mp3"), "libmp3lame")
     assert not wav_file.with_suffix(".mp3").exists()
+
+
+@pytest.mark.parametrize(
+    "write_mp3",
+    [
+        lambda path: test_ingest.write_two_bitrate_mp3(path, head_seconds=0.5, tail_seconds=0.5),
+        test_ingest.write_damaged_mp3,
+    ],
+    ids=["write_two_bitrate_mp3", "write_damaged_mp3"],
+)
+def test_mp3_helpers_skip_by_name_when_libmp3lame_is_missing(
+    write_mp3: Callable[[Path], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conftest, "ffmpeg_encoders", lambda: frozenset())
+    with pytest.raises(pytest.skip.Exception, match="encoder not available: libmp3lame"):
+        write_mp3(tmp_path / "voice.mp3")
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffprobe is not installed")
