@@ -307,8 +307,9 @@ built in this task: skip a finding that asks for one with that reason, and keep 
       them again.
    e. `git push origin HEAD:main`. A network or auth error: retry twice, a minute apart. Refused
       because origin moved — other tasks land on main too: back to d, up to three times.
-   f. Wait for that push's CI run to finish:
-      `gh run list --repo renidere/sound-scout-plugin --commit <sha> --json databaseId,url,status,conclusion`
+   f. Wait for that push's CI run to finish. Take the full 40-character sha of the pushed commit
+      from `git rev-parse HEAD` — `--commit` doesn't expand a short sha, it just returns `[]` — then
+      `gh run list --repo renidere/sound-scout-plugin --commit <full sha> --json databaseId,url,status,conclusion`
       (none yet: ask again every 20 seconds for up to three minutes) then
       `gh run watch <id> --repo renidere/sound-scout-plugin --exit-status --interval 60`, in
       ≤9-minute blocks (never without `--interval 60`). A run cancelled because a later push to

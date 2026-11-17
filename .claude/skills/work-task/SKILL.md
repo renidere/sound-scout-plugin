@@ -354,7 +354,8 @@ One Lander. It weighs each finding against the code, fixes the valid ones and sk
 a one-line reason, reruns the check, then: commit on the task branch (conventional subject, ending
 in `(#<number>)`, no closing keywords), rebase onto `origin/main` — a rebase that brought in main
 commits gets lint and the tests again, since another task's code may call what this one changed —
-push it to main (`git push origin HEAD:main`), and wait for that push's CI run to finish green.
+push it to main (`git push origin HEAD:main`), and wait for that push's CI run to finish green,
+found by the pushed commit's full sha from `git rev-parse HEAD` (a short sha returns an empty list).
 Another task may land meanwhile: a push refused because main moved goes back to the rebase. Red
 CI it fixes forward once in a new commit; red again, or a push it can't land, comes back as a
 failure. A red that main's run before the push had already, in the same job and test, isn't this
