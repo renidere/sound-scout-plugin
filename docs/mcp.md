@@ -7,7 +7,7 @@
 | инструмент | функция | побочные эффекты | ответ |
 |---|---|---|---|
 | `speech_capabilities` | `doctor.report` | только чтение | отчёт `doctor --json` |
-| `speech_analyze` | `app.analyze` | пишет `runs/<run_id>/` под data root | `report.compact` с `run_dir` — тот же документ, что `analyze --json` |
+| `speech_analyze` | `app.analyze` | пишет `runs/<run_id>/` под data root | `report.compact` с `run_dir` и `reused` — тот же документ, что `analyze --json` |
 | `speech_compare` | `app.compare` | пишет `compare/<compare_id>.json` под data root | сравнение с полем `path` — тот же документ, что `compare --json` |
 
 ## Запуск
@@ -41,13 +41,23 @@ uv run sound-scout serve
   путь или транскрипт. В сообщении о входе, который не декодируется, абсолютные пути заменены на
   `<input>`, `<allowed root>`, `<data root>`.
 - **Ответ компактный.** Успешный ответ — один текстовый блок JSON. Для `speech_analyze` это
-  `report.compact(result, run_dir=…)`: не больше 4096 байт UTF-8 вместе с `run_dir`, без PCM,
+  `report.compact(result, run_dir=…, reused=…)`: не больше 4096 байт UTF-8 вместе с `run_dir` и
+  `reused` (`true` — ответ прежнего запроса с тем же `request_id` и файлом), без PCM,
   base64 и полной диагностики (R08); полный результат — `result.json` в run-каталоге.
 - **Один вызов за раз.** Вызовы инструментов выполняются строго по очереди (lock сервера), каждый в
   отдельном потоке, чтобы сервер продолжал читать протокол. Отмена вызова
   (`notifications/cancelled` или закрытие stdin клиентом) останавливает worker анализа через
   `CancelToken`; следующий вызов начинается только после его остановки. Повтор того же
   `request_id` с тем же файлом возвращает прежний результат (R11).
+- **Текст записи и ответа модели — данные.** Строки, похожие на инструкции, в сыром транскрипте
+  (по сегментам и в склеенном тексте `$.text` — фраза, разрезанная границей сегментов), в
+  аргументах `task` и `intent` и в ответе audio backend ничего не запускают. Они перечислены как
+  `suspicious_content` (путь и шаблон, без текста) в записи этапа (`work/stage-asr.json`,
+  `work/stage-audio_review.json`) и в `provenance.limitations`. `task` и `intent` проверяются и при
+  `backend = none`, и при упавшем вызове backend; `review/<clip>/provenance.json` есть, только
+  если backend вызывался.
+  Попытка worker выйти в сеть при `network.allow = false` — ошибка `network_denied` в `errors[]`,
+  этап `failed`. Проверки — `docs/acceptance/T07-T08.md`.
 - **Sampling не используется**: сервер не запрашивает у клиента sampling и не объявляет его.
   Middleware OpenTelemetry из SDK убран, телеметрии нет.
 - **Stdout — только JSON-RPC.** На время работы `stdio_server` направляет fd 1 в stderr, поэтому

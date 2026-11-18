@@ -99,7 +99,7 @@ uv run sound-scout compare <run_id A> <run_id B> --criterion emphasis_on:<сло
 ```
 
 `analyze` вызывает `app.analyze` и печатает итог по compact-ответу (`--json` — сам compact-ответ
-с полем `run_dir`); run-каталог печатается относительно data root (`runs/<run_id>`). Код возврата
+с полями `run_dir` и `reused`); run-каталог печатается относительно data root (`runs/<run_id>`). Код возврата
 — по `status` результата: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`. `compare` вызывает
 `app.compare` (критерии — `docs/decisions/0006-compare-rules.md`) и печатает вердикт, все причины
 и файл `compare/<id>.json` (`--json` — сравнение целиком с полем `path`), код 0 при любом вердикте.

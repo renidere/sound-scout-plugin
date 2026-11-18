@@ -20,6 +20,14 @@ it can record the interrupted stage as anything. The worker and every decoder ar
 their parent with `proc.die_with_parent`, so neither outlives a killed parent. Stdout of the
 worker is pointed at stderr: stdout belongs to the MCP protocol.
 
+The worker runs under the network guard. A network attempt it denies is `network_denied` in
+`errors[]` and fails the stage it happened in, also when the stage caught the exception and
+carried on: such a stage is never recorded as a success (R09, T07). Instruction-like strings in
+the raw transcript (its segments and the joined text), in the `task` and `intent` of the request
+(with or without a backend, also when its call fails) and in the backend's response are listed as
+`suspicious_content` in the stage record (path and pattern, never the text) and named in
+`provenance.limitations`; they are data and nothing acts on them (R10, T07).
+
 The result is always assembled in the calling process from the stage records, one function for a
 complete and a partial run alike: the first requested stage without a record is the interrupted
 one (`deadline_exceeded`, `cancelled`, `worker_crashed` in `errors[]`), the requested stages after
@@ -87,12 +95,18 @@ CANCELLED = "cancelled"
 WORKER_CRASHED = "worker_crashed"
 INTERNAL_ERROR = "internal_error"
 REVIEW_CALL_FAILED = "review_call_failed"
+NETWORK_DENIED = "network_denied"
 ASR_FAILED = "asr_failed"
 NO_BACKEND_REASON = "backend = none: audio backend не выбран (Gate 0)"
 NOT_REQUESTED_REASON = "слой не запрошен"
 CANCELLED_REASON = "отменён"
 SYNTHETIC_NOTE = "synthetic: test double, не доказательство способности слышать"
 HALLUCINATION_LIMITATION = "ASR: есть сегменты suspect_hallucination"
+SUSPICIOUS_LIMITATIONS = {
+    "asr": "suspicious_content в сыром транскрипте (asr/raw.json), не исполнялось: ",
+    "audio_review": "suspicious_content в аргументах task/intent и в ответе audio backend "
+    "(work/stage-audio_review.json, review/<clip>/provenance.json), не исполнялось: ",
+}
 QUALIFICATION_FLAGS = ("validated_ru", "diction_validated_ru", "prosody_validated_ru")
 EXPECTED_ERRORS = (
     ingest.IngestError,
@@ -102,10 +116,12 @@ EXPECTED_ERRORS = (
     clips.ClipError,
     review.AudioPayloadMissing,
     paths.PathDenied,
+    guard.NetworkDenied,
 )
 _CODELESS_ERRORS = {
     review.AudioPayloadMissing: "audio_payload_missing",
     paths.PathDenied: "path_denied",
+    guard.NetworkDenied: NETWORK_DENIED,
 }
 
 
@@ -474,23 +490,44 @@ def _run_stages(
     audio_sha256: str,
 ) -> None:
     requested = {LAYER_STAGES[layer] for layer in request.layers}
+    denied = len(guard.denied_events())
     prepared, record = _prepare_stage(request.path, run, config, audio_sha256, "asr" in requested)
+    record = _with_denials(record, guard.denied_events()[denied:])
+    if record["entry"]["status"] != "completed":
+        prepared = None
     _write_record(run, config, record)
     no_signal = f"нет подготовленного сигнала: prepare {record['entry']['status']}"
     asr_completed = False
     for name in WORKER_STAGES[1:]:
         if name not in requested:
             continue
+        denied = len(guard.denied_events())
         if prepared is None:
             record = _Stage(name).done("skipped", no_signal)
         elif name == "acoustics":
             record = _acoustics_stage(prepared)
         elif name == "asr":
             record = _asr_stage(prepared, run, config)
-            asr_completed = record["entry"]["status"] == "completed"
         else:
             record = _review_stage(prepared, request, run, config, backend, asr_completed)
+        record = _with_denials(record, guard.denied_events()[denied:])
+        if name == "asr":
+            asr_completed = record["entry"]["status"] == "completed"
         _write_record(run, config, record)
+
+
+def _with_denials(record: dict, events: tuple[str, ...]) -> dict:
+    """Fail a stage in which the guard denied a network attempt, even one the stage swallowed."""
+    if not events or any(error["code"] == NETWORK_DENIED for error in record["errors"]):
+        return record
+    message = (
+        f"network access is disabled (network.allow = false): {', '.join(dict.fromkeys(events))}"
+    )
+    record["errors"].append({"stage": record["stage"], "code": NETWORK_DENIED, "message": message})
+    record["entry"]["status"] = "failed"
+    record["entry"]["reason"] = message
+    record["fragment"].pop("built", None)  # a response obtained so is no evidence of a finding
+    return record
 
 
 def _prepare_stage(
@@ -560,6 +597,19 @@ def _asr_stage(prepared: _Prepared, run: runs.Run, config: Config) -> dict:
         stage.fragment["suspect_segments"] = asr.suspect_segments(
             transcription.raw, prepared.source.duration_s
         )
+        found = [
+            item
+            for i, segment in enumerate(transcription.raw["segments"])
+            for item in review.scan_suspicious(segment["text"], f"$.segments[{i}].text")
+        ]
+        # a phrase a segment boundary cut in two is only seen in the joined text
+        in_segments = {item["pattern"] for item in found}
+        found += [
+            item
+            for item in review.scan_suspicious(transcription.raw.get("text"), "$.text")
+            if item["pattern"] not in in_segments
+        ]
+        stage.fragment["suspicious_content"] = found
     elif transcription.status == "failed":
         stage.error(ASR_FAILED, transcription.reason or ASR_FAILED)
     return stage.done(transcription.status, transcription.reason)
@@ -574,6 +624,10 @@ def _review_stage(
     asr_completed: bool,
 ) -> dict:
     stage = _Stage("audio_review")
+    # the request's own text is scanned whether or not a backend gets it (R10)
+    stage.fragment["suspicious_content"] = list(
+        review.scan_suspicious({"task": request.task, "intent": request.intent}, "trusted")
+    )
     if backend is None:
         return stage.done("unavailable", NO_BACKEND_REASON)
     try:
@@ -592,6 +646,7 @@ def _review_stage(
                 message = f"{type(error).__name__}: {error}"
                 stage.error(REVIEW_CALL_FAILED, message)
                 return stage.done("failed", message)
+        stage.fragment["suspicious_content"] = list(outcome.suspicious_content)
         if outcome.response is not None:
             stage.fragment.update(
                 model_limitations=list(outcome.response.limitations),
@@ -691,6 +746,10 @@ def _assemble(
     ]
     if asr.SUSPECT_HALLUCINATION in fragments.get("asr", {}).get("flags", []):
         limitations.append(HALLUCINATION_LIMITATION)
+    for name, prefix in SUSPICIOUS_LIMITATIONS.items():
+        found = fragments.get(name, {}).get("suspicious_content", [])
+        if found:
+            limitations.append(prefix + _suspicious_summary(found))
     for prefix, key in (
         (review.MODEL_LIMITATION, "model_limitations"),
         (review.MODEL_UNCERTAINTY, "model_uncertainties"),
@@ -800,6 +859,14 @@ def _stages(
         else:
             stages[name] = _entry(True, "skipped", cut_off)
     return stages, errors
+
+
+def _suspicious_summary(found: list[dict]) -> str:
+    """`<path>: <pattern>, …` per path; the matched text is never repeated."""
+    by_path: dict[str, list[str]] = {}
+    for item in found:
+        by_path.setdefault(item["path"], []).append(item["pattern"])
+    return "; ".join(f"{path}: {', '.join(patterns)}" for path, patterns in by_path.items())
 
 
 def _entry(requested: bool, status: str, reason: str) -> dict:

@@ -245,7 +245,7 @@ def _analyze(arguments: dict, loaded: Config, cancel: app.CancelToken | None) ->
         reason = error.reason if isinstance(error, paths.PathDenied) else None
         raise Refused(code, str(error), reason) from error
     run_dir = analysis.run.path.relative_to(loaded.data_root).as_posix()
-    return report.compact(analysis.result, run_dir=run_dir)
+    return report.compact(analysis.result, run_dir=run_dir, reused=analysis.reused)
 
 
 def _compare(arguments: dict, loaded: Config) -> dict:

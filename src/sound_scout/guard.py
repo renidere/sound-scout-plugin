@@ -16,7 +16,8 @@ directory, written on import) is turned off by `ORT_DISABLE_TELEMETRY` before th
 so a library caller is covered too.
 
 `network_guard_active` is the `doctor` check: it reports the module flag, since the hook
-itself cannot be inspected.
+itself cannot be inspected. `denied_events` lists every event the hook denied in this process,
+so a denial that the code below caught and swallowed is still on record (T07).
 """
 
 import os
@@ -41,6 +42,7 @@ OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 TELEMETRY_OFF_ENV = {"ORT_DISABLE_TELEMETRY": "1"}
 
 _installed = False
+_denied: list[str] = []
 
 
 class NetworkDenied(Exception):
@@ -73,8 +75,14 @@ def network_guard_active() -> bool:
     return _installed
 
 
+def denied_events() -> tuple[str, ...]:
+    """The audit events the guard denied in this process so far, in order."""
+    return tuple(_denied)
+
+
 def _deny_network_events(event: str, args: tuple[object, ...]) -> None:
     if event in BLOCKED_EVENTS or (event == "socket.bind" and _is_internet_socket(args[0])):
+        _denied.append(event)
         raise NetworkDenied(f"network access is disabled (network.allow = false): {event}")
 
 

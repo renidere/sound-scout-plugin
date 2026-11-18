@@ -35,7 +35,7 @@ import math
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -333,7 +333,7 @@ def run_review(
         if os.path.lexists(clip_dir / name):
             raise ReviewRecordExists(f"{REVIEW_DIR_NAME}/{clip.id}/{name} is already in the run")
     description = backend.describe()
-    suspicious = list(_scan(request.trusted_fields, "trusted"))
+    suspicious = list(scan_suspicious(request.trusted_fields, "trusted"))
     provenance: dict[str, object] = {
         "provenance_version": PROVENANCE_VERSION,
         "sound_scout": __version__,
@@ -425,8 +425,8 @@ def validate_response(
     try:
         data = json.loads(text, parse_constant=_reject_constant)
     except (ValueError, RecursionError) as error:
-        return None, [f"$: response is not valid JSON: {error}"], list(_scan(text, "$"))
-    suspicious = list(_scan(data, "$"))
+        return None, [f"$: response is not valid JSON: {error}"], list(scan_suspicious(text, "$"))
+    suspicious = list(scan_suspicious(data, "$"))
     if not isinstance(data, dict):
         return None, ["$: response must be a JSON object"], suspicious
     errors += _field_errors("$", data, RESPONSE_FIELDS)
@@ -543,8 +543,11 @@ def _key_label(key: object, index: int) -> str:
     return key if isinstance(key, str) and key in NAMED_KEYS else f"<unexpected field #{index}>"
 
 
-def _scan(value: object, path: str):
-    """Yield `{"path", "pattern"}` for every string matching an instruction-like pattern."""
+def scan_suspicious(value: object, path: str) -> Iterator[dict[str, str]]:
+    """Yield `{"path", "pattern"}` for every string matching an instruction-like pattern.
+
+    The text itself is never repeated: what matched is data, not an instruction (R10, T07).
+    """
     if isinstance(value, str):
         for name, pattern in SUSPICIOUS_PATTERNS.items():
             if pattern.search(value):
@@ -553,11 +556,11 @@ def _scan(value: object, path: str):
         for i, (key, item) in enumerate(value.items()):
             label = f"{path}.{_key_label(key, i)}"
             if isinstance(key, str) and key not in NAMED_KEYS:
-                yield from _scan(key, label)
-            yield from _scan(item, label)
+                yield from scan_suspicious(key, label)
+            yield from scan_suspicious(item, label)
     elif isinstance(value, list | tuple):
         for i, item in enumerate(value):
-            yield from _scan(item, f"{path}[{i}]")
+            yield from scan_suspicious(item, f"{path}[{i}]")
 
 
 def _make_record_dir(clip_dir: Path) -> None:

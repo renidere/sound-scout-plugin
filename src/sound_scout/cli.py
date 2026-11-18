@@ -10,13 +10,13 @@ an ingest refusal names the input, the allowed roots and the data root by placeh
 their absolute paths (ffprobe and ffmpeg quote them). Stdout carries only the answer.
 
 `analyze` calls `app.analyze` and prints `report.compact` of the result (`--json`, with
-`run_dir`) or a summary of it; the run directory is printed relative to the data root. The exit
-code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`. `compare` calls
-`app.compare` and prints the verdict, its reasons and the file `compare/<id>.json` (`--json`:
-the comparison with `path`), exit 0 whatever the verdict. `doctor` prints `doctor.report` as a
-table or JSON and exits 0 whatever the statuses are: it is a diagnosis, not a check. `serve` runs
-the MCP stdio server (`sound_scout.mcp_server`) over the same functions until the client closes
-stdin, then exits 0.
+`run_dir` and `reused`) or a summary of it; the run directory is printed relative to the data
+root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`.
+`compare` calls `app.compare` and prints the verdict, its reasons and the file
+`compare/<id>.json` (`--json`: the comparison with `path`), exit 0 whatever the verdict.
+`doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
+diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
+same functions until the client closes stdin, then exits 0.
 `eval run` counts ready `analyze` results against the human labels of the corpus
 (`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits 0
 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or a
@@ -237,7 +237,7 @@ def run_analyze(args: argparse.Namespace) -> int:
     if args.verbose:
         print(f"run directory: {analysis.run.path}", file=sys.stderr)
     run_dir = analysis.run.path.relative_to(loaded.data_root).as_posix()
-    answer = report.compact(analysis.result, run_dir=run_dir)
+    answer = report.compact(analysis.result, run_dir=run_dir, reused=analysis.reused)
     if args.json:
         print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:

@@ -140,14 +140,17 @@ def write(run: Run, result: dict, *, config: Config) -> dict:
     return document
 
 
-def compact(result: dict, *, run_dir: str | None = None) -> dict:
+def compact(result: dict, *, run_dir: str | None = None, reused: bool | None = None) -> dict:
     """The tool response: at most `COMPACT_MAX_BYTES` of UTF-8 JSON, links relative to the run.
 
-    `run_dir`, the run directory relative to the data root, goes first and counts in the limit:
-    `analyze --json` and `speech_analyze` answer with the same document.
+    `run_dir`, the run directory relative to the data root, and `reused`, whether the result is
+    the one of an earlier request with the same `request_id` and input (R11), go first and count
+    in the limit: `analyze --json` and `speech_analyze` answer with the same document.
     """
     document = _private_values_removed(result, [])
     head = {} if run_dir is None else {"run_dir": run_dir}
+    if reused is not None:
+        head["reused"] = reused
     for limit in _TEXT_LIMITS:
         answer = head | _compact(document, limit)
         if len(json.dumps(answer, ensure_ascii=False).encode("utf-8")) <= COMPACT_MAX_BYTES:

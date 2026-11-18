@@ -55,9 +55,9 @@ def loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> config.Config:
 class StdioSession:
     """`sound-scout serve` in a subprocess, spoken to line by line; keeps every stdout line."""
 
-    def __init__(self, env: dict[str, str]) -> None:
+    def __init__(self, env: dict[str, str], argv: list[str] | None = None) -> None:
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "sound_scout", "serve"],
+            argv or [sys.executable, "-m", "sound_scout", "serve"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -109,6 +109,14 @@ class StdioSession:
 
     def call_tool(self, name: str, arguments: dict) -> dict:
         return self.request("tools/call", {"name": name, "arguments": arguments})["result"]
+
+    def send_call(self, name: str, arguments: dict) -> None:
+        """Send a tool call without waiting for its answer."""
+        self._next_id += 1
+        params = {"name": name, "arguments": arguments}
+        self._send(
+            {"jsonrpc": "2.0", "id": self._next_id, "method": "tools/call", "params": params}
+        )
 
     def close(self) -> tuple[int, str]:
         self.process.stdin.close()
@@ -583,7 +591,9 @@ def test_cli_and_mcp_give_the_same_result_and_the_same_compact_answer(
     assert result_mcp["run_id"] != result_cli["run_id"]
     assert without_run_identity(result_mcp) == without_run_identity(result_cli)
     assert without_run_identity(by_mcp) == without_run_identity(by_cli)
-    assert by_mcp == report.compact(result_mcp, run_dir=f"runs/{result_mcp['run_id']}")
+    assert by_mcp == report.compact(
+        result_mcp, run_dir=f"runs/{result_mcp['run_id']}", reused=False
+    )
     assert sorted(os.listdir(data / by_mcp["run_dir"])) == sorted(
         os.listdir(data / by_cli["run_dir"])
     )

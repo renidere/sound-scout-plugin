@@ -446,6 +446,7 @@ def test_analyze_json_is_the_compact_answer_with_the_run_dir_and_exits_0_on_comp
     printed = json.loads(capsys.readouterr().out)
     assert code == 0
     run_dir = printed.pop("run_dir")
+    assert printed.pop("reused") is False
     result = result_of(analyze_config.parent / "data", run_dir)
     assert result["status"] == "complete"
     assert result["request_id"] == "r-1"

@@ -151,6 +151,20 @@ def test_guard_is_installed_once_for_repeated_calls() -> None:
     assert outcome["attempt"].startswith("denied")
 
 
+def test_a_denial_the_caller_swallows_stays_on_record() -> None:
+    outcome = run_in_child(
+        attempt_connection()
+        + """
+    guard.install_network_guard(config(allow=False))
+    before = guard.denied_events()
+    attempt()
+    socket.socket(socket.AF_UNIX).close()
+    print(json.dumps({"before": list(before), "after": list(guard.denied_events())}))
+    """
+    )
+    assert outcome == {"before": [], "after": ["socket.getaddrinfo"]}
+
+
 def test_without_guard_the_same_connection_fails_as_a_plain_os_error() -> None:
     report = '\n    print(json.dumps({"attempt": attempt()}))\n'
     outcome = run_in_child(attempt_connection() + report)
