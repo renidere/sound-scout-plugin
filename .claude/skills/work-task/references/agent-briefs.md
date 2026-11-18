@@ -316,11 +316,16 @@ built in this task: skip a finding that asks for one with that reason, and keep 
    f. Wait for that push's CI run to finish. Take the full 40-character sha of the pushed commit
       from `git rev-parse HEAD` — `--commit` doesn't expand a short sha, it just returns `[]` — then
       `gh run list --repo renidere/sound-scout-plugin --commit <full sha> --json databaseId,url,status,conclusion`
-      (none yet: ask again every 20 seconds for up to three minutes) then
-      `gh run watch <id> --repo renidere/sound-scout-plugin --exit-status --interval 60`, in
-      ≤9-minute blocks (never without `--interval 60`). A run cancelled because a later push to
-      main superseded it isn't red: watch the run of the newest main commit that contains yours
-      instead. Red: read the failing step (`gh run view <id> --log-failed`). When main's run before
+      (none yet: ask again every 20 seconds for up to three minutes), then poll its outcome once a
+      minute, one Bash call per ≤9-minute block:
+      `for i in $(seq 8); do s=$(timeout 15 gh run view <id> --repo renidere/sound-scout-plugin --json status,conclusion --jq '.status+" "+.conclusion'); echo "$s"; case $s in completed*) break;; esac; if [ "$i" -lt 8 ]; then sleep 60; fi; done`
+      (at most 8×15 s + 7×60 s = 9 minutes). Only that output decides — not an exit code, not
+      `gh run watch`: an empty line (a gh error or stall) or a status other than `completed` means
+      wait on with the next block. Not `completed` 45 minutes after
+      the push (the job's 30-minute timeout plus queueing): stop, report failed with the run url.
+      Red is `completed` with a conclusion other than `success`, `cancelled` included (the job's
+      timeout or a manual cancel: ci.yml's concurrency group is per sha, so a later push never
+      cancels your run). Red: read the failing step (`gh run view <id> --log-failed`). When main's run before
       yours failed in the same job and test — the newest completed one before yours
       (`gh run list --repo renidere/sound-scout-plugin --workflow ci.yml --branch main -L 20 --json databaseId,headSha,conclusion,createdAt,url`,
       then its `--log-failed`) — the red isn't yours, unless it is listed above as this task's
