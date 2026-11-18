@@ -32,7 +32,11 @@ jobs:
 
       - name: Install ffmpeg
         if: steps.pkg.outputs.present == 'true'
-        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+        timeout-minutes: 5
+        run: |
+          apt_opts=(-q -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
+          sudo apt-get "${apt_opts[@]}" update
+          sudo apt-get "${apt_opts[@]}" install -y ffmpeg
 
       - name: Sync
         if: steps.pkg.outputs.present == 'true'
