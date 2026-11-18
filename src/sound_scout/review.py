@@ -6,17 +6,19 @@ empty or its hash does not match the clip, so a transcript-only or empty "review
 recorded as a completed audio review. Each call leaves a verifiable trace in
 `review/<clip id>/` of the run directory: `provenance.json` (R03: backend/model/revision,
 duration and sha256 of the payload actually passed, preprocessing, ranges on the clip's own
-time scale — source-scale ranges arrive with clip extraction, #21 — prompt hash, settings,
-request IDs, response hash and validity) and `response.raw.txt` (the model output verbatim,
-never rewritten). A call that fails or returns the wrong type leaves `provenance.json` with
-`response.valid=false` and the error, so the run keeps the trace and never calls twice.
+time scale — `findings.build` maps them onto the source through `clips/<id>.json` — prompt hash,
+settings, request IDs, response hash and validity) and `response.raw.txt` (the model output
+verbatim, never rewritten). A call that fails or returns the wrong type leaves
+`provenance.json` with `response.valid=false` and the error, so the run keeps the trace and never
+calls twice.
 
 The model's JSON is validated independently by `validate_response`: only the four response
-fields of `AUDIO_REVIEW_PROMPT.md`, fixed categories, timecodes inside the clip, qualitative
-confidence notes. Server-only fields (`human_verified`, `approved`, `cost`, …) and numeric
-confidence are rejected. An observation without timecodes is accepted only in
-`unlocalized_observations` and is not a finding; an interval spanning the whole clip is marked
-`whole_clip` and is not the localisation of a specific error. Instruction-like text in the
+fields of `AUDIO_REVIEW_PROMPT.md`, the sound categories of the result contract
+(`schema.SOUND_CATEGORIES`), timecodes inside the clip, qualitative confidence notes.
+Server-only fields (`human_verified`, `approved`, `cost`, …) and numeric confidence are rejected.
+An observation without timecodes is accepted only in `unlocalized_observations` and is not a
+finding; an interval spanning the whole clip is marked `whole_clip` and is not the localisation
+of a specific error. Instruction-like text in the
 trusted fields or in the model output is never interpreted: it is listed in `suspicious_content`
 by path and pattern, without repeating the text; a key the contract does not name is model
 text too and appears in paths and errors only as `<unexpected field #n>`.
@@ -41,7 +43,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Protocol
 
-from sound_scout import __version__, paths
+from sound_scout import __version__, clips, paths, schema
 from sound_scout.config import MIB, Config
 from sound_scout.doctor import TEST_DOUBLE
 from sound_scout.runs import Run
@@ -52,7 +54,7 @@ RAW_RESPONSE_FILE_NAME = "response.raw.txt"
 PROVENANCE_VERSION = 1
 PROMPT_FILE_NAME = "AUDIO_REVIEW_PROMPT.md"
 DEFAULT_PROMPT_PATH = files("sound_scout").joinpath(PROMPT_FILE_NAME)
-CATEGORIES = ("intelligibility", "articulation", "emphasis", "phrasing", "completeness")
+CATEGORIES = schema.SOUND_CATEGORIES
 RESPONSE_FIELDS = ("observations", "unlocalized_observations", "uncertainties", "limitations")
 OBSERVATION_FIELDS = (
     "category",
@@ -128,7 +130,7 @@ class ReviewRecordExists(Exception):
 
 @dataclass(frozen=True)
 class Clip:
-    """A fragment of the decoded original, as the backend receives it (clip extraction: #21).
+    """A fragment of the decoded original, as the backend receives it (`clip_from_cut`).
 
     `payload` is raw PCM (`sample_format`, `sample_rate`, `channels`), `sha256` is the hash of
     exactly those bytes, `duration_s` is the length in seconds on the clip's own time scale.
@@ -165,6 +167,16 @@ def make_clip(
         duration_s=frames / sample_rate,
         sha256=hashlib.sha256(payload).hexdigest(),
         preprocessing=preprocessing,
+    )
+
+
+def clip_from_cut(clip: clips.Clip) -> Clip:
+    """The backend payload of a clip `clips.cut` wrote: its samples as float32, same id."""
+    return make_clip(
+        clip.id,
+        clips.pcm_f32le(clip),
+        clip.record["sample_rate"],
+        channels=clip.record["channels"],
     )
 
 
@@ -307,7 +319,7 @@ def run_review(
     call raises or returns the wrong type, `provenance.json` records the failure
     (`response.valid=false`, error type and message, no raw file) and the exception propagates.
     Once the raw response is written it stays, even if the provenance cannot be written.
-    `ranges` are on the clip's own time scale; source-scale ranges arrive with #21.
+    `ranges` are on the clip's own time scale; `findings.build` maps them onto the source.
     """
     request = build_request(clip, prompt, task=task, intent=intent)
     review_dir = paths.resolve_output(run.path, REVIEW_DIR_NAME, config)

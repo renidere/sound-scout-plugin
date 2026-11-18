@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "request_id": "req-synthetic-0001",
   "run_id": "run-synthetic-0001",
   "status": "partial",
@@ -45,7 +45,7 @@
     "input_modalities": ["text"],
     "audio_payload_sha256": null,
     "prompt_sha256": null,
-    "schema_sha256": "eee8ec6ac7d1cc9c784247edcf0d8df876c92b8492489258634f96f755be1457",
+    "schema_sha256": "4cdf3ae1b8952baab122c3154b6de2a66fcaa86b8705e3a05366b2c95540c59f",
     "transformations": [
       { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
     ],
@@ -64,7 +64,9 @@
         "original": "приме",
         "corrected": "пример",
         "source": "transcript",
-        "evidence_refs": [{ "type": "transcript", "ref": "transcript-raw" }],
+        "evidence_refs": [
+          { "type": "transcript", "ref": "transcript-raw", "sha256": "3b5d5030efa35e40b55b7c1c2ca5077f778de7149fca858bbca1a2b589068591" }
+        ],
         "certainty": "uncertain",
         "note": "обрезанное слово на границе сегмента ASR; raw не изменён"
       }
@@ -98,10 +100,14 @@
       "start": 0.0,
       "end": 12.0,
       "evidence_basis": "measurement",
-      "evidence_refs": [{ "type": "measurement", "ref": "speech_rate" }],
+      "evidence_refs": [
+        { "type": "measurement", "ref": "speech_rate", "sha256": null },
+        { "type": "clip", "ref": "clip-0-192000", "sha256": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c" }
+      ],
       "confidence_note": "одно окно измерения на весь синтетический фрагмент",
       "impact": "слушателю труднее следить за мыслью",
-      "correction": "делать паузы между смысловыми блоками"
+      "correction": "делать паузы между смысловыми блоками",
+      "polarity": "negative"
     },
     {
       "id": "f-002",
@@ -110,12 +116,17 @@
       "start": 7.5,
       "end": 8.1,
       "evidence_basis": "transcript",
-      "evidence_refs": [{ "type": "transcript", "ref": "transcript-raw" }],
+      "evidence_refs": [
+        { "type": "transcript", "ref": "transcript-raw", "sha256": "3b5d5030efa35e40b55b7c1c2ca5077f778de7149fca858bbca1a2b589068591" },
+        { "type": "clip", "ref": "clip-120000-129600", "sha256": "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c" }
+      ],
       "confidence_note": "по тексту ASR; звучание не проверялось",
-      "impact": "снижает уверенность звучания",
-      "correction": null
+      "impact": "отвлекает слушателя от мысли на границе фразы",
+      "correction": null,
+      "polarity": "neutral"
     }
   ],
+  "unlocalized": [],
   "assessment_status": {
     "diction": { "status": "not_assessed", "reason": "audio review не выполнен: backend не выбран" },
     "prosody": { "status": "not_assessed", "reason": "audio review не выполнен: backend не выбран" },
@@ -153,6 +164,22 @@
       "sha256": null,
       "source_start": null,
       "source_end": null
+    },
+    {
+      "id": "clip-0-192000",
+      "kind": "clip",
+      "path": "clips/clip-0-192000.wav",
+      "sha256": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+      "source_start": 0.0,
+      "source_end": 12.0
+    },
+    {
+      "id": "clip-120000-129600",
+      "kind": "clip",
+      "path": "clips/clip-120000-129600.wav",
+      "sha256": "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c",
+      "source_start": 7.5,
+      "source_end": 8.1
     }
   ],
   "limits": {

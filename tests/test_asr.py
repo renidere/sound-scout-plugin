@@ -617,7 +617,7 @@ def test_corrections_live_in_their_own_artifact_referencing_raw(
         "original": "превет",
         "corrected": "привет",
         "source": "human_verified",
-        "evidence_refs": [{"type": "human_label", "ref": "label-1"}],
+        "evidence_refs": [{"type": "human_label", "ref": "label-1", "sha256": "ab" * 32}],
         "certainty": "clear",
         "note": None,
     }
@@ -644,7 +644,7 @@ def test_corrections_need_a_raw_transcript_and_the_contract_shape(config: Config
         "original": "а",
         "corrected": "б",
         "source": "transcript",
-        "evidence_refs": [{"type": "transcript", "ref": "raw"}],
+        "evidence_refs": [{"type": "transcript", "ref": "raw", "sha256": "ab" * 32}],
         "certainty": "uncertain",
         "note": "x",
     }

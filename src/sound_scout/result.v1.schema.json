@@ -22,10 +22,11 @@
     "artifacts",
     "limits",
     "errors",
-    "cost"
+    "cost",
+    "unlocalized"
   ],
   "properties": {
-    "schema_version": { "const": "1.0" },
+    "schema_version": { "const": "1.1" },
     "request_id": { "$ref": "#/$defs/identifier_string" },
     "run_id": { "$ref": "#/$defs/identifier_string" },
     "status": { "enum": ["complete", "partial", "blocked", "failed"] },
@@ -178,6 +179,7 @@
     },
     "measurements": { "type": "array", "items": { "$ref": "#/$defs/measurement" } },
     "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "unlocalized": { "type": "array", "items": { "$ref": "#/$defs/unlocalized" } },
     "assessment_status": {
       "type": "object",
       "additionalProperties": false,
@@ -329,12 +331,20 @@
     "evidence_ref": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "ref"],
+      "required": ["type", "ref", "sha256"],
       "properties": {
         "type": {
-          "enum": ["measurement", "transcript", "audio_model_observation", "human_label", "artifact"]
+          "enum": [
+            "measurement",
+            "transcript",
+            "audio_model_observation",
+            "human_label",
+            "clip",
+            "artifact"
+          ]
         },
-        "ref": { "type": "string", "minLength": 1 }
+        "ref": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/nullable_sha256" }
       }
     },
     "finding": {
@@ -350,7 +360,8 @@
         "evidence_refs",
         "confidence_note",
         "impact",
-        "correction"
+        "correction",
+        "polarity"
       ],
       "properties": {
         "id": { "$ref": "#/$defs/identifier" },
@@ -361,6 +372,37 @@
         "evidence_basis": {
           "enum": ["measurement", "transcript", "audio_model_observation", "human_verified"]
         },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        },
+        "confidence_note": { "type": "string" },
+        "impact": { "type": "string" },
+        "correction": { "$ref": "#/$defs/nullable_string" },
+        "polarity": { "enum": ["negative", "neutral", "positive"] }
+      }
+    },
+    "unlocalized": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "observation",
+        "reason",
+        "evidence_basis",
+        "evidence_refs",
+        "confidence_note",
+        "impact",
+        "correction"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "category": { "type": "string", "minLength": 1 },
+        "observation": { "type": "string" },
+        "reason": { "enum": ["no_timecodes", "whole_clip"] },
+        "evidence_basis": { "const": "audio_model_observation" },
         "evidence_refs": {
           "type": "array",
           "minItems": 1,

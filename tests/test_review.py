@@ -38,7 +38,7 @@ from sound_scout.runs import Run, open_run
 SAMPLE_RATE = 16_000
 IDENTITY = {"audio": None, "model": None, "preprocessing": None, "ranges": None}
 OBSERVATION = {
-    "category": "intelligibility",
+    "category": "pronunciation",
     "observation": "the ending of the second word is hard to make out",
     "start_seconds": 0.4,
     "end_seconds": 0.9,
@@ -47,7 +47,7 @@ OBSERVATION = {
     "correction": "repeat the word with a clear final consonant",
 }
 UNLOCALIZED = {
-    "category": "phrasing",
+    "category": "pause_phrasing",
     "observation": "a pause breaks a tight phrase somewhere in the middle",
     "confidence_note": "the pause is audible, its position is not certain",
     "impact": "the phrase sounds split",

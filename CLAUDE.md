@@ -89,8 +89,9 @@
 | Канальный анализ: отчёт по каналам, вердикт, выбор рабочего моно и запись `channel_choice` | `src/sound_scout/channels.py` |
 | Производная для ASR: рабочее моно → 16 кГц через ffmpeg, `work/mono16k.f32` и запись преобразования `work/mono16k.json` | `src/sound_scout/prepare.py` |
 | Локальный ASR: faster-whisper offline из кэша HF, `asr/raw.json` и `asr/model-receipt.json`, правило `suspect_hallucination`, `transcript/corrected.json`, smoke-receipt `asr` | `src/sound_scout/asr.py` |
-| Клипы по исходным offsets: `clips/<id>.wav` + `clips/<id>.json` из `work/decoded.f32` без усиления, усиленная копия для прослушивания `listen/<id>.wav` с записанным `gain_db`, записи `artifacts[]` для контракта результата | `src/sound_scout/clips.py` |
-| Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
+| Клипы по исходным offsets: `clips/<id>.wav` + `clips/<id>.json` из `work/decoded.f32` без усиления, усиленная копия для прослушивания `listen/<id>.wav` с записанным `gain_db`, записи `artifacts[]` для контракта результата, `load` клипа и его PCM-payload `pcm_f32le` | `src/sound_scout/clips.py` |
+| Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели, payload из клипа `clip_from_cut` | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
+| Находки на шкале исходника: `build` (исходы review через `clips/<id>.json` → `findings`, `unlocalized`, неуверенные исправления, `artifacts`, `coverage.reviewed`) и `validate` (правила контракта плюс проверка файлов-доказательств run) | `src/sound_scout/findings.py` |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |

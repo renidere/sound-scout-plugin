@@ -1,8 +1,10 @@
 """Result contract v1: the packaged JSON Schema and the validator shared by CLI and MCP.
 
 The schema (`schema/result.v1.schema.json`, packaged copy next to this module) checks shape
-and enumerations; the cross-field rules of spec § 4 — timecodes, evidence references, honest
-statuses, cost, limits — are plain code here, because a schema cannot express them (R05, R09, R11).
+and enumerations; the cross-field rules of spec § 4 — timecodes, evidence references and their
+hashes, the category dictionary, coverage of audio claims, honest statuses, cost, limits — are
+plain code here, because a schema cannot express them (R04, R05, R06, R09, R11). Everything here
+reads the document alone; checks against the files of a run live in `sound_scout.findings`.
 """
 
 import hashlib
@@ -14,7 +16,9 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 from jsonschema import Draft202012Validator
 
-SCHEMA_VERSION = "1.0"
+from sound_scout.doctor import TEST_DOUBLE
+
+SCHEMA_VERSION = "1.1"
 SCHEMA_FILE_NAME = "result.v1.schema.json"
 SCHEMA_BYTES = files("sound_scout").joinpath(SCHEMA_FILE_NAME).read_bytes()
 SCHEMA: dict = json.loads(SCHEMA_BYTES)
@@ -31,7 +35,51 @@ ARTIFACT_KIND_FOR_REF_TYPE = {
     "transcript": "transcript_raw",
     "audio_model_observation": "review_response",
     "human_label": "human_label",
+    "clip": "clip",
 }
+# One dictionary from the backend response to the eval protocol (docs/eval/PROTOCOL.md § 2).
+SOUND_CATEGORIES = (
+    "pronunciation",
+    "repetition_self_correction",
+    "semantic_stress",
+    "pause_phrasing",
+    "completeness",
+)
+MEASUREMENT_CATEGORIES = ("tempo", "level", "pitch_range", "pause_length")
+TRANSCRIPT_CATEGORIES = ("filler_words", "content")
+CATEGORY_BASES = {
+    **dict.fromkeys(SOUND_CATEGORIES, ("audio_model_observation", "human_verified")),
+    **dict.fromkeys(MEASUREMENT_CATEGORIES, ("measurement",)),
+    **dict.fromkeys(TRANSCRIPT_CATEGORIES, ("transcript",)),
+}
+FORBIDDEN_CATEGORIES = frozenset(
+    {
+        "emotion",
+        "emotions",
+        "mood",
+        "health",
+        "diagnosis",
+        "personality",
+        "confidence",
+        "self_confidence",
+        "attractiveness",
+        "charisma",
+        "intelligence",
+        "honesty",
+        "anxiety",
+        "nervousness",
+        "monotony",
+        "эмоции",
+        "здоровье",
+        "диагноз",
+        "личность",
+        "уверенность",
+        "привлекательность",
+        "харизма",
+        "тревожность",
+        "монотонность",
+    }
+)
 TIME_EPS = 0.001
 _LOCAL_PROVIDERS = ("local", "none")
 _PATH_SEPARATORS = re.compile(r"[\\/]")
@@ -74,6 +122,12 @@ def validation_errors(result: object) -> list[str]:
         + _limits_errors(result)
         + _artifact_errors(result)
         + _measurement_errors(result)
+        + _category_errors(result)
+        + _polarity_errors(result)
+        + _clip_errors(result)
+        + _audio_coverage_errors(result)
+        + _review_provenance_errors(result)
+        + _synthetic_errors(result)
     )
 
 
@@ -127,13 +181,15 @@ def _timecode_errors(result: dict) -> list[str]:
 
 
 def _uniqueness_errors(result: dict) -> list[str]:
+    """Artifact ids are unique; finding and unlocalized ids share one namespace."""
     errors = []
-    for field in ("findings", "artifacts"):
+    for fields in (("findings", "unlocalized"), ("artifacts",)):
         seen: set[str] = set()
-        for i, item in enumerate(result[field]):
-            if item["id"] in seen:
-                errors.append(f"$.{field}[{i}].id: duplicate id {item['id']!r}")
-            seen.add(item["id"])
+        for field in fields:
+            for i, item in enumerate(result[field]):
+                if item["id"] in seen:
+                    errors.append(f"$.{field}[{i}].id: duplicate id {item['id']!r}")
+                seen.add(item["id"])
     return errors
 
 
@@ -145,11 +201,13 @@ def _stage_errors(result: dict) -> list[str]:
     ]
 
 
-def _evidence_claims(result: dict) -> list[tuple[str, str, str, list[dict]]]:
-    """Every (path, basis field, basis, evidence_refs) claiming evidence: findings, corrections."""
+def evidence_claims(result: dict) -> list[tuple[str, str, str, list[dict]]]:
+    """Every (path, basis field, basis, evidence_refs) claiming evidence: findings, unlocalized
+    observations, corrections."""
     claims = [
-        (f"$.findings[{i}]", "evidence_basis", f["evidence_basis"], f["evidence_refs"])
-        for i, f in enumerate(result["findings"])
+        (f"$.{name}[{i}]", "evidence_basis", f["evidence_basis"], f["evidence_refs"])
+        for name in ("findings", "unlocalized")
+        for i, f in enumerate(result[name])
     ]
     claims += [
         (f"$.transcript.corrections[{i}]", "source", c["source"], c["evidence_refs"])
@@ -162,7 +220,7 @@ def _evidence_errors(result: dict) -> list[str]:
     measurement_names = {m["name"] for m in result["measurements"]}
     artifacts = {a["id"]: a for a in result["artifacts"]}
     errors = []
-    for claim_path, field, basis, refs in _evidence_claims(result):
+    for claim_path, field, basis, refs in evidence_claims(result):
         expected = REF_TYPE_FOR_BASIS[basis]
         if all(ref["type"] != expected for ref in refs):
             errors.append(
@@ -174,18 +232,25 @@ def _evidence_errors(result: dict) -> list[str]:
             if ref["type"] == "measurement":
                 if ref["ref"] not in measurement_names:
                     errors.append(f"{path}: unknown measurement {ref['ref']!r}")
+                if ref["sha256"] is not None:
+                    errors.append(
+                        f"{claim_path}.evidence_refs[{j}].sha256: must be null for a measurement"
+                    )
                 continue
             artifact = artifacts.get(ref["ref"])
             if artifact is None:
                 errors.append(f"{path}: unknown artifact {ref['ref']!r}")
                 continue
             kind = ARTIFACT_KIND_FOR_REF_TYPE.get(ref["type"])
-            if kind is None:
-                continue
-            if artifact["kind"] != kind:
+            if kind is not None and artifact["kind"] != kind:
                 errors.append(f"{path}: artifact {ref['ref']!r} must be of kind {kind!r}")
             if artifact["sha256"] is None:
                 errors.append(f"{path}: evidence artifact {ref['ref']!r} must carry a sha256")
+            elif ref["sha256"] != artifact["sha256"]:
+                errors.append(
+                    f"{claim_path}.evidence_refs[{j}].sha256: does not match artifact "
+                    f"{ref['ref']!r}"
+                )
     raw = result["transcript"]["raw"]
     if raw is not None:
         artifact = artifacts.get(raw["artifact_ref"])
@@ -208,7 +273,7 @@ def _audio_review_errors(result: dict) -> list[str]:
     if not review_completed:
         errors += [
             f"{path}: audio_model_observation evidence requires a completed audio_review stage"
-            for path, _, basis, refs in _evidence_claims(result)
+            for path, _, basis, refs in evidence_claims(result)
             if basis == "audio_model_observation"
             or any(ref["type"] == "audio_model_observation" for ref in refs)
         ]
@@ -362,7 +427,9 @@ def _artifact_errors(result: dict) -> list[str]:
     for i, artifact in enumerate(result["artifacts"]):
         path = artifact["path"]
         windows = PureWindowsPath(path)
-        if PurePosixPath(path).is_absolute() or windows.drive or windows.root:
+        if "\0" in path:
+            errors.append(f"$.artifacts[{i}].path: must not contain a NUL character")
+        elif PurePosixPath(path).is_absolute() or windows.drive or windows.root:
             errors.append(f"$.artifacts[{i}].path: must be relative to the run directory")
         elif ".." in _PATH_SEPARATORS.split(path):
             errors.append(f"$.artifacts[{i}].path: must not contain '..' segments")
@@ -386,3 +453,179 @@ def _measurement_errors(result: dict) -> list[str]:
 
 def _text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _category_errors(result: dict) -> list[str]:
+    """Categories come from one dictionary, each on its own basis; forbidden inferences never
+    pass (R04: no emotions, health, personality, confidence; R06: low F0 is not monotony)."""
+    errors = []
+    for name in ("findings", "unlocalized"):
+        for i, item in enumerate(result[name]):
+            path, category = f"$.{name}[{i}].category", item["category"]
+            basis = item["evidence_basis"]
+            if _normalized(category) in FORBIDDEN_CATEGORIES:
+                errors.append(f"{path}: forbidden inference {category!r} (R04, R06)")
+            elif category not in CATEGORY_BASES:
+                errors.append(f"{path}: {category!r} is not in the category dictionary")
+            elif basis not in CATEGORY_BASES[category]:
+                errors.append(
+                    f"{path}: {category!r} cannot rest on evidence_basis {basis!r}, "
+                    f"only on {list(CATEGORY_BASES[category])}"
+                )
+    return errors
+
+
+def _normalized(category: str) -> str:
+    return re.sub(r"[\s-]+", "_", category.strip().lower())
+
+
+def _polarity_errors(result: dict) -> list[str]:
+    return [
+        f"$.findings[{i}].correction: a negative finding needs a short action (R05)"
+        for i, finding in enumerate(result["findings"])
+        if finding["polarity"] == "negative" and not _text(finding["correction"])
+    ]
+
+
+def _clip_errors(result: dict) -> list[str]:
+    """Every finding and unlocalized observation names a playable clip (R05); a finding's clip
+    covers its interval."""
+    artifacts = {a["id"]: a for a in result["artifacts"]}
+    errors = []
+    for name in ("findings", "unlocalized"):
+        for i, item in enumerate(result[name]):
+            path = f"$.{name}[{i}]"
+            clip_refs = [ref["ref"] for ref in item["evidence_refs"] if ref["type"] == "clip"]
+            if not clip_refs:
+                errors.append(f"{path}.evidence_refs: needs at least one reference of type 'clip'")
+            if name != "findings":
+                continue
+            for ref in clip_refs:
+                clip = artifacts.get(ref)
+                if clip is not None and not _covers(clip, item["start"], item["end"]):
+                    errors.append(f"{path}: outside clip {ref!r} source range")
+    return errors
+
+
+def _audio_coverage_errors(result: dict) -> list[str]:
+    """An audio claim lies inside coverage.reviewed and inside the source range of the review
+    response it cites; a positive finding is bounded by coverage.reviewed too (R05)."""
+    reviewed = result["coverage"]["reviewed"]
+    artifacts = {a["id"]: a for a in result["artifacts"]}
+    errors = []
+    claims = [
+        (f"$.findings[{i}]", f, f["evidence_basis"], f["polarity"] == "positive")
+        for i, f in enumerate(result["findings"])
+    ]
+    claims += [
+        (f"$.transcript.corrections[{i}]", c, c["source"], False)
+        for i, c in enumerate(result["transcript"]["corrections"])
+    ]
+    for path, item, basis, positive in claims:
+        audio = _is_audio_claim(basis, item["evidence_refs"])
+        if (audio or positive) and _subtract([item], reviewed):
+            errors.append(f"{path}: outside coverage.reviewed")
+        if not audio:
+            continue
+        for response in cited_review_responses(item["evidence_refs"], artifacts):
+            if not _has_range(response):
+                errors.append(f"{path}: review_response {response['id']!r} has no source range")
+            elif not _covers(response, item["start"], item["end"]):
+                errors.append(f"{path}: outside review_response {response['id']!r} source range")
+    for i, item in enumerate(result["unlocalized"]):
+        path = f"$.unlocalized[{i}]"
+        cited = cited_review_responses(item["evidence_refs"], artifacts)
+        cited += [
+            artifacts[ref["ref"]]
+            for ref in item["evidence_refs"]
+            if ref["type"] == "clip" and ref["ref"] in artifacts
+        ]
+        for artifact in cited:
+            if not _has_range(artifact):
+                errors.append(f"{path}: {artifact['kind']} {artifact['id']!r} has no source range")
+            elif _subtract([_range(artifact)], reviewed):
+                errors.append(
+                    f"{path}: {artifact['kind']} {artifact['id']!r} outside coverage.reviewed"
+                )
+    return errors
+
+
+def _review_provenance_errors(result: dict) -> list[str]:
+    """Each cited review response has its provenance record next to it, hashed, same range."""
+    artifacts = {a["id"]: a for a in result["artifacts"]}
+    cited: dict[str, dict] = {}
+    for _, _, _, refs in evidence_claims(result):
+        for response in cited_review_responses(refs, artifacts):
+            cited[response["id"]] = response
+    return [
+        f"$.artifacts[{_index(result, response['id'])}]: review_response {response['id']!r} has "
+        f"no review_provenance artifact in {str(PurePosixPath(response['path']).parent)!r} "
+        "with a sha256 and the same source range"
+        for response in cited.values()
+        if review_provenance_for(result, response) is None
+    ]
+
+
+def review_provenance_for(result: dict, response: dict) -> dict | None:
+    """The `review_provenance` artifact paired with a `review_response` artifact, if any."""
+    directory = PurePosixPath(response["path"]).parent
+    return next(
+        (
+            a
+            for a in result["artifacts"]
+            if a["kind"] == "review_provenance"
+            and PurePosixPath(a["path"]).parent == directory
+            and a["sha256"] is not None
+            and _range(a) == _range(response)
+        ),
+        None,
+    )
+
+
+def _synthetic_errors(result: dict) -> list[str]:
+    """A test double proves nothing about hearing: its result is marked synthetic (T03, T09)."""
+    provenance = result["provenance"]
+    if provenance["backend"] != TEST_DOUBLE:
+        return []
+    note = provenance["note"]
+    if provenance["synthetic"] is True and isinstance(note, str) and note.startswith("synthetic"):
+        return []
+    return [
+        f"$.provenance.synthetic: a {TEST_DOUBLE!r} backend result must be synthetic: true "
+        "with a note starting with 'synthetic'"
+    ]
+
+
+def _is_audio_claim(basis: str, refs: list[dict]) -> bool:
+    return basis == "audio_model_observation" or any(
+        ref["type"] == "audio_model_observation" for ref in refs
+    )
+
+
+def cited_review_responses(refs: list[dict], artifacts: dict[str, dict]) -> list[dict]:
+    return [
+        artifacts[ref["ref"]]
+        for ref in refs
+        if ref["type"] == "audio_model_observation"
+        and artifacts.get(ref["ref"], {}).get("kind") == "review_response"
+    ]
+
+
+def _has_range(artifact: dict) -> bool:
+    return artifact["source_start"] is not None and artifact["source_end"] is not None
+
+
+def _range(artifact: dict) -> dict:
+    return {"start": artifact["source_start"], "end": artifact["source_end"]}
+
+
+def _covers(artifact: dict, start: float, end: float) -> bool:
+    return (
+        _has_range(artifact)
+        and artifact["source_start"] - TIME_EPS <= start
+        and end <= artifact["source_end"] + TIME_EPS
+    )
+
+
+def _index(result: dict, artifact_id: str) -> int:
+    return next(i for i, a in enumerate(result["artifacts"]) if a["id"] == artifact_id)

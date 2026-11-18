@@ -33,9 +33,13 @@ TOP_LEVEL_KEYS = (
     "limits",
     "errors",
     "cost",
+    "unlocalized",
 )
 HEX64 = "ab" * 32
 EXAMPLE_DOC = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+WHOLE_CLIP = "clip-0-192000"
+WHOLE_CLIP_SHA = "1c" * 32
+REVIEW_DIR = f"review/{WHOLE_CLIP}"
 
 
 @pytest.fixture
@@ -54,19 +58,50 @@ def artifact(id: str, kind: str, sha256: str | None = HEX64) -> dict:
     }
 
 
+def ref(type: str, id: str, sha256: str | None = HEX64) -> dict:
+    return {"type": type, "ref": id, "sha256": None if type == "measurement" else sha256}
+
+
+def clip_ref() -> dict:
+    return ref("clip", WHOLE_CLIP, WHOLE_CLIP_SHA)
+
+
+CATEGORY_FOR_BASIS = {
+    "measurement": "tempo",
+    "transcript": "filler_words",
+    "audio_model_observation": "pronunciation",
+    "human_verified": "pronunciation",
+}
+
+
 def finding(id: str, basis: str, refs: list[dict]) -> dict:
+    """A neutral finding on 1–2 s with the given refs plus the example's whole-source clip."""
     return {
         "id": id,
-        "category": "test",
+        "category": CATEGORY_FOR_BASIS.get(basis, "content"),
         "observation": "synthetic observation",
         "start": 1.0,
         "end": 2.0,
         "evidence_basis": basis,
-        "evidence_refs": refs,
+        "evidence_refs": [*refs, clip_ref()],
         "confidence_note": "",
         "impact": "",
         "correction": None,
+        "polarity": "neutral",
     }
+
+
+def review_artifacts(
+    start: float | None = 0.0, end: float | None = 12.0, name: str = "review-response"
+) -> list[dict]:
+    """A review response and its provenance record in one review directory, one range."""
+    response = artifact(name, "review_response")
+    provenance = artifact(f"{name}-provenance", "review_provenance", "cd" * 32)
+    response["path"] = f"{REVIEW_DIR}/response.raw.txt"
+    provenance["path"] = f"{REVIEW_DIR}/provenance.json"
+    for item in (response, provenance):
+        item.update(source_start=start, source_end=end)
+    return [response, provenance]
 
 
 def complete_review(doc: dict) -> dict:
@@ -79,7 +114,7 @@ def complete_review(doc: dict) -> dict:
         "elapsed_ms": 1500,
     }
     if all(a["id"] != "review-response" for a in doc["artifacts"]):
-        doc["artifacts"].append(artifact("review-response", "review_response"))
+        doc["artifacts"] += review_artifacts()
     doc["provenance"].update(
         backend="test-double",
         input_modalities=["audio", "text"],
@@ -189,13 +224,13 @@ def test_artifact_source_timecodes_are_both_set_ordered_and_bounded(doc: dict) -
     doc["artifacts"].append(clip)
     validate(doc)
     clip.update(source_start=4.0, source_end=2.0)
-    assert_rejected(doc, "$.artifacts[4]: start must be less than end")
+    assert_rejected(doc, "$.artifacts[6]: start must be less than end")
     clip.update(source_start=-1.0, source_end=2.0)
-    assert_rejected(doc, "$.artifacts[4].start: must be >= 0")
+    assert_rejected(doc, "$.artifacts[6].start: must be >= 0")
     clip.update(source_start=2.0, source_end=99.0)
-    assert_rejected(doc, "$.artifacts[4].end: exceeds source duration")
+    assert_rejected(doc, "$.artifacts[6].end: exceeds source duration")
     clip.update(source_start=2.0, source_end=None)
-    assert_rejected(doc, "$.artifacts[4]: source_start and source_end must both be set")
+    assert_rejected(doc, "$.artifacts[6]: source_start and source_end must both be set")
 
 
 def test_duplicate_finding_and_artifact_ids_are_rejected(doc: dict) -> None:
@@ -203,7 +238,7 @@ def test_duplicate_finding_and_artifact_ids_are_rejected(doc: dict) -> None:
     assert_rejected(doc, "$.findings[2].id: duplicate id 'f-001'")
     doc = deepcopy(EXAMPLE_DOC)
     doc["artifacts"].append(deepcopy(doc["artifacts"][0]))
-    assert_rejected(doc, "$.artifacts[4].id: duplicate id 'transcript-raw'")
+    assert_rejected(doc, "$.artifacts[6].id: duplicate id 'transcript-raw'")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -296,31 +331,34 @@ def test_every_non_completed_stage_status_requires_a_reason(doc: dict, status: s
 
 
 def test_human_verified_requires_a_human_label_artifact_with_a_hash(doc: dict) -> None:
+    raw_sha = doc["artifacts"][0]["sha256"]
     doc["findings"].append(
-        finding("f-003", "human_verified", [{"type": "transcript", "ref": "transcript-raw"}])
+        finding("f-003", "human_verified", [ref("transcript", "transcript-raw", raw_sha)])
     )
     assert_rejected(
         doc, "$.findings[2].evidence_refs: evidence_basis 'human_verified' needs at least one "
     )
     doc["artifacts"].append(artifact("label-1", "human_label"))
-    doc["findings"][2]["evidence_refs"] = [{"type": "human_label", "ref": "label-1"}]
+    doc["findings"][2]["evidence_refs"] = [ref("human_label", "label-1"), clip_ref()]
     validate(doc)
     doc["artifacts"][-1]["kind"] = "other"
     assert_rejected(doc, "artifact 'label-1' must be of kind 'human_label'")
     doc["artifacts"][-1].update(kind="human_label", sha256=None)
     assert_rejected(doc, "evidence artifact 'label-1' must carry a sha256")
-    doc["findings"][2]["evidence_refs"] = [{"type": "human_label", "ref": "missing"}]
+    doc["findings"][2]["evidence_refs"] = [ref("human_label", "missing"), clip_ref()]
     assert_rejected(doc, "$.findings[2].evidence_refs[0].ref: unknown artifact 'missing'")
 
 
 def test_evidence_refs_point_at_known_measurements_and_artifacts(doc: dict) -> None:
-    doc["findings"][0]["evidence_refs"] = [{"type": "measurement", "ref": "unknown_metric"}]
+    doc["findings"][0]["evidence_refs"][0] = ref("measurement", "unknown_metric")
     assert_rejected(doc, "$.findings[0].evidence_refs[0].ref: unknown measurement 'unknown_metric'")
     doc = deepcopy(EXAMPLE_DOC)
-    doc["findings"][1]["evidence_refs"] = [{"type": "transcript", "ref": "report-md"}]
+    doc["findings"][1]["evidence_refs"][0] = ref("transcript", "report-md")
     assert_rejected(doc, "artifact 'report-md' must be of kind 'transcript_raw'")
     doc = deepcopy(EXAMPLE_DOC)
-    doc["findings"][1]["evidence_refs"].append({"type": "artifact", "ref": "report-md"})
+    doc["findings"][1]["evidence_refs"].append(ref("artifact", "report-md"))
+    assert_rejected(doc, "evidence artifact 'report-md' must carry a sha256")
+    doc["artifacts"][2]["sha256"] = HEX64
     validate(doc)
     doc["findings"][1]["evidence_refs"] = []
     assert_rejected(doc, "$.findings[1].evidence_refs: [] should be non-empty")
@@ -336,20 +374,20 @@ def test_evidence_artifacts_must_carry_a_hash(doc: dict) -> None:
         "$.transcript.corrections[0].evidence_refs[0].ref: evidence artifact 'transcript-raw' "
         "must carry a sha256"
     ) in errors
-    doc["artifacts"][0]["sha256"] = HEX64
+    doc = deepcopy(EXAMPLE_DOC)
     doc = complete_review(doc)
     doc["findings"].append(
         finding(
-            "f-003",
-            "audio_model_observation",
-            [{"type": "audio_model_observation", "ref": "review-response"}],
+            "f-003", "audio_model_observation", [ref("audio_model_observation", "review-response")]
         )
     )
     validate(doc)
-    doc["artifacts"][-1]["sha256"] = None
+    doc["artifacts"][-2]["sha256"] = None
     assert_rejected(doc, "evidence artifact 'review-response' must carry a sha256")
-    doc["findings"][2]["evidence_refs"].append({"type": "artifact", "ref": "report-md"})
-    doc["artifacts"][-1]["sha256"] = HEX64
+    doc["findings"][2]["evidence_refs"].append(ref("artifact", "transcript-raw"))
+    doc["artifacts"][-2]["sha256"] = HEX64
+    assert_rejected(doc, "$.findings[2].evidence_refs[2].sha256: does not match artifact")
+    doc["findings"][2]["evidence_refs"][2]["sha256"] = doc["artifacts"][0]["sha256"]
     validate(doc)
 
 
@@ -357,20 +395,18 @@ def test_transcript_raw_must_reference_a_transcript_raw_artifact(doc: dict) -> N
     doc["transcript"]["raw"]["artifact_ref"] = "report-md"
     assert_rejected(doc, "$.transcript.raw.artifact_ref: 'report-md' must be an artifact")
     doc["transcript"]["raw"] = None
-    doc["findings"][1]["evidence_refs"] = [{"type": "measurement", "ref": "speech_rate"}]
-    doc["findings"][1]["evidence_basis"] = "measurement"
+    doc["findings"][1]["evidence_refs"][0] = ref("measurement", "speech_rate")
+    doc["findings"][1].update(evidence_basis="measurement", category="tempo")
     validate(doc)
 
 
 def test_audio_model_observation_requires_a_completed_audio_review(doc: dict) -> None:
     doc["findings"].append(
         finding(
-            "f-003",
-            "audio_model_observation",
-            [{"type": "audio_model_observation", "ref": "review-response"}],
+            "f-003", "audio_model_observation", [ref("audio_model_observation", "review-response")]
         )
     )
-    doc["artifacts"].append(artifact("review-response", "review_response"))
+    doc["artifacts"] += review_artifacts()
     assert_rejected(doc, "$.findings[2]: audio_model_observation evidence requires a completed")
     doc = complete_review(doc)
     doc["assessment_status"]["diction"] = {"status": "assessed", "reason": None}
@@ -391,7 +427,9 @@ def test_correction_source_needs_matching_evidence(doc: dict) -> None:
     assert_rejected(doc, "'evidence_refs' is a required property")
     correction["evidence_refs"] = []
     assert_rejected(doc, "$.transcript.corrections[0].evidence_refs: [] should be non-empty")
-    correction["evidence_refs"] = [{"type": "transcript", "ref": "transcript-raw"}]
+    correction["evidence_refs"] = [
+        ref("transcript", "transcript-raw", doc["artifacts"][0]["sha256"])
+    ]
     correction["source"] = "human_verified"
     assert_rejected(
         doc,
@@ -399,7 +437,7 @@ def test_correction_source_needs_matching_evidence(doc: dict) -> None:
         "reference of type 'human_label'",
     )
     doc["artifacts"].append(artifact("label-1", "human_label"))
-    correction["evidence_refs"] = [{"type": "human_label", "ref": "label-1"}]
+    correction["evidence_refs"] = [ref("human_label", "label-1")]
     validate(doc)
     doc["artifacts"][-1]["sha256"] = None
     assert_rejected(
@@ -407,33 +445,35 @@ def test_correction_source_needs_matching_evidence(doc: dict) -> None:
         "$.transcript.corrections[0].evidence_refs[0].ref: evidence artifact 'label-1' must "
         "carry a sha256",
     )
-    correction["evidence_refs"] = [{"type": "human_label", "ref": "missing"}]
+    correction["evidence_refs"] = [ref("human_label", "missing")]
     assert_rejected(doc, "$.transcript.corrections[0].evidence_refs[0].ref: unknown artifact")
 
 
 def test_correction_from_audio_model_requires_a_completed_audio_review(doc: dict) -> None:
     correction = doc["transcript"]["corrections"][0]
-    doc["artifacts"].append(artifact("review-response", "review_response"))
+    raw_ref = deepcopy(correction["evidence_refs"][0])
+    doc["artifacts"] += review_artifacts()
     correction["source"] = "audio_model_observation"
     assert_rejected(
         doc,
         "$.transcript.corrections[0].evidence_refs: source 'audio_model_observation' needs at "
         "least one reference of type 'audio_model_observation'",
     )
-    correction["evidence_refs"] = [{"type": "audio_model_observation", "ref": "review-response"}]
+    correction["evidence_refs"] = [ref("audio_model_observation", "review-response")]
     errors = assert_rejected(
         doc,
         "$.transcript.corrections[0]: audio_model_observation evidence requires a completed "
         "audio_review stage",
     )
-    assert len(errors) == 1
+    assert errors == [
+        "$.transcript.corrections[0]: audio_model_observation evidence requires a completed "
+        "audio_review stage",
+        "$.transcript.corrections[0]: outside coverage.reviewed",
+    ]
     doc = complete_review(doc)
     validate(doc)
     correction["source"] = "transcript"
-    correction["evidence_refs"] = [
-        {"type": "transcript", "ref": "transcript-raw"},
-        {"type": "audio_model_observation", "ref": "review-response"},
-    ]
+    correction["evidence_refs"] = [raw_ref, ref("audio_model_observation", "review-response")]
     validate(doc)
     doc["stages"]["audio_review"].update(status="failed", reason="backend timed out")
     doc["status"] = "partial"
@@ -443,10 +483,8 @@ def test_correction_from_audio_model_requires_a_completed_audio_review(doc: dict
 
 
 def test_text_only_evidence_cannot_carry_an_audio_model_observation_ref(doc: dict) -> None:
-    doc["findings"][1]["evidence_refs"].append(
-        {"type": "audio_model_observation", "ref": "review-response"}
-    )
-    doc["artifacts"].append(artifact("review-response", "review_response"))
+    doc["findings"][1]["evidence_refs"].append(ref("audio_model_observation", "review-response"))
+    doc["artifacts"] += review_artifacts()
     assert_rejected(doc, "$.findings[1]: audio_model_observation evidence requires a completed")
 
 
@@ -636,6 +674,7 @@ def test_assessment_status_rules(doc: dict) -> None:
         ("../report.md", "must not contain '..'"),
         ("clips/../../report.md", "must not contain '..'"),
         ("clips\\..\\report.md", "must not contain '..'"),
+        ("clips/report\0.md", "must not contain a NUL character"),
     ],
 )
 def test_artifact_path_must_stay_inside_the_run_directory(
@@ -647,8 +686,8 @@ def test_artifact_path_must_stay_inside_the_run_directory(
 
 def test_clip_artifacts_need_source_timecodes(doc: dict) -> None:
     doc["artifacts"].append(artifact("clip-1", "clip"))
-    assert_rejected(doc, "$.artifacts[4]: kind 'clip' requires source_start and source_end")
-    doc["artifacts"][4].update(kind="listening_copy", source_start=0.0, source_end=12.0)
+    assert_rejected(doc, "$.artifacts[6]: kind 'clip' requires source_start and source_end")
+    doc["artifacts"][6].update(kind="listening_copy", source_start=0.0, source_end=12.0)
     validate(doc)
 
 

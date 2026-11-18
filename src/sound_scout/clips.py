@@ -290,6 +290,21 @@ def listening_copy(
     )
 
 
+def load(run: Run, clip_id: str, *, config: Config) -> Clip:
+    """The clip `clip_id` of `run`, its WAV checked against the record.
+
+    Raises `ClipError` (`clip_missing`, `clip_corrupt`); `paths.PathDenied` for a run directory
+    outside the data root.
+    """
+    return _load_clip(paths.resolve_output(run.path, CLIPS_DIR_NAME, config), clip_id)
+
+
+def pcm_f32le(clip: Clip) -> bytes:
+    """The clip's samples as little-endian float32, channels interleaved: the backend payload."""
+    samples, _ = _read_wav(clip.path.read_bytes())
+    return np.ascontiguousarray(samples, dtype=_SOURCE_DTYPE).tobytes()
+
+
 def artifacts(run: Run) -> list[dict]:
     """Every clip and listening copy of `run` as `artifacts[]` entries, sorted by id.
 
