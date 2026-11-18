@@ -24,11 +24,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import app, doctor, findings, proc, review, runs
+from sound_scout import app, channels, doctor, findings, proc, review, runs
 from sound_scout.app import AnalyzeRequest, Busy, CancelToken, RunIncomplete, analyze
 from sound_scout.config import Asr, Budgets, Config
 from sound_scout.review import BackendDescription, RawReviewResponse, ReviewRequest
 from tests.conftest import WavFactory
+from tests.test_ingest import write_wav
 from tests.test_proc import process_gone
 from tests.test_review import FakeBackend
 
@@ -218,6 +219,58 @@ def test_a_failed_prepare_skips_the_requested_stages_and_fails_the_result(
     for name in ("asr", "acoustics", "audio_review"):
         assert result["stages"][name]["status"] == "skipped"
         assert "prepare failed" in result["stages"][name]["reason"]
+
+
+def stereo_wav(path: Path, right_phase: float, right_sign: float = 1.0) -> Path:
+    """1 s of a 220 Hz tone on the left; on the right, shifted by `right_phase` and signed."""
+    t = np.arange(16_000) / 16_000
+    left = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    right = right_sign * 0.5 * np.sin(2 * np.pi * 220.0 * t + right_phase)
+    return write_wav(path, (np.column_stack([left, right]) * 32767).astype(np.int16))
+
+
+@pytest.mark.parametrize(
+    ("right_phase", "right_sign", "verdict", "method", "limited"),
+    [
+        (1.3, 1.0, "stereo", "arithmetic_mean", True),
+        (0.0, 1.0, "duplicated_stereo", "select_channel", False),
+        (0.0, -1.0, "cancellation", None, False),
+    ],
+    ids=["distinct", "duplicated", "cancellation"],
+)
+def test_distinct_stereo_is_averaged_and_named_in_the_limitations(
+    config: Config,
+    right_phase: float,
+    right_sign: float,
+    verdict: str,
+    method: str | None,
+    limited: bool,
+) -> None:
+    wav = stereo_wav(config.allowed_roots[0] / "stereo.wav", right_phase, right_sign)
+
+    analysis = analyze(AnalyzeRequest(str(wav), layers=("measurements",)), config)
+
+    result, run = analysis.result, analysis.run
+    limitations = result["provenance"]["limitations"]
+    assert (channels.DISTINCT_STEREO_LIMITATION in limitations) is limited
+    report_md = (run.path / "report.md").read_text(encoding="utf-8")
+    assert (channels.DISTINCT_STEREO_LIMITATION in report_md) is limited
+    choices = [
+        item["settings"]
+        for item in result["provenance"]["transformations"]
+        if item["name"] == channels.TRANSFORMATION_NAME
+    ]
+    if method is None:
+        assert result["status"] == "failed"
+        assert ("prepare", "cancellation") in codes(result)
+        assert choices == []
+        return
+    assert result["status"] == "complete", result["stages"]
+    assert len(choices) == 1
+    assert choices[0]["verdict"] == verdict
+    assert choices[0]["method"] == method
+    assert choices[0]["gain_db"] == 0.0
+    assert choices[0]["source_channels"] == 2
 
 
 @pytest.mark.parametrize("layers", [(), ("sound", "sound"), ("emotion",), "sound"])

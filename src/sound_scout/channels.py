@@ -19,12 +19,16 @@ rather than averaging channels the checks below do not cover:
   `DUPLICATE_CORRELATION`), possibly at different levels or with inverted polarity;
 - `stereo`: two distinct active channels.
 
-`choose_mono` turns the report into the working mono signal and a `channel_choice`
-transformation record in the shape of `provenance.transformations` of the result contract.
-Nothing is resampled, trimmed or amplified: the mono signal has the frames of the original and
-`gain_db` is always 0; a louder copy for listening is a separate derivative. A `zero` or
-`cancellation` verdict raises `ChannelError` with `code` `zero_signal` or `cancellation`, the
-reason the prepare stage reports as `failed`.
+These six are the whole verdict set. `choose_mono` turns the report into the working mono
+signal and a `channel_choice` transformation record in the shape of
+`provenance.transformations` of the result contract. Nothing is resampled, trimmed or amplified:
+the mono signal has the frames of the original and `gain_db` is always 0; a louder copy for
+listening is a separate derivative. A `zero` or `cancellation` verdict raises `ChannelError` with
+`code` `zero_signal` or `cancellation`, the reason the prepare stage reports as `failed`. A
+`stereo` verdict averages the channels (`arithmetic_mean`) and is a limiting condition, not a
+refusal: several microphones or several speakers are possible (R02), so the result names it in
+`provenance.limitations` with `DISTINCT_STEREO_LIMITATION`
+(`docs/decisions/0008-distinct-stereo.md`).
 """
 
 import math
@@ -38,6 +42,11 @@ ZERO_SIGNAL = "zero_signal"
 CANCELLATION = "cancellation"
 REASON_CODES = (ZERO_SIGNAL, CANCELLATION)
 TRANSFORMATION_NAME = "channel_choice"
+DISTINCT_STEREO = "stereo"
+DISTINCT_STEREO_LIMITATION = (
+    "каналы различаются и усреднены (arithmetic_mean, без gain): возможны несколько микрофонов "
+    "или несколько говорящих"
+)
 DUPLICATE_CORRELATION = 0.99
 CANCELLATION_LOSS_DB = 6.0
 _SAMPLE_DTYPE = np.dtype("<f4")
@@ -194,7 +203,7 @@ def _verdict(
         return "cancellation"
     if correlation is not None and abs(correlation) >= DUPLICATE_CORRELATION:
         return "duplicated_stereo"
-    return "stereo"
+    return DISTINCT_STEREO
 
 
 def _rms(samples: np.ndarray) -> float:

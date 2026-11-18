@@ -43,7 +43,9 @@ No stage is retried and the backend is called at most once per window (R11).
 `compare` reads two finished runs and compares them by one criterion (`sound_scout.comparison`).
 
 `stages` keeps the five keys of the contract: the channel choice is part of `prepare` and the
-findings part of `audio_review`; their own times are in the steps of the stage records.
+findings part of `audio_review`; their own times are in the steps of the stage records. A channel
+choice that averaged two distinct channels (`channels.DISTINCT_STEREO`) is named in
+`provenance.limitations`.
 """
 
 import contextlib
@@ -781,6 +783,12 @@ def _assemble(
         for layer in request.layers
         if not completed[LAYER_STAGES[layer]]
     ]
+    if any(
+        item["name"] == channels.TRANSFORMATION_NAME
+        and item["settings"]["verdict"] == channels.DISTINCT_STEREO
+        for item in prepared.get("transformations", [])
+    ):
+        limitations.append(channels.DISTINCT_STEREO_LIMITATION)
     if asr.SUSPECT_HALLUCINATION in fragments.get("asr", {}).get("flags", []):
         limitations.append(HALLUCINATION_LIMITATION)
     for name, prefix in SUSPICIOUS_LIMITATIONS.items():

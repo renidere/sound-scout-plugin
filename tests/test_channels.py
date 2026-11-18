@@ -62,7 +62,14 @@ def test_report_gives_dbfs_levels_zero_share_correlation_and_a_named_verdict(
     result = report(audio)
 
     assert result["verdict"] == verdict
-    assert result["verdict"] in {"mono", "duplicated_stereo", "one_active", "cancellation", "zero"}
+    assert result["verdict"] in {
+        "mono",
+        "duplicated_stereo",
+        "one_active",
+        "cancellation",
+        "zero",
+        "stereo",
+    }
     assert "correlation" in result
     assert result["correlation"] is None or -1.0 <= result["correlation"] <= 1.0
     assert len(result["channels"]) == audio.shape[1]
@@ -173,6 +180,7 @@ def test_distinct_stereo_is_averaged_without_gain() -> None:
     assert record["settings"]["method"] == "arithmetic_mean"
     assert record["settings"]["selected_channel"] is None
     assert record["settings"]["gain_db"] == 0.0
+    assert record["settings"]["verdict"] == channels.DISTINCT_STEREO
 
 
 def test_zero_signal_fails_with_reason_zero_signal() -> None:

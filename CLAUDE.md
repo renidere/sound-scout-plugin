@@ -93,7 +93,7 @@
 | Приём входа: probe/decode через ffprobe/ffmpeg, лимиты R02, SHA-256, `source.json` и `work/decoded.f32` в run-каталоге | `src/sound_scout/ingest.py` |
 | `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
 | Smoke-прогоны `decoder`/`acoustics`/`asr` (`asr` — на development-записи из `SOUND_SCOUT_DEV_AUDIO`) и команда `smoke`; формантный контроль KlattGrid `speech_like_control` | `src/sound_scout/smoke.py` |
-| Канальный анализ: отчёт по каналам, вердикт, выбор рабочего моно и запись `channel_choice` | `src/sound_scout/channels.py` |
+| Канальный анализ: отчёт по каналам, вердикт, выбор рабочего моно и запись `channel_choice`; различное стерео усредняется с ограничением в `limitations` (решение — `docs/decisions/0008-distinct-stereo.md`) | `src/sound_scout/channels.py` |
 | Производная для ASR: рабочее моно → 16 кГц через ffmpeg, `work/mono16k.f32` и запись преобразования `work/mono16k.json` | `src/sound_scout/prepare.py` |
 | Локальный ASR: faster-whisper offline из кэша HF, `asr/raw.json` и `asr/model-receipt.json`, правило `suspect_hallucination` и выбор доверенного текста `trusted_segments` / `suspect_segments` (решение — `docs/decisions/0005-asr-silence-hallucination.md`), `transcript/corrected.json`, smoke-receipt `asr` | `src/sound_scout/asr.py` |
 | Клипы по исходным offsets: `clips/<id>.wav` + `clips/<id>.json` из `work/decoded.f32` без усиления, усиленная копия для прослушивания `listen/<id>.wav` с записанным `gain_db`, записи `artifacts[]` для контракта результата, `load` клипа и его PCM-payload `pcm_f32le` | `src/sound_scout/clips.py` |
