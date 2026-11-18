@@ -109,6 +109,10 @@ _CODELESS_ERRORS = {
 }
 
 
+class InvalidRequest(ValueError):
+    """The request itself is malformed (layers, request ID); nothing was opened or run."""
+
+
 class Busy(Exception):
     """Another analysis holds the lock of this data root; no run was created."""
 
@@ -176,7 +180,7 @@ def analyze(
 ) -> Analysis:
     """Analyse one recording; see the module docstring.
 
-    Raises `ValueError` for a bad request, `Busy`, `paths.PathDenied` and `ingest.IngestError`
+    Raises `InvalidRequest` for a bad request, `Busy`, `paths.PathDenied` and `ingest.IngestError`
     for an input refused before any run exists, `runs.RequestMismatch` (and the other `runs`
     index errors) and `RunIncomplete` for a request ID that cannot be run again.
     """
@@ -219,10 +223,10 @@ def compare(run_a: str, run_b: str, criterion: str, config: Config) -> compariso
 
 def _checked_layers(layers: object) -> tuple[str, ...]:
     if isinstance(layers, str) or not isinstance(layers, tuple | list) or not layers:
-        raise ValueError(f"layers must be a non-empty list of {list(LAYERS)}, got {layers!r}")
+        raise InvalidRequest(f"layers must be a non-empty list of {list(LAYERS)}, got {layers!r}")
     unknown = [layer for layer in layers if layer not in LAYERS]
     if unknown or len(set(layers)) != len(layers):
-        raise ValueError(f"layers must be distinct items of {list(LAYERS)}, got {list(layers)}")
+        raise InvalidRequest(f"layers must be distinct items of {list(LAYERS)}, got {list(layers)}")
     return tuple(layers)
 
 
@@ -232,7 +236,7 @@ def _check_request_id(request_id: object) -> None:
     if not isinstance(request_id, str) or not (
         bounds["minLength"] <= len(request_id) <= bounds["maxLength"]
     ):
-        raise ValueError(
+        raise InvalidRequest(
             f"request_id must be a string of {bounds['minLength']}..{bounds['maxLength']} "
             f"characters, got {type(request_id).__name__} of length "
             f"{len(request_id) if isinstance(request_id, str) else None}"

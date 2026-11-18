@@ -800,7 +800,9 @@ def test_cli_eval_run_reports_an_unreadable_manifest(
     argv = ["eval", "run", "--manifest", str(tmp_path / "absent.json"), "--labels", "l"]
     argv += ["--results", "r", "--split", "heldout", "--output-dir", str(tmp_path / "out")]
     assert main(argv) == 1
-    assert capsys.readouterr().err.startswith("eval error: manifest cannot be read")
+    assert capsys.readouterr().err.startswith(
+        "sound-scout eval: eval_error: manifest cannot be read"
+    )
     assert not (tmp_path / "out").exists()
 
 

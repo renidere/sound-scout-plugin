@@ -224,7 +224,7 @@ def test_a_failed_prepare_skips_the_requested_stages_and_fails_the_result(
 def test_a_bad_layer_list_is_refused_before_anything_runs(
     config: Config, wav: Path, layers: object
 ) -> None:
-    with pytest.raises(ValueError, match="layers"):
+    with pytest.raises(app.InvalidRequest, match="layers"):
         analyze(AnalyzeRequest(str(wav), layers=layers), config)  # type: ignore[arg-type]
     assert not (config.data_root / "runs").exists()
 
@@ -243,7 +243,7 @@ def test_an_input_outside_the_roots_is_refused_before_a_run_exists(
 def test_a_bad_request_id_is_refused_before_anything_runs(
     config: Config, wav: Path, request_id: object
 ) -> None:
-    with pytest.raises(ValueError, match="request_id"):
+    with pytest.raises(app.InvalidRequest, match="request_id"):
         analyze(AnalyzeRequest(str(wav), request_id=request_id), config)  # type: ignore[arg-type]
     assert not (config.data_root / "runs").exists()
 

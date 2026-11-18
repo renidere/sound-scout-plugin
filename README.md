@@ -81,13 +81,29 @@ uv run sound-scout doctor
 `"development recording, 10.6 s"` — ни текста транскрипта, ни путей. Отказ — переменная не
 задана, модели нет, запись вне `allowed_roots`, в записи нет речи, receipt отклонён — печатает
 `asr: failed: <причина>`, даёт код 1 и не трогает прежний receipt. `doctor` в обоих случаях только
-читает receipt. Подкоманды `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
-`not implemented`. Локальная конфигурация —
-`sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor` читает её через
-`sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; остальные
-подкоманды и MCP будут читать её так же. Обязательны
+читает receipt. Подкоманда `serve` (MCP stdio сервер) пока завершается с кодом 2 и строкой
+`sound-scout serve: not_implemented: …`. Локальная конфигурация —
+`sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor`, `smoke`, `analyze` и
+`compare` читают её через `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; MCP
+будет читать её так же. Обязательны
 `allowed_roots` и `data_root`, остальное — безопасные умолчания из примера. Без файла — явная
-ошибка (код 1), не умолчания для путей.
+ошибка (код 1), не умолчания для путей. Ни один флаг CLI не задаёт allowed roots, data root,
+модель, backend или бюджеты: это настройки оператора (R12), такой флаг отклоняется как неизвестный.
+
+```sh
+uv run sound-scout analyze <файл> [--request-id ID] [--layers content,measurements,sound] [--task ТЕКСТ] [--json]
+uv run sound-scout compare <run_id A> <run_id B> --criterion emphasis_on:<слово> [--json]
+```
+
+`analyze` вызывает `app.analyze` и печатает итог по compact-ответу (`--json` — сам compact-ответ
+с полем `run_dir`); run-каталог печатается относительно data root (`runs/<run_id>`). Код возврата
+— по `status` результата: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`. `compare` вызывает
+`app.compare` (критерии — `docs/decisions/0006-compare-rules.md`) и печатает вердикт, все причины
+и файл `compare/<id>.json` (`--json` — сравнение целиком с полем `path`), код 0 при любом вердикте.
+Отказ — ошибка конфигурации, путь вне allowed roots, вход не аудио, занятый lock, чужой
+`request_id`, неизвестный run — одна строка в stderr `sound-scout <команда>: <код причины>:
+<сообщение>`, код 1, без трассировки; `--verbose` добавляет в stderr путь конфигурации, полный путь
+run-каталога и трассировку. Stdout содержит только ответ.
 
 Анализ выполняет `sound_scout.app.analyze` — общая точка входа CLI и MCP. На один data root
 одновременно идёт один анализ: lock `<data_root>/analyze.lock`, второй запрос сразу получает

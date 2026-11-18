@@ -1,3 +1,5 @@
+import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -11,9 +13,9 @@ import pytest
 
 from sound_scout import config, doctor, guard
 from sound_scout.cli import SUBCOMMANDS, main
+from tests.conftest import WavFactory
 
 EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve", "eval", "smoke"]
-NOT_IMPLEMENTED_SUBCOMMANDS = ["analyze", "compare", "serve"]
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are not installed",
@@ -30,15 +32,16 @@ def run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.Complet
     )
 
 
-def write_config(tmp_path: Path, *, allow_network: bool) -> Path:
+def write_config(tmp_path: Path, *, allow_network: bool, asr_model: str | None = None) -> Path:
     recordings, data = tmp_path / "recordings", tmp_path / "data"
     recordings.mkdir()
     data.mkdir()
     path = tmp_path / "sound-scout.toml"
+    asr = f"[asr]\nmodel = {json.dumps(asr_model)}\n" if asr_model else ""
     path.write_text(
         f"allowed_roots = [{json.dumps(str(recordings))}]\n"
         f"data_root = {json.dumps(str(data))}\n"
-        f"[network]\nallow = {json.dumps(allow_network)}\n",
+        f"[network]\nallow = {json.dumps(allow_network)}\n" + asr,
         encoding="utf-8",
     )
     return path
@@ -69,13 +72,14 @@ def test_help_lists_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         assert name in out
 
 
-@pytest.mark.parametrize("command", NOT_IMPLEMENTED_SUBCOMMANDS)
-def test_subcommand_exits_2_not_implemented(
-    command: str, capsys: pytest.CaptureFixture[str]
+def test_serve_is_not_implemented_yet_one_line_with_the_reason_code_and_exit_2(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main([command]) == 2
+    assert main(["serve"]) == 2
     captured = capsys.readouterr()
-    assert "not implemented" in captured.err
+    assert captured.err == (
+        "sound-scout serve: not_implemented: the MCP stdio server is not built yet\n"
+    )
     assert captured.out == ""
 
 
@@ -168,7 +172,7 @@ def test_doctor_without_configuration_is_one_line_on_stderr(
     assert main(["doctor"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith("config error: ")
+    assert captured.err.startswith("sound-scout doctor: config_error: ")
     assert captured.err.count("\n") == 1
     assert "missing.toml" in captured.err
 
@@ -202,7 +206,7 @@ def test_console_script_module_entry(tmp_path: Path) -> None:
         "offline_env": {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
     }
     assert not (tmp_path / "data" / "receipts").exists()
-    assert run_cli("analyze").returncode == 2
+    assert run_cli("serve").returncode == 2
 
 
 def offline_env(path: Path) -> dict[str, str]:
@@ -268,7 +272,7 @@ def test_smoke_without_configuration_is_one_line_on_stderr(
     assert main(["smoke"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith("config error: ")
+    assert captured.err.startswith("sound-scout smoke: config_error: ")
     assert captured.err.count("\n") == 1
 
 
@@ -376,3 +380,398 @@ def test_smoke_installs_the_network_guard(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     outcome = json.loads(result.stdout.strip().splitlines()[-1])
     assert outcome == {"before": False, "code": 0, "active": True}
+
+
+# --- analyze, compare: the application layer behind the CLI --------------------------------
+
+ABSENT_ASR_MODEL = "absent/model"
+FORBIDDEN_FLAGS = [
+    ("--allowed-roots", "/tmp"),
+    ("--allowed-root", "/tmp"),
+    ("--data-root", "/tmp"),
+    ("--model", "owner/name"),
+    ("--asr-model", "owner/name"),
+    ("--revision", "abcdef0"),
+    ("--backend", "none"),
+    ("--budget", "1"),
+    ("--budgets", "1"),
+    ("--max-duration-seconds", "1"),
+    ("--worker-deadline-seconds", "1"),
+    ("--network-allow", "true"),
+    ("--config", "/tmp/sound-scout.toml"),
+]
+OPERATOR_WORDS = ("root", "model", "revision", "backend", "budget", "max", "deadline", "network")
+
+
+@pytest.fixture
+def analyze_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """`network.allow = true` (no audit hook in this session) and an ASR model not installed."""
+    path = write_config(tmp_path, allow_network=True, asr_model=ABSENT_ASR_MODEL)
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    return path
+
+
+def result_of(data: Path, run_dir: str) -> dict:
+    return json.loads((data / run_dir / "result.json").read_text(encoding="utf-8"))
+
+
+def summary_value(out: str, key: str) -> str:
+    return next(line for line in out.splitlines() if line.startswith(f"{key}: "))[len(key) + 2 :]
+
+
+def one_line_error(err: str, command: str, code: str) -> None:
+    assert err.startswith(f"sound-scout {command}: {code}: ")
+    assert err.count("\n") == 1
+    assert "Traceback" not in err
+
+
+@needs_ffmpeg
+def test_analyze_prints_a_summary_with_the_run_dir_and_exits_3_on_partial(
+    analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = make_wav("recordings/tone.wav")
+
+    assert main(["analyze", str(wav), "--task", "прочитать фразу"]) == 3
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    run_dir = summary_value(captured.out, "run_dir")
+    result = result_of(analyze_config.parent / "data", run_dir)
+    assert run_dir == f"runs/{result['run_id']}"
+    assert summary_value(captured.out, "status") == "partial" == result["status"]
+    assert summary_value(captured.out, "stage audio_review").startswith("unavailable - backend")
+    assert summary_value(captured.out, "report") == f"{run_dir}/report.md"
+    assert summary_value(captured.out, "result") == f"{run_dir}/result.json"
+    assert str(analyze_config.parent) not in captured.out
+
+
+@needs_ffmpeg
+def test_analyze_json_is_the_compact_answer_with_the_run_dir_and_exits_0_on_complete(
+    analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from sound_scout import report
+
+    wav = make_wav("recordings/tone.wav")
+
+    code = main(["analyze", str(wav), "--json", "--layers", "measurements", "--request-id", "r-1"])
+
+    printed = json.loads(capsys.readouterr().out)
+    assert code == 0
+    run_dir = printed.pop("run_dir")
+    result = result_of(analyze_config.parent / "data", run_dir)
+    assert result["status"] == "complete"
+    assert result["request_id"] == "r-1"
+    assert result["stages"]["asr"]["requested"] is False
+    assert printed == report.compact(result)
+
+
+@needs_ffmpeg
+def test_analyze_exit_code_follows_the_result_status(
+    analyze_config: Path,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from sound_scout import app
+
+    wav = make_wav("recordings/tone.wav")
+    real = app.analyze(app.AnalyzeRequest(str(wav), layers=("measurements",)), config.load())
+    expected = {"complete": 0, "partial": 3, "blocked": 4, "failed": 1}
+    for status, exit_code in expected.items():
+        changed = dataclasses.replace(real, result={**real.result, "status": status})
+        monkeypatch.setattr(app, "analyze", lambda request, loaded, changed=changed: changed)
+        assert main(["analyze", str(wav), "--json"]) == exit_code
+        assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+@needs_ffmpeg
+def test_analyze_of_a_silent_recording_exits_1_on_failed_with_the_run_dir(
+    analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    silent = make_wav("recordings/silent.wav", seconds=0.5, frequency=0.0)
+
+    assert main(["analyze", str(silent), "--json"]) == 1
+
+    printed = json.loads(capsys.readouterr().out)
+    result = result_of(analyze_config.parent / "data", printed["run_dir"])
+    assert printed["status"] == "failed" == result["status"]
+    assert result["stages"]["prepare"]["status"] == "failed"
+
+
+@needs_ffmpeg
+def test_a_repeated_request_is_reused_and_another_file_under_its_id_is_refused(
+    analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first, second = make_wav("recordings/a.wav"), make_wav("recordings/b.wav", frequency=330.0)
+    args = ["--layers", "measurements", "--request-id", "same"]
+    assert main(["analyze", str(first), *args]) == 0
+    run_dir = summary_value(capsys.readouterr().out, "run_dir")
+
+    assert main(["analyze", str(first), *args]) == 0
+    reused = summary_value(capsys.readouterr().out, "run_dir")
+    assert reused == f"{run_dir} (reused: the result of the same earlier request)"
+
+    assert main(["analyze", str(second), *args]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    one_line_error(captured.err, "analyze", "request_mismatch")
+
+
+def test_analyze_outside_the_allowed_roots_is_one_line_path_denied(
+    analyze_config: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"RIFF")
+
+    assert main(["analyze", str(outside)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    one_line_error(captured.err, "analyze", "path_denied")
+    assert "outside allowed roots" in captured.err
+    assert not (tmp_path / "data" / "runs").exists()
+
+
+def test_verbose_adds_the_configuration_and_the_traceback_on_stderr(
+    analyze_config: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["analyze", str(tmp_path / "outside.wav"), "--verbose"]) == 1
+
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+    assert lines[0] == f"configuration: {analyze_config}"
+    assert lines[1].startswith("sound-scout analyze: path_denied: ")
+    assert "Traceback (most recent call last):" in err
+    assert "PathDenied" in err
+
+
+@needs_ffmpeg
+def test_analyze_of_a_file_that_is_not_audio_names_the_ingest_code(
+    analyze_config: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = analyze_config.parent / "recordings" / "notes.wav"
+    text.write_text("not audio at all\n", encoding="utf-8")
+
+    assert main(["analyze", str(text)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    code = captured.err.split(": ")[1]
+    assert code in {"not_audio", "corrupted", "unsupported_format"}
+    one_line_error(captured.err, "analyze", code)
+    assert str(analyze_config.parent) not in captured.err
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_an_ingest_refusal_names_the_paths_only_with_verbose(
+    verbose: bool,
+    analyze_config: Path,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from sound_scout import app, ingest
+
+    wav = make_wav("recordings/tone.wav")
+    loaded = config.load()
+    message = f"ffprobe failed: {wav.resolve()}: Invalid data; roots {loaded.allowed_roots[0]}"
+
+    def refused(request: object, loaded: object) -> None:
+        raise ingest.IngestError(ingest.NOT_AUDIO, message)
+
+    monkeypatch.setattr(app, "analyze", refused)
+
+    assert main(["analyze", str(wav), *(["--verbose"] if verbose else [])]) == 1
+
+    err = capsys.readouterr().err
+    refusal = next(line for line in err.splitlines() if line.startswith("sound-scout analyze:"))
+    if verbose:
+        assert refusal == f"sound-scout analyze: not_audio: {message}"
+    else:
+        one_line_error(err, "analyze", "not_audio")
+        assert refusal == (
+            "sound-scout analyze: not_audio: ffprobe failed: <input>: Invalid data; "
+            "roots <allowed root>"
+        )
+
+
+def test_a_value_error_outside_the_request_checks_is_an_internal_error(
+    analyze_config: Path,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from sound_scout import app
+
+    def broken(request: object, loaded: object) -> None:
+        raise ValueError("raw transcript text from /home/someone/recording.wav")
+
+    monkeypatch.setattr(app, "analyze", broken)
+
+    assert main(["analyze", str(make_wav("recordings/tone.wav"))]) == 1
+
+    assert capsys.readouterr().err == "sound-scout analyze: internal_error: ValueError\n"
+
+
+@pytest.mark.parametrize("layers", ["sound,sound", "hearing", ""])
+def test_a_bad_layer_list_is_refused_by_the_application_layer(
+    layers: str, analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wav = make_wav("recordings/tone.wav")
+
+    assert main(["analyze", str(wav), "--layers", layers]) == 1
+
+    one_line_error(capsys.readouterr().err, "analyze", "invalid_request")
+    assert not (analyze_config.parent / "data" / "runs").exists()
+
+
+def test_an_unexpected_error_is_one_line_with_its_type_only(
+    analyze_config: Path,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from sound_scout import app
+
+    def broken(request: object, loaded: object) -> None:
+        raise RuntimeError("private text from /home/someone/recording.wav")
+
+    monkeypatch.setattr(app, "analyze", broken)
+
+    assert main(["analyze", str(make_wav("recordings/tone.wav"))]) == 1
+
+    err = capsys.readouterr().err
+    assert err == "sound-scout analyze: internal_error: RuntimeError\n"
+
+
+@pytest.mark.parametrize("command", ["analyze", "compare"])
+def test_analyze_and_compare_without_configuration_are_one_line_config_error(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(tmp_path / "missing.toml"))
+    args = ["x.wav"] if command == "analyze" else ["a" * 32, "b" * 32, "--criterion", "x"]
+
+    assert main([command, *args]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    one_line_error(captured.err, command, "config_error")
+
+
+@needs_ffmpeg
+def test_compare_prints_the_verdict_and_the_file_and_json_is_the_written_comparison(
+    analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = analyze_config.parent / "data"
+    run_ids = []
+    for name, frequency in (("a.wav", 220.0), ("b.wav", 330.0)):
+        assert main(["analyze", str(make_wav(f"recordings/{name}", frequency=frequency))]) == 3
+        run_ids.append(summary_value(capsys.readouterr().out, "run_id"))
+
+    assert main(["compare", *run_ids, "--criterion", "emphasis_on:мама"]) == 0
+    out = capsys.readouterr().out
+    assert summary_value(out, "verdict") == "inconclusive"
+    assert "reason audio_review_missing (a): " in out
+    assert "reason audio_review_missing (b): " in out
+    written = summary_value(out, "comparison")
+    assert written.startswith("compare/") and (data / written).is_file()
+
+    assert main(["compare", *run_ids, "--criterion", "completeness_of_phrase", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    path = printed.pop("path")
+    assert printed == json.loads((data / path).read_text(encoding="utf-8"))
+    assert [printed["attempts"][label]["run_id"] for label in ("a", "b")] == run_ids
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        (["0" * 32, "1" * 32, "--criterion", "emphasis_on:мама"], "run_not_found"),
+        (["0" * 32, "1" * 32, "--criterion", "rating"], "criterion_invalid"),
+        (["0" * 32, "0" * 32, "--criterion", "completeness_of_phrase"], "same_run"),
+    ],
+)
+def test_a_refused_comparison_is_one_line_with_its_code_and_writes_nothing(
+    args: list[str], code: str, analyze_config: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["compare", *args]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    one_line_error(captured.err, "compare", code)
+    assert not (analyze_config.parent / "data" / "compare").exists()
+
+
+@pytest.mark.parametrize(("flag", "value"), FORBIDDEN_FLAGS)
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["analyze", "x.wav"],
+        ["compare", "a" * 32, "b" * 32, "--criterion", "completeness_of_phrase"],
+        ["doctor"],
+        ["smoke"],
+        ["serve"],
+    ],
+)
+def test_no_flag_overrides_the_operator_configuration(
+    command: list[str], flag: str, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main([*command, f"{flag}={value}"])
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"unrecognized arguments: {flag}={value}" in err
+
+
+def test_no_option_of_any_subcommand_names_an_operator_setting() -> None:
+    from sound_scout.cli import build_parser
+
+    def options(parser: argparse.ArgumentParser) -> list[str]:
+        found = []
+        for action in parser._actions:
+            found += action.option_strings
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    found += options(child)
+        return found
+
+    names = options(build_parser())
+    assert "--verbose" in names and "--request-id" in names
+    forbidden = [
+        name
+        for name in names
+        if name.startswith("--") and name != "--output-dir"
+        if any(word in name for word in OPERATOR_WORDS)
+    ]
+    assert forbidden == []
+
+
+def test_the_layers_of_the_parser_are_those_of_the_application_layer() -> None:
+    from sound_scout import app, cli
+
+    assert cli.ANALYZE_LAYERS == app.LAYERS
+
+
+@needs_ffmpeg
+def test_analyze_through_the_console_entry_with_backend_none_exits_3_with_result_json(
+    tmp_path: Path, make_wav: WavFactory
+) -> None:
+    path = write_config(tmp_path, allow_network=False, asr_model=ABSENT_ASR_MODEL)
+    path.write_text('backend = "none"\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+
+    result = run_cli("analyze", str(wav), env=offline_env(path))
+
+    assert result.returncode == 3, result.stderr
+    run_dir = summary_value(result.stdout, "run_dir")
+    document = result_of(tmp_path / "data", run_dir)
+    assert document["status"] == "partial"
+    assert document["provenance"]["backend"] == "none"
+    assert (tmp_path / "data" / run_dir / "report.md").is_file()
+
+    as_json = run_cli("analyze", str(wav), "--json", env=offline_env(path))
+    assert as_json.returncode == 3, as_json.stderr
+    assert json.loads(as_json.stdout)["status"] == "partial"
