@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import stat
 import time
 from collections.abc import Iterator
@@ -11,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import doctor, review
+from sound_scout import clips, doctor, review
 from sound_scout.config import Config
 from sound_scout.doctor import ReceiptRejected, component_status, write_receipt
 from sound_scout.paths import PathDenied
@@ -781,3 +782,195 @@ def test_suspicious_text_leaves_no_trace_outside_the_review_record(
     assert saved["response"]["valid"] is True
     assert "approved" not in keys_of(saved) and "human_verified" not in keys_of(saved)
     assert saved["response"]["suspicious_content"] == list(outcome.suspicious_content)
+
+
+# --- windows and cover (issue #25, criterion 2) ----------------------------------------------
+
+
+def test_a_range_within_the_limit_or_without_one_is_one_window() -> None:
+    assert review.windows([(0.0, 20.0)], 30.0) == [(0.0, 20.0)]
+    assert review.windows([(0.0, 70.0), (80.0, 90.0)], None) == [(0.0, 70.0), (80.0, 90.0)]
+
+
+def test_a_long_range_is_cut_into_overlapping_windows_the_last_aligned_to_its_end() -> None:
+    assert review.windows([(0.0, 70.0)], 30.0) == [(0.0, 30.0), (28.0, 58.0), (40.0, 70.0)]
+    assert review.windows([(100.0, 158.0), (0.0, 10.0)], 30.0) == [
+        (0.0, 10.0),
+        (100.0, 130.0),
+        (128.0, 158.0),
+    ]
+
+
+@pytest.mark.parametrize("length", [4.1, 30.0, 30.0005, 31.0, 56.0, 58.0, 70.0, 179.9, 180.0])
+@pytest.mark.parametrize("max_s", [4.5, 6.0, 30.0])
+def test_windows_cover_the_range_within_the_limit_with_the_overlap(
+    length: float, max_s: float
+) -> None:
+    start, end = 3.0, 3.0 + length
+    planned = review.windows([(start, end)], max_s)
+    assert planned == review.windows([(start, end)], max_s)
+    assert planned[0][0] == start and planned[-1][1] == end
+    assert all(e - s <= max_s + 1e-9 for s, e in planned)
+    for (s1, e1), (s2, e2) in zip(planned, planned[1:], strict=False):
+        assert s1 < s2 and e1 < e2
+        assert e1 - s2 >= review.WINDOW_OVERLAP_S - review.TIME_EPS
+
+
+@pytest.mark.parametrize("max_s", [4.0, 1.0, 0, -30.0, float("nan"), float("inf"), "30", True])
+def test_a_window_limit_that_is_not_a_finite_length_above_twice_the_overlap_is_refused(
+    max_s: object,
+) -> None:
+    with pytest.raises(ValueError, match="max_audio_seconds"):
+        review.windows([(0.0, 70.0)], max_s)
+
+
+@dataclass
+class WindowedBackend(FakeBackend):
+    """The test double declaring a window limit; it can answer invalid or fail at one call."""
+
+    max_audio_seconds: object = None
+    invalid_at: int | None = None
+    fail_at: int | None = None
+
+    def describe(self) -> BackendDescription:
+        limits = (
+            {} if self.max_audio_seconds is None else {"max_audio_seconds": self.max_audio_seconds}
+        )
+        return BackendDescription(doctor.TEST_DOUBLE, None, None, ("audio",), limits=limits)
+
+    def review(self, request: ReviewRequest) -> RawReviewResponse:
+        self.requests.append(request)
+        if len(self.requests) - 1 == self.fail_at:
+            raise RuntimeError("the model is down")
+        if len(self.requests) - 1 == self.invalid_at:
+            return RawReviewResponse("not json")
+        return RawReviewResponse(self.text)
+
+
+LONG_S = 10.0
+
+
+@pytest.fixture
+def long_run(config: Config) -> Run:
+    from sound_scout import ingest
+    from tests.test_ingest import write_wav
+
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg and ffprobe are not installed")
+    run = open_run("req-long", IDENTITY, config.data_root)
+    t = np.arange(int(LONG_S * SAMPLE_RATE)) / SAMPLE_RATE
+    tone = (0.3 * np.sin(2 * np.pi * 220.0 * t) * 32767).astype(np.int16)
+    ingest.decode(write_wav(config.allowed_roots[0] / "long.wav", tone, SAMPLE_RATE), run, config)
+    return run
+
+
+def test_cover_calls_the_backend_once_per_window_with_that_window_clip(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend(max_audio_seconds=6)
+
+    covered = review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)], task="t")
+
+    assert covered.windows == [(0.0, 6.0), (4.0, 10.0)]
+    assert covered.failure is None
+    assert len(backend.requests) == len(covered.outcomes) == 2
+    for window, request, outcome in zip(
+        covered.windows, backend.requests, covered.outcomes, strict=True
+    ):
+        assert request.duration_s <= 6.0
+        saved = clips.load(long_run, request.clip_id, config=config)
+        assert (saved.source_start, saved.source_end) == window
+        assert (
+            hashlib.sha256(request.payload).hexdigest()
+            == hashlib.sha256(clips.pcm_f32le(saved)).hexdigest()
+        )
+        assert (
+            outcome.provenance["payload"]["sha256"] == hashlib.sha256(request.payload).hexdigest()
+        )
+        assert outcome.provenance_path.parent.name == request.clip_id
+        assert request.trusted_fields["task"] == "t" and request.prompt == prompt.text
+
+
+def test_cover_without_a_limit_reviews_the_whole_range_as_one_clip_as_before(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend()
+
+    covered = review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)])
+
+    [request] = backend.requests
+    assert covered.windows == [(0.0, LONG_S)] and covered.failure is None
+    assert request.clip_id == clips.cut(long_run, 0.0, LONG_S, 0, config=config).id
+
+
+def test_an_invalid_response_does_not_stop_the_walk(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend(max_audio_seconds=5.0, invalid_at=1)
+
+    covered = review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)])
+
+    assert len(covered.windows) == len(backend.requests) == len(covered.outcomes) == 3
+    assert covered.outcomes[1].response is None and covered.failure is None
+
+
+def test_a_failed_call_stops_the_walk_and_is_not_repeated(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend(max_audio_seconds=5.0, fail_at=1)
+
+    covered = review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)])
+
+    assert len(covered.windows) == 3
+    assert len(backend.requests) == 2 and len(covered.outcomes) == 1
+    assert covered.failure == (covered.windows[1], "RuntimeError: the model is down")
+    failed = long_run.path / "review" / backend.requests[1].clip_id / "provenance.json"
+    assert json.loads(failed.read_text(encoding="utf-8"))["response"]["valid"] is False
+
+
+def test_after_window_gets_the_outcomes_so_far_and_nothing_after_a_failed_call(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend(max_audio_seconds=5.0, fail_at=2)
+    seen: list[list[str]] = []
+
+    covered = review.cover(
+        backend,
+        long_run,
+        config,
+        prompt,
+        [(0.0, LONG_S)],
+        after_window=lambda outcomes: seen.append([o.provenance["clip_id"] for o in outcomes]),
+    )
+
+    ids = [o.provenance["clip_id"] for o in covered.outcomes]
+    assert len(ids) == 2 and covered.failure is not None
+    assert seen == [ids[:1], ids]
+
+
+def test_a_bad_limit_fails_before_any_clip_is_cut_or_call_made(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    backend = WindowedBackend(max_audio_seconds="thirty")
+    with pytest.raises(ValueError, match="max_audio_seconds"):
+        review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)])
+    assert backend.requests == [] and not (long_run.path / "clips").exists()
+
+
+def test_a_stop_before_a_call_ends_the_walk_without_calling(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    class Stop(BaseException):
+        pass
+
+    backend = WindowedBackend(max_audio_seconds=6)
+    seen = []
+
+    def stop_at_second() -> None:
+        seen.append(len(backend.requests))
+        if len(seen) == 2:
+            raise Stop
+
+    with pytest.raises(Stop):
+        review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)], before_call=stop_at_second)
+    assert len(backend.requests) == 1

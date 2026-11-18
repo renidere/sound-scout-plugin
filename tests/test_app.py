@@ -675,7 +675,7 @@ def test_synthetic_smoke_with_the_test_double_is_complete_and_marked_synthetic(
     marker = next(i for i, line in enumerate(markdown) if "Синтетический прогон" in line)
     assert marker < markdown.index("## Этапы")
     steps = [step["name"] for step in stage_record(run, "audio_review")["steps"]]
-    assert steps == ["clip", "review", "findings"]
+    assert steps == ["review", "findings"]
     findings.validate(result, run=run)
 
 
@@ -725,11 +725,10 @@ class WhisperModel:
 """
 
 
-def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def fake_asr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config, Path]:
     """The spawned worker imports `faster_whisper` from `sys.path`, so a test double package
-    placed first stands in for the model; the snapshot is a fake one in a fake HF cache."""
+    placed first stands in for the model; the snapshot is a fake one in a fake HF cache.
+    Returns the config and a recording of 1 s of digital silence, then 0.5 s of a tone."""
     fake = tmp_path / "fake-packages" / "faster_whisper"
     fake.mkdir(parents=True)
     (fake / "__init__.py").write_text(FAKE_WHISPER, encoding="utf-8")
@@ -751,6 +750,13 @@ def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(
         out.setsampwidth(2)
         out.setframerate(16_000)
         out.writeframes(np.concatenate([np.zeros(16_000, np.int16), tone]).tobytes())
+    return config, wav
+
+
+def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, wav = fake_asr(tmp_path, monkeypatch)
 
     analysis = analyze(
         AnalyzeRequest(str(wav), layers=("content", "sound")), config, backend=FakeBackend()
@@ -803,6 +809,247 @@ def test_a_failing_backend_call_is_recorded_and_not_repeated(
     provenance = list((analysis.run.path / "review").glob("*/provenance.json"))
     assert len(provenance) == 1
     assert json.loads(provenance[0].read_text())["response"]["valid"] is False
+
+
+@dataclass
+class RecordingBackend(FakeBackend):
+    """The test double with a window limit; it logs every request it gets (the worker is another
+    process) and answers invalid or fails at the call it is told to."""
+
+    log: str = ""
+    max_audio_seconds: float | None = None
+    invalid_at: int | None = None
+    fail_at: int | None = None
+
+    def describe(self) -> BackendDescription:
+        description = super().describe()
+        if self.max_audio_seconds is None:
+            return description
+        limits = {review.MAX_AUDIO_SECONDS_LIMIT: self.max_audio_seconds}
+        return dataclasses.replace(description, limits=limits)
+
+    def review(self, request: ReviewRequest) -> RawReviewResponse:
+        fields = {f.name: getattr(request, f.name) for f in dataclasses.fields(request)}
+        fields["payload"] = hashlib.sha256(request.payload).hexdigest()
+        fields["response_fields"] = list(request.response_fields)
+        with open(self.log, "a", encoding="utf-8") as out:
+            out.write(json.dumps(fields, ensure_ascii=False) + "\n")
+        call = len(self.requests)
+        self.requests.append(request)
+        if call == self.fail_at:
+            raise RuntimeError("backend is down")
+        if call == self.invalid_at:
+            return RawReviewResponse("not json")
+        return RawReviewResponse(self.text, self.request_id)
+
+
+def logged(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.fixture
+def long_wav(make_wav: WavFactory, config: Config) -> Path:
+    return make_wav("recordings/long.wav", seconds=11.0)
+
+
+WINDOWS = [(0.0, 5.0), (3.0, 8.0), (6.0, 11.0)]
+
+
+def test_a_long_recording_is_reviewed_window_by_window_and_covered_in_full(
+    config: Config, long_wav: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log), max_audio_seconds=5.0)
+
+    analysis = analyze(AnalyzeRequest(str(long_wav), layers=LISTENED), config, backend=backend)
+
+    result, run = analysis.result, analysis.run
+    requests = logged(log)
+    assert result["status"] == "complete", result["errors"]
+    assert result["coverage"]["reviewed"] == [{"start": 0.0, "end": 11.0}]
+    assert result["coverage"]["unreviewed"] == []
+    clips = [a for a in result["artifacts"] if a["kind"] == "clip"]
+    assert [(c["source_start"], c["source_end"]) for c in clips] == WINDOWS
+    assert [r["clip_id"] for r in requests] == [c["id"] for c in clips]
+    assert all(r["duration_s"] <= 5.0 for r in requests)
+    assert result["provenance"]["audio_payload_sha256"] == requests[0]["payload"]
+    report_md = (run.path / "report.md").read_text(encoding="utf-8")
+    assert (
+        "SHA-256 audio payload первого окна из 3 (payload каждого окна — в артефактах "
+        f"review_provenance): {requests[0]['payload']};"
+    ) in report_md
+    assert len(result["findings"]) == 3 and len(result["unlocalized"]) == 3
+    assert (
+        result["provenance"]["limitations"].count(
+            review.MODEL_LIMITATION + "only the passed fragment was heard"
+        )
+        == 3
+    )
+    findings.validate(result, run=run)
+
+
+def test_an_invalid_window_leaves_its_uncovered_part_unreviewed_and_the_result_partial(
+    config: Config, long_wav: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log), max_audio_seconds=5.0, invalid_at=1)
+
+    analysis = analyze(AnalyzeRequest(str(long_wav), layers=LISTENED), config, backend=backend)
+
+    result = analysis.result
+    assert len(logged(log)) == 3
+    assert result["stages"]["audio_review"]["status"] == "completed"
+    assert result["status"] == "partial"
+    assert result["coverage"]["unreviewed"] == [{"start": 5.0, "end": 6.0}]
+    assert ("audio_review", findings.RESPONSE_INVALID) in codes(result)
+    findings.validate(result, run=analysis.run)
+
+
+def test_a_failed_window_call_stops_the_review_and_leaves_the_rest_unreviewed(
+    config: Config, long_wav: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log), max_audio_seconds=5.0, fail_at=1)
+
+    analysis = analyze(AnalyzeRequest(str(long_wav), layers=LISTENED), config, backend=backend)
+
+    result = analysis.result
+    assert len(logged(log)) == 2
+    assert result["stages"]["audio_review"]["status"] == "completed"
+    assert ("audio_review", app.REVIEW_CALL_FAILED) in codes(result)
+    assert result["coverage"]["unreviewed"] == [{"start": 5.0, "end": 11.0}]
+    assert result["status"] == "partial"
+    findings.validate(result, run=analysis.run)
+
+
+def test_a_failed_first_window_call_fails_the_review_without_calling_the_rest(
+    config: Config, long_wav: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log), max_audio_seconds=5.0, fail_at=0)
+
+    analysis = analyze(AnalyzeRequest(str(long_wav), layers=LISTENED), config, backend=backend)
+
+    result = analysis.result
+    assert len(logged(log)) == 1
+    assert result["stages"]["audio_review"]["status"] == "failed"
+    assert ("audio_review", app.REVIEW_CALL_FAILED) in codes(result)
+    assert result["coverage"]["unreviewed"] == [{"start": 0.0, "end": 11.0}]
+
+
+@dataclass
+class WindowHangingBackend(RecordingBackend):
+    """Answers the windows before `hang_at`, then hangs on a child like `SlowFakeBackend`."""
+
+    hang_at: int = 1
+    pid_dir: str = ""
+
+    def review(self, request: ReviewRequest) -> RawReviewResponse:
+        if len(self.requests) == self.hang_at:
+            write_pid(Path(self.pid_dir) / "worker", os.getpid())
+            child = str(Path(self.pid_dir) / "child")
+            proc.run([sys.executable, "-c", CHILD, child], timeout=900, max_output_bytes=1024)
+        return super().review(request)
+
+
+@pytest.mark.parametrize("hang_at", [1, 0], ids=["after a window", "on the first window"])
+def test_an_interrupted_review_keeps_the_windows_it_finished(
+    config: Config, long_wav: Path, tmp_path: Path, pid_dir: Path, hang_at: int
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = WindowHangingBackend(
+        log=str(log), max_audio_seconds=5.0, hang_at=hang_at, pid_dir=str(pid_dir)
+    )
+    token = CancelToken()
+
+    def cancel_when_the_child_runs() -> None:
+        wait_for(pid_dir / "child")
+        token.cancel()
+
+    canceller = threading.Thread(target=cancel_when_the_child_runs)
+    canceller.start()
+    analysis = analyze(
+        AnalyzeRequest(str(long_wav), layers=("sound",)), config, backend=backend, cancel=token
+    )
+    canceller.join()
+
+    result, run = analysis.result, analysis.run
+    stage = result["stages"]["audio_review"]
+    assert len(logged(log)) == hang_at  # the hung call never logs
+    assert ("audio_review", "cancelled") in codes(result)
+    assert result["status"] == "partial"
+    assert stage["reason"] == app.CANCELLED_REASON
+    if hang_at:
+        assert stage["status"] == "completed"
+        assert result["coverage"]["reviewed"] == [{"start": 0.0, "end": 5.0}]
+        assert result["coverage"]["unreviewed"] == [{"start": 5.0, "end": 11.0}]
+        assert len(result["findings"]) == 1
+        assert result["provenance"]["audio_payload_sha256"] == logged(log)[0]["payload"]
+        assert stage_record(run, "audio_review")[app.CHECKPOINT] is True
+    else:
+        assert stage["status"] == "failed"
+        assert result["coverage"]["reviewed"] == [] and result["findings"] == []
+        assert not (run.path / "work" / "stage-audio_review.json").exists()
+    findings.validate(result, run=run)
+
+
+def test_a_backend_limit_that_is_not_a_length_fails_the_review_before_any_call(
+    config: Config, long_wav: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log), max_audio_seconds=3.0)
+
+    analysis = analyze(AnalyzeRequest(str(long_wav), layers=LISTENED), config, backend=backend)
+
+    assert logged(log) == []
+    assert analysis.result["stages"]["audio_review"]["status"] == "failed"
+    assert "max_audio_seconds" in analysis.result["stages"]["audio_review"]["reason"]
+
+
+def test_the_first_review_pass_is_blind_to_the_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, wav = fake_asr(tmp_path, monkeypatch)
+    log = tmp_path / "requests.jsonl"
+    backend = RecordingBackend(log=str(log))
+
+    analysis = analyze(
+        AnalyzeRequest(str(wav), layers=("content", "sound"), task="прочитать", intent="ясно"),
+        config,
+        backend=backend,
+    )
+
+    result, run = analysis.result, analysis.run
+    assert result["stages"]["asr"]["status"] == "completed", result["stages"]
+    assert "выдумка" in (run.path / "asr" / "raw.json").read_text(encoding="utf-8")
+    [request] = logged(log)
+    assert set(request) == {
+        "clip_id",
+        "payload",
+        "sample_rate",
+        "channels",
+        "sample_format",
+        "duration_s",
+        "prompt",
+        "prompt_sha256",
+        "task",
+        "intent",
+        "response_fields",
+    }
+    assert request["prompt"] == review.load_prompt().text
+    assert (request["task"], request["intent"]) == ("прочитать", "ясно")
+    assert "выдумка" not in json.dumps(request, ensure_ascii=False)
+    trusted = backend_request(request).trusted_fields
+    assert set(trusted) == {"clip_id", "duration_s", "task", "intent"}
+    report_md = (run.path / "report.md").read_text(encoding="utf-8")
+    assert f"SHA-256 audio payload: {request['payload']};" in report_md
+    findings.validate(result, run=run)
+
+
+def backend_request(logged_request: dict) -> ReviewRequest:
+    return ReviewRequest(**{**logged_request, "payload": b"", "response_fields": ()})
 
 
 # --- stdout and orphans ----------------------------------------------------------------------

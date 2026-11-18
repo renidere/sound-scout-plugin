@@ -23,6 +23,12 @@ trusted fields or in the model output is never interpreted: it is listed in `sus
 by path and pattern, without repeating the text; a key the contract does not name is model
 text too and appears in paths and errors only as `<unexpected field #n>`.
 
+`cover` reviews requested source ranges window by window: `windows` cuts each range into
+overlapping windows no longer than the backend's own `limits["max_audio_seconds"]` (a backend
+without that limit gets one window per range), each window becomes its own clip and its own
+review record, and a failed backend call stops the walk, so the remaining windows stay unreviewed
+and nothing is called twice (R03, R11). The request carries no transcript: the first pass is blind.
+
 The prompt is the packaged copy of `docs/spec/AUDIO_REVIEW_PROMPT.md` (byte-equal, checked by
 the tests); `load_prompt` reads it and takes its SHA-256 as the prompt version. The backend
 decides nothing about provenance, stage status or validity: the server writes those.
@@ -35,7 +41,7 @@ import math
 import os
 import re
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -43,7 +49,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Protocol
 
-from sound_scout import __version__, clips, paths, schema
+from sound_scout import __version__, clips, guard, paths, schema
 from sound_scout.config import MIB, Config
 from sound_scout.doctor import TEST_DOUBLE
 from sound_scout.runs import Run
@@ -88,6 +94,9 @@ NAMED_KEYS = frozenset(RESPONSE_FIELDS + OBSERVATION_FIELDS + TRUSTED_FIELD_NAME
 )
 MAX_RESPONSE_BYTES = 1 * MIB
 TIME_EPS = 0.001
+MAX_AUDIO_SECONDS_LIMIT = "max_audio_seconds"
+WINDOW_OVERLAP_S = 2.0
+WINDOW_PAD_MS = 0
 WHOLE_CLIP_FRACTION = 0.95
 DIR_MODE = 0o700
 SUSPICIOUS_PATTERNS = {
@@ -129,6 +138,11 @@ class AudioPayloadMissing(Exception):
 
 class ReviewRecordExists(Exception):
     """The run already holds a review record for this clip; nothing was called or overwritten."""
+
+
+# What `run_review` raises for a bad payload or path or a denied network attempt, not a failed
+# call; `cover` passes it on.
+_NOT_A_CALL_FAILURE = (AudioPayloadMissing, clips.ClipError, paths.PathDenied, guard.NetworkDenied)
 
 
 @dataclass(frozen=True)
@@ -409,6 +423,87 @@ def run_review(
         tuple(errors),
         tuple(suspicious),
     )
+
+
+@dataclass(frozen=True)
+class Covered:
+    """What `cover` did: the planned windows on the source scale, one outcome per window called,
+    and the window whose call failed with the error, after which nothing more was called."""
+
+    windows: list[tuple[float, float]]
+    outcomes: list[ReviewOutcome]
+    failure: tuple[tuple[float, float], str] | None
+
+
+def windows(
+    ranges: list[tuple[float, float]], max_s: object, overlap_s: float = WINDOW_OVERLAP_S
+) -> list[tuple[float, float]]:
+    """Windows covering each range: none longer than `max_s`, neighbours overlapping by at least
+    `overlap_s`, the last one aligned to the range end; `max_s=None` keeps each range whole."""
+    if max_s is not None and not (_number(max_s) and max_s > 2 * overlap_s):
+        raise ValueError(
+            f"backend limit {MAX_AUDIO_SECONDS_LIMIT} must be a finite number of seconds "
+            f"> {2 * overlap_s}"
+        )
+    planned: list[tuple[float, float]] = []
+    for start, end in sorted(ranges):
+        if max_s is None or end - start <= max_s:
+            planned.append((start, end))
+            continue
+        step = max_s - overlap_s
+        n = 0
+        # A later window ending within TIME_EPS of the range end would duplicate the last one.
+        while n == 0 or start + n * step + max_s < end - TIME_EPS:
+            planned.append((start + n * step, start + n * step + max_s))
+            n += 1
+        planned.append((end - max_s, end))
+    return planned
+
+
+def cover(
+    backend: AudioBackend,
+    run: Run,
+    config: Config,
+    prompt: Prompt,
+    ranges: list[tuple[float, float]],
+    *,
+    task: str | None = None,
+    intent: str | None = None,
+    before_call: Callable[[], None] | None = None,
+    after_window: Callable[[list[ReviewOutcome]], None] | None = None,
+) -> Covered:
+    """Review `ranges` of the source window by window, each window its own clip and record.
+
+    The window length is the backend's `limits["max_audio_seconds"]`. An invalid response does
+    not stop the walk (`findings.build` leaves that window out of `reviewed`); a failed call does:
+    it is recorded by `run_review`, never repeated, and the windows after it are not called (R11).
+    `before_call` runs right before every backend call, so a caller can stop the walk there;
+    `after_window` gets the outcomes so far after every window reviewed, so a caller can keep them
+    before the next call.
+    """
+    limit = backend.describe().limits.get(MAX_AUDIO_SECONDS_LIMIT)
+    planned = windows(ranges, limit)
+    outcomes: list[ReviewOutcome] = []
+    cut_ids: set[str] = set()
+    for window in planned:
+        cut = clips.cut(run, *window, WINDOW_PAD_MS, config=config)
+        if cut.id in cut_ids:  # two windows less than a frame apart are one clip
+            continue
+        cut_ids.add(cut.id)
+        clip = clip_from_cut(cut)
+        if before_call is not None:
+            before_call()
+        try:
+            outcomes.append(
+                run_review(backend, clip, run, config, prompt, task=task, intent=intent)
+            )
+        except _NOT_A_CALL_FAILURE:
+            raise
+        except Exception as error:
+            return Covered(planned, outcomes, (window, f"{type(error).__name__}: {error}"))
+        if after_window is not None:
+            after_window(list(outcomes))
+    return Covered(planned, outcomes, None)
 
 
 def validate_response(

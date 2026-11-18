@@ -8,10 +8,11 @@ identity raises `runs.RequestMismatch`, and a run that never completed raises `R
 rather than charging the request again.
 
 The stages run in a child process (`multiprocessing`, `spawn`), the worker: prepare (ingest,
-channels, the 16 kHz copy for ASR), acoustics, asr, audio_review (the clip, one backend call,
-findings). After each stage the worker writes `work/stage-<name>.json` atomically: the contract
-entry, errors, its steps with their times and its part of the result. The caller watches
-`budgets.worker_deadline_seconds` and the `CancelToken`; on either it sends SIGTERM and, after
+channels, the 16 kHz copy for ASR), acoustics, asr, audio_review (`review.cover`: a clip and one
+backend call per window, then findings). After each stage the worker writes
+`work/stage-<name>.json` atomically: the contract entry, errors, its steps with their times and its
+part of the result. The caller watches `budgets.worker_deadline_seconds` and the `CancelToken`; on
+either it sends SIGTERM and, after
 `TERMINATE_GRACE_SECONDS`, SIGKILL. SIGTERM raises `WorkerStopped` in the worker, which no stage
 boundary catches, so `proc.run` kills the group of a running decoder on the way out. The handler
 also notes the stop first, and every step and record write checks that note: a stop swallowed on
@@ -29,11 +30,15 @@ the raw transcript (its segments and the joined text), in the `task` and `intent
 `provenance.limitations`; they are data and nothing acts on them (R10, T07).
 
 The result is always assembled in the calling process from the stage records, one function for a
-complete and a partial run alike: the first requested stage without a record is the interrupted
-one (`deadline_exceeded`, `cancelled`, `worker_crashed` in `errors[]`), the requested stages after
-it are `skipped`. `report.write` checks and writes `result.json` and `report.md`. The run is
-marked complete except after a cancel: a repeat of a cancelled request is refused, never rerun.
-No stage is retried and the backend is called at most once (R11).
+complete and a partial run alike: the first requested stage without a final record is the
+interrupted one (`deadline_exceeded`, `cancelled`, `worker_crashed` in `errors[]`), the requested
+stages after it are `skipped`. `audio_review` writes a checkpoint record after every window, so
+the windows reviewed before an interruption keep their findings and their coverage. With several
+windows, `provenance.audio_payload_sha256` is the payload of the first one; every window's payload
+is in its `review_provenance` artifact. `report.write` checks and writes `result.json` and
+`report.md`. The run is marked complete except after a cancel: a repeat of a cancelled request is
+refused, never rerun.
+No stage is retried and the backend is called at most once per window (R11).
 
 `compare` reads two finished runs and compares them by one criterion (`sound_scout.comparison`).
 
@@ -89,7 +94,8 @@ TERMINATE_GRACE_SECONDS = 0.5
 LOCK_FILE_NAME = "analyze.lock"
 LOCK_FILE_MODE = 0o600
 STAGE_RECORD = "stage-{name}.json"
-CLIP_PAD_MS = 0
+CHECKPOINT = "checkpoint"
+CLIP_PAD_MS = review.WINDOW_PAD_MS
 DEADLINE_EXCEEDED = "deadline_exceeded"
 CANCELLED = "cancelled"
 WORKER_CRASHED = "worker_crashed"
@@ -624,50 +630,77 @@ def _review_stage(
     asr_completed: bool,
 ) -> dict:
     stage = _Stage("audio_review")
+    denied = len(guard.denied_events())
     # the request's own text is scanned whether or not a backend gets it (R10)
-    stage.fragment["suspicious_content"] = list(
+    in_request = list(
         review.scan_suspicious({"task": request.task, "intent": request.intent}, "trusted")
     )
+    stage.fragment["suspicious_content"] = in_request
     if backend is None:
         return stage.done("unavailable", NO_BACKEND_REASON)
+    requested = [(0.0, prepared.source.duration_s)]
     try:
-        with stage.step("clip"):
-            cut = clips.cut(run, 0.0, prepared.source.duration_s, CLIP_PAD_MS, config=config)
-            clip = review.clip_from_cut(cut)
         prompt = review.load_prompt()
-        with stage.step("review"):
-            try:
-                outcome = review.run_review(
-                    backend, clip, run, config, prompt, task=request.task, intent=request.intent
-                )
-            except EXPECTED_ERRORS:
-                raise
-            except Exception as error:  # the call itself failed: recorded, never repeated (R11)
-                message = f"{type(error).__name__}: {error}"
-                stage.error(REVIEW_CALL_FAILED, message)
-                return stage.done("failed", message)
-        stage.fragment["suspicious_content"] = list(outcome.suspicious_content)
-        if outcome.response is not None:
-            stage.fragment.update(
-                model_limitations=list(outcome.response.limitations),
-                model_uncertainties=list(outcome.response.uncertainties),
-            )
-        stage.fragment.update(
-            backend=outcome.provenance["backend"],
-            payload_sha256=outcome.provenance["payload"]["sha256"],
-            prompt_sha256=prompt.sha256,
-        )
         transcript = asr.read_raw(run) if asr_completed else None
-        with stage.step("findings"):
-            built = findings.build(run, [outcome], None, transcript, config=config)
+
+        def record(
+            into: _Stage,
+            outcomes: list[review.ReviewOutcome],
+            failure: tuple[tuple[float, float], str] | None,
+        ) -> dict:
+            """The stage record of the windows reviewed so far."""
+            suspicious = list(in_request)
+            for outcome in outcomes:
+                suspicious += [i for i in outcome.suspicious_content if i not in suspicious]
+            into.fragment["suspicious_content"] = suspicious
+            if failure is not None:  # the call itself failed: recorded, never repeated (R11)
+                into.error(REVIEW_CALL_FAILED, failure[1])
+                if not outcomes:
+                    return into.done("failed", failure[1])
+            responses = [o.response for o in outcomes if o.response is not None]
+            if responses:
+                into.fragment.update(
+                    model_limitations=[text for r in responses for text in r.limitations],
+                    model_uncertainties=[text for r in responses for text in r.uncertainties],
+                )
+            first = outcomes[0].provenance
+            into.fragment.update(
+                backend=first["backend"],
+                payload_sha256=first["payload"]["sha256"],
+                prompt_sha256=prompt.sha256,
+            )
+            with into.step("findings"):
+                built = findings.build(
+                    run, outcomes, None, transcript, config=config, requested=requested
+                )
+            into.fragment["built"] = dataclasses.asdict(built)
+            into.errors += built.errors
+            if built.reviewed:
+                return into.done("completed", None)
+            error = (built.errors or [{"code": INTERNAL_ERROR, "message": "no range"}])[0]
+            return into.done("failed", f"{error['code']}: {error['message']}")
+
+        def checkpoint(outcomes: list[review.ReviewOutcome]) -> None:
+            kept = _Stage(stage.name)
+            kept.started, kept.steps = stage.started, list(stage.steps)
+            so_far = _with_denials(record(kept, outcomes, None), guard.denied_events()[denied:])
+            _write_record(run, config, {**so_far, CHECKPOINT: True})
+
+        with stage.step("review"):
+            covered = review.cover(
+                backend,
+                run,
+                config,
+                prompt,
+                requested,
+                task=request.task,
+                intent=request.intent,
+                before_call=_raise_if_stopped,
+                after_window=checkpoint,
+            )
+        return record(stage, covered.outcomes, covered.failure)
     except Exception as error:
         return stage.failed(error)
-    stage.fragment["built"] = dataclasses.asdict(built)
-    stage.errors += built.errors
-    if built.reviewed:
-        return stage.done("completed", None)
-    first = built.errors[0] if built.errors else {"code": INTERNAL_ERROR, "message": "no range"}
-    return stage.done("failed", f"{first['code']}: {first['message']}")
 
 
 def _write_record(run: runs.Run, config: Config, record: dict) -> None:
@@ -836,7 +869,11 @@ def _assemble(
 def _stages(
     layers: tuple[str, ...], records: dict[str, dict], interruption: _Interruption | None
 ) -> tuple[dict[str, dict], list[dict]]:
-    """The contract entry of each worker stage and the errors; the cut-off one is interrupted."""
+    """The contract entry of each worker stage and the errors; the cut-off one is interrupted.
+
+    The cut-off stage may have left a checkpoint (`audio_review` after each window): it stays
+    `completed` with the interruption as its reason when the windows it kept reviewed anything,
+    so their findings and coverage reach the result and the rest is `coverage.unreviewed`."""
     requested = {"prepare": True} | {
         stage: layer in layers for layer, stage in LAYER_STAGES.items()
     }
@@ -847,14 +884,16 @@ def _stages(
         record = records.get(name)
         if not requested[name]:
             stages[name] = _entry(False, "skipped", NOT_REQUESTED_REASON)
-        elif record is not None:
+        elif record is not None and not record.get(CHECKPOINT):
             stages[name] = record["entry"]
             errors += record["errors"]
         elif cut_off is None:
             if interruption is None:
                 interruption = _Interruption(INTERNAL_ERROR, "worker ended without a stage record")
             cut_off = interruption.reason
-            stages[name] = _entry(True, "failed", cut_off)
+            kept = record is not None and record["entry"]["status"] == "completed"
+            stages[name] = _entry(True, "completed" if kept else "failed", cut_off)
+            errors += record["errors"] if record is not None else []
             errors.append({"stage": name, "code": interruption.code, "message": cut_off})
         else:
             stages[name] = _entry(True, "skipped", cut_off)

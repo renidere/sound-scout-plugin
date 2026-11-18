@@ -23,9 +23,10 @@ names a valid response of this run, the cited clip and the backend the result cl
 double never passes for a real backend; `transcript.suspect_segments` is exactly what
 `asr.suspect_segments` makes of the run's `asr/raw.json`, so no flagged segment is dropped; and
 the `findings`, `unlocalized` and audio `transcript.corrections` citing a response are exactly
-what `build`'s own code makes of the stored `response.raw.txt` on its clip's source range, up to
-the placeholders `report.write` puts in place of private values (`REDACTIONS`). These errors
-name the path and the rule, never the text.
+what `build`'s own code makes of the stored `response.raw.txt` files on their clips' source ranges
+(duplicates of overlapping windows merged the same way), up to the placeholders `report.write`
+puts in place of private values (`REDACTIONS`). These errors name the path and the rule, never the
+text.
 """
 
 import contextlib
@@ -48,6 +49,7 @@ CLIP_MISSING = "review_clip_missing"
 PAYLOAD_MISMATCH = "review_payload_mismatch"
 RECORD_MISMATCH = "review_record_mismatch"
 INTERVAL_EMPTY = "review_interval_empty"
+WINDOW_BOUNDARY = "window_boundary"
 TRANSCRIPT_ARTIFACT_ID = "transcript-raw"
 DISAGREEMENT_CATEGORY = "pronunciation"
 DISAGREEMENT_NOTE = (
@@ -80,6 +82,7 @@ def build(
     transcript: Mapping | None,
     *,
     config: Config,
+    requested: list[tuple[float, float]] | None = None,
 ) -> Built:
     """Findings of `review_results` on the source timescale; nothing is written to disk.
 
@@ -89,15 +92,20 @@ def build(
     observation whose interval is empty once clamped to the clip on the source scale is skipped
     with an `errors[]` entry too. Mixing test-double and real backend outcomes raises `ValueError`,
     and so does a transcript whose segments `asr.trusted_segments` refuses.
+
+    Outcomes of overlapping windows (`review.cover`) share their duplicates: the same observation
+    heard in the overlap of two or more windows becomes one finding citing all of them
+    (`_merge_window_duplicates`). With `requested`, the source ranges asked for, a finding cut by
+    the inner edge of its window adds a `window_boundary` entry to `errors[]`, unless a window of
+    the finding it was merged with heard across that edge.
     """
     outcomes = list(review_results)
     if len({review.is_test_double(outcome.provenance) for outcome in outcomes}) > 1:
         raise ValueError("test-double and real backend outcomes cannot make one result")
     words = _words(transcript)
     raw_sha256 = _transcript_sha256(run, transcript) if transcript is not None else None
-    findings: list[dict] = []
+    made_all: list[_Made] = []
     unlocalized: list[dict] = []
-    corrections: list[dict] = []
     artifacts: list[dict] = []
     reviewed: list[tuple[float, float]] = []
     errors: list[dict] = []
@@ -118,11 +126,14 @@ def build(
             },
         ]
         assert outcome.response is not None
-        made = _from_response(outcome.response, clip, refs, words, raw_sha256)
-        findings += made.findings
+        made = _from_response(outcome.response, clip, refs)
+        made_all.append(made)
         unlocalized += made.unlocalized
-        corrections += made.corrections
         errors += made.errors
+    found, into = _merge_window_duplicates(made_all)
+    corrections = _corrections(found, words, raw_sha256)
+    if requested is not None:
+        errors += _boundary_errors(made_all, into, requested)
     if corrections:
         artifacts.append(
             {
@@ -135,7 +146,7 @@ def build(
             }
         )
     return Built(
-        findings,
+        found,
         unlocalized,
         corrections,
         artifacts,
@@ -225,21 +236,20 @@ def _checked_record(
 
 @dataclass(frozen=True)
 class _Made:
+    """What one response makes; `span` is its clip's source range, `corrections` are filled in
+    only after the findings of all windows are merged."""
+
     findings: list[dict]
     unlocalized: list[dict]
     corrections: list[dict]
     errors: list[dict]
+    clip_id: str
+    span: tuple[float, float]
 
 
-def _from_response(
-    response: review.ReviewResponse,
-    clip: clips.Clip,
-    refs: list[dict],
-    words: list[Mapping],
-    raw_sha256: str | None,
-) -> _Made:
+def _from_response(response: review.ReviewResponse, clip: clips.Clip, refs: list[dict]) -> _Made:
     """What one validated response makes on the source scale; `build` and `validate` share it."""
-    made = _Made([], [], [], [])
+    made = _Made([], [], [], [], clip.id, (clip.source_start, clip.source_end))
     localized, unplaced = [], []
     for obs in response.observations:
         if obs["whole_clip"] and _polarity(obs) == "negative":
@@ -259,12 +269,6 @@ def _from_response(
             )
             continue
         made.findings.append(finding)
-        heard = _overlapping(words, finding["start"], finding["end"])
-        if heard and (finding["category"], finding["polarity"]) == (
-            DISAGREEMENT_CATEGORY,
-            "negative",
-        ):
-            made.corrections.append(_disagreement(finding, heard, refs[1], raw_sha256))
     for n, (obs, reason) in enumerate(unplaced, 1):
         made.unlocalized.append(_unlocalized(f"u-{clip.id}-{n}", obs, reason, refs))
     return made
@@ -304,9 +308,134 @@ def _unlocalized(item_id: str, obs: Mapping, reason: str, refs: list[dict]) -> d
     }
 
 
-def _disagreement(
-    finding: dict, heard: list[Mapping], review_ref: dict, raw_sha256: str | None
-) -> dict:
+def _merge_window_duplicates(made: list[_Made]) -> tuple[list[dict], dict[str, str]]:
+    """The findings of all windows with the duplicates of overlapping windows merged, and the id
+    each finding went into; `build` and `validate` share it.
+
+    For clips A and B with `A.start < B.start` and an overlap `Z = [B.start, A.end]`, a finding of
+    A and one of B with the same category and polarity, whose intervals meet and both meet `Z`,
+    are one observation heard twice. Such pairs join transitively, so an event heard in three
+    windows is one finding too, but a group never holds two findings of one clip. A group keeps its
+    earliest finding, by `(clip start, start, id)`, with the union of the intervals and the
+    references of the others appended in that order; the order of the rest is kept, and the
+    result does not depend on the order of `made`.
+    """
+    items = [(finding, m.span, m.clip_id) for m in made for finding in m.findings]
+    order = sorted(range(len(items)), key=lambda i: (items[i][1][0], *_place(items[i][0])))
+    rank = {i: n for n, i in enumerate(order)}
+    parent = list(range(len(items)))
+    clips_in = [{clip_id} for _, _, clip_id in items]
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    for n, i in enumerate(order):
+        for j in order[n + 1 :]:
+            a, b = root(i), root(j)
+            if a == b or clips_in[a] & clips_in[b] or not _duplicates(items[i], items[j]):
+                continue
+            keep, gone = sorted((a, b), key=rank.__getitem__)
+            parent[gone] = keep
+            clips_in[keep] |= clips_in[gone]
+    groups: dict[int, list[int]] = {}
+    for i in order:
+        groups.setdefault(root(i), []).append(i)
+    found, into = [], {}
+    for i, (finding, _, _) in enumerate(items):
+        members = groups.get(i)
+        for m in members or []:
+            into[items[m][0]["id"]] = finding["id"]
+        if members is None:
+            continue
+        if len(members) == 1:
+            found.append(finding)
+            continue
+        refs: list[dict] = []
+        for m in members:
+            refs += [dict(r) for r in items[m][0]["evidence_refs"] if r not in refs]
+        found.append(
+            {
+                **finding,
+                "start": min(items[m][0]["start"] for m in members),
+                "end": max(items[m][0]["end"] for m in members),
+                "evidence_refs": refs,
+            }
+        )
+    return found, into
+
+
+def _place(finding: dict) -> tuple[float, str]:
+    return finding["start"], finding["id"]
+
+
+def _duplicates(a: tuple, b: tuple) -> bool:
+    """`a` and `b` (finding, clip span, clip id), `a`'s clip starting first, are one observation
+    heard in the overlap of their clips."""
+    (fa, (a_start, a_end), _), (fb, (b_start, _), _) = a, b
+    zone = (b_start, a_end)
+    return (
+        a_start < b_start
+        and zone[1] - zone[0] > schema.TIME_EPS
+        and (fa["category"], fa["polarity"]) == (fb["category"], fb["polarity"])
+        and _meet((fa["start"], fa["end"]), (fb["start"], fb["end"]))
+        and _meet((fa["start"], fa["end"]), zone)
+        and _meet((fb["start"], fb["end"]), zone)
+    )
+
+
+def _meet(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return a[0] < b[1] + schema.TIME_EPS and b[0] < a[1] + schema.TIME_EPS
+
+
+def _boundary_errors(
+    made: list[_Made], into: dict[str, str], requested: list[tuple[float, float]]
+) -> list[dict]:
+    """A finding touching an edge of its window that is not an edge of a requested range may be
+    cut by the window (R03). The mark goes to the finding it was merged into, unless a window of
+    another finding in that merge holds the edge inside, so the event was heard across it."""
+    edges = [edge for interval in requested for edge in interval]
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for m in made:
+        for finding in m.findings:
+            spans.setdefault(into[finding["id"]], []).append(m.span)
+    errors = []
+    for m in made:
+        for finding in m.findings:
+            merged_id = into[finding["id"]]
+            for at, edge in ((finding["start"], m.span[0]), (finding["end"], m.span[1])):
+                inner = all(abs(edge - outer) > schema.TIME_EPS for outer in edges)
+                heard_across = any(
+                    start + schema.TIME_EPS < edge < end - schema.TIME_EPS
+                    for start, end in spans[merged_id]
+                )
+                if inner and abs(at - edge) <= schema.TIME_EPS and not heard_across:
+                    errors.append(
+                        {
+                            "stage": STAGE,
+                            "code": WINDOW_BOUNDARY,
+                            "message": f"finding {merged_id} touches the inner edge of "
+                            f"window {m.clip_id} at {round(edge, 6)} s; its interval may be cut",
+                        }
+                    )
+    return errors
+
+
+def _corrections(found: list[dict], words: list[Mapping], raw_sha256: str | None) -> list[dict]:
+    """An ASR/audio-model disagreement for each negative pronunciation finding over words."""
+    corrections = []
+    for finding in found:
+        heard = _overlapping(words, finding["start"], finding["end"])
+        if heard and (finding["category"], finding["polarity"]) == (
+            DISAGREEMENT_CATEGORY,
+            "negative",
+        ):
+            corrections.append(_disagreement(finding, heard, raw_sha256))
+    return corrections
+
+
+def _disagreement(finding: dict, heard: list[Mapping], raw_sha256: str | None) -> dict:
     """Both versions side by side; the raw transcript stays as it is, nothing is chosen."""
     return {
         "start": finding["start"],
@@ -315,7 +444,7 @@ def _disagreement(
         "corrected": finding["observation"],
         "source": "audio_model_observation",
         "evidence_refs": [
-            dict(review_ref),
+            *(dict(r) for r in finding["evidence_refs"] if r["type"] == "audio_model_observation"),
             {"type": "transcript", "ref": TRANSCRIPT_ARTIFACT_ID, "sha256": raw_sha256},
         ],
         "certainty": "uncertain",
@@ -465,13 +594,28 @@ def _content_errors(
             raw_sha256 = raw_artifact["sha256"]
             with contextlib.suppress(ValueError, TypeError, AttributeError):
                 words = _words(raw)
-    expected: dict[str, _Made] = {}
+    rebuilt: dict[str, _Made] = {}
     for response_id, record in records.items():
-        made = _rebuilt(run, responses[response_id], record, artifacts, words or [], raw_sha256)
+        made = _rebuilt(run, responses[response_id], record, artifacts)
         if isinstance(made, str):
             errors.append(f"$.artifacts[{index[response_id]}]: {made}")
         elif made is not None:
-            expected[response_id] = made
+            rebuilt[response_id] = made
+    # Findings and corrections are what the responses make together, duplicates of overlapping
+    # windows merged; each is checked against the response it cites first.
+    found, _ = _merge_window_duplicates(list(rebuilt.values()))
+    corrections = _corrections(found, words or [], raw_sha256)
+    expected = {
+        response_id: _Made(
+            [f for f in found if _first_response(f["evidence_refs"]) == response_id],
+            made.unlocalized,
+            [c for c in corrections if _first_response(c["evidence_refs"]) == response_id],
+            [],
+            made.clip_id,
+            made.span,
+        )
+        for response_id, made in rebuilt.items()
+    }
     groups = (
         ("findings", "$.findings", result["findings"], "evidence_basis"),
         ("unlocalized", "$.unlocalized", result["unlocalized"], "evidence_basis"),
@@ -505,14 +649,11 @@ def _content_errors(
     return errors
 
 
-def _rebuilt(
-    run: Run,
-    response: dict,
-    record: dict,
-    artifacts: dict,
-    words: list[Mapping],
-    raw_sha256: str | None,
-) -> _Made | str | None:
+def _first_response(refs: list[dict]) -> str | None:
+    return next((r["ref"] for r in refs if r["type"] == "audio_model_observation"), None)
+
+
+def _rebuilt(run: Run, response: dict, record: dict, artifacts: dict) -> _Made | str | None:
     """What the stored response makes, a rule it breaks, or None when its clip is not usable."""
     clip_artifact = artifacts.get(record.get("clip_id"))
     if clip_artifact is None or clip_artifact["kind"] != "clip":
@@ -549,7 +690,7 @@ def _rebuilt(
         {"type": "clip", "ref": clip_artifact["id"], "sha256": clip_artifact["sha256"]},
         {"type": "audio_model_observation", "ref": response["id"], "sha256": response["sha256"]},
     ]
-    return _from_response(parsed, clip, refs, words, raw_sha256)
+    return _from_response(parsed, clip, refs)
 
 
 def _same(expected: object, actual: object) -> bool:

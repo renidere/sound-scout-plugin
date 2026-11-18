@@ -360,7 +360,8 @@ def render(result: dict) -> str:
         f"- backend: `{provenance['backend']}`, модель: {_cell(provenance['model'])}, "
         f"revision: {_cell(provenance['revision'])}.",
         f"- входные модальности: {', '.join(provenance['input_modalities']) or '—'}; "
-        f"SHA-256 audio payload: {_cell(provenance['audio_payload_sha256'])}; "
+        f"SHA-256 audio payload{_windows_note(result['artifacts'])}: "
+        f"{_cell(provenance['audio_payload_sha256'])}; "
         f"prompt: {_cell(provenance['prompt_sha256'])}; схема: `{provenance['schema_sha256']}`.",
         "- версии: "
         + ", ".join(f"{k} {v}" for k, v in sorted(provenance["versions"].items()))
@@ -373,6 +374,14 @@ def render(result: dict) -> str:
         f"- `{a['id']}` ({a['kind']}): [`{a['path']}`]({a['path']})" for a in result["artifacts"]
     ]
     return "\n".join(lines) + "\n"
+
+
+def _windows_note(artifacts: list[dict]) -> str:
+    """With several review windows the provenance field names the first window's payload only."""
+    windows = sum(a["kind"] == "review_provenance" for a in artifacts)
+    if windows < 2:
+        return ""
+    return f" первого окна из {windows} (payload каждого окна — в артефактах review_provenance)"
 
 
 def _compact(result: dict, limit: int) -> dict:

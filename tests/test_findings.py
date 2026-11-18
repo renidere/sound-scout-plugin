@@ -971,3 +971,223 @@ def test_schema_bump_requires_polarity_and_evidence_ref_sha256(doc: dict) -> Non
     doc["findings"][0]["polarity"] = "negative"
     del doc["findings"][0]["evidence_refs"][0]["sha256"]
     assert_rejected(doc, "$.findings[0].evidence_refs[0]: 'sha256' is a required property")
+
+
+# --- overlapping windows (issue #25, criterion 2) --------------------------------------------
+
+WINDOW_A, WINDOW_B = (0.0, 1.5), (1.0, SOURCE_DURATION)  # overlap [1.0, 1.5]
+REQUESTED = [(0.0, SOURCE_DURATION)]
+
+
+def observation(start: float, end: float, **changes: object) -> dict:
+    return {**NEGATIVE, "start_seconds": start, "end_seconds": end, **changes}
+
+
+def windowed(
+    run: Run,
+    config: Config,
+    a: list[dict],
+    b: list[dict],
+    transcript: dict | None = None,
+    requested: list[tuple[float, float]] | None = REQUESTED,
+) -> tuple[Built, review.ReviewOutcome]:
+    """Two overlapping windows reviewed with observations on each clip's own scale."""
+    outcomes = []
+    for (start, end), observations in ((WINDOW_A, a), (WINDOW_B, b)):
+        response = {**RESPONSE, "observations": observations, "unlocalized_observations": []}
+        outcomes.append(reviewed(run, config, cut(run, start, end, 0, config=config), response))
+    built = build(run, outcomes, [], transcript, config=config, requested=requested)
+    return built, outcomes[0]
+
+
+def boundary_errors(built: Built) -> list[dict]:
+    return [e for e in built.errors if e["code"] == findings.WINDOW_BOUNDARY]
+
+
+def test_the_same_observation_in_the_overlap_of_two_windows_is_one_finding(
+    run: Run, config: Config
+) -> None:
+    built, first = windowed(run, config, [observation(1.1, 1.4)], [observation(0.15, 0.45)])
+
+    [finding] = built.findings
+    assert (finding["start"], finding["end"]) == (1.1, 1.45)
+    assert [ref["type"] for ref in finding["evidence_refs"]] == [
+        "clip",
+        "audio_model_observation",
+        "clip",
+        "audio_model_observation",
+    ]
+    assert len({ref["ref"] for ref in finding["evidence_refs"]}) == 4
+    assert built.reviewed == [{"start": 0.0, "end": SOURCE_DURATION}]
+    assert boundary_errors(built) == []
+    findings.validate(document(run, built, first), run=run)
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ({"category": "semantic_stress"}, {}),
+        ({"correction": None}, {}),
+    ],
+    ids=["other category", "other polarity"],
+)
+def test_overlap_observations_of_another_kind_stay_two(run: Run, config: Config, a, b) -> None:
+    built, first = windowed(
+        run, config, [observation(1.1, 1.4, **a)], [observation(0.15, 0.45, **b)]
+    )
+    assert len(built.findings) == 2
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_equal_observations_outside_the_overlap_stay_two(run: Run, config: Config) -> None:
+    built, first = windowed(run, config, [observation(0.2, 0.5)], [observation(1.2, 1.4)])
+    assert [(f["start"], f["end"]) for f in built.findings] == [(0.2, 0.5), (2.2, 2.4)]
+    assert boundary_errors(built) == []
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_an_event_cut_by_both_windows_is_merged_across_the_overlap(
+    run: Run, config: Config
+) -> None:
+    built, first = windowed(run, config, [observation(0.8, 1.5)], [observation(0.0, 0.8)])
+
+    [finding] = built.findings
+    assert (finding["start"], finding["end"]) == (0.8, 1.8)
+    assert boundary_errors(built) == []
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_a_finding_at_an_inner_window_edge_without_a_pair_is_marked(
+    run: Run, config: Config
+) -> None:
+    built, _ = windowed(run, config, [observation(1.2, 1.5)], [observation(1.2, 1.5)])
+
+    [mark] = boundary_errors(built)
+    assert mark["stage"] == "audio_review"
+    assert mark["message"].startswith(f"finding {built.findings[0]['id']} touches the inner edge")
+    assert "at 1.5 s" in mark["message"]
+
+
+def test_a_merged_finding_keeps_the_mark_of_an_edge_no_window_heard_across(
+    run: Run, config: Config
+) -> None:
+    built, _ = windowed(
+        run,
+        config,
+        [observation(1.1, 1.4)],
+        [observation(0.1, 1.5)],
+        requested=[(0.0, SOURCE_DURATION + 1.0)],
+    )
+
+    [finding] = built.findings
+    assert (finding["start"], finding["end"]) == (1.1, SOURCE_DURATION)
+    [mark] = boundary_errors(built)
+    assert mark["message"].startswith(f"finding {finding['id']} touches the inner edge")
+    assert f"at {SOURCE_DURATION} s" in mark["message"]
+
+
+def windows_reviewed(
+    run: Run, config: Config, observed: list[tuple[tuple[float, float], list[dict]]]
+) -> tuple[Built, review.ReviewOutcome]:
+    outcomes = []
+    for (start, end), observations in observed:
+        response = {**RESPONSE, "observations": observations, "unlocalized_observations": []}
+        outcomes.append(reviewed(run, config, cut(run, start, end, 0, config=config), response))
+    return build(run, outcomes, [], None, config=config, requested=REQUESTED), outcomes[0]
+
+
+def test_an_event_heard_in_three_overlapping_windows_is_one_finding(
+    run: Run, config: Config
+) -> None:
+    built, first = windows_reviewed(
+        run,
+        config,
+        [
+            ((0.0, 1.5), [observation(1.3, 1.4)]),
+            ((1.0, SOURCE_DURATION), [observation(0.3, 0.4)]),
+            ((1.2, SOURCE_DURATION), [observation(0.1, 0.2)]),
+        ],
+    )
+
+    [finding] = built.findings
+    assert (finding["start"], finding["end"]) == (1.3, 1.4)
+    assert [ref["type"] for ref in finding["evidence_refs"]] == [
+        "clip",
+        "audio_model_observation",
+    ] * 3
+    assert boundary_errors(built) == []
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_a_merge_never_takes_two_findings_of_one_window(run: Run, config: Config) -> None:
+    built, first = windows_reviewed(
+        run,
+        config,
+        [
+            ((0.0, 1.5), [observation(1.05, 1.15), observation(1.3, 1.45)]),
+            ((1.0, SOURCE_DURATION), [observation(0.0, 0.5)]),
+        ],
+    )
+
+    assert [(f["start"], f["end"]) for f in built.findings] == [(1.0, 1.5), (1.3, 1.45)]
+    assert [len(f["evidence_refs"]) for f in built.findings] == [4, 2]
+    assert boundary_errors(built) == []
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_without_the_requested_ranges_no_finding_is_marked(run: Run, config: Config) -> None:
+    built, _ = windowed(
+        run, config, [observation(1.2, 1.5)], [observation(1.2, 1.5)], requested=None
+    )
+    assert len(built.findings) == 2 and boundary_errors(built) == []
+
+
+def test_a_finding_at_the_edge_of_the_requested_range_is_not_marked(
+    run: Run, config: Config
+) -> None:
+    built, _ = windowed(run, config, [observation(0.0, 0.3)], [observation(1.2, 1.5)])
+    assert len(built.findings) == 2 and boundary_errors(built) == []
+
+
+def test_a_merged_disagreement_with_asr_is_one_correction_citing_both_windows(
+    run: Run, config: Config
+) -> None:
+    transcript = write_raw(run, [{"start": 1.2, "end": 1.3, "word": " пример", "probability": 0.9}])
+
+    built, first = windowed(
+        run, config, [observation(1.1, 1.4)], [observation(0.15, 0.45)], transcript
+    )
+
+    [correction_] = built.corrections
+    assert [ref["type"] for ref in correction_["evidence_refs"]] == [
+        "audio_model_observation",
+        "audio_model_observation",
+        "transcript",
+    ]
+    assert (correction_["start"], correction_["end"]) == (1.1, 1.45)
+    findings.validate(document(run, built, first), run=run)
+
+
+def test_the_validator_rebuilds_the_merge_and_rejects_a_changed_merged_finding(
+    run: Run, config: Config
+) -> None:
+    built, first = windowed(run, config, [observation(1.1, 1.4)], [observation(0.15, 0.45)])
+    doc = document(run, built, first)
+    doc["findings"][0]["end"] = 1.4
+    assert_rejected(doc, "$.findings[0]: does not match the review response it cites", run)
+    doc = document(run, built, first)
+    doc["findings"][0]["evidence_refs"] = doc["findings"][0]["evidence_refs"][:2]
+    doc["findings"][0]["end"] = 1.4
+    assert_rejected(doc, "$.findings[0]: does not match the review response it cites", run)
+
+
+def test_clips_with_a_gap_between_them_do_not_cover_a_finding_together(
+    run: Run, config: Config
+) -> None:
+    built, first = windowed(run, config, [observation(0.8, 1.5)], [observation(0.0, 0.8)])
+    doc = document(run, built, first)
+    for artifact in doc["artifacts"]:
+        if artifact["source_start"] == WINDOW_B[0]:
+            artifact["source_start"] = 1.6
+    errors = assert_rejected(doc, "$.findings[0]: outside clip")
+    assert any("$.findings[0]: outside review_response" in error for error in errors)

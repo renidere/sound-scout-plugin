@@ -499,8 +499,8 @@ def _polarity_errors(result: dict) -> list[str]:
 
 
 def _clip_errors(result: dict) -> list[str]:
-    """Every finding and unlocalized observation names a playable clip (R05); a finding's clip
-    covers its interval."""
+    """Every finding and unlocalized observation names a playable clip (R05); a finding's clips
+    cover its interval (`_not_covering`)."""
     artifacts = {a["id"]: a for a in result["artifacts"]}
     errors = []
     for name in ("findings", "unlocalized"):
@@ -511,16 +511,16 @@ def _clip_errors(result: dict) -> list[str]:
                 errors.append(f"{path}.evidence_refs: needs at least one reference of type 'clip'")
             if name != "findings":
                 continue
-            for ref in clip_refs:
-                clip = artifacts.get(ref)
-                if clip is not None and not _covers(clip, item["start"], item["end"]):
-                    errors.append(f"{path}: outside clip {ref!r} source range")
+            clips = [artifacts[ref] for ref in clip_refs if ref in artifacts]
+            for clip in _not_covering(clips, item["start"], item["end"]):
+                errors.append(f"{path}: outside clip {clip['id']!r} source range")
     return errors
 
 
 def _audio_coverage_errors(result: dict) -> list[str]:
-    """An audio claim lies inside coverage.reviewed and inside the source range of the review
-    response it cites; a positive finding is bounded by coverage.reviewed too (R05)."""
+    """An audio claim lies inside coverage.reviewed and inside the source ranges of the review
+    responses it cites (`_not_covering`); a positive finding is bounded by coverage.reviewed too
+    (R05)."""
     reviewed = result["coverage"]["reviewed"]
     artifacts = {a["id"]: a for a in result["artifacts"]}
     errors = []
@@ -538,10 +538,12 @@ def _audio_coverage_errors(result: dict) -> list[str]:
             errors.append(f"{path}: outside coverage.reviewed")
         if not audio:
             continue
-        for response in cited_review_responses(item["evidence_refs"], artifacts):
+        responses = cited_review_responses(item["evidence_refs"], artifacts)
+        outside = _not_covering(responses, item["start"], item["end"])
+        for response in responses:
             if not _has_range(response):
                 errors.append(f"{path}: review_response {response['id']!r} has no source range")
-            elif not _covers(response, item["start"], item["end"]):
+            elif response in outside:
                 errors.append(f"{path}: outside review_response {response['id']!r} source range")
     for i, item in enumerate(result["unlocalized"]):
         path = f"$.unlocalized[{i}]"
@@ -628,6 +630,21 @@ def _has_range(artifact: dict) -> bool:
 
 def _range(artifact: dict) -> dict:
     return {"start": artifact["source_start"], "end": artifact["source_end"]}
+
+
+def _not_covering(cited: list[dict], start: float, end: float) -> list[dict]:
+    """The cited artifacts that do not cover `[start, end]`. Overlapping windows cover a merged
+    finding together: when each overlaps the interval and their union leaves no gap in it, none
+    is reported; otherwise each one that does not cover it alone is."""
+    if (
+        cited
+        and all(
+            _has_range(a) and a["source_start"] < end and start < a["source_end"] for a in cited
+        )
+        and not subtract([{"start": start, "end": end}], [_range(a) for a in cited])
+    ):
+        return []
+    return [a for a in cited if not _covers(a, start, end)]
 
 
 def _covers(artifact: dict, start: float, end: float) -> bool:
