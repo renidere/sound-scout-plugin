@@ -1,4 +1,4 @@
-"""Initial and control attempt compared by one criterion (R07, T10); see 0005-compare-rules.md.
+"""Initial and control attempt compared by one criterion (R07, T10); see 0006-compare-rules.md.
 
 `compare` reads two complete `analyze` runs by `run_id` (never by path: R10), checks each
 `result.json` with `findings.validate` against the files of its run and compares them by one
@@ -10,8 +10,8 @@ listed at once. So `improved` never follows from a shorter recording or fewer pa
 in the rule. The audio model's own limitations and uncertainties of each attempt are carried into
 `limitations`; they never change the verdict.
 
-The word of a criterion is looked up in the raw transcript (`asr/raw.json`, segments flagged
-`suspect_hallucination` left out), never in the model's text. The result is checked against
+The word of a criterion is looked up in the raw transcript (`asr/raw.json`, only the segments
+`asr.trusted_segments` trusts), never in the model's text. The result is checked against
 `compare.v1.schema.json` and written to `<data_root>/compare/<compare_id>.json` (0600,
 exclusive). Nothing is run: no lock, no model, no backend, no network.
 """
@@ -328,12 +328,13 @@ def _windows(criterion: Criterion, attempt: Attempt) -> list[dict] | None:
 
 
 def _words(raw: object) -> list[tuple[float, float, str]] | None:
-    if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
+    try:
+        trusted = asr.trusted_segments(raw)[0]
+    except ValueError:
         return None
     words = [
         (float(word["start"]), float(word["end"]), normalized_word(word["word"]))
-        for segment in raw["segments"]
-        if isinstance(segment, dict) and segment.get(asr.SUSPECT_HALLUCINATION) is not True
+        for segment in trusted
         for word in segment.get("words") or []
         if isinstance(word, dict)
         and isinstance(word.get("word"), str)

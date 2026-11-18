@@ -1,4 +1,4 @@
-# 0005 — Сравнение исходной и контрольной попыток: критерии, окна, правило вердикта
+# 0006 — Сравнение исходной и контрольной попыток: критерии, окна, правило вердикта
 
 - **Статус:** принято.
 - **Дата:** 2026-11-18.
@@ -23,10 +23,10 @@
    `intelligibility_of:<слово>` → `pronunciation`, `completeness_of_phrase` → `completeness`.
    Слово одно, 1..64 символа без пробелов; сопоставление после `casefold`, `ё→е` и отбрасывания
    пунктуации по краям.
-3. **Окна.** Слово ищется в сыром транскрипте `asr/raw.json` (сегменты `suspect_hallucination`
-   пропускаются), а не в тексте модели. `emphasis_on`, `intelligibility_of` — интервалы всех
-   вхождений; `pause_before` — от конца предыдущего слова (или 0.0) до конца слова;
-   `completeness_of_phrase` — `coverage.requested` целиком. Audio review по критерию есть, если
+3. **Окна.** Слово ищется в сыром транскрипте `asr/raw.json` (только сегменты, которым
+   доверяет `asr.trusted_segments`, — решение 0005), а не в тексте модели. `emphasis_on`,
+   `intelligibility_of` — интервалы всех вхождений; `pause_before` — от конца предыдущего слова
+   (или 0.0) до конца слова; `completeness_of_phrase` — `coverage.requested` целиком. Audio review по критерию есть, если
    `stages.audio_review` — `completed` и каждое окно внутри `coverage.reviewed` (± `TIME_EPS`).
 4. **Evidence** каждой попытки: findings категории критерия, пересекающие окна (для
    `completeness_of_phrase` — все), unlocalized этой категории, для `pause_before` — интервалы

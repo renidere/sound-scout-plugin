@@ -539,6 +539,23 @@ def test_words_of_a_suspect_hallucination_segment_are_not_looked_up(
     assert codes(result) == {("word_not_found", "b")}
 
 
+def test_a_raw_transcript_without_the_trust_flag_is_result_invalid(
+    config: Config, make_attempt
+) -> None:
+    run_a = make_attempt(observations=(STRESS,))
+    run_b = make_attempt(frequency=230.0)
+    rewrite_json(
+        run_dir(config, run_b) / "asr" / "raw.json",
+        lambda d: d["segments"][0].pop("suspect_hallucination"),
+    )
+
+    with pytest.raises(CompareError) as error:
+        app.compare(run_a, run_b, "emphasis_on:мыла", config)
+
+    assert error.value.code == "result_invalid"
+    assert compare_files(config) == []
+
+
 def test_a_window_outside_the_reviewed_range_is_criterion_not_reviewed(
     config: Config, make_attempt
 ) -> None:
