@@ -40,9 +40,9 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 
 from sound_scout import findings
+from sound_scout._schema_messages import schema_errors
 from sound_scout.doctor import TEST_DOUBLE
 from sound_scout.eval import labels, manifest
-from sound_scout.eval._schema import schema_errors
 from sound_scout.eval.manifest import CATEGORIES, CATEGORY_GROUPS, MIN_HELDOUT_EVENTS_PER_GROUP
 from sound_scout.runs import Run
 from sound_scout.schema import _non_finite_numbers
