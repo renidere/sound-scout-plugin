@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from sound_scout.eval import manifest
+from sound_scout.eval import _schema, labels, manifest
+from sound_scout.eval._schema import schema_errors
 from sound_scout.eval.manifest import (
     CATEGORIES,
     MIN_CLIPS,
@@ -328,3 +329,112 @@ def test_protocol_covers_categories_matching_volumes_split_rule_abstention_and_c
         "T06",
     ):
         assert fragment in text, fragment
+
+
+MANIFEST_TEXT = "секрет-манифеста"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "path"),
+    [
+        (lambda d: d.update(name=MANIFEST_TEXT), "$.name"),
+        (lambda d: d.update(schema_version=MANIFEST_TEXT), "$.schema_version"),
+        (lambda d: d.update(note=[MANIFEST_TEXT]), "$.note"),
+        (lambda d: d.update({MANIFEST_TEXT: "x"}), "$: Additional properties are not allowed"),
+        (lambda d: d.update(records={"note": MANIFEST_TEXT}), "$.records"),
+        (lambda d: d["records"].append(MANIFEST_TEXT), "$.records[20]"),
+        (lambda d: d["records"][0].update(id=MANIFEST_TEXT), "$.records[0].id"),
+        (lambda d: d["records"][0].update(source_group=MANIFEST_TEXT), "$.records[0].source_group"),
+        (lambda d: d["records"][0].update(pair_id=MANIFEST_TEXT), "$.records[0].pair_id"),
+        (lambda d: d["records"][0].update(split=MANIFEST_TEXT), "$.records[0].split"),
+        (lambda d: d["records"][0].update(note={"text": MANIFEST_TEXT}), "$.records[0].note"),
+        (lambda d: d["records"][0].update(path=[MANIFEST_TEXT]), "$.records[0].path"),
+        (lambda d: d["records"][0].update(duration_s=MANIFEST_TEXT), "$.records[0].duration_s"),
+        (
+            lambda d: d["records"][0].update(categories=[MANIFEST_TEXT, MANIFEST_TEXT]),
+            "$.records[0].categories",
+        ),
+    ],
+)
+def test_schema_errors_name_the_rule_without_echoing_manifest_values(
+    tmp_path: Path, capsys, doc: dict, mutate, path: str
+) -> None:
+    mutate(doc)
+    report = assert_rejected(doc, path)
+    assert not any(MANIFEST_TEXT in error for error in report.errors), report.errors
+    assert main([str(write(tmp_path, doc))]) == 1
+    out = capsys.readouterr().out
+    assert path in out
+    assert MANIFEST_TEXT not in out
+
+
+IDENTIFIER_PATTERN = "'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (
+            lambda d: d["records"][0].update(id="-bad"),
+            f"$.records[0].id: must match pattern {IDENTIFIER_PATTERN}",
+        ),
+        (
+            lambda d: d["records"][0].update(split="test"),
+            "$.records[0].split: must be one of ['dev', 'heldout']",
+        ),
+        (
+            lambda d: d["records"][0].update(negative_control="no"),
+            "$.records[0].negative_control: must be of type boolean",
+        ),
+        (
+            lambda d: d.update(note=1),
+            "$.note: must be of type ['string', 'null']",
+        ),
+        (
+            lambda d: d["records"][0].pop("sha256"),
+            "$.records[0]: 'sha256' is a required property",
+        ),
+        (
+            lambda d: d["records"][0].update(extra=1),
+            "$.records[0]: Additional properties are not allowed, allowed: ['categories',",
+        ),
+        (lambda d: d.update(schema_version="2.0"), "$.schema_version: '1.0' was expected"),
+        (
+            lambda d: d["records"][0].update(duration_s=0),
+            "$.records[0].duration_s: must be greater than 0",
+        ),
+        (
+            lambda d: d["records"][0].update(pair_id="-bad"),
+            "$.records[0].pair_id: must be null or a valid identifier",
+        ),
+        (
+            lambda d: d["records"][0].update(categories=["completeness", "completeness"]),
+            "$.records[0].categories: has non-unique items, every item must be unique",
+        ),
+        (
+            lambda d: d["records"][0].update(path=""),
+            "$.records[0].path: must be at least 1 characters long",
+        ),
+    ],
+)
+def test_each_manifest_schema_rule_is_named_with_its_path(
+    tmp_path: Path, doc: dict, mutate, error: str
+) -> None:
+    mutate(doc)
+    report = validate(write(tmp_path, doc))
+    assert any(e.startswith(error) for e in report.errors), report.errors
+    assert not any("violates schema rule" in e for e in report.errors), report.errors
+
+
+def test_manifest_and_labels_build_schema_messages_in_one_place() -> None:
+    assert manifest.schema_errors is _schema.schema_errors
+    assert labels.schema_errors is _schema.schema_errors
+    for module in (manifest, labels):
+        assert not hasattr(module, "_schema_message"), module
+        assert not hasattr(module, "_json_path"), module
+        assert not hasattr(module, "Draft202012Validator"), module
+
+
+def test_rule_without_its_own_message_is_named_without_the_value() -> None:
+    errors = schema_errors({"properties": {"name": {"maxLength": 3}}}, {"name": MANIFEST_TEXT})
+    assert errors == ["$.name: violates schema rule 'maxLength'"]

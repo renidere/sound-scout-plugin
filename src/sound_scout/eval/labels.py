@@ -18,8 +18,7 @@ from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
-
+from sound_scout.eval._schema import schema_errors
 from sound_scout.eval.manifest import PROSODY_CATEGORIES
 from sound_scout.schema import _non_finite_numbers
 
@@ -79,10 +78,7 @@ def validate(path: str | Path) -> LabelsReport:
 def validation_report(labels: object) -> LabelsReport:
     """Every violation as `<json path>: <message>`; the rules run only on a sound shape."""
     errors = _non_finite_numbers(labels, "$")
-    errors += [
-        f"{error.json_path}: {_schema_message(error)}"
-        for error in sorted(Draft202012Validator(SCHEMA).iter_errors(labels), key=_json_path)
-    ]
+    errors += schema_errors(SCHEMA, labels)
     if errors:
         return LabelsReport(errors)
     assert isinstance(labels, dict)
@@ -125,38 +121,6 @@ def _bytes_report(data: bytes) -> tuple[dict, LabelsReport]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         return {}, LabelsReport([f"$: not a UTF-8 JSON document: {exc}"])
     return labels, validation_report(labels)
-
-
-def _json_path(error) -> str:
-    return error.json_path
-
-
-def _schema_message(error) -> str:
-    """Built from the schema rule alone: `error.message` quotes the annotator's text."""
-    rule = error.validator_value
-    match error.validator:
-        case "required":
-            return "; ".join(
-                f"{name!r} is a required property" for name in rule if name not in error.instance
-            )
-        case "additionalProperties":
-            allowed = sorted(error.schema["properties"])
-            return f"Additional properties are not allowed, allowed: {allowed}"
-        case "const":
-            return f"{rule!r} was expected"
-        case "enum":
-            return f"must be one of {rule}"
-        case "type":
-            return f"must be of type {rule}"
-        case "pattern":
-            return f"must match pattern {rule!r}"
-        case "minimum":
-            return f"must be at least {rule}"
-        case "exclusiveMinimum":
-            return f"must be greater than {rule}"
-        case "oneOf":
-            return "must be null or a valid second opinion"
-    return f"violates schema rule {error.validator!r}"
 
 
 def _model_reference_errors(value: object, path: str) -> list[str]:

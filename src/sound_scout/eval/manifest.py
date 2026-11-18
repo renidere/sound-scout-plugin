@@ -16,8 +16,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from jsonschema import Draft202012Validator
-
+from sound_scout.eval._schema import schema_errors
 from sound_scout.schema import _non_finite_numbers
 
 SCHEMA_VERSION = "1.0"
@@ -70,10 +69,7 @@ def validate(path: str | Path) -> ManifestReport:
 def validation_report(manifest: object) -> ManifestReport:
     """Every violation as `<json path>: <message>`; record rules run only on a sound shape."""
     errors = _non_finite_numbers(manifest, "$")
-    errors += [
-        f"{error.json_path}: {error.message}"
-        for error in sorted(Draft202012Validator(SCHEMA).iter_errors(manifest), key=_json_path)
-    ]
+    errors += schema_errors(SCHEMA, manifest)
     if errors:
         return ManifestReport(errors, _empty_coverage())
     assert isinstance(manifest, dict)
@@ -86,10 +82,6 @@ def validation_report(manifest: object) -> ManifestReport:
     )
     coverage = _heldout_coverage(records)
     return ManifestReport(errors + _volume_errors(records, coverage), coverage)
-
-
-def _json_path(error) -> str:
-    return error.json_path
 
 
 def _empty_coverage() -> dict[str, int]:
