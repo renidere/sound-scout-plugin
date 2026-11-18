@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/renidere/sound-scout-plugin/schema/labels.v1.schema.json",
+  "title": "Sound Scout human labels of one clip, version 1",
+  "description": "Человеческая разметка одного клипа квалификационного корпуса (T04, T06, R05; docs/eval/PROTOCOL.md § 2, docs/eval/LABELING.md): кто и когда размечал, события с категорией, интервалом на исходной шкале клипа, описанием услышанного и меткой clear/uncertain. Лежит в data/corpus/<name>/labels/<clip id>.json вне git. Правила, которых схема не выражает (событие внутри длительности клипа, комментарий у uncertain, второе мнение только для просодии, отсутствие ссылок на прогоны и выходы модели), проверяет sound_scout.eval.labels.validate поверх этой схемы.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "clip_id",
+    "clip_sha256",
+    "clip_duration_s",
+    "annotator",
+    "annotated_at",
+    "model_outputs_seen",
+    "events"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "clip_id": { "$ref": "#/$defs/identifier" },
+    "clip_sha256": { "$ref": "#/$defs/sha256" },
+    "clip_duration_s": { "type": "number", "exclusiveMinimum": 0 },
+    "annotator": { "$ref": "#/$defs/text" },
+    "annotated_at": { "$ref": "#/$defs/text" },
+    "model_outputs_seen": { "const": false },
+    "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
+    "note": { "$ref": "#/$defs/nullable_string" }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "text": { "type": "string", "pattern": "\\S" },
+    "nullable_string": { "type": ["string", "null"] },
+    "category": {
+      "enum": [
+        "pronunciation",
+        "repetition_self_correction",
+        "semantic_stress",
+        "pause_phrasing",
+        "completeness"
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "start", "end", "description", "certainty", "comment"],
+      "properties": {
+        "category": { "$ref": "#/$defs/category" },
+        "start": { "type": "number", "minimum": 0 },
+        "end": { "type": "number" },
+        "description": { "$ref": "#/$defs/text" },
+        "certainty": { "enum": ["clear", "uncertain"] },
+        "comment": { "$ref": "#/$defs/nullable_string" },
+        "second_opinion": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/second_opinion" }]
+        }
+      }
+    },
+    "second_opinion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["annotator", "agrees", "comment"],
+      "properties": {
+        "annotator": { "$ref": "#/$defs/text" },
+        "agrees": { "type": "boolean" },
+        "comment": { "$ref": "#/$defs/nullable_string" }
+      }
+    }
+  }
+}
