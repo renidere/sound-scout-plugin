@@ -71,11 +71,19 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 (`nightly-tag.txt` релиза v1.0.0). Архив `llama-b12359-bin-ubuntu-x64.tar.gz` (CPU, x64),
 23 311 084 байт, SHA-256
 `0bc1f091e8916102b6d8f2cf944233a620e90a0f856c72d0ce41150c65c2e72e`. Каталог по умолчанию:
-`~/.local/opt/llama.cpp/b12359/`. Используются `llama-mtmd-cli` и `llama-server` (аудиовход через
-`--audio` / `multimodal_data`; мультимодальность `llama-server` помечена в документации как
-experimental). Лицензия MIT.
+`~/.local/opt/llama.cpp/b12359/`. Лицензия MIT.
 
-Сервер, если используется, слушает только `127.0.0.1` на свободном порту, один анализ за раз.
+Из сборки используется только `llama-server` (`src/sound_scout/eval/gate0.py`; запуск и результат —
+`docs/decisions/0007-gate0-result.md`). `llama-mtmd-cli` не используется: шаблон чата Gemma 4 он
+без `--jinja` отклоняет, а с `--jinja` шаблон включает режим рассуждений (`<|think|>`). Сервер
+запускается с `--jinja` и локальными `-m`/`--mmproj`; аудио подаётся в `POST /v1/chat/completions`
+частью сообщения `input_audio` (WAV в base64, `"format": "wav"`). В запросе передаётся
+`"chat_template_kwargs": {"enable_thinking": false}` — просьба подавить режим рассуждений, а не
+гарантия: в Gate 0 на transcript-only запросах варианта A сервер всё равно вернул
+`reasoning_content` (`docs/decisions/0007-gate0-result.md`, разделы 4 и 6).
+Мультимодальность `llama-server` помечена в документации llama.cpp как experimental.
+
+Сервер слушает только `127.0.0.1` на свободном порту, один анализ за раз (`--parallel 1`).
 
 ### 3.3. Ограничения модели, влияющие на код
 

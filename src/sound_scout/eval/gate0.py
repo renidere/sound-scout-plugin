@@ -101,6 +101,7 @@ PAIRS_FILE = "pairs.json"
 CONTROLS = ("S0", "N1", "T1")
 
 HOST = "127.0.0.1"
+CHAT_ROUTE = "/v1/chat/completions"
 CONTEXT_TOKENS = 4096
 THREADS_IDLE = 12
 THREADS_BUSY = 8
@@ -1054,7 +1055,7 @@ def _send(entry, out, manifest, client, watch, attempt, config_, request_timeout
     line["rss_before_bytes"] = watch.current()
     watch.reset_window()
     started = time.monotonic()
-    status, raw, error = client.request("/v1/chat/completions", body, timeout=request_timeout)
+    status, raw, error = client.request(CHAT_ROUTE, body, timeout=request_timeout)
     line["wall_s"] = round(time.monotonic() - started, 3)
     line.update(
         {

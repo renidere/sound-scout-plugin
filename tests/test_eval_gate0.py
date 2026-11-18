@@ -207,6 +207,35 @@ def test_server_argv_is_local_with_the_protocol_settings_and_no_download_flag() 
     assert not gate0.DOWNLOAD_FLAGS.intersection(argv) and pairs
 
 
+def test_dependencies_runtime_section_describes_the_llama_server_route_gate0_uses() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    runtime = dependencies.split("### 3.2. Runtime", 1)[1].split("\n### ", 1)[0]
+    flat = " ".join(runtime.split())
+    argv = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
+    assert gate0.SERVER_BINARY == "llama-server" and "--jinja" in argv
+    assert argv[argv.index("--parallel") + 1] == "1"
+    assert argv[argv.index("--host") + 1] == gate0.HOST
+    assert gate0.SAMPLING["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "используется только `llama-server`" in flat
+    assert "`llama-mtmd-cli` не используется" in flat
+    for detail in (
+        "Сервер запускается с `--jinja`",
+        f"`POST {gate0.CHAT_ROUTE}`",
+        f"`{gate0.HOST}`",
+        "(`--parallel 1`)",
+        "просьба подавить режим рассуждений, а не гарантия",
+        "`reasoning_content`",
+        "`input_audio` (WAV в base64",
+        '"chat_template_kwargs": {"enable_thinking": false}',
+        str(gate0.DECISION_DOC),
+    ):
+        assert detail in flat, detail
+    for retired in ("--audio", "multimodal_data"):
+        assert retired not in dependencies, retired
+    mtmd_lines = [line for line in dependencies.splitlines() if "llama-mtmd-cli" in line]
+    assert mtmd_lines and all("не используется" in line for line in mtmd_lines)
+
+
 # --- the verdict rule ----------------------------------------------------------------------
 
 
