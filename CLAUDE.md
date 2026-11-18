@@ -89,7 +89,7 @@
 | Зависимости: пакеты, программы, runtime, веса с ревизиями и SHA-256 | `docs/dependencies.md` |
 | Поручение агенту и границы полномочий | `docs/spec/AGENT_PROMPT.md` |
 | Контракт результата (JSON Schema), пример | `schema/` (упакованная копия — `src/sound_scout/result.v1.schema.json`) |
-| Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
+| Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe; долгоживущий `llama-server` Gate 0 с ограниченным логом (`proc.start`) | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
 | Приём входа: probe/decode через ffprobe/ffmpeg, лимиты R02, SHA-256, `source.json` и `work/decoded.f32` в run-каталоге | `src/sound_scout/ingest.py` |
 | `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
 | Smoke-прогоны `decoder`/`acoustics`/`asr` (`asr` — на development-записи из `SOUND_SCOUT_DEV_AUDIO`) и команда `smoke`; формантный контроль KlattGrid `speech_like_control` | `src/sound_scout/smoke.py` |
@@ -99,7 +99,7 @@
 | Клипы по исходным offsets: `clips/<id>.wav` + `clips/<id>.json` из `work/decoded.f32` без усиления, усиленная копия для прослушивания `listen/<id>.wav` с записанным `gain_db`, записи `artifacts[]` для контракта результата, `load` клипа и его PCM-payload `pcm_f32le` | `src/sound_scout/clips.py` |
 | Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели, payload из клипа `clip_from_cut` | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
 | Находки на шкале исходника: `build` (исходы review через `clips/<id>.json` → `findings`, `unlocalized`, неуверенные исправления, `artifacts`, `coverage.reviewed`) и `validate` (правила контракта плюс проверка файлов-доказательств run) | `src/sound_scout/findings.py` |
-| Квалификация Gate 1: манифест корпуса, человеческая разметка, evaluation runner (`eval run`: сопоставление по PROTOCOL.md § 6, метрики, контроли, отчёт `<date>-report.md`/`.json`) | `src/sound_scout/eval/` (`manifest.py`, `labels.py`, `runner.py`) |
+| Квалификация Gate 1: манифест корпуса, человеческая разметка, evaluation runner (`eval run`: сопоставление по PROTOCOL.md § 6, метрики, контроли, отчёт `<date>-report.md`/`.json`); spike Gate 0: `prepare`/`run`/`verdict`, решение — `docs/decisions/0007-gate0-result.md` | `src/sound_scout/eval/` (`manifest.py`, `labels.py`, `runner.py`, `gate0.py`) |
 | Сквозной анализ `analyze`: lock data root (`Busy`), предварительная проверка входа, request_id и кэш через `runs.open_run`, worker-процесс с deadline и `CancelToken`, записи этапов `work/stage-<этап>.json`, единая сборка результата | `src/sound_scout/app.py` |
 | Отчёт: `write` (полный `result.json` и `report.md` на русском в run-каталоге, без приватных путей), `compact` (ответ ≤ 4 KiB), правило приоритета findings `prioritized`, `cost`; решение — `docs/decisions/0004-report-priority.md` | `src/sound_scout/report.py` |
 | Сравнение исходной и контрольной попыток `app.compare`: критерии, окна по сырому транскрипту, правило вердикта, `conditions_diff`, запись `compare/<id>.json`; схема `schema/compare.v1.schema.json`; решение — `docs/decisions/0006-compare-rules.md` | `src/sound_scout/comparison.py` |

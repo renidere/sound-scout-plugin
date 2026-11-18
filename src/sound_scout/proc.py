@@ -1,12 +1,16 @@
 """Bounded child processes: argv only, a process group, wall time, output and memory caps (R10).
 
-`run` is the only way the package starts a program. It takes a list of arguments (never a
-command string, never a shell), starts the child in a new session so that the whole process
-group can be killed when the wall time runs out or the caller is interrupted (R11: no orphaned
-worker), keeps at most `max_output_bytes` of each of stdout and stderr, and on Linux caps the
-child's address space with `RLIMIT_AS` when `memory_bytes` is given. Every child also gets
+`run` and `start` are the only ways the package starts a program. `run` takes a list of
+arguments (never a command string, never a shell), starts the child in a new session so that the
+whole process group can be killed when the wall time runs out or the caller is interrupted (R11:
+no orphaned worker), keeps at most `max_output_bytes` of each of stdout and stderr, and on Linux
+caps the child's address space with `RLIMIT_AS` when `memory_bytes` is given. Every child also gets
 `die_with_parent` before `exec`: on Linux it is killed when the process that started it dies, even
 by SIGKILL, so a killed analysis worker leaves no decoder behind (R11).
+
+`start` is for the one long-lived child, the Gate 0 `llama-server` (`eval.gate0`): the same argv
+check, new session and `die_with_parent`, but no wall time, because its caller stops it; its
+stdout and stderr go to a log file kept to `max_log_bytes`.
 
 `ffmpeg_argv` and `ffprobe_argv` build the decoder command lines: the protocol whitelist
 `file,pipe` makes the decoder itself refuse `http://`, `concat:` and every other non-file
@@ -23,9 +27,11 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import BinaryIO
 
 PROTOCOL_WHITELIST = "file,pipe"
 KILL_GRACE_SECONDS = 5.0
@@ -105,6 +111,43 @@ def run(
         truncated=output.truncated,
         duration_seconds=time.monotonic() - started,
     )
+
+
+def start(
+    argv: Sequence[str], *, log: BinaryIO, max_log_bytes: int
+) -> tuple[subprocess.Popen, threading.Thread]:
+    """Start a long-lived child the caller stops itself; return it and the thread copying its log.
+
+    stdout and stderr go to `log`, at most `max_log_bytes`; the excess is drained and dropped,
+    so the child never blocks on a full pipe. The thread ends when the child closes its output:
+    join it after stopping the child and before closing `log`.
+    """
+    argv = _checked_argv(argv)
+    if max_log_bytes < 0:
+        raise ValueError(f"max_log_bytes must not be negative, got {max_log_bytes!r}")
+    child = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        preexec_fn=_child_setup(None),
+    )
+    copier = threading.Thread(
+        target=_copy_capped, args=(child.stdout, log, max_log_bytes), daemon=True
+    )
+    copier.start()
+    return child, copier
+
+
+def _copy_capped(source, target: BinaryIO, limit: int) -> None:
+    room = limit
+    with source:
+        while chunk := os.read(source.fileno(), _READ_CHUNK):
+            if room > 0:
+                target.write(chunk[:room])
+                target.flush()
+                room -= min(room, len(chunk))
 
 
 def ffmpeg_argv(*args: str) -> list[str]:

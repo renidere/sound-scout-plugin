@@ -154,6 +154,39 @@ def test_rejects_negative_output_cap() -> None:
         run(["true"], timeout=1, max_output_bytes=-1)
 
 
+def test_start_copies_both_streams_to_the_log_up_to_the_cap_without_blocking(
+    tmp_path: Path,
+) -> None:
+    script = "import sys; sys.stderr.write('b' * 10); sys.stderr.flush(); print('a' * 300000)"
+    log_path = tmp_path / "server.log"
+    with open(log_path, "wb") as log:
+        child, copier = proc.start([PYTHON, "-c", script], log=log, max_log_bytes=1000)
+        assert child.wait(timeout=30) == 0
+        copier.join(timeout=30)
+        assert not copier.is_alive()
+    assert log_path.read_bytes() == b"b" * 10 + b"a" * 990
+
+
+def test_start_puts_the_child_in_its_own_session_without_stdin(tmp_path: Path) -> None:
+    script = "import os, sys; print(os.getsid(0) == os.getpid(), sys.stdin.read() == '')"
+    log_path = tmp_path / "server.log"
+    with open(log_path, "wb") as log:
+        child, copier = proc.start([PYTHON, "-c", script], log=log, max_log_bytes=ONE_MIB)
+        child.wait(timeout=30)
+        copier.join(timeout=30)
+    assert log_path.read_text() == "True True\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "cap", "error"), [("sleep 1", 10, TypeError), (["true"], -1, ValueError)]
+)
+def test_start_rejects_a_command_string_and_a_negative_log_cap(
+    tmp_path: Path, argv: object, cap: int, error: type
+) -> None:
+    with open(tmp_path / "server.log", "wb") as log, pytest.raises(error):
+        proc.start(argv, log=log, max_log_bytes=cap)  # type: ignore[arg-type]
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is applied on Linux only")
 def test_memory_limit_applies_to_the_child() -> None:
     script = "import resource, json; print(json.dumps(resource.getrlimit(resource.RLIMIT_AS)))"
