@@ -231,8 +231,10 @@ def test_ffmpeg_runs_through_proc_run_with_argv_whitelist_and_budgets(
         return proc.run(argv, **kwargs)
 
     monkeypatch.setattr(prepare, "run", spy)
+    # Not the 2048 default, so the value is proven to reach `proc.run`; far above the
+    # ~300 MiB of address space a real ffmpeg needs here (RLIMIT_AS, see #56).
     budgets = Budgets(
-        max_duration_seconds=7, max_subprocess_seconds=11, max_subprocess_memory_mib=333
+        max_duration_seconds=7, max_subprocess_seconds=11, max_subprocess_memory_mib=1536
     )
     tight = Config(config.allowed_roots, config.data_root, budgets)
 
@@ -242,7 +244,7 @@ def test_ffmpeg_runs_through_proc_run_with_argv_whitelist_and_budgets(
     for argv, kwargs in calls:
         assert isinstance(argv, list) and all(isinstance(a, str) for a in argv)
         assert argv[0] == "ffmpeg"
-        assert kwargs["timeout"] == 11 and kwargs["memory_bytes"] == 333 * MIB
+        assert kwargs["timeout"] == 11 and kwargs["memory_bytes"] == 1536 * MIB
     argv, kwargs = calls[1]
     assert kwargs["max_output_bytes"] == 7 * SR * 4
     assert "-nostdin" in argv
