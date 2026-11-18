@@ -52,6 +52,10 @@ docs/spec/AGENT_PROMPT.md "Полномочия и запреты"):
   and push; everyone else leaves git alone.
 - Never commit .env*, sound-scout.toml, data/, runs/, local/, .revmux/, .work-task/, a recording
   or a report with private content; never --no-verify.
+- docs/spec/ is the owner's requirements package and is READ-ONLY for agents: never edit any file
+  under it, not even to add a cross-reference. A spec line the code contradicts, or one that needs
+  updating after a decision, goes on the FOUND line (the Filer files it for the owner); decisions
+  go in docs/decisions/.
 - CLAUDE.md and docs/spec/ are binding — read CLAUDE.md before working, and the spec sections the
   issue names.
 - Temp files go in a temp dir outside the repo (mktemp -d).

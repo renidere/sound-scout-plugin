@@ -22,6 +22,8 @@ while IFS= read -r path; do
       case "$path" in *.example) ;; *) block "$path is an env file" ;; esac ;;
     sound-scout.toml|*/sound-scout.toml)
       block "$path is the operator's local config (sound-scout.example.toml is the one to commit)" ;;
+    docs/spec/*)
+      block "$path is the owner's requirements package: agents never change docs/spec/" ;;
     data/*|runs/*|local/*|.work-task/*|.revmux/*|.venv/*|htmlcov/*|coverage/*|*.pem|*.p12|*.key)
       block "$path should not be committed" ;;
     *.wav|*.WAV|*.mp3|*.ogg|*.oga|*.opus|*.m4a|*.aac|*.flac|*.webm|*.mp4|*.mov)
