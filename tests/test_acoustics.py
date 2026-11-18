@@ -431,6 +431,22 @@ def test_control_pitch_of_150_and_225_hz_gives_p50_within_3_percent_through_meas
 
 ONNXRUNTIME_TELEMETRY_STORE = Path(".cache/Microsoft/DeveloperTools/.onnxruntime")
 ONNXRUNTIME_SESSION_FILE = ".ses"
+# onnxruntime writes no telemetry under a CI runner it recognises by these variables, which would
+# make the control below fail and the checks above it pass for nothing.
+ONNXRUNTIME_CI_MARKERS = (
+    "CI",
+    "TF_BUILD",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "TRAVIS",
+    "JENKINS_URL",
+    "CODEBUILD_BUILD_ID",
+    "BUILDKITE",
+    "TEAMCITY_VERSION",
+    "APPVEYOR",
+    "BITBUCKET_BUILD_NUMBER",
+)
 
 VAD_CHILD = """
 import json, os, sys
@@ -451,12 +467,13 @@ print(json.dumps({
 
 
 def run_with_private_home(tmp_path: Path, script: str, telemetry: str | None) -> tuple[dict, list]:
-    """Run `script` in a child with HOME and TMPDIR in empty temp dirs and the telemetry
-    variable unset or set to `telemetry`; return its JSON and every path created in them."""
+    """Run `script` in a child with HOME and TMPDIR in empty temp dirs, no CI markers and the
+    telemetry variable unset or set to `telemetry`; return its JSON and every path created."""
     home, temp = tmp_path / "home", tmp_path / "tmp"
     home.mkdir()
     temp.mkdir()
-    env = {key: value for key, value in os.environ.items() if key not in guard.TELEMETRY_OFF_ENV}
+    dropped = {*guard.TELEMETRY_OFF_ENV, *ONNXRUNTIME_CI_MARKERS}
+    env = {key: value for key, value in os.environ.items() if key not in dropped}
     if telemetry is not None:
         env["ORT_DISABLE_TELEMETRY"] = telemetry
     env.update(HOME=str(home), TMPDIR=str(temp))
