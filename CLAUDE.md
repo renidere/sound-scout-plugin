@@ -87,6 +87,7 @@
 | Приём входа: probe/decode через ffprobe/ffmpeg, лимиты R02, SHA-256, `source.json` и `work/decoded.f32` в run-каталоге | `src/sound_scout/ingest.py` |
 | `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
 | Канальный анализ: отчёт по каналам, вердикт, выбор рабочего моно и запись `channel_choice` | `src/sound_scout/channels.py` |
+| Производная для ASR: рабочее моно → 16 кГц через ffmpeg, `work/mono16k.f32` и запись преобразования `work/mono16k.json` | `src/sound_scout/prepare.py` |
 | Локальный ASR: faster-whisper offline из кэша HF, `asr/raw.json` и `asr/model-receipt.json`, правило `suspect_hallucination`, `transcript/corrected.json`, smoke-receipt `asr` | `src/sound_scout/asr.py` |
 | Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |

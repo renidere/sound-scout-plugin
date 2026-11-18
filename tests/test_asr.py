@@ -11,7 +11,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import asr, channels, doctor, guard, ingest
+from sound_scout import asr, channels, doctor, guard, ingest, prepare
 from sound_scout.asr import (
     INFERENCE_PARAMETERS,
     MODEL_UNAVAILABLE_REASON,
@@ -269,6 +268,33 @@ def test_transcribe_writes_raw_and_model_receipt_with_source_timecodes(
     assert receipt["audio_uploaded"] is False and receipt["paid_inference_called"] is False
     assert not any("/" in str(v) for v in receipt["files"][0].values())
     assert str(run.path) not in result.receipt_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_transcribe_takes_the_mono16k_derivative_and_keeps_source_timecodes(
+    config: Config, run, fake_model
+) -> None:
+    """A 48 kHz source with a tone from 1.25 s: the derivative is what the model gets, and a
+    segment the model places at the tone's onset in that array lands at 1.25 s of the source."""
+    rate, duration_s, onset_s = 48_000, 2.5, 1.25
+    t = np.arange(int(duration_s * rate)) / rate
+    tone = (0.5 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    mono = np.where(t >= onset_s, tone, np.float32(0.0)).astype(np.float32)
+    derivative = prepare.mono16k(mono, rate, run, config)
+    heard_onset = int(np.argmax(np.abs(derivative.samples) > 0.05)) / SR
+    model = fake_model([segment(heard_onset, duration_s, " тон")])
+
+    result = transcribe(derivative.samples, run, config)
+
+    assert result.status == "completed", result.reason
+    assert model.calls[0]["frames"] == len(derivative.samples) == derivative.record["frames"]
+    raw = json.loads(result.raw_path.read_text(encoding="utf-8"))
+    assert raw["audio"]["sha256"] == derivative.sha256
+    assert raw["audio"]["timescale"] == "source" and raw["audio"]["offset_s"] == 0.0
+    assert abs(raw["audio"]["duration_s"] - duration_s) < 0.001
+    assert abs(raw["segments"][0]["start"] - onset_s) < 0.001
+    assert raw["segments"][0]["end"] == duration_s
+    assert sorted(p.name for p in (run.path / "work").iterdir()) == ["mono16k.f32", "mono16k.json"]
 
 
 def test_model_constructor_gets_the_snapshot_dir_cpu_int8_and_local_files_only(
@@ -783,35 +809,6 @@ def test_real_model_on_five_seconds_of_silence_is_empty_or_flagged(
     assert all(len(f["sha256"]) == 64 for f in receipt["files"])
 
 
-def resample_16k_mono(mono: np.ndarray, sample_rate: int, tmp_path: Path) -> np.ndarray:
-    """ffmpeg resample of the working mono to 16 kHz float32 (the test's derivative)."""
-    source = tmp_path / "mono.f32"
-    source.write_bytes(np.ascontiguousarray(mono, dtype="<f4").tobytes())
-    out = subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-f",
-            "f32le",
-            "-ar",
-            str(sample_rate),
-            "-ac",
-            "1",
-            "-i",
-            str(source),
-            "-ar",
-            str(SR),
-            "-f",
-            "f32le",
-            "-",
-        ],
-        check=True,
-        capture_output=True,
-    ).stdout
-    return np.frombuffer(out, dtype="<f4").copy()
-
-
 @pytest.mark.slow
 @pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -834,12 +831,14 @@ def test_real_model_transcribes_the_dev_recording_and_writes_the_smoke_receipt(
     source = ingest.decode(recording, run, config)
     audio = channels.load(source)
     mono, _ = channels.choose_mono(audio, channels.report(audio))
-    mono16k = resample_16k_mono(mono, source.probe.sample_rate, tmp_path)
-    assert abs(len(mono16k) / SR - source.duration_s) < 0.01
+    derivative = prepare.mono16k(mono, source.probe.sample_rate, run, config)
+    mono16k = derivative.samples
+    assert abs(len(mono16k) / SR - source.duration_s) < 0.001
 
     result = transcribe(mono16k, run, config)
 
     assert result.status == "completed", result.reason
+    assert result.raw["audio"]["sha256"] == derivative.sha256
     words = [w for s in result.raw["segments"] for w in s["words"] or []]
     assert words, "a recording with speech gives words"
     assert all(0 <= w["start"] <= w["end"] <= source.duration_s + 0.1 for w in words)
