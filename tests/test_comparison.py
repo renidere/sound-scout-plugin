@@ -756,6 +756,7 @@ def test_a_symlink_in_place_of_a_run_directory_is_refused(
     [
         lambda path: rewrite_json(path, lambda d: d["provenance"].update(synthetic=False)),
         lambda path: rewrite_json(path, lambda d: d["artifacts"][0].update(sha256="0" * 64)),
+        lambda path: rewrite_json(path, lambda d: d["findings"][0].update(start=0.1)),
         lambda path: (os.chmod(path, 0o600), path.write_text("{not json", encoding="utf-8")),
     ],
 )
@@ -772,3 +773,21 @@ def test_a_spoiled_result_json_is_result_invalid_without_its_text(
     assert error.value.code == "result_invalid"
     assert "слово звучит" not in str(error.value)
     assert compare_files(config) == []
+
+
+def test_load_attempt_trusts_an_unedited_result_and_refuses_a_shifted_finding(
+    config: Config, make_attempt
+) -> None:
+    disagreement = observation("pronunciation", 0.6, 0.9, "произнести слово отчётливо")
+    run_id = make_attempt(observations=(disagreement, STRESS))
+    path = run_dir(config, run_id) / "result.json"
+    result = json.loads(path.read_text(encoding="utf-8"))
+    assert result["transcript"]["corrections"], "the audio correction is checked too"
+    assert comparison.load_attempt(run_id, config).run_id == run_id
+
+    rewrite_json(path, lambda d: d["findings"][0].update(start=0.1))
+
+    with pytest.raises(CompareError) as error:
+        comparison.load_attempt(run_id, config)
+    assert error.value.code == comparison.RESULT_INVALID
+    assert "слово звучит" not in str(error.value)

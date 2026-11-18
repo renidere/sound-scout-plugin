@@ -718,6 +718,208 @@ def test_test_double_review_cannot_back_a_real_backend_result(run: Run, doc: dic
     assert_rejected(doc, "review backend 'other-backend' does not match provenance.backend", run)
 
 
+# --- content against the stored response -----------------------------------------------------
+
+CHANGED = "текст, которого в ответе backend нет"
+MISMATCH = "does not match the review response it cites"
+
+
+def assert_rejected_quietly(doc: dict, fragment: str, run: Run) -> list[str]:
+    """Rejected with `fragment`, and no error repeats text of the document or the response."""
+    errors = assert_rejected(doc, fragment, run)
+    texts = [CHANGED, *(obs["observation"] for obs in RESPONSE["observations"])]
+    texts += [UNLOCALIZED["observation"], NEGATIVE["correction"], "приме"]
+    texts += [obs["category"] for obs in RESPONSE["observations"]]
+    texts += [UNLOCALIZED["category"], "repetition_self_correction"]
+    assert not any(text in error for error in errors for text in texts), errors
+    return errors
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("start", 1.0),
+        ("end", 1.3),
+        ("category", "repetition_self_correction"),
+        ("observation", CHANGED),
+        ("confidence_note", CHANGED),
+        ("impact", CHANGED),
+        ("correction", CHANGED),
+        ("polarity", "neutral"),
+    ],
+)
+def test_a_finding_changed_against_its_stored_response_is_rejected(
+    run: Run, doc: dict, field: str, value: object
+) -> None:
+    findings.validate(doc, run=run)
+    doc["findings"][0][field] = value
+    findings.validate(doc)
+    assert_rejected_quietly(doc, f"$.findings[0]: {MISMATCH}", run)
+
+
+def test_a_changed_unlocalized_observation_is_rejected(run: Run, doc: dict) -> None:
+    doc["unlocalized"][1]["observation"] = CHANGED
+    findings.validate(doc)
+    assert_rejected_quietly(doc, f"$.unlocalized[1]: {MISMATCH}", run)
+    doc["unlocalized"][1]["observation"] = UNLOCALIZED["observation"]
+    doc["unlocalized"][0]["reason"] = "no_timecodes"
+    assert_rejected_quietly(doc, f"$.unlocalized[0]: {MISMATCH}", run)
+
+
+@pytest.mark.parametrize("field", ["findings", "unlocalized"])
+def test_an_extra_or_missing_entry_against_the_cited_response_is_rejected(
+    run: Run, doc: dict, field: str
+) -> None:
+    extra = {**deepcopy(doc[field][0]), "id": "extra-1"}
+    doc[field].append(extra)
+    findings.validate(doc)
+    assert_rejected_quietly(
+        doc, f"$.{field}[2]: the review response it cites makes no such entry", run
+    )
+    del doc[field][1:]
+    findings.validate(doc)
+    assert_rejected_quietly(
+        doc, f"$.{field}: 1 entries the review response at $.artifacts[1] makes are missing", run
+    )
+
+
+def test_a_finding_moved_off_the_audio_basis_is_missing_from_its_response(
+    run: Run, doc: dict
+) -> None:
+    doc["findings"].pop(1)
+    doc["unlocalized"].clear()
+    assert_rejected_quietly(doc, "$.unlocalized: 2 entries the review response at", run)
+
+
+@pytest.fixture
+def disagreeing(run: Run, config: Config, clip: Clip) -> dict:
+    """A document whose negative pronunciation finding disagrees with an ASR word."""
+    transcript = write_raw(run, [{"start": 1.1, "end": 1.2, "word": " приме", "probability": 0.9}])
+    outcome = reviewed(run, config, clip)
+    doc = document(run, build(run, [outcome], [], transcript, config=config), outcome)
+    assert len(doc["transcript"]["corrections"]) == 1
+    return doc
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda c: c.update(original=CHANGED),
+        lambda c: c.update(corrected=CHANGED),
+        lambda c: c.update(start=1.1),
+        lambda c: c.update(end=1.2),
+    ],
+)
+def test_a_changed_audio_correction_is_rejected(run: Run, disagreeing: dict, change) -> None:
+    findings.validate(disagreeing, run=run)
+    change(disagreeing["transcript"]["corrections"][0])
+    findings.validate(disagreeing)
+    assert_rejected_quietly(disagreeing, f"$.transcript.corrections[0]: {MISMATCH}", run)
+
+
+def test_an_added_or_dropped_audio_correction_is_rejected(run: Run, disagreeing: dict) -> None:
+    corrections = disagreeing["transcript"]["corrections"]
+    corrections.append(deepcopy(corrections[0]))
+    findings.validate(disagreeing)
+    assert_rejected_quietly(
+        disagreeing,
+        "$.transcript.corrections[1]: the review response it cites makes no such entry",
+        run,
+    )
+    corrections.clear()
+    assert_rejected_quietly(
+        disagreeing, "$.transcript.corrections: 1 entries the review response at", run
+    )
+
+
+def drop_all_it_makes(doc: dict) -> None:
+    doc["findings"].clear()
+    doc["unlocalized"].clear()
+    doc["transcript"]["corrections"].clear()
+
+
+def test_every_entry_of_a_response_dropped_is_rejected(run: Run, disagreeing: dict) -> None:
+    drop_all_it_makes(disagreeing)
+    findings.validate(disagreeing)
+    errors = assert_rejected_quietly(
+        disagreeing, "$.findings: 2 entries the review response at $.artifacts[1] makes", run
+    )
+    for path in ("$.unlocalized: 2 entries", "$.transcript.corrections: 1 entries"):
+        assert any(error.startswith(path) for error in errors), errors
+
+
+def test_an_uncited_response_is_checked_against_its_files_and_clip(run: Run, doc: dict) -> None:
+    drop_all_it_makes(doc)
+    rewrite_provenance(run, doc, lambda r: r.update(run_id="another-run"))
+    assert_rejected(doc, "review provenance belongs to another run", run)
+    (run.path / "clips" / f"{doc['artifacts'][0]['id']}.json").unlink()
+    assert_rejected(doc, "$.artifacts[0]: the run holds no clip record", run)
+    (run.path / doc["artifacts"][1]["path"]).write_text("{}", encoding="utf-8")
+    assert_rejected(doc, "$.artifacts[1]: sha256 does not match the file", run)
+
+
+def test_a_response_that_makes_nothing_still_validates(run: Run, config: Config, clip) -> None:
+    empty = {**RESPONSE, "observations": [], "unlocalized_observations": []}
+    outcome = reviewed(run, config, clip, empty)
+    built = build(run, [outcome], [], None, config=config)
+    assert built.findings == built.unlocalized == []
+    findings.validate(document(run, built, outcome), run=run)
+
+
+def test_a_broken_file_is_not_read_for_the_content_check(
+    run: Run, disagreeing: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_bytes((run.path / "asr" / "raw.json").read_bytes())
+    (run.path / "asr" / "raw.json").unlink()
+    (run.path / "asr" / "raw.json").symlink_to(outside)
+    clip_record = run.path / "clips" / f"{disagreeing['artifacts'][0]['id']}.json"
+    (tmp_path / "clip.json").write_bytes(clip_record.read_bytes())
+    clip_record.unlink()
+    clip_record.symlink_to(tmp_path / "clip.json")
+    read: list[str] = []
+    original = findings._read_json
+    monkeypatch.setattr(
+        findings, "_read_json", lambda r, relative: read.append(relative) or original(r, relative)
+    )
+    assert_rejected(disagreeing, "not a regular file", run)
+    assert "asr/raw.json" not in read
+    assert not any(relative.startswith("clips/") for relative in read), read
+
+
+def test_text_redacted_by_the_report_still_matches_its_response(run: Run, doc: dict) -> None:
+    original = doc["findings"][0]["observation"]
+    doc["findings"][0]["observation"] = original.replace("второго", "<user>")
+    findings.validate(doc, run=run)
+    doc["findings"][0]["observation"] = "<private path>"
+    findings.validate(doc, run=run)
+    spoiled = [
+        f"<user>{original}",
+        original.replace("второго", "<user> лишнее"),
+        "<user><user>" + original[1:],
+    ]
+    for observation in spoiled:
+        doc["findings"][0]["observation"] = observation
+        assert_rejected(doc, f"$.findings[0]: {MISMATCH}", run)
+
+
+def test_a_stored_response_the_validator_refuses_is_rejected(run: Run, doc: dict) -> None:
+    review_id = doc["artifacts"][1]["id"]
+    path = run.path / doc["artifacts"][1]["path"]
+    path.write_text('{"observations": "x"}', encoding="utf-8")
+    new_sha256 = sha256_of(path)
+    rewrite_provenance(run, doc, lambda r: r["response"].update(sha256=new_sha256))
+    doc["artifacts"][1]["sha256"] = new_sha256
+    for claim in doc["findings"] + doc["unlocalized"]:
+        for ref in claim["evidence_refs"]:
+            if ref["ref"] == review_id:
+                ref["sha256"] = new_sha256
+    findings.validate(doc)
+    assert_rejected(
+        doc, "$.artifacts[1]: review response does not pass the response validator", run
+    )
+
+
 def test_human_verified_without_a_record_on_disk_is_rejected(run: Run, doc: dict) -> None:
     label = {
         "id": "label-1",

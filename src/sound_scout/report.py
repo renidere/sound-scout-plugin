@@ -74,8 +74,7 @@ SUSPECT_SEGMENTS_LEAD = (
     "произнесённым и в отчёт не выводится."
 )
 CONFIDENCE_ORDER = ("human_verified", "audio_model_observation", "measurement", "transcript")
-PRIVATE_PATH = "<private path>"
-PRIVATE_USER = "<user>"
+PRIVATE_PATH, PRIVATE_USER = findings.REDACTIONS
 _TEXT_LIMITS = (400, 200, 100, 40)
 # Two or more segments, the first with an ASCII letter or digit and each with a word character:
 # a path, never the phoneme notation of an observation (/ш/, /ть/, (/о/), /р/-/л/).

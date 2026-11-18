@@ -20,6 +20,7 @@ from sound_scout.schema import ResultValidationError
 from tests.test_clips import RATE, burst
 from tests.test_findings import (
     IDENTITY,
+    RESPONSE,
     SOURCE_DURATION,
     SUSPECT_WORD,
     document,
@@ -303,17 +304,40 @@ def test_write_leaves_neither_file_when_the_second_one_fails(
 
 
 def test_phoneme_notation_passes_write_and_compact_unchanged(
-    run: Run, config: Config, heard: dict
+    run: Run, config: Config, clip: Clip
 ) -> None:
     observation = "Звук /ш/ смазан, /ть/ звучит как /ч/, безударный (/о/) и пара /р/-/л/."
-    for finding in heard["findings"]:
-        finding["observation"] = observation
+    response = {
+        **RESPONSE,
+        "observations": [{**obs, "observation": observation} for obs in RESPONSE["observations"]],
+    }
+    outcome = reviewed(run, config, clip, response)
+    heard = document(run, build(run, [outcome], [], None, config=config), outcome)
     returned = report.write(run, heard, config=config)
     result, markdown = written(run)
     assert all(f["observation"] == observation for f in returned["findings"])
     assert all(f["observation"] == observation for f in result["findings"])
     assert observation in markdown
     assert all(f["observation"] == observation for f in report.compact(returned)["findings"])
+
+
+def test_a_private_path_heard_in_a_response_is_redacted_and_still_matches_it(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    observation = f"модель упоминает {run.path}/notes.txt и путь /srv/media/take.wav"
+    response = {
+        **RESPONSE,
+        "observations": [{**RESPONSE["observations"][0], "observation": observation}],
+    }
+    outcome = reviewed(run, config, clip, response)
+    returned = report.write(
+        run, document(run, build(run, [outcome], [], None, config=config), outcome), config=config
+    )
+    result, _ = written(run)
+    assert result["findings"][0]["observation"] == returned["findings"][0]["observation"]
+    assert str(run.path) not in result["findings"][0]["observation"]
+    assert "<private path>" in result["findings"][0]["observation"]
+    findings.validate(result, run=run)
 
 
 # --- compact ----------------------------------------------------------------------------------

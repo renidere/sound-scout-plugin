@@ -950,7 +950,8 @@ def test_an_unfinished_result_is_refused(
 @needs_ffmpeg
 def test_a_finding_not_based_on_hearing_is_not_scored(corpus: Corpus, tmp_path: Path) -> None:
     results = copied_results(corpus, tmp_path)
-    target = corpus.finding_id("h-diction", "pronunciation", 1.9)
+    heard = corpus.finding_id("h-diction", "pronunciation", 1.9)
+    target = "human-verified-1"
     label = results / "h-diction" / "human-label.json"
     label.write_text("{}", encoding="utf-8")
 
@@ -966,11 +967,13 @@ def test_a_finding_not_based_on_hearing_is_not_scored(corpus: Corpus, tmp_path: 
                 "source_end": None,
             }
         )
-        finding = next(f for f in doc["findings"] if f["id"] == target)
-        finding["evidence_basis"] = "human_verified"
+        # a copy next to the backend's own finding: that one must stay as its response made it
+        finding = json.loads(json.dumps(next(f for f in doc["findings"] if f["id"] == heard)))
+        finding.update(id=target, evidence_basis="human_verified")
         finding["evidence_refs"].append(
             {"type": "human_label", "ref": "human-label", "sha256": digest}
         )
+        doc["findings"].append(finding)
 
     rewrite_result(results, "h-diction", human_verified)
     report = evaluate(corpus.write_manifest(), corpus.labels, results, "heldout", today=TODAY)

@@ -20,13 +20,19 @@ never become findings here: F0 or a pause length is not an auditory conclusion (
 the files behind the evidence: each cited artifact, the raw transcript and the paired review
 provenance exist as regular files inside the run with the recorded sha256, and the provenance
 names a valid response of this run, the cited clip and the backend the result claims, so a test
-double never passes for a real backend; and `transcript.suspect_segments` is exactly what
-`asr.suspect_segments` makes of the run's `asr/raw.json`, so no flagged segment is dropped.
+double never passes for a real backend; `transcript.suspect_segments` is exactly what
+`asr.suspect_segments` makes of the run's `asr/raw.json`, so no flagged segment is dropped; and
+the `findings`, `unlocalized` and audio `transcript.corrections` citing a response are exactly
+what `build`'s own code makes of the stored `response.raw.txt` on its clip's source range, up to
+the placeholders `report.write` puts in place of private values (`REDACTIONS`). These errors
+name the path and the rule, never the text.
 """
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -47,6 +53,9 @@ DISAGREEMENT_CATEGORY = "pronunciation"
 DISAGREEMENT_NOTE = (
     "версия аудиомодели — описание наблюдения; ASR-вариант не заменён, выбор не сделан"
 )
+# What `report.write` puts in a result in place of private paths and the user name.
+REDACTIONS = ("<private path>", "<user>")
+_REDACTION_SPLIT = re.compile("|".join(map(re.escape, REDACTIONS)))
 _HASH_CHUNK = 1 << 20
 _CLIP_RECORD_KEYS = ("kind", "path", "sha256", "source_start", "source_end")
 
@@ -109,33 +118,11 @@ def build(
             },
         ]
         assert outcome.response is not None
-        localized, unplaced = [], []
-        for obs in outcome.response.observations:
-            if obs["whole_clip"] and _polarity(obs) == "negative":
-                unplaced.append((obs, "whole_clip"))
-            else:
-                localized.append(obs)
-        unplaced += [(obs, "no_timecodes") for obs in outcome.response.unlocalized_observations]
-        for n, obs in enumerate(localized, 1):
-            finding = _finding(f"f-{clip.id}-{n}", obs, clip, refs)
-            if finding["start"] >= finding["end"]:
-                errors.append(
-                    _error(
-                        INTERVAL_EMPTY,
-                        f"observation {n} of clip {clip.id!r} lies past the clip's end on the "
-                        "source timescale; it is not a finding",
-                    )
-                )
-                continue
-            findings.append(finding)
-            heard = _overlapping(words, finding["start"], finding["end"])
-            if heard and (finding["category"], finding["polarity"]) == (
-                DISAGREEMENT_CATEGORY,
-                "negative",
-            ):
-                corrections.append(_disagreement(finding, heard, refs[1], raw_sha256))
-        for n, (obs, reason) in enumerate(unplaced, 1):
-            unlocalized.append(_unlocalized(f"u-{clip.id}-{n}", obs, reason, refs))
+        made = _from_response(outcome.response, clip, refs, words, raw_sha256)
+        findings += made.findings
+        unlocalized += made.unlocalized
+        corrections += made.corrections
+        errors += made.errors
     if corrections:
         artifacts.append(
             {
@@ -234,6 +221,53 @@ def _checked_record(
         **span,
     }
     return clip, response_artifact, provenance_artifact
+
+
+@dataclass(frozen=True)
+class _Made:
+    findings: list[dict]
+    unlocalized: list[dict]
+    corrections: list[dict]
+    errors: list[dict]
+
+
+def _from_response(
+    response: review.ReviewResponse,
+    clip: clips.Clip,
+    refs: list[dict],
+    words: list[Mapping],
+    raw_sha256: str | None,
+) -> _Made:
+    """What one validated response makes on the source scale; `build` and `validate` share it."""
+    made = _Made([], [], [], [])
+    localized, unplaced = [], []
+    for obs in response.observations:
+        if obs["whole_clip"] and _polarity(obs) == "negative":
+            unplaced.append((obs, "whole_clip"))
+        else:
+            localized.append(obs)
+    unplaced += [(obs, "no_timecodes") for obs in response.unlocalized_observations]
+    for n, obs in enumerate(localized, 1):
+        finding = _finding(f"f-{clip.id}-{n}", obs, clip, refs)
+        if finding["start"] >= finding["end"]:
+            made.errors.append(
+                _error(
+                    INTERVAL_EMPTY,
+                    f"observation {n} of clip {clip.id!r} lies past the clip's end on the "
+                    "source timescale; it is not a finding",
+                )
+            )
+            continue
+        made.findings.append(finding)
+        heard = _overlapping(words, finding["start"], finding["end"])
+        if heard and (finding["category"], finding["polarity"]) == (
+            DISAGREEMENT_CATEGORY,
+            "negative",
+        ):
+            made.corrections.append(_disagreement(finding, heard, refs[1], raw_sha256))
+    for n, (obs, reason) in enumerate(unplaced, 1):
+        made.unlocalized.append(_unlocalized(f"u-{clip.id}-{n}", obs, reason, refs))
+    return made
 
 
 def _polarity(observation: Mapping) -> str:
@@ -338,12 +372,16 @@ def _run_errors(result: dict, run: Run) -> list[str]:
     }
     if result["transcript"]["raw"] is not None:
         to_check.add(result["transcript"]["raw"]["artifact_ref"])
-    responses = {
-        response["id"]: response
+    cited = {
+        response["id"]
         for _, _, _, refs in claims
         for response in schema.cited_review_responses(refs, artifacts)
     }
+    # Every paired response is rebuilt, cited or not, so dropping all it makes is noticed.
+    responses = {a["id"]: a for a in result["artifacts"] if a["kind"] == "review_response"}
     pairs = {rid: schema.review_provenance_for(result, r) for rid, r in responses.items()}
+    pairs = {rid: pair for rid, pair in pairs.items() if pair is not None or rid in cited}
+    to_check |= {rid for rid, pair in pairs.items() if pair is not None}
     to_check |= {pair["id"] for pair in pairs.values() if pair is not None}
     errors: list[str] = []
     broken: set[str] = set()
@@ -388,7 +426,164 @@ def _run_errors(result: dict, run: Run) -> list[str]:
             elif clip["id"] not in clip_records:
                 clip_records.add(clip["id"])
                 errors += _clip_record_errors(run, f"$.artifacts[{index[clip['id']]}]", clip)
+    for response_id in records.keys() - cited:
+        record, response = records[response_id], responses[response_id]
+        clip = artifacts.get(record.get("clip_id"))
+        if (
+            clip is None
+            or clip["kind"] != "clip"
+            or (clip["source_start"], clip["source_end"])
+            != (response["source_start"], response["source_end"])
+        ):
+            errors.append(
+                f"$.artifacts[{index[response_id]}]: review_response was made for clip "
+                f"{record.get('clip_id')!r}, not a clip of this result with its range"
+            )
+        elif clip["id"] not in clip_records:
+            clip_records.add(clip["id"])
+            errors += _clip_record_errors(run, f"$.artifacts[{index[clip['id']]}]", clip)
+    return errors + _content_errors(result, run, responses, records, broken)
+
+
+def _content_errors(
+    result: dict, run: Run, responses: dict, records: dict, broken: set[str]
+) -> list[str]:
+    """Findings, unlocalized and audio corrections are what `_from_response` makes of the cited,
+    stored responses; an entry citing a response that cannot be rebuilt is left to the rules
+    that already reject it."""
+    artifacts = {a["id"]: a for a in result["artifacts"]}
+    index = {a["id"]: i for i, a in enumerate(result["artifacts"])}
+    errors: list[str] = []
+    words: list[Mapping] | None = []
+    raw_sha256 = None
+    raw_ref = result["transcript"]["raw"]
+    if raw_ref is not None:
+        words = None
+        raw_artifact = artifacts[raw_ref["artifact_ref"]]
+        raw = None if raw_artifact["id"] in broken else _read_json(run, raw_artifact["path"])
+        if isinstance(raw, dict):
+            raw_sha256 = raw_artifact["sha256"]
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                words = _words(raw)
+    expected: dict[str, _Made] = {}
+    for response_id, record in records.items():
+        made = _rebuilt(run, responses[response_id], record, artifacts, words or [], raw_sha256)
+        if isinstance(made, str):
+            errors.append(f"$.artifacts[{index[response_id]}]: {made}")
+        elif made is not None:
+            expected[response_id] = made
+    groups = (
+        ("findings", "$.findings", result["findings"], "evidence_basis"),
+        ("unlocalized", "$.unlocalized", result["unlocalized"], "evidence_basis"),
+        ("corrections", "$.transcript.corrections", result["transcript"]["corrections"], "source"),
+    )
+    for field, path, entries, basis in groups:
+        cited: dict[str, list[int]] = {response_id: [] for response_id in expected}
+        for i, entry in enumerate(entries):
+            if entry[basis] != "audio_model_observation":
+                continue
+            cites = schema.cited_review_responses(entry["evidence_refs"], artifacts)
+            response_id = next((r["id"] for r in cites if r["id"] in expected), None)
+            if response_id is not None:
+                cited[response_id].append(i)
+        if field == "corrections" and words is None:
+            if any(cited.values()):
+                errors.append(f"{path}: the raw transcript gives no words to check them against")
+            continue
+        for response_id, positions in cited.items():
+            made = getattr(expected[response_id], field)
+            for n, i in enumerate(positions):
+                if n >= len(made):
+                    errors.append(f"{path}[{i}]: the review response it cites makes no such entry")
+                elif not _same(made[n], entries[i]):
+                    errors.append(f"{path}[{i}]: does not match the review response it cites")
+            if len(made) > len(positions):
+                errors.append(
+                    f"{path}: {len(made) - len(positions)} entries the review response at "
+                    f"$.artifacts[{index[response_id]}] makes are missing"
+                )
     return errors
+
+
+def _rebuilt(
+    run: Run,
+    response: dict,
+    record: dict,
+    artifacts: dict,
+    words: list[Mapping],
+    raw_sha256: str | None,
+) -> _Made | str | None:
+    """What the stored response makes, a rule it breaks, or None when its clip is not usable."""
+    clip_artifact = artifacts.get(record.get("clip_id"))
+    if clip_artifact is None or clip_artifact["kind"] != "clip":
+        return None
+    if _clip_record_errors(run, "", clip_artifact) or (
+        clip_artifact["source_start"],
+        clip_artifact["source_end"],
+    ) != (response["source_start"], response["source_end"]):
+        return None
+    relative = f"{clips.CLIPS_DIR_NAME}/{clip_artifact['id']}.json"
+    clip_record = _read_json(run, relative)
+    if not isinstance(clip_record, dict):
+        return None
+    payload = record.get("payload")
+    duration = payload.get("duration_s") if isinstance(payload, dict) else None
+    if not _number(duration) or duration <= 0:
+        return "review provenance records no payload duration to check the response against"
+    try:
+        text = (run.path / response["path"]).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "review response is not readable UTF-8 text"
+    parsed, _, _ = review.validate_response(text, duration)
+    if parsed is None:
+        return "review response does not pass the response validator"
+    clip = clips.Clip(
+        clip_artifact["id"],
+        clips.CLIP_KIND,
+        run.path / clip_record["path"],
+        run.path / relative,
+        clip_record,
+        reused=True,
+    )
+    refs = [
+        {"type": "clip", "ref": clip_artifact["id"], "sha256": clip_artifact["sha256"]},
+        {"type": "audio_model_observation", "ref": response["id"], "sha256": response["sha256"]},
+    ]
+    return _from_response(parsed, clip, refs, words, raw_sha256)
+
+
+def _same(expected: object, actual: object) -> bool:
+    """Equal, allowing the placeholders `report.write` puts in place of private values."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        return expected.keys() == actual.keys() and all(
+            _same(expected[key], actual[key]) for key in expected
+        )
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(map(_same, expected, actual))
+    if isinstance(expected, str) and isinstance(actual, str):
+        return _redacted_from(expected, actual)
+    if _number(expected) and _number(actual):
+        return expected == actual
+    return type(expected) is type(actual) and expected == actual
+
+
+def _redacted_from(expected: str, actual: str) -> bool:
+    """`actual` is `expected` with some non-empty parts replaced by `REDACTIONS`.
+
+    Leftmost matching of the literal parts, so a crafted document cannot make it backtrack."""
+    parts = _REDACTION_SPLIT.split(actual)
+    if len(parts) == 1:
+        return expected == actual
+    first, *middle, last = parts
+    if not expected.startswith(first):
+        return False
+    cursor, end = len(first) + 1, len(expected) - len(last)
+    for part in middle:
+        found = expected.find(part, cursor, end)
+        if found < 0:
+            return False
+        cursor = found + len(part) + 1
+    return cursor <= end and expected.endswith(last)
 
 
 def _suspect_segment_errors(result: dict, run: Run, raw_artifact: dict) -> list[str]:
