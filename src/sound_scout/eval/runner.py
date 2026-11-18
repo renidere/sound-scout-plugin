@@ -21,13 +21,14 @@ listed as pending and the run is NOT QUALIFIED until a person judged it. Only fi
 disqualifies. Pairs are assigned one to one, the largest overlap first. A finding matched to an
 `uncertain` event is neither TP nor FP; an `uncertain` event is outside recall.
 
-Negative controls (§ 9) are counted on every control of the manifest, both splits: each finding
-of the five categories (the adapter carries the backend's own uncertainty into `uncertainties`
-and `unlocalized`, never into `findings`, so a finding is a confident claim), each transcript
-correction with `certainty: clear`, and each segment of the raw transcript with text that is not
-flagged `suspect_hallucination`. The manifest does not tell silence and noise from a corrupted-
-ASR control, so raw transcript words count on every control: a corrupted-ASR control fails
-closed.
+Negative controls (§ 9) are counted on every control of the manifest, both splits, by the kind
+its manifest record names. On every kind: each finding of the five categories (the adapter carries
+the backend's own uncertainty into `uncertainties` and `unlocalized`, never into `findings`, so a
+finding is a confident claim) and each transcript correction with `certainty: clear`. On
+`silence` and `noise` also each segment of the raw transcript with text that is not flagged
+`suspect_hallucination`; on `corrupted_asr` the speech is real, so its raw transcript words are
+not a fabrication. A control without a kind (`manifest.validate` rejects it) is counted as
+silence: it fails closed.
 
 The thresholds below mirror the protocol's tables; a test asserts they match its text. They are
 the owner's to change in the protocol, never here.
@@ -478,6 +479,8 @@ def _control_fabrications(
             if correction["certainty"] == "clear":
                 counts["transcript"] += 1
                 listed.append({"clip_id": clip_id, "kind": "clear_correction", "ref": str(i)})
+        if clip.record.get("control_kind") == "corrupted_asr":
+            continue
         for i in _confident_raw_segments(clip, results_dir / clip_id, reasons):
             counts["transcript"] += 1
             listed.append({"clip_id": clip_id, "kind": "raw_transcript_words", "ref": str(i)})

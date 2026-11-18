@@ -1,10 +1,11 @@
 """Qualification corpus manifest v1 (Gate 1, T04–T06): the schema and the rules between records.
 
 The schema (`schema/corpus-manifest.v1.schema.json`, packaged copy next to this module) checks the
-shape of one record; what a schema cannot express — one split per source group, unique hashes,
-categories versus negative controls, the minimum volumes of docs/eval/PROTOCOL.md — is plain code
-here. `validate` returns a report instead of raising: the evaluation runner and the owner need the
-whole list of shortfalls, not the first one.
+shape of one record; the rules between fields and records — one split per source group, unique
+hashes, categories versus negative controls, a control kind on every control and only there, the
+minimum volumes of docs/eval/PROTOCOL.md — are plain code here, each with its own message.
+`validate` returns a report instead of raising: the evaluation runner and the owner need the whole
+list of shortfalls, not the first one.
 """
 
 import hashlib
@@ -30,6 +31,7 @@ PROSODY_CATEGORIES = ("semantic_stress", "pause_phrasing", "completeness")
 CATEGORIES = DICTION_CATEGORIES + PROSODY_CATEGORIES
 CATEGORY_GROUPS = {"diction": DICTION_CATEGORIES, "prosody": PROSODY_CATEGORIES}
 PAIR_CATEGORY = "semantic_stress"
+CONTROL_KINDS = ("silence", "noise", "corrupted_asr")
 MIN_CLIPS = 20
 MIN_NEGATIVE_CONTROLS = 5
 MIN_HELDOUT_EVENTS_PER_GROUP = 5
@@ -112,6 +114,13 @@ def _record_errors(records: list[dict]) -> list[str]:
             errors.append(
                 f"$.records[{i}].categories: a record without categories must be a negative control"
             )
+        if record["negative_control"] and "control_kind" not in record:
+            errors.append(
+                f"$.records[{i}].control_kind: a negative control names its kind, one of "
+                + ", ".join(CONTROL_KINDS)
+            )
+        if not record["negative_control"] and "control_kind" in record:
+            errors.append(f"$.records[{i}].control_kind: only a negative control carries a kind")
         if record.get("pair_id") is not None and PAIR_CATEGORY not in record["categories"]:
             errors.append(
                 f"$.records[{i}].pair_id: a member of a same-words pair carries {PAIR_CATEGORY!r}"

@@ -12,6 +12,7 @@ from sound_scout._schema_messages import schema_errors
 from sound_scout.eval import labels, manifest
 from sound_scout.eval.manifest import (
     CATEGORIES,
+    CONTROL_KINDS,
     MIN_CLIPS,
     MIN_NEGATIVE_CONTROLS,
     ManifestReport,
@@ -38,6 +39,7 @@ def record(
     *,
     group: str | None = None,
     negative_control: bool = False,
+    control_kind: str = "silence",
     pair_id: str | None = None,
 ) -> dict:
     doc = {
@@ -50,6 +52,8 @@ def record(
         "categories": categories,
         "negative_control": negative_control,
     }
+    if negative_control:
+        doc["control_kind"] = control_kind
     if pair_id is not None:
         doc["pair_id"] = pair_id
     return doc
@@ -71,8 +75,16 @@ def qualifying_manifest() -> dict:
     ]
     dev = [record(f"d-{i}", "dev", ["pronunciation", "semantic_stress"]) for i in range(5)]
     controls = [
-        record(f"nc-{i}", split, [], negative_control=True)
-        for i, split in enumerate(("heldout", "heldout", "heldout", "dev", "dev"))
+        record(f"nc-{i}", split, [], negative_control=True, control_kind=kind)
+        for i, (split, kind) in enumerate(
+            [
+                ("heldout", "silence"),
+                ("heldout", "noise"),
+                ("heldout", "corrupted_asr"),
+                ("dev", "silence"),
+                ("dev", "corrupted_asr"),
+            ]
+        )
     ]
     records = heldout + dev + controls
     assert len(records) == MIN_CLIPS
@@ -110,6 +122,8 @@ def test_schema_is_valid_draft_2020_12_and_packaged_copy_is_byte_equal() -> None
     assert hashlib.sha256(root_bytes).hexdigest() == manifest.SCHEMA_SHA256
     assert manifest.SCHEMA["properties"]["schema_version"] == {"const": manifest.SCHEMA_VERSION}
     assert tuple(manifest.SCHEMA["$defs"]["category"]["enum"]) == CATEGORIES
+    record_properties = manifest.SCHEMA["$defs"]["record"]["properties"]
+    assert tuple(record_properties["control_kind"]["enum"]) == CONTROL_KINDS
     assert manifest.SCHEMA["$defs"]["record"]["properties"]["split"]["enum"] == list(
         manifest.SPLITS
     )
@@ -157,6 +171,37 @@ def test_record_without_category_must_be_a_negative_control(doc: dict) -> None:
     assert_rejected(doc, "$.records[19].categories: a negative control carries no categories")
 
 
+def test_negative_control_must_name_its_kind(doc: dict) -> None:
+    del doc["records"][-1]["control_kind"]
+    report = assert_rejected(
+        doc,
+        "$.records[19].control_kind: a negative control names its kind, one of "
+        "silence, noise, corrupted_asr",
+    )
+    assert len(report.errors) == 1
+
+
+def test_kind_on_a_record_that_is_not_a_control_is_rejected(doc: dict) -> None:
+    doc["records"][0]["control_kind"] = "noise"
+    report = assert_rejected(
+        doc, "$.records[0].control_kind: only a negative control carries a kind"
+    )
+    assert len(report.errors) == 1
+
+
+@pytest.mark.parametrize("kind", CONTROL_KINDS)
+def test_every_control_kind_is_accepted(doc: dict, kind: str) -> None:
+    doc["records"][-1]["control_kind"] = kind
+    assert validation_report(doc).ok
+
+
+def test_unknown_control_kind_is_a_named_schema_error(doc: dict) -> None:
+    doc["records"][-1]["control_kind"] = "music"
+    assert_rejected(
+        doc, "$.records[19].control_kind: must be one of ['silence', 'noise', 'corrupted_asr']"
+    )
+
+
 def test_category_shortfall_in_heldout_names_the_category_and_the_group(doc: dict) -> None:
     doc["records"][4]["categories"] = ["pronunciation"]  # h-pause-1 loses pause_phrasing
     doc["records"][5]["categories"] = ["pronunciation"]  # h-compl-1 loses completeness
@@ -187,6 +232,7 @@ def test_minimum_clip_and_negative_control_counts(doc: dict) -> None:
     doc = qualifying_manifest()
     doc["records"][-1]["negative_control"] = False
     doc["records"][-1]["categories"] = ["completeness"]
+    del doc["records"][-1]["control_kind"]
     assert_rejected(
         doc,
         f"{MIN_NEGATIVE_CONTROLS - 1} negative controls, the corpus needs at least "

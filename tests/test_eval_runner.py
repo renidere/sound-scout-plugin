@@ -177,23 +177,26 @@ class Corpus:
         *,
         raw_segments: list[dict] | None = None,
         assessed: bool = True,
+        control_kind: str = "silence",
+        clear_correction: bool = False,
     ) -> None:
         control = not categories
-        self.records.append(
-            {
-                "id": clip_id,
-                "path": f"audio/{clip_id}.wav",
-                "sha256": sha(clip_id),
-                "duration_s": DURATION,
-                "split": split,
-                "source_group": f"g-{clip_id}",
-                "categories": categories,
-                "negative_control": control,
-            }
-        )
+        record = {
+            "id": clip_id,
+            "path": f"audio/{clip_id}.wav",
+            "sha256": sha(clip_id),
+            "duration_s": DURATION,
+            "split": split,
+            "source_group": f"g-{clip_id}",
+            "categories": categories,
+            "negative_control": control,
+        }
+        if control:
+            record["control_kind"] = control_kind
+        self.records.append(record)
         if not control:
             self.write_labels(clip_id, events)
-        self.write_result(clip_id, observations, raw_segments, assessed)
+        self.write_result(clip_id, observations, raw_segments, assessed, clear_correction)
 
     def write_labels(self, clip_id: str, events: list[dict]) -> None:
         labels = {
@@ -209,7 +212,12 @@ class Corpus:
         (self.labels / f"{clip_id}.json").write_text(json.dumps(labels), encoding="utf-8")
 
     def write_result(
-        self, clip_id: str, observations: list[dict], raw_segments, assessed: bool
+        self,
+        clip_id: str,
+        observations: list[dict],
+        raw_segments,
+        assessed: bool,
+        clear_correction: bool = False,
     ) -> None:
         run = open_run(f"req-{clip_id}", IDENTITY, self.data)
         t = np.arange(int(DURATION * RATE)) / RATE
@@ -251,6 +259,21 @@ class Corpus:
                 }
             )
             doc["transcript"]["raw"] = {"artifact_ref": "transcript-raw"}
+        if clear_correction:
+            ref = doc["transcript"]["raw"]["artifact_ref"]
+            raw_sha256 = next(a["sha256"] for a in doc["artifacts"] if a["id"] == ref)
+            doc["transcript"]["corrections"].append(
+                {
+                    "start": 1.0,
+                    "end": 2.0,
+                    "original": "слово",
+                    "corrected": "другое слово",
+                    "source": "transcript",
+                    "evidence_refs": [{"type": "transcript", "ref": ref, "sha256": raw_sha256}],
+                    "certainty": "clear",
+                    "note": None,
+                }
+            )
         status = {"status": "assessed", "reason": None}
         if not assessed:
             status = {"status": "not_assessed", "reason": "синтетика: отказ"}
@@ -385,6 +408,7 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         [],
         [observation("completeness", 4.0, 5.0)],
         raw_segments=[{"text": "шум", "words": [], "suspect_hallucination": True}],
+        control_kind="noise",
     )
     return corpus
 
@@ -454,6 +478,89 @@ def test_negative_controls_count_confident_fabrications_in_both_splits(report: d
         ("c-dev-noise", "finding"),
     }
     assert any("уверенных выдумок" in reason for reason in report["groups"]["diction"]["failed"])
+
+
+CONTROL_RAW = [{"text": "слово", "words": [], "suspect_hallucination": False}]
+
+
+def control_report(
+    base: Path, kind: str, *, findings: bool = False, clear_correction: bool = False
+) -> dict:
+    base.mkdir()
+    corpus = Corpus(base)
+    observations = [observation("pronunciation", 4.0, 4.5)] if findings else []
+    corpus.add(
+        "c-control",
+        "heldout",
+        [],
+        [],
+        observations,
+        raw_segments=CONTROL_RAW,
+        control_kind=kind,
+        clear_correction=clear_correction,
+    )
+    return corpus.evaluate()
+
+
+def fabrication_kinds(report: dict) -> list[str]:
+    return [f["kind"] for f in report["failures"]["control_fabrications"]]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("kind", ["silence", "noise"])
+def test_silence_and_noise_controls_count_raw_words_findings_and_clear_corrections(
+    tmp_path: Path, kind: str
+) -> None:
+    words = control_report(tmp_path / "words", kind)
+    assert words["negative_controls"]["confident_fabrications"] == {
+        "diction": 0,
+        "prosody": 0,
+        "transcript": 1,
+    }
+    assert fabrication_kinds(words) == ["raw_transcript_words"]
+    everything = control_report(tmp_path / "all", kind, findings=True, clear_correction=True)
+    assert everything["negative_controls"]["confident_fabrications"] == {
+        "diction": 1,
+        "prosody": 0,
+        "transcript": 2,
+    }
+    assert sorted(fabrication_kinds(everything)) == [
+        "clear_correction",
+        "finding",
+        "raw_transcript_words",
+    ]
+
+
+@needs_ffmpeg
+def test_corrupted_asr_control_counts_findings_and_clear_corrections_not_raw_words(
+    tmp_path: Path,
+) -> None:
+    words = control_report(tmp_path / "words", "corrupted_asr")
+    assert words["negative_controls"] == {
+        "clips": 1,
+        "confident_fabrications": {"diction": 0, "prosody": 0, "transcript": 0},
+    }
+    assert fabrication_kinds(words) == []
+    corrected = control_report(tmp_path / "corrected", "corrupted_asr", clear_correction=True)
+    assert corrected["negative_controls"]["confident_fabrications"] == {
+        "diction": 0,
+        "prosody": 0,
+        "transcript": 1,
+    }
+    assert fabrication_kinds(corrected) == ["clear_correction"]
+    found = control_report(tmp_path / "found", "corrupted_asr", findings=True)
+    assert found["negative_controls"]["confident_fabrications"]["diction"] == 1
+    assert fabrication_kinds(found) == ["finding"]
+
+
+@needs_ffmpeg
+def test_a_control_without_a_kind_counts_raw_words_and_fails_closed(tmp_path: Path) -> None:
+    corpus = Corpus(tmp_path)
+    corpus.add("c-control", "heldout", [], [], [], raw_segments=CONTROL_RAW)
+    del corpus.records[0]["control_kind"]
+    report = corpus.evaluate()
+    assert report["negative_controls"]["confident_fabrications"]["transcript"] == 1
+    assert fabrication_kinds(report) == ["raw_transcript_words"]
 
 
 @needs_ffmpeg
