@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import clips, doctor, review
+from sound_scout import clips, doctor, guard, review
 from sound_scout.config import Config
 from sound_scout.doctor import ReceiptRejected, component_status, write_receipt
 from sound_scout.paths import PathDenied
@@ -946,6 +946,20 @@ def test_after_window_gets_the_outcomes_so_far_and_nothing_after_a_failed_call(
     ids = [o.provenance["clip_id"] for o in covered.outcomes]
     assert len(ids) == 2 and covered.failure is not None
     assert seen == [ids[:1], ids]
+
+
+def test_a_denied_network_attempt_is_not_a_failed_call_and_ends_the_walk_raised(
+    long_run: Run, config: Config, prompt: Prompt
+) -> None:
+    class DeniedBackend(WindowedBackend):
+        def review(self, request: ReviewRequest) -> RawReviewResponse:
+            self.requests.append(request)
+            raise guard.NetworkDenied("connect 203.0.113.1:443")
+
+    backend = DeniedBackend(max_audio_seconds=5.0)
+    with pytest.raises(guard.NetworkDenied):
+        review.cover(backend, long_run, config, prompt, [(0.0, LONG_S)])
+    assert len(backend.requests) == 1
 
 
 def test_a_bad_limit_fails_before_any_clip_is_cut_or_call_made(
