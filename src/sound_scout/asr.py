@@ -31,6 +31,10 @@ Whisper's own no-speech, log-probability or compression-ratio signals past their
 is flagged in `segments[].suspect_hallucination`, and `flags` carries the flag for the whole
 transcript. On this workstation the installed model answers 5 s of digital silence with a
 confident phrase (word probabilities near 0.9), so the signal rule is the one that catches it.
+Consumers of the transcript therefore rely on the flag, never on word probabilities
+(docs/decisions/0005-asr-silence-hallucination.md): `trusted_segments` is the one place that
+splits the text into trusted and flagged segments, and `suspect_segments` gives the flagged
+ones as the result contract's `transcript.suspect_segments` — intervals and signals, no text.
 
 `write_smoke_receipt` is the only path to the `asr` smoke receipt of `doctor`: it accepts a
 completed, unflagged transcription with at least one word, produced by faster-whisper's own
@@ -88,6 +92,12 @@ SILENT_SPAN_RMS_DBFS = -60.0
 NO_SPEECH_THRESHOLD = 0.6
 LOGPROB_THRESHOLD = -1.0
 COMPRESSION_RATIO_THRESHOLD = 2.4
+HALLUCINATION_SIGNALS = (
+    "silent_span",
+    "no_speech_prob",
+    "low_avg_logprob",
+    "high_compression_ratio",
+)
 HALLUCINATION_RULE = {
     "silent_span_rms_dbfs": SILENT_SPAN_RMS_DBFS,
     "no_speech_threshold": NO_SPEECH_THRESHOLD,
@@ -254,17 +264,76 @@ def hallucination_signals(segment: Mapping[str, object], mono16k: np.ndarray) ->
     text = segment.get("text")
     if not isinstance(text, str) or not text.strip():
         return []
-    signals = []
     rms_dbfs = _span_rms_dbfs(segment, mono16k)
-    if rms_dbfs is None or rms_dbfs < SILENT_SPAN_RMS_DBFS:
-        signals.append("silent_span")
-    if _number(segment.get("no_speech_prob"), 0.0) > NO_SPEECH_THRESHOLD:
-        signals.append("no_speech_prob")
-    if _number(segment.get("avg_logprob"), 0.0) < LOGPROB_THRESHOLD:
-        signals.append("low_avg_logprob")
-    if _number(segment.get("compression_ratio"), 0.0) > COMPRESSION_RATIO_THRESHOLD:
-        signals.append("high_compression_ratio")
-    return signals
+    present = (
+        rms_dbfs is None or rms_dbfs < SILENT_SPAN_RMS_DBFS,
+        _number(segment.get("no_speech_prob"), 0.0) > NO_SPEECH_THRESHOLD,
+        _number(segment.get("avg_logprob"), 0.0) < LOGPROB_THRESHOLD,
+        _number(segment.get("compression_ratio"), 0.0) > COMPRESSION_RATIO_THRESHOLD,
+    )
+    return [name for name, found in zip(HALLUCINATION_SIGNALS, present, strict=True) if found]
+
+
+def trusted_segments(raw: Mapping) -> tuple[list[dict], list[dict]]:
+    """(trusted, flagged): the segments of a raw transcript that carry text, split by the flag.
+
+    The decision rests on `segments[].suspect_hallucination` alone, never on word
+    probabilities (docs/decisions/0005). The very segment objects of `raw` are returned, in
+    order, and `raw` is not changed; a flagged one carries its `hallucination_signals`. A
+    segment with blank text is in neither list. A malformed transcript — and a segment without
+    a string `text` or without a boolean flag — is a `ValueError` naming the path, never the
+    text: trust is not given by default.
+    """
+    segments = raw.get("segments") if isinstance(raw, Mapping) else None
+    if not isinstance(segments, list):
+        raise ValueError("raw transcript: segments must be a list")
+    trusted: list[dict] = []
+    flagged: list[dict] = []
+    for index, segment in enumerate(segments):
+        path = f"raw transcript: segments[{index}]"
+        if not isinstance(segment, Mapping):
+            raise ValueError(f"{path} must be an object")
+        text = segment.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"{path}.text must be a string")
+        suspect = segment.get(SUSPECT_HALLUCINATION)
+        if not isinstance(suspect, bool):
+            raise ValueError(f"{path}.{SUSPECT_HALLUCINATION} must be a boolean")
+        if text.strip():
+            (flagged if suspect else trusted).append(segment)
+    return trusted, flagged
+
+
+def suspect_segments(raw: Mapping, duration_s: float) -> list[dict]:
+    """The result contract's `transcript.suspect_segments`: each flagged segment of `raw` as
+    its interval clamped to `[0, duration_s]`, its signals and `certainty: "uncertain"` — no
+    text, so a made-up phrase never reaches the result or the report (R05, T05)."""
+    flagged = {id(segment) for segment in trusted_segments(raw)[1]}
+    items = []
+    for index, segment in enumerate(raw["segments"]):
+        if id(segment) not in flagged:
+            continue
+        path = f"raw transcript: segments[{index}]"
+        start, end = segment.get("start"), segment.get("end")
+        if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in (start, end)):
+            raise ValueError(f"{path}: start and end must be numbers")
+        signals = segment.get("hallucination_signals")
+        if (
+            not isinstance(signals, list)
+            or not signals
+            or any(signal not in HALLUCINATION_SIGNALS for signal in signals)
+        ):
+            raise ValueError(f"{path}.hallucination_signals must name the signals of the rule")
+        end = max(0.0, min(duration_s, round(end, 6)))
+        items.append(
+            {
+                "start": min(max(0.0, round(start, 6)), end),
+                "end": end,
+                "signals": list(signals),
+                "certainty": "uncertain",
+            }
+        )
+    return items
 
 
 def read_raw(run: Run) -> dict:

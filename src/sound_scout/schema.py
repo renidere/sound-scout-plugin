@@ -17,7 +17,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from sound_scout._schema_messages import schema_errors
 from sound_scout.doctor import TEST_DOUBLE
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 SCHEMA_FILE_NAME = "result.v1.schema.json"
 SCHEMA_BYTES = files("sound_scout").joinpath(SCHEMA_FILE_NAME).read_bytes()
 SCHEMA: dict = json.loads(SCHEMA_BYTES)
@@ -107,6 +107,7 @@ def validation_errors(result: object) -> list[str]:
     assert isinstance(result, dict)
     return (
         _timecode_errors(result)
+        + _suspect_segment_errors(result)
         + _uniqueness_errors(result)
         + _stage_errors(result)
         + _evidence_errors(result)
@@ -169,6 +170,24 @@ def _timecode_errors(result: dict) -> list[str]:
             errors.append(f"{path}: start must be less than end, got {start} >= {end}")
         if end > duration:
             errors.append(f"{path}.end: exceeds source duration {duration}, got {end}")
+    return errors
+
+
+def _suspect_segment_errors(result: dict) -> list[str]:
+    """Flagged ASR segments lie inside the source; a zero-length one is kept, since Whisper
+    emits such segments and hiding them is not allowed. Without a raw transcript there are
+    none (docs/decisions/0005)."""
+    transcript = result["transcript"]
+    if transcript["raw"] is None and transcript["suspect_segments"]:
+        return ["$.transcript.suspect_segments: must be empty when transcript.raw is null"]
+    duration = result["source"]["duration_s"]
+    errors = []
+    for i, item in enumerate(transcript["suspect_segments"]):
+        path = f"$.transcript.suspect_segments[{i}]"
+        if item["start"] > item["end"]:
+            errors.append(f"{path}: start must not exceed end, got {item['start']} > {item['end']}")
+        if item["end"] > duration:
+            errors.append(f"{path}.end: exceeds source duration {duration}, got {item['end']}")
     return errors
 
 

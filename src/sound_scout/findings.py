@@ -11,6 +11,8 @@ with a correction is `negative`, one without is `neutral`; `build` never claims 
 
 An ASR/audio-model disagreement is kept, not settled: a negative `pronunciation` finding over
 words of the raw transcript adds a correction with both versions and `certainty: "uncertain"`.
+Only words of trusted segments (`asr.trusted_segments`) count: a segment flagged
+`suspect_hallucination` is not speech, so a made-up phrase is never quoted as `original`.
 The raw transcript is never rewritten and no "more literary" form is chosen (R05). Measurements
 never become findings here: F0 or a pause length is not an auditory conclusion (R04, R06).
 
@@ -18,7 +20,8 @@ never become findings here: F0 or a pause length is not an auditory conclusion (
 the files behind the evidence: each cited artifact, the raw transcript and the paired review
 provenance exist as regular files inside the run with the recorded sha256, and the provenance
 names a valid response of this run, the cited clip and the backend the result claims, so a test
-double never passes for a real backend.
+double never passes for a real backend; and `transcript.suspect_segments` is exactly what
+`asr.suspect_segments` makes of the run's `asr/raw.json`, so no flagged segment is dropped.
 """
 
 import hashlib
@@ -75,7 +78,8 @@ def build(
     and not used: measurements never turn into auditory findings (R04, R06). An outcome that
     cannot be trusted is skipped with an `errors[]` entry and adds nothing to `reviewed`; an
     observation whose interval is empty once clamped to the clip on the source scale is skipped
-    with an `errors[]` entry too. Mixing test-double and real backend outcomes raises `ValueError`.
+    with an `errors[]` entry too. Mixing test-double and real backend outcomes raises `ValueError`,
+    and so does a transcript whose segments `asr.trusted_segments` refuses.
     """
     outcomes = list(review_results)
     if len({review.is_test_double(outcome.provenance) for outcome in outcomes}) > 1:
@@ -290,7 +294,7 @@ def _words(transcript: Mapping | None) -> list[Mapping]:
         return []
     return [
         word
-        for segment in transcript.get("segments") or []
+        for segment in asr.trusted_segments(transcript)[0]
         for word in segment.get("words") or []
         if _number(word.get("start")) and _number(word.get("end"))
     ]
@@ -348,6 +352,9 @@ def _run_errors(result: dict, run: Run) -> list[str]:
         if found:
             broken.add(artifact_id)
         errors += found
+    raw_ref = result["transcript"]["raw"]
+    if raw_ref is not None and raw_ref["artifact_ref"] not in broken:
+        errors += _suspect_segment_errors(result, run, artifacts[raw_ref["artifact_ref"]])
     records = {}
     clip_records: set[str] = set()
     for response_id, pair in pairs.items():
@@ -382,6 +389,21 @@ def _run_errors(result: dict, run: Run) -> list[str]:
                 clip_records.add(clip["id"])
                 errors += _clip_record_errors(run, f"$.artifacts[{index[clip['id']]}]", clip)
     return errors
+
+
+def _suspect_segment_errors(result: dict, run: Run, raw_artifact: dict) -> list[str]:
+    """`transcript.suspect_segments` restates the flagged segments of the hashed raw file."""
+    raw = _read_json(run, raw_artifact["path"])
+    try:
+        expected = asr.suspect_segments(raw, result["source"]["duration_s"])
+    except ValueError as error:
+        return [f"$.transcript.raw: {error}"]
+    if result["transcript"]["suspect_segments"] != expected:
+        return [
+            "$.transcript.suspect_segments: does not match the suspect_hallucination segments "
+            "of the raw transcript"
+        ]
+    return []
 
 
 def _clip_record_errors(run: Run, path: str, clip: dict) -> list[str]:

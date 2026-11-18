@@ -101,6 +101,12 @@ uv run sound-scout doctor
 - `asr/raw.json` и `asr/model-receipt.json` — сырой транскрипт и запись о модели;
   `transcript/corrected.json` — исправления отдельным слоем (см. ниже).
 
+Доверие к тексту ASR решает правило `suspect_hallucination`, а не вероятности слов: на цифровой
+тишине модель отвечает уверенной выдуманной фразой. Доверенные и помеченные сегменты выбирает одна
+функция `asr.trusted_segments(raw)`; помеченные попадают в `result.json` и `report.md` только как
+интервалы `transcript.suspect_segments` с признаками и `certainty: "uncertain"`, без текста
+(`docs/decisions/0005-asr-silence-hallucination.md`).
+
 ## Проверки
 
 ```sh

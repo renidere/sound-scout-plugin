@@ -26,9 +26,9 @@ its manifest record names. On every kind: each finding of the five categories (t
 the backend's own uncertainty into `uncertainties` and `unlocalized`, never into `findings`, so a
 finding is a confident claim) and each transcript correction with `certainty: clear`. On
 `silence` and `noise` also each segment of the raw transcript with text that is not flagged
-`suspect_hallucination`; on `corrupted_asr` the speech is real, so its raw transcript words are
-not a fabrication. A control without a kind (`manifest.validate` rejects it) is counted as
-silence: it fails closed.
+`suspect_hallucination` (`asr.trusted_segments`, the one rule of docs/decisions/0005); on
+`corrupted_asr` the speech is real, so its raw transcript words are not a fabrication. A
+control without a kind (`manifest.validate` rejects it) is counted as silence: it fails closed.
 
 The thresholds below mirror the protocol's tables; a test asserts they match its text. They are
 the owner's to change in the protocol, never here.
@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-from sound_scout import findings
+from sound_scout import asr, findings
 from sound_scout._schema_messages import schema_errors
 from sound_scout.doctor import TEST_DOUBLE
 from sound_scout.eval import labels, manifest
@@ -488,22 +488,17 @@ def _control_fabrications(
 
 
 def _confident_raw_segments(clip: _Clip, run_dir: Path, reasons: list[str]) -> list[int]:
-    """Indices of raw transcript segments with text not flagged `suspect_hallucination`; the
-    file was checked against its hash with the run when the result was loaded."""
+    """Indices of the trusted raw transcript segments (`asr.trusted_segments`); the file was
+    checked against its hash with the run when the result was loaded."""
     raw = clip.result["transcript"]["raw"]
     if raw is None:
         return []
     clip_id = clip.record["id"]
     artifact = next(a for a in clip.result["artifacts"] if a["id"] == raw["artifact_ref"])
     try:
-        segments = json.loads((run_dir / PurePosixPath(artifact["path"])).read_bytes())["segments"]
-        return [
-            i
-            for i, segment in enumerate(segments)
-            if isinstance(segment.get("text"), str)
-            and segment["text"].strip()
-            and segment.get("suspect_hallucination") is not True
-        ]
+        raw_doc = json.loads((run_dir / PurePosixPath(artifact["path"])).read_bytes())
+        trusted = {id(segment) for segment in asr.trusted_segments(raw_doc)[0]}
+        return [i for i, segment in enumerate(raw_doc["segments"]) if id(segment) in trusted]
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         reasons.append(
             f"контроль {clip_id!r}: сырой транскрипт не проверен ({type(error).__name__}), "

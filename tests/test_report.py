@@ -18,7 +18,16 @@ from sound_scout.report import AUDIO_MODEL_PHRASE, COMPACT_MAX_BYTES, ReportErro
 from sound_scout.runs import Run, open_run
 from sound_scout.schema import ResultValidationError
 from tests.test_clips import RATE, burst
-from tests.test_findings import IDENTITY, SOURCE_DURATION, document, reviewed, write_raw
+from tests.test_findings import (
+    IDENTITY,
+    SOURCE_DURATION,
+    SUSPECT_WORD,
+    document,
+    raw_segment,
+    reviewed,
+    with_raw_artifact,
+    write_raw,
+)
 from tests.test_ingest import write_wav
 from tests.test_schema import EXAMPLE_DOC
 
@@ -71,7 +80,7 @@ def unheard(run: Run, clip: Clip) -> dict:
         "reviewed": [],
         "unreviewed": [{"start": 0.0, "end": SOURCE_DURATION}],
     }
-    doc["transcript"] = {"raw": None, "corrections": []}
+    doc["transcript"] = {"raw": None, "corrections": [], "suspect_segments": []}
     doc["measurements"][0]["settings"] = {"window_s": SOURCE_DURATION}
     finding = deepcopy(EXAMPLE_DOC["findings"][0])
     finding.update(start=1.0, end=1.5)
@@ -163,6 +172,52 @@ def test_written_result_json_is_full_by_schema_and_report_md_covers_every_sectio
     assert "- 0 (`actual`, local)" in markdown
     correction = result["transcript"]["corrections"][0]
     assert f"«{correction['original']}» → «{correction['corrected']}»" in markdown
+
+
+def test_flagged_asr_segments_are_listed_as_intervals_without_their_text(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    flagged = raw_segment([SUSPECT_WORD], ["silent_span", "no_speech_prob"])
+    transcript = write_raw(run, [], [flagged])
+    outcome = reviewed(run, config, clip)
+    result = with_raw_artifact(
+        run,
+        document(run, build(run, [outcome], [], transcript, config=config), outcome),
+        transcript,
+    )
+
+    report.write(run, result, config=config)
+    written_result, markdown = written(run)
+
+    assert written_result["transcript"]["suspect_segments"] == [
+        {
+            "start": 1.1,
+            "end": 1.2,
+            "signals": ["silent_span", "no_speech_prob"],
+            "certainty": "uncertain",
+        }
+    ]
+    assert report.SUSPECT_SEGMENTS_LEAD in markdown
+    assert "- 1.10–1.20 с: признаки `silent_span`, `no_speech_prob`." in markdown
+    assert markdown.index(report.SUSPECT_SEGMENTS_LEAD) > markdown.index("## Транскрипт")
+    assert markdown.index(report.SUSPECT_SEGMENTS_LEAD) < markdown.index("## Наблюдения")
+    assert "выдумка" not in markdown
+    assert "выдумка" not in json.dumps(written_result, ensure_ascii=False)
+    assert "выдумка" not in json.dumps(report.compact(written_result), ensure_ascii=False)
+
+
+def test_report_without_flagged_segments_has_no_suspect_heading(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    transcript = write_raw(run, [{"start": 1.1, "end": 1.2, "word": " приме", "probability": 0.9}])
+    outcome = reviewed(run, config, clip)
+    report.write(
+        run,
+        document(run, build(run, [outcome], [], transcript, config=config), outcome),
+        config=config,
+    )
+    _, markdown = written(run)
+    assert report.SUSPECT_SEGMENTS_LEAD not in markdown
 
 
 def test_report_without_audio_review_says_partial_and_not_assessed(

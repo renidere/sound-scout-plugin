@@ -24,8 +24,10 @@ verbal confidence never becomes a number (R05).
 
 The phrase «аудиомодель отмечает» is used only for audio model evidence of a completed audio
 review; without it the report says `partial` and `not_assessed` with the reasons the result
-carries (R11). `cost` builds the contract's `cost`: zero only for a local run, `unknown` for an
-external provider without data — a zero cloud cost is never made up (§ 4).
+carries (R11). An ASR segment flagged `suspect_hallucination` is listed as an interval with its
+signals, never with its text (docs/decisions/0005). `cost` builds the contract's `cost`: zero
+only for a local run, `unknown` for an external provider without data — a zero cloud cost is
+never made up (§ 4).
 """
 
 import contextlib
@@ -66,6 +68,10 @@ INTELLIGIBILITY_ORDER = (
     "pitch_range",
     "filler_words",
     "content",
+)
+SUSPECT_SEGMENTS_LEAD = (
+    "Сегменты ASR с пометкой `suspect_hallucination` (`uncertain`): их текст не считается "
+    "произнесённым и в отчёт не выводится."
 )
 CONFIDENCE_ORDER = ("human_verified", "audio_model_observation", "measurement", "transcript")
 PRIVATE_PATH = "<private path>"
@@ -282,6 +288,12 @@ def render(result: dict) -> str:
             f"- {_span(c)}: «{c['original']}» → «{c['corrected']}» (источник `{c['source']}`, "
             f"`{c['certainty']}`){': ' + c['note'] if c['note'] else ''}."
         )
+    if result["transcript"]["suspect_segments"]:
+        lines += ["", SUSPECT_SEGMENTS_LEAD, ""]
+    lines += [
+        f"- {_span(s)}: признаки " + ", ".join(f"`{signal}`" for signal in s["signals"]) + "."
+        for s in result["transcript"]["suspect_segments"]
+    ]
     lines += ["", f"## Наблюдения ({len(result['findings'])})", ""]
     if not result["findings"]:
         lines.append("Наблюдений нет. Это не значит «всё хорошо» за пределами охвата и оценки.")

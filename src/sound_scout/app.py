@@ -530,6 +530,9 @@ def _asr_stage(prepared: _Prepared, run: runs.Run, config: Config) -> dict:
             "source_end": None,
         }
         stage.fragment["flags"] = list(transcription.flags)
+        stage.fragment["suspect_segments"] = asr.suspect_segments(
+            transcription.raw, prepared.source.duration_s
+        )
     elif transcription.status == "failed":
         stage.error(ASR_FAILED, transcription.reason or ASR_FAILED)
     return stage.done(transcription.status, transcription.reason)
@@ -711,6 +714,7 @@ def _assemble(
         "transcript": {
             "raw": {"artifact_ref": findings.TRANSCRIPT_ARTIFACT_ID} if completed["asr"] else None,
             "corrections": built["corrections"] if built else [],
+            "suspect_segments": fragments["asr"]["suspect_segments"] if completed["asr"] else [],
         },
         "measurements": fragments.get("acoustics", {}).get("measurements", []),
         "findings": built["findings"] if built else [],

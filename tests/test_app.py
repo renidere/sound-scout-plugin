@@ -17,9 +17,11 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from sound_scout import app, doctor, findings, proc, runs
@@ -674,6 +676,98 @@ def test_synthetic_smoke_with_the_test_double_is_complete_and_marked_synthetic(
     assert marker < markdown.index("## Этапы")
     steps = [step["name"] for step in stage_record(run, "audio_review")["steps"]]
     assert steps == ["clip", "review", "findings"]
+    findings.validate(result, run=run)
+
+
+FAKE_WHISPER = """
+from dataclasses import dataclass
+
+
+@dataclass
+class Word:
+    start: float
+    end: float
+    word: str
+    probability: float
+
+
+@dataclass
+class Segment:
+    id: int
+    seek: int
+    start: float
+    end: float
+    text: str
+    tokens: list
+    avg_logprob: float
+    compression_ratio: float
+    no_speech_prob: float
+    words: list
+    temperature: float = 0.0
+
+
+@dataclass
+class Info:
+    language: str = "ru"
+    language_probability: float = 1.0
+
+
+class WhisperModel:
+    \"\"\"Test double: a confident phrase over whatever it is given, as the real model does
+    on digital silence; proves the pipeline contract, never that anything was heard.\"\"\"
+
+    def __init__(self, path, **settings):
+        pass
+
+    def transcribe(self, audio, **parameters):
+        words = [Word(0.3, 0.95, " выдумка", 0.93)]
+        return iter([Segment(0, 0, 0.0, 0.95, " выдумка", [1], -0.1, 0.9, 0.01, words)]), Info()
+"""
+
+
+def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spawned worker imports `faster_whisper` from `sys.path`, so a test double package
+    placed first stands in for the model; the snapshot is a fake one in a fake HF cache."""
+    fake = tmp_path / "fake-packages" / "faster_whisper"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text(FAKE_WHISPER, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(fake.parent))
+    snapshot = tmp_path / "hf" / "models--o--n" / "snapshots" / ("0" * 40)
+    snapshot.mkdir(parents=True)
+    for name in doctor.WEIGHT_FILES:
+        (snapshot / name).write_bytes(b"not a model")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf"))
+    root, data_root = tmp_path / "recordings", tmp_path / "data"
+    root.mkdir()
+    data_root.mkdir()
+    config = Config(allowed_roots=(root,), data_root=data_root, asr=Asr(model="o/n"))
+    t = np.arange(8_000) / 16_000
+    tone = (0.5 * np.sin(2 * np.pi * 220.0 * t) * 32767).astype(np.int16)
+    wav = root / "silence-then-tone.wav"
+    with wave.open(str(wav), "wb") as out:  # 1 s of digital silence, then 0.5 s of a tone
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(16_000)
+        out.writeframes(np.concatenate([np.zeros(16_000, np.int16), tone]).tobytes())
+
+    analysis = analyze(
+        AnalyzeRequest(str(wav), layers=("content", "sound")), config, backend=FakeBackend()
+    )
+
+    result, run = analysis.result, analysis.run
+    assert result["stages"]["asr"]["status"] == "completed", result["stages"]
+    assert result["stages"]["audio_review"]["status"] == "completed", result["stages"]
+    assert result["transcript"]["suspect_segments"] == [
+        {"start": 0.0, "end": 0.95, "signals": ["silent_span"], "certainty": "uncertain"}
+    ]
+    assert app.HALLUCINATION_LIMITATION in result["provenance"]["limitations"]
+    assert result["findings"][0]["category"] == "pronunciation"
+    assert result["transcript"]["corrections"] == []
+    assert "выдумка" in (run.path / "asr" / "raw.json").read_text(encoding="utf-8")
+    for name in ("result.json", "report.md"):
+        assert "выдумка" not in (run.path / name).read_text(encoding="utf-8"), name
     findings.validate(result, run=run)
 
 

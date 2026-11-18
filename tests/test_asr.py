@@ -9,6 +9,7 @@ the local Hugging Face cache (never downloaded here) and, for the recording, the
 import dataclasses
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -18,7 +19,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import asr, channels, doctor, guard, ingest, prepare
+from sound_scout import asr, channels, doctor, guard, ingest, prepare, schema
+from sound_scout._schema_messages import schema_errors
 from sound_scout.asr import (
     INFERENCE_PARAMETERS,
     MODEL_UNAVAILABLE_REASON,
@@ -603,6 +605,114 @@ def test_transcribe_marks_silence_segments_with_the_rule(config: Config, run, fa
     assert result.raw["hallucination_rule"] == asr.HALLUCINATION_RULE
 
 
+# --- the one rule of trust: trusted_segments / suspect_segments (docs/decisions/0005) ---------
+
+
+def test_confident_phrase_over_silence_is_flagged_and_quiet_speech_is_trusted(
+    config: Config, run, fake_model
+) -> None:
+    quiet = (speech_like(2.0) * 0.01).astype(np.float32)  # about -53 dBFS RMS, above the rule
+    audio = np.concatenate([quiet, silence(3.0)])
+    fake_model(
+        [
+            segment(0.0, 2.0, " тихая речь", [word(0.0, 2.0, " тихая", 0.4)]),
+            segment(2.2, 2.2, "  ", []),
+            segment(2.5, 4.9, " Уверенная фраза", [word(2.5, 4.9, " Уверенная", 0.95)]),
+        ]
+    )
+    result = transcribe(audio, run, config)
+    raw_path = run.path / "asr" / "raw.json"
+    raw_bytes = raw_path.read_bytes()
+
+    trusted, flagged = asr.trusted_segments(result.raw)
+
+    assert [s["text"] for s in trusted] == [" тихая речь"]
+    assert [s["text"] for s in flagged] == [" Уверенная фраза"]
+    assert flagged[0]["hallucination_signals"] == ["silent_span"]
+    assert trusted[0] is result.raw["segments"][0] and flagged[0] is result.raw["segments"][2]
+    assert asr.suspect_segments(result.raw, len(audio) / SR) == [
+        {"start": 2.5, "end": 4.9, "signals": ["silent_span"], "certainty": "uncertain"}
+    ]
+    assert raw_path.read_bytes() == raw_bytes, "the raw transcript is not changed (R05)"
+    assert read_raw(run) == result.raw
+
+
+def test_trust_rests_on_the_flag_not_on_word_probabilities() -> None:
+    confident = {"text": " фраза", "suspect_hallucination": True, "words": [{"probability": 0.99}]}
+    unsure = {"text": " слово", "suspect_hallucination": False, "words": [{"probability": 0.05}]}
+
+    assert asr.trusted_segments({"segments": [confident, unsure]}) == ([unsure], [confident])
+    assert asr.trusted_segments({"segments": []}) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("raw", "path"),
+    [
+        ({}, "segments must be a list"),
+        ({"segments": {"0": "секрет"}}, "segments must be a list"),
+        ({"segments": ["секрет"]}, "segments[0] must be an object"),
+        ({"segments": [{"text": ["секрет"], "suspect_hallucination": False}]}, "segments[0].text"),
+        ({"segments": [{"text": " секрет"}]}, "segments[0].suspect_hallucination"),
+        (
+            {"segments": [{"text": " секрет", "suspect_hallucination": "false"}]},
+            "segments[0].suspect_hallucination must be a boolean",
+        ),
+        (
+            {"segments": [{"text": "", "suspect_hallucination": False}, {"text": " секрет"}]},
+            "segments[1].suspect_hallucination",
+        ),
+    ],
+)
+def test_a_missing_or_malformed_flag_is_an_error_naming_the_path_not_the_text(
+    raw: dict, path: str
+) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        asr.trusted_segments(raw)
+    assert path in str(excinfo.value)
+    assert "секрет" not in str(excinfo.value)
+    with pytest.raises(ValueError):
+        asr.suspect_segments(raw, 5.0)
+
+
+def test_suspect_segments_are_clamped_to_the_source_and_carry_no_text() -> None:
+    def flagged(start: object, end: object, signals: object = ("silent_span",)) -> dict:
+        return {
+            "start": start,
+            "end": end,
+            "text": " секрет",
+            "words": [{"word": " секрет"}],
+            "hallucination_signals": list(signals) if isinstance(signals, tuple) else signals,
+            "suspect_hallucination": True,
+        }
+
+    raw = {"segments": [flagged(-0.2, 1.0), flagged(4.9999999, 5.3), flagged(5.4, 5.6)]}
+    items = asr.suspect_segments(raw, 5.0)
+
+    assert items == [
+        {"start": 0.0, "end": 1.0, "signals": ["silent_span"], "certainty": "uncertain"},
+        {"start": 5.0, "end": 5.0, "signals": ["silent_span"], "certainty": "uncertain"},
+        {"start": 5.0, "end": 5.0, "signals": ["silent_span"], "certainty": "uncertain"},
+    ]
+    assert "секрет" not in json.dumps(items, ensure_ascii=False)
+    for bad, fragment in (
+        (flagged("0", 1.0), "segments[0]: start and end must be numbers"),
+        (flagged(0.0, True), "segments[0]: start and end must be numbers"),
+        (flagged(0.0, 1.0, []), "segments[0].hallucination_signals"),
+        (flagged(0.0, 1.0, ("echo",)), "segments[0].hallucination_signals"),
+        (flagged(0.0, 1.0, "silent_span"), "segments[0].hallucination_signals"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(fragment)):
+            asr.suspect_segments({"segments": [bad]}, 5.0)
+
+
+def test_signal_names_are_one_list_from_the_rule_to_the_contract() -> None:
+    item = schema.SCHEMA["$defs"]["suspect_segment"]["properties"]["signals"]["items"]
+    assert tuple(item["enum"]) == asr.HALLUCINATION_SIGNALS
+    every = {"no_speech_prob": 0.9, "avg_logprob": -2.0, "compression_ratio": 3.0}
+    signals = hallucination_signals({"start": 0.0, "end": 1.0, "text": " x", **every}, silence())
+    assert tuple(signals) == asr.HALLUCINATION_SIGNALS
+
+
 # --- the raw transcript is immutable; corrections are a separate artifact --------------------
 
 
@@ -878,6 +988,13 @@ def test_real_model_on_five_seconds_of_silence_is_empty_or_flagged(
         assert result.flags == (SUSPECT_HALLUCINATION,)
         assert all(s[SUSPECT_HALLUCINATION] for s in with_text)
         assert all("silent_span" in s["hallucination_signals"] for s in with_text)
+    trusted, flagged = asr.trusted_segments(raw)
+    assert trusted == [], "no trusted text on silence (T05)"
+    assert [id(s) for s in flagged] == [id(s) for s in with_text]
+    item_schema = {"$ref": "#/$defs/suspect_segment", "$defs": schema.SCHEMA["$defs"]}
+    items = asr.suspect_segments(raw, 5.0)
+    assert len(items) == len(with_text)
+    assert all(schema_errors(item_schema, item) == [] for item in items)
     receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
     assert {f["name"] for f in receipt["files"]} >= {"model.bin", "config.json"}
     assert all(len(f["sha256"]) == 64 for f in receipt["files"])

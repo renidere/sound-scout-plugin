@@ -234,6 +234,43 @@ def test_artifact_source_timecodes_are_both_set_ordered_and_bounded(doc: dict) -
     assert_rejected(doc, "$.artifacts[6]: source_start and source_end must both be set")
 
 
+def test_suspect_segments_carry_an_interval_and_signals_without_text(doc: dict) -> None:
+    assert doc["transcript"]["suspect_segments"] == [
+        {"start": 11.4, "end": 12.0, "signals": ["silent_span"], "certainty": "uncertain"}
+    ]
+    item = doc["transcript"]["suspect_segments"][0]
+    item.update(start=12.0, end=12.0)
+    validate(doc)
+    cases = [
+        (lambda i: i.pop("signals"), "[0]: 'signals' is a required property"),
+        (lambda i: i.update(signals=["echo"]), "[0].signals[0]: must be one of"),
+        (lambda i: i.update(signals=[]), "[0].signals: must have at least 1 items"),
+        (lambda i: i.update(signals=["silent_span"] * 2), "[0].signals: has non-unique items"),
+        (lambda i: i.update(certainty="clear"), "[0].certainty: 'uncertain' was expected"),
+        (lambda i: i.update(text=RESULT_TEXT), "[0]: Additional properties are not allowed"),
+        (lambda i: i.update(start=-0.1), "[0].start: must be at least 0"),
+        (lambda i: i.update(start=5.0, end=4.0), "[0]: start must not exceed end"),
+        (lambda i: i.update(end=12.5), "[0].end: exceeds source duration 12.0"),
+    ]
+    for change, fragment in cases:
+        broken = deepcopy(EXAMPLE_DOC)
+        change(broken["transcript"]["suspect_segments"][0])
+        errors = assert_rejected(broken, "$.transcript.suspect_segments" + fragment)
+        assert not any(RESULT_TEXT in e for e in errors), errors
+
+
+def test_suspect_segments_are_required_and_empty_without_a_raw_transcript(doc: dict) -> None:
+    del doc["transcript"]["suspect_segments"]
+    assert_rejected(doc, "$.transcript: 'suspect_segments' is a required property")
+    doc = deepcopy(EXAMPLE_DOC)
+    doc["transcript"]["raw"] = None
+    doc["findings"][1]["evidence_refs"][0] = ref("measurement", "speech_rate")
+    doc["findings"][1].update(evidence_basis="measurement", category="tempo")
+    assert_rejected(doc, "$.transcript.suspect_segments: must be empty when transcript.raw is null")
+    doc["transcript"]["suspect_segments"] = []
+    validate(doc)
+
+
 def test_duplicate_finding_and_artifact_ids_are_rejected(doc: dict) -> None:
     doc["findings"].append(deepcopy(doc["findings"][0]))
     assert_rejected(doc, "$.findings[2].id: duplicate id 'f-001'")
@@ -398,6 +435,7 @@ def test_transcript_raw_must_reference_a_transcript_raw_artifact(doc: dict) -> N
     doc["transcript"]["raw"]["artifact_ref"] = "report-md"
     assert_rejected(doc, "$.transcript.raw.artifact_ref: 'report-md' must be an artifact")
     doc["transcript"]["raw"] = None
+    doc["transcript"]["suspect_segments"] = []
     doc["findings"][1]["evidence_refs"][0] = ref("measurement", "speech_rate")
     doc["findings"][1].update(evidence_basis="measurement", category="tempo")
     validate(doc)
@@ -742,7 +780,7 @@ def set_path(doc: dict, path: tuple, value: object) -> None:
         (("stages",), RESULT_TEXT, "$.stages: must be of type object"),
         (("stages",), {RESULT_TEXT: RESULT_TEXT}, "$.stages: Additional properties are not"),
         (("transcript", "raw"), RESULT_TEXT, "$.transcript.raw: must be null or object"),
-        (("schema_version",), RESULT_TEXT, "$.schema_version: '1.1' was expected"),
+        (("schema_version",), RESULT_TEXT, "$.schema_version: '1.2' was expected"),
         (("cost", "currency"), RESULT_TEXT, "$.cost.currency: must be null or string"),
     ],
 )
@@ -770,7 +808,7 @@ RESULT_SCHEMA_RULES = {
         1,
         "$.source: Additional properties are not allowed, allowed: [",
     ),
-    "const": (("schema_version",), "2.0", "$.schema_version: '1.1' was expected"),
+    "const": (("schema_version",), "2.0", "$.schema_version: '1.2' was expected"),
     "enum": (("stages", "asr", "status"), "done", "$.stages.asr.status: must be one of ["),
     "minLength": (("source", "id"), "", "$.source.id: must be at least 1 characters long"),
     "maxLength": (("run_id",), "r" * 257, "$.run_id: must be at most 256 characters long"),

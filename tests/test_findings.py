@@ -1,6 +1,7 @@
 """`findings`: backend observations on the source timescale, the unlocalized list, ASR
 disagreements, and the validator over the document and the run's files (issue #31)."""
 
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -106,9 +107,21 @@ def reviewed(
     )
 
 
-def write_raw(run: Run, words: list[dict]) -> dict:
+def raw_segment(words: list[dict], signals: list[str] | None = None) -> dict:
+    """A raw transcript segment over `words`, flagged `suspect_hallucination` when `signals`."""
+    return {
+        "start": words[0]["start"] if words else 0.0,
+        "end": words[-1]["end"] if words else 0.0,
+        "text": "x",
+        "words": words,
+        "hallucination_signals": list(signals or []),
+        "suspect_hallucination": bool(signals),
+    }
+
+
+def write_raw(run: Run, words: list[dict], segments: list[dict] | None = None) -> dict:
     (run.path / "asr").mkdir()
-    raw = {"kind": "transcript_raw", "segments": [{"text": "x", "words": words}]}
+    raw = {"kind": "transcript_raw", "segments": segments or [raw_segment(words)]}
     (run.path / "asr" / "raw.json").write_text(json.dumps(raw, ensure_ascii=False), "utf-8")
     return asr.read_raw(run)
 
@@ -125,6 +138,7 @@ def document(run: Run, built: Built, outcome: review.ReviewOutcome) -> dict:
     doc["transcript"] = {
         "raw": {"artifact_ref": "transcript-raw"} if raw else None,
         "corrections": deepcopy(built.corrections),
+        "suspect_segments": [],
     }
     doc["coverage"] = {
         "requested": deepcopy(built.reviewed),
@@ -367,6 +381,86 @@ def test_neutral_pronunciation_over_words_is_no_disagreement(
     assert build(run, [outcome], [], transcript, config=config).corrections == []
 
 
+SUSPECT_WORD = {"start": 1.1, "end": 1.2, "word": " выдумка", "probability": 0.95}
+
+
+def with_raw_artifact(run: Run, doc: dict, transcript: dict) -> dict:
+    """`doc` citing the run's `asr/raw.json` as its raw transcript, as the pipeline does."""
+    doc["artifacts"].append(
+        {
+            "id": "transcript-raw",
+            "kind": "transcript_raw",
+            "path": "asr/raw.json",
+            "sha256": sha256_of(run.path / "asr" / "raw.json"),
+            "source_start": None,
+            "source_end": None,
+        }
+    )
+    doc["transcript"]["raw"] = {"artifact_ref": "transcript-raw"}
+    doc["transcript"]["suspect_segments"] = asr.suspect_segments(transcript, SOURCE_DURATION)
+    return doc
+
+
+def test_a_flagged_segment_is_never_quoted_as_a_disagreement(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    segments = [raw_segment([SUSPECT_WORD], ["silent_span"])]
+    transcript = write_raw(run, [], segments)
+    raw_before = sha256_of(run.path / "asr" / "raw.json")
+    outcome = reviewed(run, config, clip)
+
+    result = build(run, [outcome], [], transcript, config=config)
+
+    assert result.corrections == []
+    assert result.findings[0]["category"] == "pronunciation", "the finding itself stays"
+    assert "выдумка" not in json.dumps(dataclasses.asdict(result), ensure_ascii=False)
+    assert sha256_of(run.path / "asr" / "raw.json") == raw_before
+    doc = with_raw_artifact(run, document(run, result, outcome), transcript)
+    assert doc["transcript"]["suspect_segments"] == [
+        {"start": 1.1, "end": 1.2, "signals": ["silent_span"], "certainty": "uncertain"}
+    ]
+    findings.validate(doc, run=run)
+
+
+def test_a_transcript_without_the_flag_is_refused_by_build(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    segment = raw_segment([SUSPECT_WORD])
+    del segment["suspect_hallucination"]
+    transcript = write_raw(run, [], [segment])
+    with pytest.raises(ValueError, match=r"segments\[0\]\.suspect_hallucination"):
+        build(run, [reviewed(run, config, clip)], [], transcript, config=config)
+
+
+def test_validate_with_the_run_requires_the_flagged_segments_of_raw_json(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    transcript = write_raw(run, [], [raw_segment([SUSPECT_WORD], ["silent_span"])])
+    outcome = reviewed(run, config, clip)
+    doc = with_raw_artifact(
+        run,
+        document(run, build(run, [outcome], [], transcript, config=config), outcome),
+        transcript,
+    )
+    findings.validate(doc, run=run)
+    mismatch = "$.transcript.suspect_segments: does not match the suspect_hallucination segments"
+
+    doc["transcript"]["suspect_segments"] = []
+    findings.validate(doc)
+    assert_rejected(doc, mismatch, run)
+    doc["transcript"]["suspect_segments"] = asr.suspect_segments(transcript, SOURCE_DURATION)
+    doc["transcript"]["suspect_segments"][0]["end"] = 1.3
+    assert_rejected(doc, mismatch, run)
+
+    raw_path = run.path / "asr" / "raw.json"
+    raw_path.write_text(json.dumps({"segments": [{"text": " выдумка"}]}), "utf-8")
+    doc["artifacts"][-1]["sha256"] = sha256_of(raw_path)
+    errors = assert_rejected(
+        doc, "$.transcript.raw: raw transcript: segments[0].suspect_hallucination", run
+    )
+    assert not any("выдумка" in error for error in errors)
+
+
 # --- document rules ---------------------------------------------------------------------------
 
 
@@ -574,7 +668,7 @@ def test_test_double_result_must_be_marked_synthetic(doc: dict) -> None:
 
 def test_dictionary_is_one_from_backend_to_eval() -> None:
     assert review.CATEGORIES == schema.SOUND_CATEGORIES == manifest.CATEGORIES
-    assert schema.SCHEMA_VERSION == "1.1"
+    assert schema.SCHEMA_VERSION == "1.2"
     assert set(schema.CATEGORY_BASES) == set(
         schema.SOUND_CATEGORIES + schema.MEASUREMENT_CATEGORIES + schema.TRANSCRIPT_CATEGORIES
     )
@@ -660,7 +754,7 @@ def test_audio_model_observation_without_a_review_artifact_is_rejected(doc: dict
     )
 
 
-@pytest.mark.parametrize("version", ["1.0", "1.2"])
+@pytest.mark.parametrize("version", ["1.0", "1.1", "1.3"])
 def test_schema_version_bump_is_required(doc: dict, version: str) -> None:
     findings.validate(doc)
     doc["schema_version"] = version

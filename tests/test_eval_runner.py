@@ -259,6 +259,8 @@ class Corpus:
                 }
             )
             doc["transcript"]["raw"] = {"artifact_ref": "transcript-raw"}
+        if transcript is not None:
+            doc["transcript"]["suspect_segments"] = asr.suspect_segments(transcript, DURATION)
         if clear_correction:
             ref = doc["transcript"]["raw"]["artifact_ref"]
             raw_sha256 = next(a["sha256"] for a in doc["artifacts"] if a["id"] == ref)
@@ -407,7 +409,16 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         [],
         [],
         [observation("completeness", 4.0, 5.0)],
-        raw_segments=[{"text": "шум", "words": [], "suspect_hallucination": True}],
+        raw_segments=[
+            {
+                "start": 0.5,
+                "end": 1.5,
+                "text": "шум",
+                "words": [],
+                "hallucination_signals": ["no_speech_prob"],
+                "suspect_hallucination": True,
+            }
+        ],
         control_kind="noise",
     )
     return corpus
@@ -551,6 +562,61 @@ def test_corrupted_asr_control_counts_findings_and_clear_corrections_not_raw_wor
     found = control_report(tmp_path / "found", "corrupted_asr", findings=True)
     assert found["negative_controls"]["confident_fabrications"]["diction"] == 1
     assert fabrication_kinds(found) == ["finding"]
+
+
+def test_confident_raw_segments_are_the_trusted_ones_by_their_index(tmp_path: Path) -> None:
+    raw_path = tmp_path / "asr" / "raw.json"
+    raw_path.parent.mkdir()
+    result = {
+        "transcript": {"raw": {"artifact_ref": "transcript-raw"}},
+        "artifacts": [{"id": "transcript-raw", "path": "asr/raw.json"}],
+    }
+    clip = runner._Clip({"id": "c-control"}, [], result)
+    segments = [
+        {"text": " ", "suspect_hallucination": False},
+        {"text": "слово", "suspect_hallucination": False},
+        {
+            "text": "выдумка",
+            "suspect_hallucination": True,
+            "hallucination_signals": ["silent_span"],
+        },
+        {"text": "ещё", "suspect_hallucination": False},
+    ]
+    raw_path.write_text(json.dumps({"segments": segments}), encoding="utf-8")
+    reasons: list[str] = []
+    assert runner._confident_raw_segments(clip, tmp_path, reasons) == [1, 3]
+    assert reasons == []
+
+    del segments[1]["suspect_hallucination"]
+    raw_path.write_text(json.dumps({"segments": segments}), encoding="utf-8")
+    assert runner._confident_raw_segments(clip, tmp_path, reasons) == []
+    assert reasons == [
+        "контроль 'c-control': сырой транскрипт не проверен (ValueError), § 9 не подтверждён"
+    ]
+
+
+@needs_ffmpeg
+def test_a_control_whose_raw_segment_has_no_flag_is_not_confirmed(tmp_path: Path) -> None:
+    corpus = Corpus(tmp_path)
+    corpus.add("c-control", "heldout", [], [], [], raw_segments=CONTROL_RAW)
+    results = tmp_path / "copied-results"
+    shutil.copytree(corpus.results, results, symlinks=False)
+    raw = results / "c-control" / "asr" / "raw.json"
+    raw.chmod(0o600)
+    raw.write_text(json.dumps({"segments": [{"text": "слово", "words": []}]}), encoding="utf-8")
+    result_path = results / "c-control" / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    artifact = next(a for a in result["artifacts"] if a["id"] == "transcript-raw")
+    artifact["sha256"] = hashlib.sha256(raw.read_bytes()).hexdigest()
+    result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+    report = evaluate(corpus.write_manifest(), corpus.labels, results, "heldout", today=TODAY)
+
+    assert report["negative_controls"]["confident_fabrications"]["transcript"] == 0
+    assert any(
+        "результат клипа 'c-control' не подтверждён файлами run" in r
+        for r in report["not_qualified_reasons"]
+    )
 
 
 @needs_ffmpeg
