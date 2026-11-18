@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -160,11 +161,36 @@ def decode(path: str | os.PathLike[str], run: Run, config: Config) -> Source:
     """
     resolved = paths.resolve_input(path, config)
     with paths.open_input(resolved, config) as file:
-        opened = os.fstat(file.fileno())
-        probed = _probe_open(file, resolved, config)
-        sha256 = _sha256(file)
-        samples = _decode_samples(resolved, probed, config)
-        _require_unchanged(file, resolved, opened)
+        return _decode_open(file, resolved, run, config)
+
+
+def decode_generated(path: Path, run: Run, config: Config) -> Source:
+    """Decode a file this process generated itself under the data root, like the smoke input.
+
+    Such a file is no recording of the user, so the input policy of `decode` (allowed roots,
+    denied names, which the data root may well have among its ancestors) does not apply to it:
+    the path must lie under `config.data_root` and the file is opened without following a
+    symlink. The budgets, the format whitelist and the outputs are those of `decode`.
+    """
+    resolved = Path(os.path.abspath(path))
+    if not resolved.is_relative_to(config.data_root):
+        raise paths.PathDenied(path, paths.OUTSIDE_DATA_ROOT)
+    try:
+        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        raise paths.PathDenied(path, f"cannot open: {error.strerror}") from None
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise paths.PathDenied(path, paths.NOT_REGULAR_FILE)
+        return _decode_open(file, resolved, run, config)
+
+
+def _decode_open(file: BinaryIO, resolved: Path, run: Run, config: Config) -> Source:
+    opened = os.fstat(file.fileno())
+    probed = _probe_open(file, resolved, config)
+    sha256 = _sha256(file)
+    samples = _decode_samples(resolved, probed, config)
+    _require_unchanged(file, resolved, opened)
     frame_bytes = BYTES_PER_SAMPLE * probed.channels
     if len(samples) % frame_bytes:
         raise IngestError(CORRUPTED, "decoder output is not whole frames")

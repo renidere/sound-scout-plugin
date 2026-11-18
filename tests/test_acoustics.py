@@ -1,7 +1,8 @@
 """Acoustic measurements (issue #18, R04 layer 2): VAD spans, RMS and F0 of the working mono.
 
 The speech-like control signal is synthesised with Praat's KlattGrid (formant synthesis of
-alternating vowels at a set pitch), not recorded: Silero VAD does not take burst noise or a pure
+alternating vowels at a set pitch, `sound_scout.smoke.speech_like_control`, shared with the
+`acoustics` smoke run), not recorded: Silero VAD does not take burst noise or a pure
 tone for speech, so a tone is tested through `acoustic_track` with given spans, and `measure`
 end to end through the formant synthesis. The detector and Praat run for real; nothing is mocked.
 The boundary tolerance the span tests assert (start 50 ms, end two VAD windows) and the choice
@@ -15,7 +16,6 @@ from pathlib import Path
 import numpy as np
 import parselmouth
 import pytest
-from parselmouth.praat import call
 
 from sound_scout import acoustics
 from sound_scout.acoustics import (
@@ -26,16 +26,11 @@ from sound_scout.acoustics import (
     speech_activity,
 )
 from sound_scout.schema import validate
+from sound_scout.smoke import place
+from sound_scout.smoke import speech_like_control as speech_like
 from tests.test_schema import EXAMPLE_DOC
 
 RATE = 16_000
-VOWEL_FORMANTS = (
-    (300, 2300, 3000, 3400),
-    (300, 800, 2300, 2800),
-    (500, 1800, 2500, 3000),
-    (800, 1200, 2300, 2800),
-)
-BANDWIDTHS = (50, 60, 100, 120)
 VAD_WINDOW_S = acoustics.VAD_WINDOW_SAMPLES / acoustics.VAD_RATE
 BOUNDARY_TOLERANCE_S = 0.05
 END_TOLERANCE_S = acoustics.VAD_END_LAG_WINDOWS * VAD_WINDOW_S
@@ -44,34 +39,6 @@ END_TOLERANCE_S = acoustics.VAD_END_LAG_WINDOWS * VAD_WINDOW_S
 def sine(frequency: float, seconds: float = 2.0, rate: int = RATE, amplitude: float = 0.2):
     t = np.arange(int(seconds * rate)) / rate
     return (amplitude * np.sin(2 * np.pi * frequency * t)).astype(np.float32)
-
-
-def speech_like(seconds: float, rate: int, f0: float = 130.0, syllable_s: float = 0.1):
-    """Formant-synthesised alternating vowels at pitch `f0`, faded 20 ms at both ends."""
-    grid = call("Create KlattGrid", "kg", 0, seconds, 6, 1, 1, 6, 1, 1, 1)
-    call(grid, "Add pitch point", 0, f0)
-    call(grid, "Add voicing amplitude point", 0, 90)
-    onset, index = 0.0, 0
-    while onset < seconds - 1e-9:
-        formants = VOWEL_FORMANTS[index % len(VOWEL_FORMANTS)]
-        for number, (frequency, bandwidth) in enumerate(zip(formants, BANDWIDTHS, strict=True), 1):
-            call(grid, "Add oral formant frequency point", number, onset, frequency)
-            call(grid, "Add oral formant bandwidth point", number, onset, bandwidth)
-        onset, index = onset + syllable_s, index + 1
-    sound = call(call(grid, "To Sound"), "Resample", rate, 50)
-    samples = sound.values[0][: int(seconds * rate)]
-    fade = int(0.02 * rate)
-    envelope = np.ones(len(samples))
-    envelope[:fade] = np.linspace(0, 1, fade)
-    envelope[-fade:] = np.linspace(1, 0, fade)
-    return (0.5 * samples * envelope / np.max(np.abs(samples))).astype(np.float32)
-
-
-def place(speech: np.ndarray, start_s: float, total_s: float, rate: int) -> np.ndarray:
-    audio = np.zeros(int(total_s * rate), dtype=np.float32)
-    begin = int(start_s * rate)
-    audio[begin : begin + len(speech)] = speech
-    return audio
 
 
 def by_name(result: dict) -> dict[str, dict]:

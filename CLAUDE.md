@@ -86,6 +86,7 @@
 | Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
 | Приём входа: probe/decode через ffprobe/ffmpeg, лимиты R02, SHA-256, `source.json` и `work/decoded.f32` в run-каталоге | `src/sound_scout/ingest.py` |
 | `doctor`, отпечатки компонентов и smoke-receipts | `src/sound_scout/doctor.py` |
+| Smoke-прогоны `decoder`/`acoustics` и команда `smoke`; формантный контроль KlattGrid `speech_like_control` | `src/sound_scout/smoke.py` |
 | Канальный анализ: отчёт по каналам, вердикт, выбор рабочего моно и запись `channel_choice` | `src/sound_scout/channels.py` |
 | Производная для ASR: рабочее моно → 16 кГц через ffmpeg, `work/mono16k.f32` и запись преобразования `work/mono16k.json` | `src/sound_scout/prepare.py` |
 | Локальный ASR: faster-whisper offline из кэша HF, `asr/raw.json` и `asr/model-receipt.json`, правило `suspect_hallucination`, `transcript/corrected.json`, smoke-receipt `asr` | `src/sound_scout/asr.py` |

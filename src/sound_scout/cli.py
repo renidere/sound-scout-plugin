@@ -7,8 +7,11 @@ a diagnosis, not a check. A configuration error is one line on stderr and exit c
 (`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits
 0 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or
 a report that already exists, is one line on stderr and exit code 1; missing or invalid labels
-and results are NOT QUALIFIED reasons in the report. The other subcommands are not implemented
-yet and exit 2.
+and results are NOT QUALIFIED reasons in the report. `smoke [decoder] [acoustics]` loads the
+same configuration, installs the network guard, runs the real components on a synthetic signal
+(`sound_scout.smoke`, imported only here: it loads Praat and the speech detector) and saves the
+smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was written,
+1 otherwise. The other subcommands are not implemented yet and exit 2.
 """
 
 import argparse
@@ -24,10 +27,15 @@ SUBCOMMANDS = {
     "compare": "compare two analyzed recordings",
     "serve": "run the MCP stdio server",
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
+    "smoke": "run the real decoder and acoustics on synthetic audio and save their "
+    "smoke-receipts for doctor",
 }
+# The names of `smoke.COMPONENTS`, repeated so that building the parser does not import `smoke`.
+SMOKE_COMPONENTS = ("decoder", "acoustics")
 NOT_IMPLEMENTED_EXIT_CODE = 2
 CONFIG_ERROR_EXIT_CODE = 1
 EVAL_ERROR_EXIT_CODE = 1
+SMOKE_FAILED_EXIT_CODE = 1
 TABLE_COLUMNS = ("component", "status", "last smoke", "fingerprint", "reason")
 FINGERPRINT_DIGITS = 12
 QUALIFICATION_FLAGS = ("validated_ru", "diction_validated_ru", "prosody_validated_ru")
@@ -48,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "eval":
             _add_eval_arguments(subparser)
+        if name == "smoke":
+            subparser.add_argument(
+                "components",
+                nargs="*",
+                choices=SMOKE_COMPONENTS,
+                help="components to smoke-test (default: all of them)",
+            )
     return parser
 
 
@@ -80,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(as_json=args.json)
     if args.command == "eval":
         return run_eval(args)
+    if args.command == "smoke":
+        return run_smoke(tuple(dict.fromkeys(args.components)) or SMOKE_COMPONENTS)
     print(f"sound-scout {args.command}: not implemented", file=sys.stderr)
     return NOT_IMPLEMENTED_EXIT_CODE
 
@@ -97,6 +114,25 @@ def run_doctor(*, as_json: bool) -> int:
     else:
         print(format_report(report))
     return 0
+
+
+def run_smoke(components: tuple[str, ...]) -> int:
+    try:
+        loaded = config.load()
+    except config.ConfigError as error:
+        print(f"config error: {' '.join(str(error).split())}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT_CODE
+    guard.install_network_guard(loaded)
+    from sound_scout import smoke
+
+    outcomes = smoke.run(loaded, components)
+    for name, outcome in outcomes.items():
+        if isinstance(outcome, smoke.SmokeFailed):
+            print(f"{name}: failed: {' '.join(outcome.reason.split())}")
+        else:
+            print(f"{name}: ok ({outcome.relative_to(loaded.data_root).as_posix()})")
+    failed = any(isinstance(outcome, smoke.SmokeFailed) for outcome in outcomes.values())
+    return SMOKE_FAILED_EXIT_CODE if failed else 0
 
 
 def run_eval(args: argparse.Namespace) -> int:

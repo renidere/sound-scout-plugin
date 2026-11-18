@@ -44,9 +44,30 @@ uv run sound-scout --help
 `acoustics`, `audio_review`: `ready | unavailable | unvalidated | permission_required` с причиной,
 отпечатком и временем последнего smoke-теста), `--json` — тот же отчёт в JSON; код возврата 0 при
 любых статусах, это диагностика, а не проверка. `ready` требует smoke-receipt
-(`<data_root>/receipts/<компонент>.json`), который пишет smoke-тест компонента; `doctor` только
-читает его, ничего не скачивает и не запускает inference. Подкоманды `analyze`, `compare`, `serve`
-пока завершаются с кодом 2 и сообщением `not implemented`. Локальная конфигурация —
+(`<data_root>/receipts/<компонент>.json`), совпадающий с текущим отпечатком компонента; `doctor`
+только читает его, ничего не пишет, не скачивает и не запускает inference.
+
+Receipt для `decoder` и `acoustics` оператор получает командой `smoke`, затем проверяет `doctor`:
+
+```sh
+uv run sound-scout smoke            # оба компонента; или `smoke decoder`, `smoke acoustics`
+uv run sound-scout doctor
+```
+
+`smoke` читает ту же конфигурацию, что и `doctor`, ставит сетевой guard и по-настоящему
+прогоняет компоненты на синтетическом сигнале: настоящий FFmpeg декодирует WAV PCM 48 кГц длиной
+1 с (точное число отсчётов, совпадение с записанным сигналом), настоящие Silero VAD и Praat
+измеряют формантный контроль с F0 150 Гц (p50 в пределах ±3 %, одна речевая область) и цифровую
+тишину (ни одной речевой области). Записи пользователя и сеть не нужны; сама команда пишет только
+временный `<data_root>/.smoke-*`, который удаляется, и `receipts/`. Вне data root пока пишет сам
+onnxruntime при импорте детектора речи — свои файлы телеметрии
+`~/.cache/Microsoft/DeveloperTools/.onnxruntime` и `.ses` во временном каталоге; отключение этой
+записи — отдельная задача. Receipt пишется только при успехе всех проверок; при неудаче команда печатает `<компонент>: failed: <причина>`, завершается с кодом 1, а
+прежний receipt остаётся нетронутым. Повторяйте `smoke`, когда `doctor` пишет, что receipt
+устарел (`stale`): после обновления FFmpeg или пакетов (`praat-parselmouth`, `onnxruntime`,
+`faster-whisper`, `sound-scout`) и после смены `budgets`. Receipt `asr` эта команда пока не пишет
+(задача #54). Подкоманды `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
+`not implemented`. Локальная конфигурация —
 `sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor` читает её через
 `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; остальные
 подкоманды и MCP будут читать её так же. Обязательны

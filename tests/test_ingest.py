@@ -247,6 +247,49 @@ def test_decode_writes_source_json_and_decoded_f32(tone: Path, run: Run, config:
     assert str(tone) not in source.record_path.read_text(encoding="utf-8")
 
 
+def test_decode_generated_takes_a_file_under_a_data_root_below_a_denied_name(
+    tmp_path: Path, root: Path
+) -> None:
+    data_root = tmp_path / ".hermes" / "data"
+    data_root.mkdir(parents=True)
+    config = Config(allowed_roots=(root,), data_root=data_root)
+    generated = write_wav(data_root / "input.wav", sine(1.0))
+
+    with pytest.raises(PathDenied, match="outside allowed roots"):
+        decode(generated, open_run("req-1", IDENTITY, data_root), config)
+    source = ingest.decode_generated(generated, open_run("req-2", IDENTITY, data_root), config)
+
+    assert (source.frames, source.duration_s) == (SAMPLE_RATE, 1.0)
+    assert source.decoded_path.stat().st_size == SAMPLE_RATE * 4
+
+
+def test_decode_generated_keeps_the_budgets(data_root: Path, run: Run, config: Config) -> None:
+    generated = write_wav(data_root / "input.wav", sine(1.0))
+    small = Config(
+        allowed_roots=config.allowed_roots,
+        data_root=data_root,
+        budgets=Budgets(max_input_bytes=1000),
+    )
+
+    with pytest.raises(IngestError) as refused:
+        ingest.decode_generated(generated, run, small)
+
+    assert refused.value.code == ingest.INPUT_TOO_LARGE
+    assert run_dir_entries(run) == {"request.json", "manifest.json"}
+
+
+def test_decode_generated_refuses_a_file_outside_the_data_root_or_a_symlink(
+    tone: Path, data_root: Path, run: Run, config: Config
+) -> None:
+    with pytest.raises(PathDenied, match="outside data root"):
+        ingest.decode_generated(tone, run, config)
+    link = data_root / "input.wav"
+    link.symlink_to(tone)
+    with pytest.raises(PathDenied, match="cannot open"):
+        ingest.decode_generated(link, run, config)
+    assert run_dir_entries(run) == {"request.json", "manifest.json"}
+
+
 def test_source_json_limits_share_their_names_with_the_result_contract(
     root: Path, run: Run, config: Config
 ) -> None:
