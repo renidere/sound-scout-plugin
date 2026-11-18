@@ -407,6 +407,52 @@ def test_a_stop_swallowed_inside_a_stage_writes_no_record_and_the_stage_is_inter
     assert manifest(run)["complete"] is complete
 
 
+@pytest.mark.parametrize("code", [app.CANCELLED, app.DEADLINE_EXCEEDED])
+def test_a_stop_swallowed_in_a_step_keeps_the_next_step_of_the_stage_from_starting(
+    config: Config, wav: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    real_cut, real_run_review = app.clips.cut, app.review.run_review
+    review_calls: list[str] = []
+
+    def cut_swallowing_the_stop(*args: object, **kwargs: object) -> object:
+        clip = real_cut(*args, **kwargs)
+        # A lazy C-extension import reports the stop as ImportError, and the caller shrugs it off.
+        try:
+            try:
+                app._raise_stopped(signal.SIGTERM, None)
+            except app.WorkerStopped as stop:
+                raise ImportError("initialization failed") from stop
+        except ImportError:
+            pass
+        return clip
+
+    def counting_run_review(*args: object, **kwargs: object) -> object:
+        review_calls.append("review")
+        return real_run_review(*args, **kwargs)
+
+    def execute_in_process(request: AnalyzeRequest, config: Config, run: runs.Run, *rest: object):
+        try:
+            app._run_stages(request, config, run, rest[0], rest[1])
+        except app.WorkerStopped:
+            return app._Interruption(code, "прерван")
+        raise AssertionError("the swallowed stop let the stage run to its record")
+
+    monkeypatch.setattr(app, "_stop_signal", None)
+    monkeypatch.setattr(app.clips, "cut", cut_swallowing_the_stop)
+    monkeypatch.setattr(app.review, "run_review", counting_run_review)
+    monkeypatch.setattr(app, "_execute", execute_in_process)
+
+    analysis = analyze(AnalyzeRequest(str(wav), layers=LISTENED), config, backend=FakeBackend())
+
+    result, run = analysis.result, analysis.run
+    assert review_calls == []
+    assert stage_record(run, "acoustics")["entry"]["status"] == "completed"
+    assert not (run.path / "work" / "stage-audio_review.json").exists()
+    assert result["stages"]["audio_review"]["status"] == "failed"
+    assert ("audio_review", code) in codes(result)
+    assert result["status"] == "partial"
+
+
 def test_a_backend_that_swallows_the_cancel_leaves_no_completed_review(
     config: Config, wav: Path, pid_dir: Path
 ) -> None:
