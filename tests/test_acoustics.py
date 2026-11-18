@@ -10,6 +10,10 @@ of the control are recorded in `docs/decisions/0003-vad-boundary-tolerance.md`.
 """
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from copy import deepcopy
 from pathlib import Path
 
@@ -17,7 +21,7 @@ import numpy as np
 import parselmouth
 import pytest
 
-from sound_scout import acoustics
+from sound_scout import acoustics, guard
 from sound_scout.acoustics import (
     MEASUREMENT_NAMES,
     VadUnavailable,
@@ -423,3 +427,81 @@ def test_control_pitch_of_150_and_225_hz_gives_p50_within_3_percent_through_meas
     assert f0_value["p50"] == pytest.approx(f0, rel=0.03)
     assert f0_value["p10"] <= f0_value["p50"] <= f0_value["p90"]
     assert values["f0_hz"]["settings"]["voiced_speech_frames"] > 50
+
+
+ONNXRUNTIME_TELEMETRY_STORE = Path(".cache/Microsoft/DeveloperTools/.onnxruntime")
+ONNXRUNTIME_SESSION_FILE = ".ses"
+
+VAD_CHILD = """
+import json, os, sys
+from sound_scout import acoustics
+from sound_scout.smoke import place, speech_like_control
+
+imported_early = "onnxruntime" in sys.modules
+result = acoustics.measure(place(speech_like_control(1.2, 16000), 1.0, 3.0, 16000), 16000)
+spans = {item["name"]: item for item in result["measurements"]}["speech_spans"]["value"]
+print(json.dumps({
+    "imported_early": imported_early,
+    "loaded": "onnxruntime" in sys.modules,
+    "status": result["status"],
+    "spans": len(spans or []),
+    "telemetry_env": os.environ.get("ORT_DISABLE_TELEMETRY"),
+}))
+"""
+
+
+def run_with_private_home(tmp_path: Path, script: str, telemetry: str | None) -> tuple[dict, list]:
+    """Run `script` in a child with HOME and TMPDIR in empty temp dirs and the telemetry
+    variable unset or set to `telemetry`; return its JSON and every path created in them."""
+    home, temp = tmp_path / "home", tmp_path / "tmp"
+    home.mkdir()
+    temp.mkdir()
+    env = {key: value for key, value in os.environ.items() if key not in guard.TELEMETRY_OFF_ENV}
+    if telemetry is not None:
+        env["ORT_DISABLE_TELEMETRY"] = telemetry
+    env.update(HOME=str(home), TMPDIR=str(temp))
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    created = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    return json.loads(result.stdout.strip().splitlines()[-1]), [
+        path for path in created if path not in {"home", "tmp"}
+    ]
+
+
+@pytest.mark.parametrize("telemetry", [None, "0"])
+def test_real_vad_run_writes_no_onnxruntime_telemetry(
+    tmp_path: Path, telemetry: str | None
+) -> None:
+    """R09/R10: a real Silero VAD run switches onnxruntime telemetry off before its import,
+    even when the environment had it unset or explicitly on."""
+    outcome, created = run_with_private_home(tmp_path, VAD_CHILD, telemetry)
+
+    assert outcome == {
+        "imported_early": False,
+        "loaded": True,
+        "status": "completed",
+        "spans": 1,
+        "telemetry_env": "1",
+    }
+    assert not (tmp_path / "home" / ONNXRUNTIME_TELEMETRY_STORE).exists()
+    assert not (tmp_path / "tmp" / ONNXRUNTIME_SESSION_FILE).exists()
+    assert created == []
+
+
+def test_plain_onnxruntime_import_writes_telemetry_the_check_above_would_see(
+    tmp_path: Path,
+) -> None:
+    """The control for the test above: the same child, importing onnxruntime itself without
+    the variable, does write the store and the session file, so their absence means something."""
+    script = 'import json, onnxruntime\nprint(json.dumps({"loaded": True}))\n'
+    outcome, _ = run_with_private_home(tmp_path, script, None)
+
+    assert outcome == {"loaded": True}
+    assert (tmp_path / "home" / ONNXRUNTIME_TELEMETRY_STORE).is_dir()
+    assert (tmp_path / "tmp" / ONNXRUNTIME_SESSION_FILE).exists()

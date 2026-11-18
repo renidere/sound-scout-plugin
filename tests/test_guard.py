@@ -24,10 +24,12 @@ def config(allow):
 """
 
 
-def run_in_child(body: str) -> dict:
+def run_in_child(body: str, extra_env: dict[str, str] | None = None) -> dict:
     """Run the script in a fresh interpreter and return the JSON it prints on its last line."""
     script = PRELUDE + textwrap.dedent(body)
-    env = {key: value for key, value in os.environ.items() if key not in guard.OFFLINE_ENV}
+    managed = guard.OFFLINE_ENV.keys() | guard.TELEMETRY_OFF_ENV.keys()
+    env = {key: value for key, value in os.environ.items() if key not in managed}
+    env.update(extra_env or {})
     result = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, env=env, check=False
     )
@@ -68,6 +70,26 @@ def test_guard_denies_connections_and_sets_offline_env() -> None:
     assert outcome["active"] is True
     assert outcome["attempt"].startswith("denied: network access is disabled")
     assert outcome["env"] == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+
+
+@pytest.mark.parametrize("allow", [False, True])
+@pytest.mark.parametrize("inherited", [None, "0"])
+def test_guard_switches_telemetry_off_whatever_network_allow_says(
+    allow: bool, inherited: str | None
+) -> None:
+    outcome = run_in_child(
+        f"""
+    before = os.environ.get("ORT_DISABLE_TELEMETRY")
+    installed = guard.install_network_guard(config(allow={allow}))
+    print(json.dumps({{
+        "before": before,
+        "installed": installed,
+        "telemetry": os.environ.get("ORT_DISABLE_TELEMETRY"),
+    }}))
+    """,
+        {} if inherited is None else {"ORT_DISABLE_TELEMETRY": inherited},
+    )
+    assert outcome == {"before": inherited, "installed": not allow, "telemetry": "1"}
 
 
 @pytest.mark.parametrize(
@@ -138,11 +160,13 @@ def test_without_guard_the_same_connection_fails_as_a_plain_os_error() -> None:
 def test_allowed_network_installs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in guard.OFFLINE_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ORT_DISABLE_TELEMETRY", "0")
     allowed = Config(allowed_roots=(Path("/"),), data_root=Path("/"), network=Network(allow=True))
     assert guard.install_network_guard(allowed) is False
     assert guard.network_guard_active() is False
     for name in guard.OFFLINE_ENV:
         assert name not in os.environ
+    assert os.environ["ORT_DISABLE_TELEMETRY"] == "1"
 
 
 def test_guard_flag_is_off_in_this_test_session() -> None:

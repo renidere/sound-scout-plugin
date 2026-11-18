@@ -336,6 +336,26 @@ def test_model_constructor_gets_the_snapshot_dir_cpu_int8_and_local_files_only(
     assert os.environ["HF_HUB_OFFLINE"] == "1" and os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
+def test_model_loader_switches_onnxruntime_telemetry_off_before_the_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """faster-whisper's VAD filter loads onnxruntime: telemetry is off by the time it can."""
+    import faster_whisper
+
+    seen: list[str | None] = []
+
+    class RecordingWhisperModel:
+        def __init__(self, *args, **kwargs) -> None:
+            seen.append(os.environ.get("ORT_DISABLE_TELEMETRY"))
+
+    monkeypatch.setenv("ORT_DISABLE_TELEMETRY", "0")
+    monkeypatch.setattr(faster_whisper, "WhisperModel", RecordingWhisperModel)
+
+    asr._load_model(tmp_path)
+
+    assert seen == ["1"]
+
+
 def test_missing_weights_under_hf_hub_offline_reach_neither_model_package_nor_network(
     config: Config, run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

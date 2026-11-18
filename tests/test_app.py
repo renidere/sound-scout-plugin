@@ -769,3 +769,54 @@ def test_the_dev_recording_runs_real_asr_with_backend_none(tmp_path: Path) -> No
         assert errors == [], len(errors)
     finally:
         shutil.rmtree(data_root)
+
+
+# --- telemetry -------------------------------------------------------------------------------
+
+ANALYZE_CHILD = """
+import json, os, sys
+from pathlib import Path
+from sound_scout.app import AnalyzeRequest, analyze
+from sound_scout.config import Config, Network
+
+base = Path({base!r})
+config = Config(
+    allowed_roots=(base / "recordings",),
+    data_root=base / "data",
+    network=Network(allow={allow}),
+)
+result = analyze(AnalyzeRequest({wav!r}, layers=("measurements",)), config).result
+print(json.dumps({{
+    "acoustics": result["stages"]["acoustics"]["status"],
+    "parent_loaded": "onnxruntime" in sys.modules,
+    "parent_env": os.environ.get("ORT_DISABLE_TELEMETRY"),
+}}))
+"""
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_analyze_worker_runs_the_real_vad_without_onnxruntime_telemetry(
+    tmp_path: Path, make_wav: WavFactory, allow: bool
+) -> None:
+    """R09: the analyze worker, not the inherited environment, switches onnxruntime telemetry
+    off before the speech detector loads it, whatever `network.allow` says."""
+    (tmp_path / "recordings").mkdir()
+    (tmp_path / "data").mkdir()
+    wav = make_wav("recordings/tone.wav", seconds=1.0)
+    home, temp = tmp_path / "home", tmp_path / "tmp"
+    home.mkdir()
+    temp.mkdir()
+    env = {key: value for key, value in os.environ.items() if key != "ORT_DISABLE_TELEMETRY"}
+    env.update(HOME=str(home), TMPDIR=str(temp))
+    script = ANALYZE_CHILD.format(base=str(tmp_path), wav=str(wav), allow=allow)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout.strip().splitlines()[-1])
+    assert outcome == {"acoustics": "completed", "parent_loaded": False, "parent_env": None}
+    assert not (home / ".cache/Microsoft/DeveloperTools/.onnxruntime").exists()
+    assert not (temp / ".ses").exists()
+    assert sorted(home.rglob("*")) == [] and sorted(temp.rglob("*")) == []

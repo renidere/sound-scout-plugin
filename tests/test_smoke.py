@@ -366,21 +366,6 @@ def test_decoder_smoke_runs_the_decoder_under_the_operator_budgets(
     assert status(config, "decoder")["status"] == "ready"
 
 
-# onnxruntime 1.32 writes its 1DS telemetry device ID and session file on import, outside the
-# data root; that is a defect of its own (switch the telemetry off), not of the smoke run. These
-# paths (the store with its SQLite files, the session file) and the directories created on the
-# way to them are the only writes tolerated outside the data root until it is fixed; anything
-# else fails the test.
-ONNXRUNTIME_TELEMETRY_FILES = ("home/.cache/Microsoft/DeveloperTools/.onnxruntime", "tmp/.ses")
-
-
-def is_onnxruntime_telemetry_write(path: str) -> bool:
-    return any(
-        path == known or known.startswith(f"{path}/") or path.startswith(f"{known}/")
-        for known in ONNXRUNTIME_TELEMETRY_FILES
-    )
-
-
 CHILD = """
 import json, os, sys
 from pathlib import Path
@@ -430,7 +415,8 @@ def test_smoke_writes_nothing_outside_the_data_root_under_the_guard(
     home, temp = tmp_path / "home", tmp_path / "tmp"
     home.mkdir()
     temp.mkdir()
-    env = {key: value for key, value in os.environ.items() if key not in guard.OFFLINE_ENV}
+    managed = guard.OFFLINE_ENV.keys() | guard.TELEMETRY_OFF_ENV.keys()
+    env = {key: value for key, value in os.environ.items() if key not in managed}
     env.update(HOME=str(home), TMPDIR=str(temp))
     script = CHILD.format(base=str(tmp_path.resolve()))
 
@@ -445,8 +431,7 @@ def test_smoke_writes_nothing_outside_the_data_root_under_the_guard(
     assert result.returncode == 0, result.stderr
     outcome = json.loads(result.stdout.strip().splitlines()[-1])
     assert outcome["paths"] == [True, True], outcome["outcomes"]
-    outside = [path for path in outcome["changed"] if not is_onnxruntime_telemetry_write(path)]
-    assert outside == []
+    assert outcome["changed"] == []
     assert outcome["sockets"] == []
     assert outcome["spawned"] and set(outcome["spawned"]) <= {"ffmpeg", "ffprobe"}
     assert outcome["data_root"] == [doctor.RECEIPTS_DIR_NAME]

@@ -15,9 +15,8 @@ existing receipt untouched.
 
 Nothing is downloaded and no recording is read. Everything this module writes goes into a
 temporary `<data_root>/.smoke-*` directory, removed whatever happens, and into
-`<data_root>/receipts/`. onnxruntime itself, imported for the speech detector, currently writes
-its own telemetry files outside the data root (`~/.cache/Microsoft/DeveloperTools/.onnxruntime`
-and a `.ses` session file in the temporary directory); switching that off is a separate fix.
+`<data_root>/receipts/`; onnxruntime, imported for the speech detector, has its telemetry
+switched off before the import (`guard.disable_telemetry`), so it writes nothing either.
 The network guard is the caller's: the `smoke` subcommand installs it like `doctor` does.
 """
 

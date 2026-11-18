@@ -28,6 +28,7 @@ import os
 import numpy as np
 import parselmouth
 
+from sound_scout import guard
 from sound_scout.doctor import VAD_ASSET, installed_version, package_dir
 
 VAD_RATE = 16_000
@@ -141,6 +142,7 @@ def measure(mono: np.ndarray, rate: int) -> dict:
 def speech_activity(mono: np.ndarray, rate: int) -> list[dict]:
     """Speech spans `{"start", "end"}` in seconds of the original signal (Silero VAD)."""
     _require_mono(mono, rate)
+    guard.disable_telemetry()
     vad_asset_path()
     if package_dir("onnxruntime") is None:
         raise VadUnavailable("onnxruntime is not installed, the Silero VAD cannot run")

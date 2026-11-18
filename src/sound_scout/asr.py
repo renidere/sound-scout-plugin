@@ -376,6 +376,7 @@ def write_smoke_receipt(
 
 def _load_model(snapshot_dir: Path):
     """Open the snapshot directory with faster-whisper; the one place the package is imported."""
+    guard.disable_telemetry()
     from faster_whisper import WhisperModel
 
     return WhisperModel(
