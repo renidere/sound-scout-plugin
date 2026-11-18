@@ -37,9 +37,11 @@ Every later fix before a commit — a review finding, a red CI fixed forward —
 Hard limits — the spec's permission boundaries hold for you (docs/spec/REQUIREMENTS.md § R09,
 docs/spec/AGENT_PROMPT.md "Полномочия и запреты"):
 - No model or weight downloads, no external or paid inference, no uploads of recordings or
-  transcripts anywhere, no telemetry, no spending. Locally installed models already named in
-  local/HANDOFF.md may be used read-only, offline (`local_files_only`), within an analysis
-  request. Whatever needs more is `needs the owner` — report it, never work around it with a mock
+  transcripts anywhere, no telemetry, no spending. Locally installed models and runtimes named in
+  docs/dependencies.md (and local/HANDOFF.md) may be used read-only, offline (`local_files_only`,
+  llama.cpp only with local `-m`/`--mmproj`, never `-hf`/`-mu`/`-mmu`), within an analysis request
+  or a spike the owner approved. Every dependency a change adds or updates goes into
+  docs/dependencies.md in the same commit. Whatever needs more is `needs the owner` — report it, never work around it with a mock
   presented as the real thing, a fake JSON or an `approved=true` you wrote yourself.
 - The running Hermes and its profile are never modified. A task about connecting to Hermes
   prepares the instructions and the config example; the connection itself is the owner's step.

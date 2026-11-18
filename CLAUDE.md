@@ -8,8 +8,13 @@
 отдельная задача.
 
 - **Стек:** Python 3.13, `uv` (pyproject + `uv.lock`), `ruff`, `pytest`; системный FFmpeg;
-  `faster-whisper` для ASR; `praat-parselmouth` для F0. Один backend слухового анализа после
-  Gate 0. Без UI, очередей, БД, provider framework.
+  `faster-whisper` для ASR; `praat-parselmouth` для F0. Backend слухового анализа — Gemma 4
+  E4B-it (GGUF через llama.cpp, только локально; решение владельца, `docs/spec/REQUIREMENTS.md`
+  раздел 9), пока Gate 0 не скажет иное. Без UI, очередей, БД, provider framework.
+- **Зависимости:** все Python-пакеты, системные программы, runtime и файлы весов записаны в
+  `docs/dependencies.md` с версией или ревизией, лицензией и SHA-256. Новая или обновлённая
+  зависимость вносится туда в том же коммите; веса и ревизии вне этого файла не скачиваются без
+  решения владельца.
 - **Язык:** документация, задачи, комментарии на доске и в коде-пояснениях — русский; код,
   идентификаторы, commit messages, имена тестов, CI и скилы агента — английский.
 - **Доска:** https://github.com/users/renidere/projects/1 — колонки Backlog, In Progress,
@@ -81,6 +86,7 @@
 | что | где |
 |---|---|
 | Требования, контракт результата, приёмка | `docs/spec/REQUIREMENTS.md` |
+| Зависимости: пакеты, программы, runtime, веса с ревизиями и SHA-256 | `docs/dependencies.md` |
 | Поручение агенту и границы полномочий | `docs/spec/AGENT_PROMPT.md` |
 | Контракт результата (JSON Schema), пример | `schema/` (упакованная копия — `src/sound_scout/result.v1.schema.json`) |
 | Сетевой guard процесса; ограниченный subprocess и argv ffmpeg/ffprobe | `src/sound_scout/guard.py`, `src/sound_scout/proc.py` |
