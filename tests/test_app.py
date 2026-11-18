@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import app, doctor, findings, proc, runs
+from sound_scout import app, doctor, findings, proc, review, runs
 from sound_scout.app import AnalyzeRequest, Busy, CancelToken, RunIncomplete, analyze
 from sound_scout.config import Asr, Budgets, Config
 from sound_scout.review import BackendDescription, RawReviewResponse, ReviewRequest
@@ -668,8 +668,8 @@ def test_synthetic_smoke_with_the_test_double_is_complete_and_marked_synthetic(
     assert result["findings"] and result["unlocalized"]
     assert result["coverage"]["unreviewed"] == []
     assert result["provenance"]["limitations"] == [
-        app.MODEL_LIMITATION + "only the passed fragment was heard",
-        app.MODEL_UNCERTAINTY + "the first word may be a name",
+        review.MODEL_LIMITATION + "only the passed fragment was heard",
+        review.MODEL_UNCERTAINTY + "the first word may be a name",
     ]
     markdown = (run.path / "report.md").read_text(encoding="utf-8").splitlines()
     marker = next(i for i, line in enumerate(markdown) if "Синтетический прогон" in line)

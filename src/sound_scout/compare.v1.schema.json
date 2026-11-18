@@ -1,0 +1,918 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/renidere/sound-scout-plugin/schema/compare.v1.schema.json",
+  "title": "Sound Scout comparison of two attempts, contract version 1",
+  "description": "Сравнение исходной (a) и контрольной (b) попыток по одному критерию (R07, T10): вердикт только по наблюдениям аудиомодели категории критерия, условия записи — отдельно. Правила — docs/decisions/0005-compare-rules.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "compare_id",
+    "created_at",
+    "criterion",
+    "verdict",
+    "reasons",
+    "attempts",
+    "conditions_diff",
+    "limitations",
+    "synthetic"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "compare_id": {
+      "$ref": "#/$defs/run_id"
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw",
+        "kind",
+        "word",
+        "category"
+      ],
+      "properties": {
+        "raw": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "emphasis_on",
+            "pause_before",
+            "intelligibility_of",
+            "completeness_of_phrase"
+          ]
+        },
+        "word": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "category": {
+          "$ref": "#/$defs/category"
+        }
+      }
+    },
+    "verdict": {
+      "enum": [
+        "improved",
+        "not_improved",
+        "inconclusive"
+      ]
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reason"
+      }
+    },
+    "attempts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "a",
+        "b"
+      ],
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/attempt"
+        },
+        "b": {
+          "$ref": "#/$defs/attempt"
+        }
+      }
+    },
+    "conditions_diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duration_s",
+        "pauses",
+        "level_dbfs",
+        "channel",
+        "format",
+        "gain",
+        "task",
+        "intent",
+        "backend"
+      ],
+      "properties": {
+        "duration_s": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "delta",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "type": "number",
+              "minimum": 0
+            },
+            "b": {
+              "type": "number",
+              "minimum": 0
+            },
+            "delta": {
+              "type": "number"
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "pauses": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "source",
+            "note"
+          ],
+          "properties": {
+            "a": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/pauses"
+                }
+              ]
+            },
+            "b": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/pauses"
+                }
+              ]
+            },
+            "source": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "level_dbfs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "delta",
+            "limit_db",
+            "exceeds",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "b": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "delta": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "limit_db": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "exceeds": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "channel": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "differs",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/channel"
+                }
+              ]
+            },
+            "b": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/channel"
+                }
+              ]
+            },
+            "differs": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "format": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "differs",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/format"
+                }
+              ]
+            },
+            "b": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/format"
+                }
+              ]
+            },
+            "differs": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "gain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "known",
+            "reason"
+          ],
+          "properties": {
+            "a": {
+              "type": "null"
+            },
+            "b": {
+              "type": "null"
+            },
+            "known": {
+              "const": false
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "task": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "known",
+            "differs",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "b": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "known": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "boolean"
+              }
+            },
+            "differs": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "intent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "known",
+            "differs",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "b": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "known": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "boolean"
+              }
+            },
+            "differs": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        },
+        "backend": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "a",
+            "b",
+            "differs",
+            "source"
+          ],
+          "properties": {
+            "a": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/backend"
+                }
+              ]
+            },
+            "b": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/backend"
+                }
+              ]
+            },
+            "differs": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "synthetic": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullable_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "category": {
+      "enum": [
+        "semantic_stress",
+        "pause_phrasing",
+        "pronunciation",
+        "completeness"
+      ]
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "ref",
+        "sha256"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "measurement",
+            "transcript",
+            "audio_model_observation",
+            "human_label",
+            "clip",
+            "artifact"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/nullable_sha256"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "polarity",
+        "start",
+        "end",
+        "observation",
+        "evidence_basis",
+        "evidence_refs"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/category"
+        },
+        "polarity": {
+          "enum": [
+            "negative",
+            "neutral",
+            "positive"
+          ]
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end": {
+          "type": "number",
+          "minimum": 0
+        },
+        "observation": {
+          "type": "string"
+        },
+        "evidence_basis": {
+          "enum": [
+            "audio_model_observation",
+            "human_verified"
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence_ref"
+          }
+        }
+      }
+    },
+    "unlocalized": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "observation",
+        "reason",
+        "correction",
+        "evidence_basis",
+        "evidence_refs"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/category"
+        },
+        "observation": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "no_timecodes",
+            "whole_clip"
+          ]
+        },
+        "correction": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_basis": {
+          "const": "audio_model_observation"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence_ref"
+          }
+        }
+      }
+    },
+    "speech_span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "start",
+        "end",
+        "evidence_basis"
+      ],
+      "properties": {
+        "name": {
+          "const": "speech_spans"
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end": {
+          "type": "number",
+          "minimum": 0
+        },
+        "evidence_basis": {
+          "const": "measurement"
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "request_id",
+        "result_sha256",
+        "status",
+        "audio_review",
+        "windows",
+        "reviewed",
+        "word_occurrences",
+        "evidence"
+      ],
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/run_id"
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "failed"
+          ]
+        },
+        "audio_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "completed",
+                "skipped",
+                "unavailable",
+                "failed"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "windows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/range"
+          }
+        },
+        "reviewed": {
+          "type": "boolean"
+        },
+        "word_occurrences": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "findings",
+            "unlocalized",
+            "measurements"
+          ],
+          "properties": {
+            "findings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/finding"
+              }
+            },
+            "unlocalized": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/unlocalized"
+              }
+            },
+            "measurements": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/speech_span"
+              }
+            }
+          }
+        }
+      }
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "attempt",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "audio_review_missing",
+            "criterion_not_reviewed",
+            "word_not_found",
+            "level_differs",
+            "level_unknown",
+            "channel_differs",
+            "channel_unknown",
+            "format_differs",
+            "format_unknown",
+            "task_differs",
+            "task_unknown",
+            "intent_differs",
+            "backend_differs",
+            "same_recording",
+            "unlocalized_observation",
+            "no_baseline_issue"
+          ]
+        },
+        "attempt": {
+          "enum": [
+            "a",
+            "b",
+            null
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "pauses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "speech_spans",
+        "pause_total_s"
+      ],
+      "properties": {
+        "speech_spans": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pause_total_s": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_channels",
+        "method",
+        "selected_channel"
+      ],
+      "properties": {
+        "source_channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_channel": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "format": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "container",
+        "codec",
+        "sample_rate"
+      ],
+      "properties": {
+        "container": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "codec": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_rate": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "model",
+        "revision",
+        "prompt_sha256",
+        "synthetic"
+      ],
+      "properties": {
+        "backend": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prompt_sha256": {
+          "$ref": "#/$defs/nullable_sha256"
+        },
+        "synthetic": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

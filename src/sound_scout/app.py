@@ -27,6 +27,8 @@ it are `skipped`. `report.write` checks and writes `result.json` and `report.md`
 marked complete except after a cancel: a repeat of a cancelled request is refused, never rerun.
 No stage is retried and the backend is called at most once (R11).
 
+`compare` reads two finished runs and compares them by one criterion (`sound_scout.comparison`).
+
 `stages` keeps the five keys of the contract: the channel choice is part of `prepare` and the
 findings part of `audio_review`; their own times are in the steps of the stage records.
 """
@@ -56,6 +58,7 @@ from sound_scout import (
     asr,
     channels,
     clips,
+    comparison,
     doctor,
     findings,
     guard,
@@ -90,8 +93,6 @@ NOT_REQUESTED_REASON = "слой не запрошен"
 CANCELLED_REASON = "отменён"
 SYNTHETIC_NOTE = "synthetic: test double, не доказательство способности слышать"
 HALLUCINATION_LIMITATION = "ASR: есть сегменты suspect_hallucination"
-MODEL_LIMITATION = "audio backend (заявлено моделью), ограничение: "
-MODEL_UNCERTAINTY = "audio backend (заявлено моделью), неопределённость: "
 QUALIFICATION_FLAGS = ("validated_ru", "diction_validated_ru", "prosody_validated_ru")
 EXPECTED_ERRORS = (
     ingest.IngestError,
@@ -204,6 +205,16 @@ def analyze(
         if interruption is None or interruption.code != CANCELLED:
             run = runs.complete_run(run)
         return Analysis(written, run, False)
+
+
+def compare(run_a: str, run_b: str, criterion: str, config: Config) -> comparison.Comparison:
+    """Attempt `run_a` (initial) against `run_b` (control) by one criterion (R07).
+
+    Both are `run_id`s of complete `analyze` runs under the data root; the result is written to
+    `<data_root>/compare/<compare_id>.json`. Nothing is run and no lock is taken: compare only
+    reads finished runs. Raises `comparison.CompareError` with its `code`, writing nothing.
+    """
+    return comparison.compare(run_a, run_b, criterion, config)
 
 
 def _checked_layers(layers: object) -> tuple[str, ...]:
@@ -665,8 +676,8 @@ def _assemble(
     if asr.SUSPECT_HALLUCINATION in fragments.get("asr", {}).get("flags", []):
         limitations.append(HALLUCINATION_LIMITATION)
     for prefix, key in (
-        (MODEL_LIMITATION, "model_limitations"),
-        (MODEL_UNCERTAINTY, "model_uncertainties"),
+        (review.MODEL_LIMITATION, "model_limitations"),
+        (review.MODEL_UNCERTAINTY, "model_uncertainties"),
     ):
         limitations += [prefix + text for text in review_fragment.get(key, [])]
     if not completed["prepare"]:

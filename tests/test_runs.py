@@ -110,6 +110,7 @@ def test_open_run_creates_private_run_dir_with_request_and_manifest(
         "identity_hash": identity_hash(IDENTITY),
         "created_at": request["created_at"],
         "package_version": __version__,
+        "task_context": None,
     }
     assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$", request["created_at"])
     assert json.loads((run.path / "manifest.json").read_text()) == {
@@ -122,6 +123,16 @@ def test_open_run_creates_private_run_dir_with_request_and_manifest(
     assert [entry.read_text().strip() for entry in index_entries] == [run.run_id]
     assert mode_of(index_entries[0]) == 0o600
     assert not any("passwd" in str(path) for path in data_root.rglob("*"))
+
+
+def test_request_json_records_the_task_context_of_the_identity(data_root: Path) -> None:
+    context = {"layers": ["sound"], "task": "прочитать абзац", "intent": None}
+
+    run = open_run("with-task", {**IDENTITY, "task_context": context}, data_root)
+    without = open_run("without-task", {"audio": None}, data_root)
+
+    assert json.loads((run.path / "request.json").read_text())["task_context"] == context
+    assert json.loads((without.path / "request.json").read_text())["task_context"] is None
 
 
 def test_open_run_rejects_empty_request_id(data_root: Path) -> None:

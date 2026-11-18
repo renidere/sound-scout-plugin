@@ -69,6 +69,9 @@ TIMECODE_FIELDS = ("start_seconds", "end_seconds")
 UNLOCALIZED_FIELDS = tuple(name for name in OBSERVATION_FIELDS if name not in TIMECODE_FIELDS)
 TEXT_FIELDS = ("observation", "confidence_note", "impact")
 TRUSTED_FIELD_NAMES = ("clip_id", "duration_s", "task", "intent")
+# How app puts the response's limitations and uncertainties into `provenance.limitations`.
+MODEL_LIMITATION = "audio backend (заявлено моделью), ограничение: "
+MODEL_UNCERTAINTY = "audio backend (заявлено моделью), неопределённость: "
 SERVER_ONLY_FIELDS = {
     "human_verified": "human_verified is set only by a human evidence record (R05)",
     "approved": "approval is never taken from a model response (R09)",

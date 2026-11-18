@@ -6,7 +6,8 @@ and the existing run stays untouched. The identity hash is SHA-256 of canonical 
 R11 fields; a field not known yet is present but empty (null). The data root comes from the
 operator configuration (`config.Config.data_root`), never from a tool argument.
 
-Layout: `<data_root>/runs/<run_id>/` (0700) holds `request.json` and `manifest.json` (0600);
+Layout: `<data_root>/runs/<run_id>/` (0700) holds `request.json` (with the request's
+`task_context`, read by `comparison`) and `manifest.json` (0600);
 `<data_root>/runs/by-request/<sha256(request_id)>` names the run of a request, so a raw
 request ID never becomes a path segment. Run directories are created exclusively and are never
 overwritten; the index entry is published with a hard link, so it either names a run or does
@@ -109,6 +110,7 @@ def open_run(request_id: str, identity: Mapping[str, object], data_root: Path) -
                 "identity_hash": digest,
                 "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "package_version": __version__,
+                "task_context": identity.get("task_context"),
             },
         )
         _write_private_json(run_dir / MANIFEST_FILE_NAME, {"run_id": run_id, "complete": False})
