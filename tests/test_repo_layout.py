@@ -95,6 +95,47 @@ def test_readme_describes_installation_and_checks() -> None:
         assert fragment in readme, fragment
 
 
+def test_readme_status_names_chosen_backend_and_unpassed_gates() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    status = " ".join(readme.split("Статус:", 1)[1].split("\n\n", 1)[0].split())
+    assert "не выбран" not in readme
+    for fragment in (
+        "Gemma 4 E4B-it",
+        "llama.cpp",
+        "только локально",
+        "`docs/decisions/0001-audio-backend.md`",
+        "Gate 0 на реальном аудио не пройден",
+        "русская квалификация (Gate 1) не пройдена",
+        "подключение к Hermes не выполнено",
+        "инструмент не считается готовым",
+    ):
+        assert fragment in status, fragment
+    assert "validated_ru" not in readme
+    assert "`ready`" not in status
+    assert "слыш" not in status.lower()
+    assert not re.search(r"/home/|/Users/|[A-Z]:\\", readme)
+
+
+def test_readme_backend_link_resolves_to_owner_decision_and_dependencies() -> None:
+    decision = REPO_ROOT / "docs" / "decisions" / "0001-audio-backend.md"
+    assert decision.is_file()
+    assert "Gemma 4 E4B-it — **выбрана**" in decision.read_text(encoding="utf-8")
+    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
+    backend = " ".join(dependencies.split("## 3. Audio-understanding backend", 1)[1].split())
+    assert "**Gemma 4 E4B-it** в GGUF через llama.cpp, только локально" in backend
+
+
+def test_readme_makes_no_claim_that_a_model_hears_speech() -> None:
+    readme = " ".join((REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
+    lowered = readme.lower()
+    for phrase in ("слышит русскую речь", "оценивает произношение"):
+        assert phrase not in lowered, phrase
+    negated_hearing = re.compile(r"\bне\s+(?:\S+\s+){0,4}?\S*слыш|не доказывает, что \S+ слыш")
+    sentences = [s for s in re.split(r"(?<=[.:;])\s+", lowered) if "слыш" in s]
+    for sentence in sentences:
+        assert negated_hearing.search(sentence), sentence
+
+
 def test_conftest_synthesizes_wav_and_no_media_files_in_git(wav_file: Path) -> None:
     assert (REPO_ROOT / "tests" / "conftest.py").is_file()
     assert wav_file.is_file() and not wav_file.is_relative_to(REPO_ROOT)
