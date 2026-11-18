@@ -36,7 +36,10 @@ VAD_THRESHOLD = 0.5
 VAD_MIN_SILENCE_MS = 300
 VAD_MIN_SPEECH_MS = 100
 VAD_PAD_MS = 0
-VAD_TAIL_SAMPLES = VAD_RATE * VAD_MIN_SILENCE_MS // 1000 + 2 * VAD_WINDOW_SAMPLES
+VAD_WINDOW_MS = 1000 * VAD_WINDOW_SAMPLES // VAD_RATE
+# The detector closes a span up to this many windows after speech ends (docs/decisions/0003).
+VAD_END_LAG_WINDOWS = 2
+VAD_TAIL_SAMPLES = VAD_RATE * VAD_MIN_SILENCE_MS // 1000 + VAD_END_LAG_WINDOWS * VAD_WINDOW_SAMPLES
 F0_FLOOR_HZ = 50.0
 F0_CEILING_HZ = 600.0
 F0_SILENCE_THRESHOLD = 0.03
@@ -69,8 +72,10 @@ LIMITATIONS = {
     ],
     "speech_spans": [
         VAD_PAUSE_LIMITATION,
-        f"boundaries are quantised to the detector's {1000 * VAD_WINDOW_SAMPLES // VAD_RATE} ms "
-        "windows and the end can lag the signal by up to two windows",
+        f"boundaries are quantised to the detector's {VAD_WINDOW_MS} ms windows: the start is "
+        "within one window of the speech onset and the end can lag the end of speech by up to "
+        f"{VAD_END_LAG_WINDOWS} windows ({VAD_END_LAG_WINDOWS * VAD_WINDOW_MS} ms), as measured "
+        "on a synthetic control, not on real speech",
         "the detector runs on a 16 kHz copy made for it alone; the spans are reported on the "
         "time scale of the original signal",
         "a speech span says only that speech was detected, not what was said or how",
@@ -324,7 +329,7 @@ def _vad_settings(rate: int, spans: list[dict] | None) -> dict:
         "min_speech_duration_ms": VAD_MIN_SPEECH_MS,
         "speech_pad_ms": VAD_PAD_MS,
         "detector_sample_rate": VAD_RATE,
-        "window_ms": 1000 * VAD_WINDOW_SAMPLES // VAD_RATE,
+        "window_ms": VAD_WINDOW_MS,
         "resampled_for_detector": rate != VAD_RATE,
         "resampler": None
         if rate == VAD_RATE

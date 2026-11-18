@@ -4,6 +4,8 @@ The speech-like control signal is synthesised with Praat's KlattGrid (formant sy
 alternating vowels at a set pitch), not recorded: Silero VAD does not take burst noise or a pure
 tone for speech, so a tone is tested through `acoustic_track` with given spans, and `measure`
 end to end through the formant synthesis. The detector and Praat run for real; nothing is mocked.
+The boundary tolerance the span tests assert (start 50 ms, end two VAD windows) and the choice
+of the control are recorded in `docs/decisions/0003-vad-boundary-tolerance.md`.
 """
 
 import json
@@ -36,6 +38,7 @@ VOWEL_FORMANTS = (
 BANDWIDTHS = (50, 60, 100, 120)
 VAD_WINDOW_S = acoustics.VAD_WINDOW_SAMPLES / acoustics.VAD_RATE
 BOUNDARY_TOLERANCE_S = 0.05
+END_TOLERANCE_S = acoustics.VAD_END_LAG_WINDOWS * VAD_WINDOW_S
 
 
 def sine(frequency: float, seconds: float = 2.0, rate: int = RATE, amplitude: float = 0.2):
@@ -155,18 +158,14 @@ def test_signal_shorter_than_a_tenth_of_a_second_gives_null_with_the_reason() ->
 
 
 @pytest.mark.parametrize(("rate", "start_s"), [(RATE, 1.0), (48_000, 0.75), (44_100, 1.0)])
-def test_speech_like_signal_gives_one_span_within_50_ms_on_the_original_scale(
+def test_speech_like_signal_gives_one_span_within_the_declared_tolerance_on_the_original_scale(
     rate: int, start_s: float
 ) -> None:
     """One utterance at three native rates: the span lands on the original time scale.
 
-    The issue names speech-like burst noise as the control; Silero VAD does not take noise for
-    speech, so the control is formant-synthesised vowels (`speech_like`). The detector decides
-    per 32 ms window and its end lags by up to two windows: over a sweep of onsets 0.5–1.5 s at a
-    7 ms step at 16 kHz the start was within 23 ms and the end within 53 ms of the truth, so the
-    50 ms of the issue is not met for every placement, and the deviation is recorded on the
-    issue. The placements here are ordinary ones, not chosen to pass; the spans must agree
-    across the three rates.
+    The control is formant-synthesised vowels (`speech_like`), because the detector does not
+    take noise for speech. The tolerance is the declared one: the start within 50 ms, the end
+    within two detector windows (see `docs/decisions/0003` and the onset sweep below).
     """
     speech = speech_like(1.2, rate)
     audio = place(speech, start_s, 4.0, rate)
@@ -179,7 +178,7 @@ def test_speech_like_signal_gives_one_span_within_50_ms_on_the_original_scale(
     spans = values["speech_spans"]["value"]
     assert len(spans) == 1, spans
     assert spans[0]["start"] == pytest.approx(start_s, abs=BOUNDARY_TOLERANCE_S)
-    assert spans[0]["end"] == pytest.approx(start_s + 1.2, abs=BOUNDARY_TOLERANCE_S)
+    assert spans[0]["end"] == pytest.approx(start_s + 1.2, abs=END_TOLERANCE_S)
     settings = values["speech_spans"]["settings"]
     assert settings["min_silence_duration_ms"] == 300
     assert settings["speech_pad_ms"] == 0
@@ -193,6 +192,32 @@ def test_speech_like_signal_gives_one_span_within_50_ms_on_the_original_scale(
     assert values["rms_dbfs"]["value"]["p10"] <= values["rms_dbfs"]["value"]["p50"] <= 0.0
 
 
+def test_onset_sweep_keeps_the_start_within_50_ms_and_the_end_within_two_windows() -> None:
+    """The declared tolerance holds at every onset, not at placements picked to pass.
+
+    One synthesised utterance is shifted to 143 onsets 0.5–1.5 s at a 7 ms step (more than a
+    detector window at a step finer than it); the real Silero VAD runs on each placement. The
+    start is held to the limitation's own bound, one detector window, not only to the 50 ms
+    of the fixed placements above.
+    """
+    speech = speech_like(1.2, RATE)
+    start_errors, end_errors = [], []
+
+    for start_s in np.arange(0.5, 1.5 + 1e-9, 0.007):
+        start_s = float(start_s)
+        spans = speech_activity(place(speech, start_s, 4.0, RATE), RATE)
+
+        assert len(spans) == 1, (start_s, spans)
+        assert spans[0]["start"] == pytest.approx(start_s, abs=BOUNDARY_TOLERANCE_S), start_s
+        assert spans[0]["end"] == pytest.approx(start_s + 1.2, abs=END_TOLERANCE_S), start_s
+        start_errors.append(spans[0]["start"] - start_s)
+        end_errors.append(spans[0]["end"] - (start_s + 1.2))
+
+    assert len(start_errors) == 143
+    assert 0 < max(np.abs(start_errors)) <= VAD_WINDOW_S < BOUNDARY_TOLERANCE_S, start_errors
+    assert 0 < max(np.abs(end_errors)) <= END_TOLERANCE_S, end_errors
+
+
 @pytest.mark.parametrize("tail_s", [0.05, 0.29], ids=["tail_50ms", "tail_290ms"])
 def test_an_utterance_ending_inside_the_last_300_ms_ends_where_it_ends_not_at_eof(
     tail_s: float,
@@ -203,7 +228,7 @@ def test_an_utterance_ending_inside_the_last_300_ms_ends_where_it_ends_not_at_eo
     spans = speech_activity(audio, RATE)
 
     assert len(spans) == 1, spans
-    assert spans[0]["end"] == pytest.approx(2.2, abs=BOUNDARY_TOLERANCE_S)
+    assert spans[0]["end"] == pytest.approx(2.2, abs=END_TOLERANCE_S)
     assert spans[0]["end"] < 2.2 + tail_s
 
 
@@ -225,9 +250,9 @@ def test_two_utterances_with_a_pause_give_two_spans_and_the_pause_is_not_a_findi
 
     assert len(spans) == 2, spans
     assert spans[0]["start"] == pytest.approx(0.5, abs=BOUNDARY_TOLERANCE_S)
-    assert spans[0]["end"] == pytest.approx(1.3, abs=BOUNDARY_TOLERANCE_S)
+    assert spans[0]["end"] == pytest.approx(1.3, abs=END_TOLERANCE_S)
     assert spans[1]["start"] == pytest.approx(2.3, abs=BOUNDARY_TOLERANCE_S)
-    assert spans[1]["end"] == pytest.approx(3.1, abs=BOUNDARY_TOLERANCE_S)
+    assert spans[1]["end"] == pytest.approx(3.1, abs=END_TOLERANCE_S)
     limitations = " ".join(by_name(measure(audio, RATE))["speech_spans"]["limitations"])
     assert "not a hesitation" in limitations
 
@@ -239,9 +264,29 @@ def test_limitations_name_digital_level_vad_pause_and_octave_errors() -> None:
     assert "digital level" in rms and "not the loudness of the voice" in rms
     spans = " ".join(values["speech_spans"]["limitations"])
     assert "VAD pause is not a hesitation" in spans
+    assert f"{acoustics.VAD_WINDOW_MS} ms windows: the start is within one window" in spans
+    assert round(VAD_WINDOW_S * 1000) == acoustics.VAD_WINDOW_MS
+    lag_ms = acoustics.VAD_END_LAG_WINDOWS * acoustics.VAD_WINDOW_MS
+    assert f"{acoustics.VAD_END_LAG_WINDOWS} windows ({lag_ms} ms)" in spans
+    assert lag_ms == round(END_TOLERANCE_S * 1000)
     f0 = " ".join(values["f0_hz"]["limitations"])
     assert "octave errors" in f0.lower()
     assert "not expressiveness" in f0
+
+
+def test_vad_settings_are_the_declared_detector_parameters_and_not_changed_silently() -> None:
+    """The tolerance is documented, not bought by retuning the detector (R04, issue #55)."""
+    settings = by_name(measure(place(speech_like(1.2, RATE), 1.0, 4.0, RATE), RATE))[
+        "speech_spans"
+    ]["settings"]
+
+    assert settings["threshold"] == 0.5
+    assert settings["min_silence_duration_ms"] == 300
+    assert settings["min_speech_duration_ms"] == 100
+    assert settings["speech_pad_ms"] == 0
+    assert settings["detector_sample_rate"] == 16_000
+    assert settings["window_ms"] == 32 == acoustics.VAD_WINDOW_MS
+    assert acoustics.VAD_TAIL_SAMPLES == 16_000 * 300 // 1000 + 2 * 512
 
 
 def test_measures_the_given_signal_and_never_applies_gain_itself() -> None:
