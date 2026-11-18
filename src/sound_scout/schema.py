@@ -100,7 +100,7 @@ def validate(result: object) -> None:
 
 def validation_errors(result: object) -> list[str]:
     """Every violation as `<json path>: <message>`; cross-field rules run only on a sound shape."""
-    errors = _non_finite_numbers(result, "$")
+    errors = _non_finite_numbers(SCHEMA, result)
     errors += schema_errors(SCHEMA, result)
     if errors:
         return errors
@@ -128,14 +128,57 @@ def validation_errors(result: object) -> list[str]:
     )
 
 
-def _non_finite_numbers(value: object, path: str) -> list[str]:
+def _non_finite_numbers(schema: dict, document: object) -> list[str]:
+    """NaN/Infinity anywhere in `document`, before its schema check. A path names only keys
+    `schema` declares: any other key is text of the document, so a number under it is reported
+    at the object holding the key (R09, R11)."""
+    return list(dict.fromkeys(_non_finite(document, "$", [schema], schema)))
+
+
+def _non_finite(value: object, path: str, schemas: list, root: dict) -> list[str]:
     if isinstance(value, float) and not math.isfinite(value):
         return [f"{path}: NaN/Infinity is not allowed, use null"]
+    schemas = _alternatives(schemas, root)
+    errors = []
     if isinstance(value, dict):
-        return [e for k, v in value.items() for e in _non_finite_numbers(v, f"{path}.{k}")]
+        for key, item in value.items():
+            declared = [s["properties"][key] for s in schemas if key in s.get("properties", {})]
+            if declared:
+                errors += _non_finite(item, f"{path}.{key}", declared, root)
+            elif _has_non_finite(item):
+                errors.append(f"{path}: NaN/Infinity under an undeclared key is not allowed")
+    elif isinstance(value, list):
+        items = [s["items"] for s in schemas if isinstance(s.get("items"), dict)]
+        for i, item in enumerate(value):
+            errors += _non_finite(item, f"{path}[{i}]", items, root)
+    return errors
+
+
+def _alternatives(schemas: list, root: dict) -> list[dict]:
+    """The subschemas a value may match: local `$ref`s resolved, `oneOf`/`anyOf`/`allOf` opened."""
+    found = []
+    for subschema in schemas:
+        if not isinstance(subschema, dict):
+            continue
+        found.append(subschema)
+        if "$ref" in subschema:
+            target = root
+            for part in subschema["$ref"].removeprefix("#/").split("/"):
+                target = target[part]
+            found += _alternatives([target], root)
+        for keyword in ("oneOf", "anyOf", "allOf"):
+            found += _alternatives(subschema.get(keyword, []), root)
+    return found
+
+
+def _has_non_finite(value: object) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_has_non_finite(item) for item in value.values())
     if isinstance(value, list):
-        return [e for i, v in enumerate(value) for e in _non_finite_numbers(v, f"{path}[{i}]")]
-    return []
+        return any(_has_non_finite(item) for item in value)
+    return False
 
 
 def _timecode_errors(result: dict) -> list[str]:
@@ -400,7 +443,7 @@ def _cost_errors(result: dict) -> list[str]:
     if kind in ("actual", "estimated") and amount == 0 and cost["provider"] not in _LOCAL_PROVIDERS:
         errors.append(
             f"$.cost.amount: zero {kind} cost is only accepted for providers "
-            f"{list(_LOCAL_PROVIDERS)}, got provider {cost['provider']!r}"
+            f"{list(_LOCAL_PROVIDERS)}"
         )
     return errors
 
@@ -475,13 +518,13 @@ def _category_errors(result: dict) -> list[str]:
             path, category = f"$.{name}[{i}].category", item["category"]
             basis = item["evidence_basis"]
             if _normalized(category) in FORBIDDEN_CATEGORIES:
-                errors.append(f"{path}: forbidden inference {category!r} (R04, R06)")
+                errors.append(f"{path}: names a forbidden inference (R04, R06)")
             elif category not in CATEGORY_BASES:
-                errors.append(f"{path}: {category!r} is not in the category dictionary")
+                errors.append(f"{path}: not in the category dictionary (R04, R06)")
             elif basis not in CATEGORY_BASES[category]:
                 errors.append(
-                    f"{path}: {category!r} cannot rest on evidence_basis {basis!r}, "
-                    f"only on {list(CATEGORY_BASES[category])}"
+                    f"{path}: this category cannot rest on evidence_basis {basis!r}, "
+                    f"only on {list(CATEGORY_BASES[category])} (R04, R06)"
                 )
     return errors
 

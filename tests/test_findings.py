@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from sound_scout import asr, findings, ingest, review, schema
+from sound_scout._schema_messages import schema_errors
 from sound_scout.clips import Clip, cut
 from sound_scout.config import Config
 from sound_scout.eval import manifest
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 IDENTITY = {"audio": None, "model": None, "preprocessing": None, "ranges": None}
 SOURCE_DURATION = 2.5
+MARKER = "MARKER-a1b2c3"
 CLIP_START, CLIP_END = 0.85, 1.65  # cut(1.0, 1.5) padded by 150 ms
 NEGATIVE = {
     "category": "pronunciation",
@@ -591,16 +593,66 @@ def test_unlocalized_observation_is_bounded_by_coverage(doc: dict) -> None:
 @pytest.mark.parametrize("field", ["findings", "unlocalized"])
 def test_forbidden_inferences_are_rejected(doc: dict, field: str, category: str) -> None:
     doc[field][0]["category"] = category
-    assert_rejected(doc, f"$.{field}[0].category: forbidden inference {category!r} (R04, R06)")
+    errors = assert_rejected(doc, f"$.{field}[0].category: names a forbidden inference (R04, R06)")
+    assert not any(category in error for error in errors), errors
 
 
 def test_category_outside_the_dictionary_or_off_its_basis_is_rejected(doc: dict) -> None:
     doc["findings"][0]["category"] = "charm"
-    assert_rejected(doc, "$.findings[0].category: 'charm' is not in the category dictionary")
+    assert_rejected(doc, "$.findings[0].category: not in the category dictionary (R04, R06)")
     doc["findings"][0]["category"] = "tempo"
-    assert_rejected(doc, "'tempo' cannot rest on evidence_basis 'audio_model_observation'")
+    assert_rejected(
+        doc,
+        "$.findings[0].category: this category cannot rest on evidence_basis "
+        "'audio_model_observation', only on ['measurement'] (R04, R06)",
+    )
     doc["unlocalized"][0]["category"] = "filler_words"
-    assert_rejected(doc, "$.unlocalized[0].category: 'filler_words' cannot rest on")
+    assert_rejected(
+        doc,
+        "$.unlocalized[0].category: this category cannot rest on evidence_basis "
+        "'audio_model_observation', only on ['transcript'] (R04, R06)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "fragment"),
+    [
+        (MARKER, "not in the category dictionary (R04, R06)"),
+        (f"emotion {MARKER}", "not in the category dictionary (R04, R06)"),
+        (" Self-Confidence ", "names a forbidden inference (R04, R06)"),
+    ],
+)
+@pytest.mark.parametrize("field", ["findings", "unlocalized"])
+def test_category_errors_do_not_quote_the_category(
+    doc: dict, field: str, category: str, fragment: str
+) -> None:
+    doc[field][0]["category"] = category
+    assert not schema_errors(schema.SCHEMA, doc)
+    errors = assert_rejected(doc, f"$.{field}[0].category: {fragment}")
+    with pytest.raises(ResultValidationError) as excinfo:
+        schema.validate(doc)
+    for text in (*errors, str(excinfo.value)):
+        assert MARKER not in text and category.strip() not in text, text
+
+
+@pytest.mark.parametrize(
+    ("field", "category", "allowed"),
+    [("findings", "tempo", "['measurement']"), ("unlocalized", "filler_words", "['transcript']")],
+)
+def test_category_on_a_wrong_basis_error_does_not_quote_the_category(
+    doc: dict, field: str, category: str, allowed: str
+) -> None:
+    doc[field][0]["category"] = category
+    assert not schema_errors(schema.SCHEMA, doc)
+    errors = assert_rejected(
+        doc,
+        f"$.{field}[0].category: this category cannot rest on evidence_basis "
+        f"'audio_model_observation', only on {allowed} (R04, R06)",
+    )
+    with pytest.raises(ResultValidationError) as excinfo:
+        schema.validate(doc)
+    for text in (*errors, str(excinfo.value)):
+        assert category not in text, text
 
 
 def measured(doc: dict, category: str, polarity: str = "neutral") -> dict:
@@ -620,7 +672,11 @@ def test_sound_category_cannot_rest_on_a_measurement(doc: dict) -> None:
     doc["findings"].append(measured(doc, "pitch_range"))
     findings.validate(doc)
     doc["findings"][-1]["category"] = "semantic_stress"
-    assert_rejected(doc, "'semantic_stress' cannot rest on evidence_basis 'measurement'")
+    assert_rejected(
+        doc,
+        "$.findings[2].category: this category cannot rest on evidence_basis 'measurement', "
+        "only on ['audio_model_observation', 'human_verified'] (R04, R06)",
+    )
     doc["findings"][-1]["evidence_refs"][0]["sha256"] = "ab" * 32
     assert_rejected(doc, "evidence_refs[0].sha256: must be null for a measurement")
 

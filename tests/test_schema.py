@@ -285,9 +285,7 @@ def test_nan_and_infinity_are_rejected_but_null_passes(doc: dict, value: float) 
     assert_rejected(doc, "$.measurements[0].value: NaN/Infinity is not allowed, use null")
     doc = deepcopy(EXAMPLE_DOC)
     doc["measurements"][1]["settings"]["threshold"] = [1.0, {"depth": value}]
-    assert_rejected(
-        doc, "$.measurements[1].settings.threshold[1].depth: NaN/Infinity is not allowed"
-    )
+    assert_rejected(doc, "$.measurements[1].settings: NaN/Infinity under an undeclared key")
     doc = deepcopy(EXAMPLE_DOC)
     doc["measurements"][0].update(value=None, reason="synthetic: not obtained")
     validate(doc)
@@ -602,6 +600,37 @@ def test_validated_ru_requires_both_layer_flags_and_a_backend(doc: dict) -> None
     assert_rejected(doc, "$.capabilities.validated_ru: requires a selected audio_backend")
     doc["capabilities"]["audio_backend"] = {"name": "test-double", "model": None, "revision": None}
     validate(doc)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    ("place", "path"),
+    [
+        ((), "$"),
+        (("stages",), "$.stages"),
+        (("measurements", 1, "settings"), "$.measurements[1].settings"),
+    ],
+)
+def test_non_finite_number_under_an_undeclared_key_names_its_parent(
+    doc: dict, value: float, place: tuple, path: str
+) -> None:
+    target = doc
+    for step in place:
+        target = target[step]
+    target[RESULT_TEXT] = {"nested": [value]}
+    errors = validation_errors(doc)
+    assert f"{path}: NaN/Infinity under an undeclared key is not allowed" in errors, errors
+    assert not any(RESULT_TEXT in error for error in errors), errors
+
+
+@pytest.mark.parametrize("kind", ["actual", "estimated"])
+def test_zero_cost_error_names_allowed_providers_not_the_given_one(doc: dict, kind: str) -> None:
+    doc["cost"].update(kind=kind, amount=0, provider=RESULT_TEXT)
+    with pytest.raises(ResultValidationError) as excinfo:
+        validate(doc)
+    expected = f"$.cost.amount: zero {kind} cost is only accepted for providers ['local', 'none']"
+    assert expected in excinfo.value.errors
+    assert RESULT_TEXT not in str(excinfo.value)
 
 
 def test_cost_rules(doc: dict) -> None:

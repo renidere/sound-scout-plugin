@@ -535,7 +535,8 @@ def _load_manifest(path: Path) -> tuple[bytes, list[dict]]:
         document = json.loads(data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise EvalError(f"manifest cannot be read: {type(error).__name__}") from error
-    errors = _non_finite_numbers(document, "$") + schema_errors(manifest.SCHEMA, document)
+    errors = _non_finite_numbers(manifest.SCHEMA, document)
+    errors += schema_errors(manifest.SCHEMA, document)
     if errors:
         raise EvalError("manifest does not match its schema:\n" + "\n".join(errors))
     return data, document["records"]

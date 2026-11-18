@@ -297,6 +297,17 @@ def test_missing_or_unreadable_manifest_file_is_an_error_not_an_exception(tmp_pa
     assert validate(tmp_path).errors[0].startswith("$: cannot read manifest:")
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("-inf")])
+def test_non_finite_number_under_an_undeclared_key_names_its_parent(
+    doc: dict, value: float
+) -> None:
+    marker = "MARKER-a1b2c3"
+    doc[marker] = [{"x": value}]
+    errors = validation_report(doc).errors
+    assert "$: NaN/Infinity under an undeclared key is not allowed" in errors, errors
+    assert not any(marker in error for error in errors), errors
+
+
 @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "1e999"])
 def test_non_finite_duration_is_rejected_before_the_schema(
     tmp_path: Path, doc: dict, raw: str

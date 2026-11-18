@@ -77,7 +77,7 @@ def validate(path: str | Path) -> LabelsReport:
 
 def validation_report(labels: object) -> LabelsReport:
     """Every violation as `<json path>: <message>`; the rules run only on a sound shape."""
-    errors = _non_finite_numbers(labels, "$")
+    errors = _non_finite_numbers(SCHEMA, labels)
     errors += schema_errors(SCHEMA, labels)
     if errors:
         return LabelsReport(errors)

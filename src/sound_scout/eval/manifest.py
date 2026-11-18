@@ -70,7 +70,7 @@ def validate(path: str | Path) -> ManifestReport:
 
 def validation_report(manifest: object) -> ManifestReport:
     """Every violation as `<json path>: <message>`; record rules run only on a sound shape."""
-    errors = _non_finite_numbers(manifest, "$")
+    errors = _non_finite_numbers(SCHEMA, manifest)
     errors += schema_errors(SCHEMA, manifest)
     if errors:
         return ManifestReport(errors, _empty_coverage())

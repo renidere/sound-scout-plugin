@@ -213,7 +213,7 @@ def compare(run_a: object, run_b: object, criterion_text: object, config: Config
         raise CompareError(SAME_RUN, "the two attempts are the same run")
     a, b = load_attempt(run_a, config), load_attempt(run_b, config)
     result = build(criterion, a, b)
-    errors = schema._non_finite_numbers(result, "$") + schema_errors(SCHEMA, result)
+    errors = schema._non_finite_numbers(SCHEMA, result) + schema_errors(SCHEMA, result)
     if errors:
         raise ValueError("comparison does not match compare.v1:\n" + "\n".join(errors))
     compare_dir = config.data_root / COMPARE_DIR_NAME

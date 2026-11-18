@@ -266,6 +266,17 @@ def test_non_finite_number_is_rejected_before_the_schema(
     assert report.errors[0] == "$.clip_duration_s: NaN/Infinity is not allowed, use null"
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("-inf")])
+def test_non_finite_number_under_an_undeclared_key_names_its_parent(
+    doc: dict, value: float
+) -> None:
+    marker = "MARKER-a1b2c3"
+    doc[marker] = [{"x": value}]
+    errors = validation_report(doc).errors
+    assert "$: NaN/Infinity under an undeclared key is not allowed" in errors, errors
+    assert not any(marker in error for error in errors), errors
+
+
 def test_main_prints_each_file_and_exits_non_zero_on_any_invalid(tmp_path: Path, capsys) -> None:
     good = write(tmp_path, valid_labels())
     assert main([str(good)]) == 0
