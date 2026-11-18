@@ -4,7 +4,11 @@
 size, through `ffprobe`. The input is judged by its content, never by its extension: the
 container and codec `ffprobe` finds must be a row of `SUPPORTED_FORMATS` (R02: WAV PCM, MP3,
 OGG/Opus, M4A/AAC) and the file must hold exactly one audio stream and nothing else; anything
-else is refused as `unsupported_format` with the container, codec or stream named. `decode`
+else is refused as `unsupported_format` with the container, codec or stream named. The
+container is pinned at the decoder too: `ffprobe` and `ffmpeg` run with `-format_whitelist`
+of the `SUPPORTED_FORMATS` demuxers, so a playlist or script renamed to `.wav` (concat, hls)
+is refused before its demuxer opens a single file it names, and `ffmpeg` decodes with `-f`
+set to the demuxer `ffprobe` found. `decode`
 writes two files into the run directory and nothing else: `source.json` (SHA-256 of the
 original, its metadata, the source ID, the limits applied and the declared-vs-actual duration
 check) and `work/decoded.f32` — the audio stream as raw little-endian float32 PCM, interleaved,
@@ -38,6 +42,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -65,6 +70,8 @@ SUPPORTED_FORMATS: dict[str, frozenset[str]] = {
     "ogg": frozenset({"opus"}),
     "mov,mp4,m4a,3gp,3g2,mj2": frozenset({"aac"}),
 }
+FORMAT_WHITELIST = ",".join(SUPPORTED_FORMATS)
+_NOT_ON_WHITELIST = re.compile(r"\[(\S+) @ 0x[0-9a-f]+\] Format not on whitelist")
 
 INPUT_TOO_LARGE = "input_too_large"
 NOT_AUDIO = "not_audio"
@@ -197,12 +204,15 @@ def _probe_open(file: BinaryIO, resolved: Path, config: Config) -> Probe:
             "json",
             "-show_format",
             "-show_streams",
+            "-format_whitelist",
+            FORMAT_WHITELIST,
             str(resolved),
         ),
         config,
         max_output_bytes=PROBE_OUTPUT_LIMIT,
     )
     _require_in_time(result, "ffprobe", config)
+    _require_whitelisted(result)
     if result.returncode != 0 or result.truncated:
         code = CORRUPTED if looks_like_wav else NOT_AUDIO
         raise IngestError(code, f"ffprobe failed: {_stderr_tail(result)}")
@@ -224,6 +234,15 @@ def _probe_open(file: BinaryIO, resolved: Path, config: Config) -> Probe:
             f"declared duration {probed.declared_duration_s} s, the limit is {max_duration} s",
         )
     return probed
+
+
+def _require_whitelisted(result: RunResult) -> None:
+    """A demuxer off the whitelist is a format refusal, not a damaged or non-audio file."""
+    if result.returncode == 0:
+        return
+    found = _NOT_ON_WHITELIST.search(result.stderr.decode("utf-8", errors="replace"))
+    if found:
+        raise IngestError(UNSUPPORTED_FORMAT, f"container {found[1]!r} is not supported")
 
 
 def _parse_probe(data: dict[str, object], size: int) -> Probe | None:
@@ -314,6 +333,10 @@ def _decode_samples(resolved: Path, probed: Probe, config: Config) -> bytes:
             "-v",
             "error",
             "-xerror",
+            "-format_whitelist",
+            FORMAT_WHITELIST,
+            "-f",
+            probed.container.split(",")[0],
             "-i",
             str(resolved),
             "-map",

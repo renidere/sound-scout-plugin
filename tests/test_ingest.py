@@ -531,6 +531,92 @@ def test_refuses_a_container_or_codec_outside_the_table(
     assert_refused(path, run, config, "unsupported_format", reason)
 
 
+PLAYLISTS = {
+    "ffconcat": ("ffconcat version 1.0\nfile other.wav\n", {"unsupported_format"}),
+    # FFmpeg 7.1+ does not detect hls in a file named `.wav` at all; older ones detect it and
+    # the format whitelist refuses it.
+    "m3u8": (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nother.wav\n#EXT-X-ENDLIST\n",
+        {"not_audio", "unsupported_format"},
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", PLAYLISTS)
+def test_a_playlist_renamed_to_wav_is_refused_without_opening_what_it_names(
+    root: Path, run: Run, config: Config, kind: str
+) -> None:
+    """`other.wav` is missing: a demuxer that tried to open it would fail on "not found"."""
+    text, codes = PLAYLISTS[kind]
+    path = root / "voice.wav"
+    path.write_text(text)
+
+    with pytest.raises(IngestError) as info:
+        decode(path, run, config)
+
+    assert info.value.code in codes
+    assert "No such file" not in info.value.message
+    assert run_dir_entries(run) == {"request.json", "manifest.json"}
+
+
+def test_a_renamed_ffconcat_is_refused_for_its_format(root: Path, run: Run, config: Config) -> None:
+    path = root / "voice.wav"
+    path.write_text(PLAYLISTS["ffconcat"][0])
+
+    with pytest.raises(IngestError, match="container 'concat' is not supported") as info:
+        probe(path, config)
+    assert info.value.code == "unsupported_format"
+    assert_refused(path, run, config, "unsupported_format", "container 'concat' is not supported")
+
+
+@pytest.mark.parametrize("kind", PLAYLISTS)
+def test_a_file_named_by_the_playlist_is_never_opened(
+    root: Path, run: Run, config: Config, kind: str
+) -> None:
+    """`other.wav` exists as a FIFO without a writer: opening it would block until the timeout."""
+    text, codes = PLAYLISTS[kind]
+    os.mkfifo(root / "other.wav")
+    path = root / "voice.wav"
+    path.write_text(text)
+    bounded = Config(config.allowed_roots, config.data_root, Budgets(max_subprocess_seconds=10))
+
+    with pytest.raises(IngestError) as info:
+        decode(path, run, bounded)
+
+    assert info.value.code in codes
+    assert run_dir_entries(run) == {"request.json", "manifest.json"}
+
+
+def test_decoder_calls_pin_the_format_and_restrict_protocols_and_stdin(
+    tone: Path, run: Run, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    real_run = ingest.run
+
+    def recording(argv: list[str], **kwargs: object) -> object:
+        calls.append(list(argv))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(ingest, "run", recording)
+    decode(tone, run, config)
+
+    assert ingest.FORMAT_WHITELIST == "wav,mp3,ogg,mov,mp4,m4a,3gp,3g2,mj2"
+    ffprobe, ffmpeg = calls
+    assert ffprobe[0] == "ffprobe" and ffprobe[-1] == str(tone)
+    assert ffmpeg[0] == "ffmpeg" and ffmpeg.count("-i") == 1
+    before_input = ffmpeg[: ffmpeg.index("-i")]
+    assert "-nostdin" in before_input
+    for options in (ffprobe, before_input):
+        assert _option(options, "-protocol_whitelist") == "file,pipe"
+        assert _option(options, "-format_whitelist") == ingest.FORMAT_WHITELIST
+    assert _option(before_input, "-f") == "wav"
+
+
+def _option(argv: list[str], name: str) -> str:
+    assert argv.count(name) == 1, argv
+    return argv[argv.index(name) + 1]
+
+
 def test_refuses_two_audio_streams(root: Path, run: Run, config: Config, encode: Encoder) -> None:
     wav = write_wav(root / "original.wav", sine(1.0))
     path = encode(wav, root / "two.m4a", "aac", "-i", str(wav), "-map", "0:a", "-map", "1:a")
