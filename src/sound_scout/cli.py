@@ -2,8 +2,13 @@
 
 `doctor` loads the operator configuration, installs the network guard for the rest of the
 process, prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is
-a diagnosis, not a check. A configuration error is one line on stderr and exit code 1. The
-other subcommands are not implemented yet and exit 2.
+a diagnosis, not a check. A configuration error is one line on stderr and exit code 1.
+`eval run` counts ready `analyze` results against the human labels of the corpus
+(`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits
+0 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or
+a report that already exists, is one line on stderr and exit code 1; missing or invalid labels
+and results are NOT QUALIFIED reasons in the report. The other subcommands are not implemented
+yet and exit 2.
 """
 
 import argparse
@@ -11,15 +16,18 @@ import json
 import sys
 
 from sound_scout import __version__, config, doctor, guard
+from sound_scout.eval import runner
 
 SUBCOMMANDS = {
     "doctor": "report the state of the decoder, ASR, acoustic analysis and audio backend",
     "analyze": "analyze one recording and write a run directory under the data root",
     "compare": "compare two analyzed recordings",
     "serve": "run the MCP stdio server",
+    "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
 }
 NOT_IMPLEMENTED_EXIT_CODE = 2
 CONFIG_ERROR_EXIT_CODE = 1
+EVAL_ERROR_EXIT_CODE = 1
 TABLE_COLUMNS = ("component", "status", "last smoke", "fingerprint", "reason")
 FINGERPRINT_DIGITS = 12
 QUALIFICATION_FLAGS = ("validated_ru", "diction_validated_ru", "prosody_validated_ru")
@@ -38,13 +46,40 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument(
                 "--json", action="store_true", help="print the report as JSON instead of a table"
             )
+        if name == "eval":
+            _add_eval_arguments(subparser)
     return parser
+
+
+def _add_eval_arguments(parser: argparse.ArgumentParser) -> None:
+    actions = parser.add_subparsers(dest="eval_command", required=True, metavar="action")
+    run = actions.add_parser(
+        "run",
+        help="match findings to labels by docs/eval/PROTOCOL.md and write the report",
+        description="match findings to labels by docs/eval/PROTOCOL.md and write the report",
+    )
+    run.add_argument("--manifest", required=True, help="corpus manifest.json")
+    run.add_argument("--labels", required=True, help="directory of <clip id>.json label files")
+    run.add_argument(
+        "--results", required=True, help="directory of <clip id>/result.json run directories"
+    )
+    run.add_argument("--split", required=True, choices=["dev", "heldout"])
+    run.add_argument(
+        "--agreements", help="a person's observation-agreement judgements of candidate pairs"
+    )
+    run.add_argument(
+        "--output-dir",
+        default=str(runner.DEFAULT_OUTPUT_DIR),
+        help=f"where the report goes (default: {runner.DEFAULT_OUTPUT_DIR})",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         return run_doctor(as_json=args.json)
+    if args.command == "eval":
+        return run_eval(args)
     print(f"sound-scout {args.command}: not implemented", file=sys.stderr)
     return NOT_IMPLEMENTED_EXIT_CODE
 
@@ -61,6 +96,26 @@ def run_doctor(*, as_json: bool) -> int:
         print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
     else:
         print(format_report(report))
+    return 0
+
+
+def run_eval(args: argparse.Namespace) -> int:
+    try:
+        report = runner.evaluate(
+            args.manifest,
+            args.labels,
+            args.results,
+            args.split,
+            agreements_path=args.agreements,
+        )
+        markdown_path, json_path = runner.write_report(report, args.output_dir)
+    except runner.EvalError as error:
+        print(f"eval error: {' '.join(str(error).split())}", file=sys.stderr)
+        return EVAL_ERROR_EXIT_CODE
+    for flag in QUALIFICATION_FLAGS:
+        print(f"{flag}: {json.dumps(report[flag])}")
+    print(f"report: {markdown_path}")
+    print(f"report json: {json_path}")
     return 0
 
 

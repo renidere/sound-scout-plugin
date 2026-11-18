@@ -10,7 +10,7 @@ import pytest
 from sound_scout import config, doctor
 from sound_scout.cli import SUBCOMMANDS, main
 
-EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve"]
+EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve", "eval"]
 NOT_IMPLEMENTED_SUBCOMMANDS = ["analyze", "compare", "serve"]
 
 
