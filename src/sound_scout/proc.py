@@ -4,7 +4,9 @@
 command string, never a shell), starts the child in a new session so that the whole process
 group can be killed when the wall time runs out or the caller is interrupted (R11: no orphaned
 worker), keeps at most `max_output_bytes` of each of stdout and stderr, and on Linux caps the
-child's address space with `RLIMIT_AS` when `memory_bytes` is given.
+child's address space with `RLIMIT_AS` when `memory_bytes` is given. Every child also gets
+`die_with_parent` before `exec`: on Linux it is killed when the process that started it dies, even
+by SIGKILL, so a killed analysis worker leaves no decoder behind (R11).
 
 `ffmpeg_argv` and `ffprobe_argv` build the decoder command lines: the protocol whitelist
 `file,pipe` makes the decoder itself refuse `http://`, `concat:` and every other non-file
@@ -15,6 +17,7 @@ input. ffprobe never reads stdin and does not know `-nostdin`; `run` opens stdin
 """
 
 import contextlib
+import ctypes
 import os
 import selectors
 import signal
@@ -27,6 +30,9 @@ from dataclasses import dataclass
 PROTOCOL_WHITELIST = "file,pipe"
 KILL_GRACE_SECONDS = 5.0
 _READ_CHUNK = 65536
+_PR_SET_PDEATHSIG = 1
+# Resolved once in the parent: a dlopen in the forked child of a threaded process can deadlock.
+_LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform == "linux" else None
 
 
 @dataclass(frozen=True)
@@ -67,7 +73,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        preexec_fn=_memory_limit(memory_bytes),
+        preexec_fn=_child_setup(memory_bytes),
     )
     assert child.stdout is not None and child.stderr is not None
     output = _Output(child.stdout, child.stderr, max_output_bytes)
@@ -120,6 +126,33 @@ def _checked_argv(argv: object) -> list[str]:
     if not argv or not all(isinstance(item, str) for item in argv):
         raise TypeError("argv must be a non-empty list of str")
     return list(argv)
+
+
+def die_with_parent(parent_pid: int | None = None) -> None:
+    """Have the kernel SIGKILL this process when its parent dies (Linux; elsewhere a no-op).
+
+    With `parent_pid`, a parent that died before the request took effect is noticed too: the
+    process kills itself, as the signal would have.
+    """
+    if _LIBC is None:
+        return
+    if _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if parent_pid is not None and os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _child_setup(memory_bytes: int | None) -> Callable[[], None]:
+    parent_pid = os.getpid()
+    limit = _memory_limit(memory_bytes)
+
+    def setup() -> None:
+        die_with_parent(parent_pid)
+        if limit is not None:
+            limit()
+
+    return setup
 
 
 def _memory_limit(memory_bytes: int | None) -> Callable[[], None] | None:

@@ -995,3 +995,22 @@ def test_unknown_declared_duration_leaves_the_mismatch_null(
     record = json.loads(source.record_path.read_text(encoding="utf-8"))
     assert record["declared_duration_s"] is None
     assert record["limits"]["duration_mismatch"] is None
+
+
+def test_input_sha256_hashes_the_file_within_the_policy_and_the_size_limit(
+    root: Path, config: Config
+) -> None:
+    path = root / "bytes.wav"
+    path.write_bytes(b"x" * 2000)
+
+    assert ingest.input_sha256(path, config) == hashlib.sha256(b"x" * 2000).hexdigest()
+    small = Config(
+        allowed_roots=config.allowed_roots,
+        data_root=config.data_root,
+        budgets=Budgets(max_input_bytes=1000),
+    )
+    with pytest.raises(IngestError) as refused:
+        ingest.input_sha256(path, small)
+    assert refused.value.code == "input_too_large"
+    with pytest.raises(PathDenied):
+        ingest.input_sha256(config.data_root / "elsewhere.wav", config)

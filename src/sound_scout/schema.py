@@ -293,7 +293,7 @@ def _completeness_errors(result: dict) -> list[str]:
         for i in range(1, len(ranges)):
             if ranges[i]["start"] < ranges[i - 1]["end"] - TIME_EPS:
                 errors.append(f"$.coverage.{name}[{i}]: ranges must be sorted and not overlap")
-    uncovered = _subtract(coverage["requested"], coverage["reviewed"])
+    uncovered = subtract(coverage["requested"], coverage["reviewed"])
     if not _same_ranges(coverage["unreviewed"], uncovered):
         errors.append(
             "$.coverage.unreviewed: must equal requested minus reviewed, expected "
@@ -315,7 +315,7 @@ def _completeness_errors(result: dict) -> list[str]:
     return errors
 
 
-def _subtract(requested: list[dict], reviewed: list[dict]) -> list[tuple[float, float]]:
+def subtract(requested: list[dict], reviewed: list[dict]) -> list[tuple[float, float]]:
     """`requested` minus `reviewed` as (start, end) pairs, ignoring gaps up to TIME_EPS."""
     pieces = []
     for wanted in requested:
@@ -515,7 +515,7 @@ def _audio_coverage_errors(result: dict) -> list[str]:
     ]
     for path, item, basis, positive in claims:
         audio = _is_audio_claim(basis, item["evidence_refs"])
-        if (audio or positive) and _subtract([item], reviewed):
+        if (audio or positive) and subtract([item], reviewed):
             errors.append(f"{path}: outside coverage.reviewed")
         if not audio:
             continue
@@ -535,7 +535,7 @@ def _audio_coverage_errors(result: dict) -> list[str]:
         for artifact in cited:
             if not _has_range(artifact):
                 errors.append(f"{path}: {artifact['kind']} {artifact['id']!r} has no source range")
-            elif _subtract([_range(artifact)], reviewed):
+            elif subtract([_range(artifact)], reviewed):
                 errors.append(
                     f"{path}: {artifact['kind']} {artifact['id']!r} outside coverage.reviewed"
                 )

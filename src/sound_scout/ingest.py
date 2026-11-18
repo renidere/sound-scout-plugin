@@ -153,6 +153,17 @@ def probe(path: str | os.PathLike[str], config: Config) -> Probe:
         return _probe_open(file, resolved, config)
 
 
+def input_sha256(path: str | os.PathLike[str], config: Config) -> str:
+    """SHA-256 of an input, read through the policy and the size limit like `decode`."""
+    resolved = paths.resolve_input(path, config)
+    with paths.open_input(resolved, config) as file:
+        size = os.fstat(file.fileno()).st_size
+        limit = config.budgets.max_input_bytes
+        if size > limit:
+            raise IngestError(INPUT_TOO_LARGE, f"{size} bytes, the limit is {limit}")
+        return _sha256(file)
+
+
 def decode(path: str | os.PathLike[str], run: Run, config: Config) -> Source:
     """Decode an input into `run`: `source.json` and `work/decoded.f32`.
 

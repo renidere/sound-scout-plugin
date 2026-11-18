@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -186,6 +187,41 @@ def test_memory_limit_is_skipped_on_other_platforms(monkeypatch: pytest.MonkeyPa
 def test_rejects_non_positive_memory_limit() -> None:
     with pytest.raises(ValueError, match="memory_bytes must be positive"):
         run(["true"], timeout=1, max_output_bytes=16, memory_bytes=0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG exists on Linux only")
+def test_a_child_dies_with_its_killed_parent(tmp_path: Path) -> None:
+    pid_file = tmp_path / "child"
+    child = (
+        "import os, sys, time\n"
+        "open(sys.argv[1] + '.tmp', 'w').write(str(os.getpid()))\n"
+        "os.replace(sys.argv[1] + '.tmp', sys.argv[1])\n"
+        "time.sleep(600)\n"
+    )
+    parent_script = (
+        "import sys\n"
+        "from sound_scout import proc\n"
+        "proc.run([sys.executable, '-c', sys.argv[1], sys.argv[2]], timeout=600,"
+        " max_output_bytes=1024)\n"
+    )
+    parent = subprocess.Popen([PYTHON, "-c", parent_script, child, str(pid_file)])
+    try:
+        deadline = time.monotonic() + 30
+        while not pid_file.exists():
+            assert time.monotonic() < deadline, "the child did not start"
+            time.sleep(0.02)
+        child_pid = int(pid_file.read_text())
+        parent.kill()
+        parent.wait()
+        assert process_gone(child_pid, wait_seconds=2.0)
+    finally:
+        parent.kill()
+        parent.wait()
+
+
+def test_die_with_parent_is_a_no_op_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proc, "_LIBC", None)
+    assert proc.die_with_parent(os.getpid() + 1) is None
 
 
 def test_decoder_argv_always_restrict_protocols_and_stdin() -> None:

@@ -74,6 +74,14 @@ onnxruntime при импорте детектора речи — свои фа�
 `allowed_roots` и `data_root`, остальное — безопасные умолчания из примера. Без файла — явная
 ошибка (код 1), не умолчания для путей.
 
+Анализ выполняет `sound_scout.app.analyze` — общая точка входа CLI и MCP. На один data root
+одновременно идёт один анализ: lock `<data_root>/analyze.lock`, второй запрос сразу получает
+`Busy`, очереди нет. Этапы выполняет дочерний процесс-worker; его срок —
+`budgets.worker_deadline_seconds`, по истечении worker и его дочерние процессы останавливаются, а
+результат собирается из готовых этапов (`work/stage-<этап>.json`) как `partial`, а если не
+завершился даже `prepare` — как `failed`. Отмена через
+`CancelToken` освобождает worker не дольше чем за 2 с.
+
 Для pre-commit-хуков установите [lefthook](https://github.com/evilmartians/lefthook) и выполните
 `lefthook install`: перед коммитом по staged-файлам пройдут `ruff check` и `ruff format --check`.
 
