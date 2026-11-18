@@ -14,8 +14,7 @@ import re
 from importlib.resources import files
 from pathlib import PurePosixPath, PureWindowsPath
 
-from jsonschema import Draft202012Validator
-
+from sound_scout._schema_messages import schema_errors
 from sound_scout.doctor import TEST_DOUBLE
 
 SCHEMA_VERSION = "1.1"
@@ -102,10 +101,7 @@ def validate(result: object) -> None:
 def validation_errors(result: object) -> list[str]:
     """Every violation as `<json path>: <message>`; cross-field rules run only on a sound shape."""
     errors = _non_finite_numbers(result, "$")
-    errors += [
-        f"{error.json_path}: {error.message}"
-        for error in sorted(Draft202012Validator(SCHEMA).iter_errors(result), key=_json_path)
-    ]
+    errors += schema_errors(SCHEMA, result)
     if errors:
         return errors
     assert isinstance(result, dict)
@@ -129,10 +125,6 @@ def validation_errors(result: object) -> list[str]:
         + _review_provenance_errors(result)
         + _synthetic_errors(result)
     )
-
-
-def _json_path(error) -> str:
-    return error.json_path
 
 
 def _non_finite_numbers(value: object, path: str) -> list[str]:

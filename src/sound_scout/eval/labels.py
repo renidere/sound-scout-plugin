@@ -18,7 +18,7 @@ from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
-from sound_scout.eval._schema import schema_errors
+from sound_scout._schema_messages import schema_errors
 from sound_scout.eval.manifest import PROSODY_CATEGORIES
 from sound_scout.schema import _non_finite_numbers
 

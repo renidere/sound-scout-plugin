@@ -52,9 +52,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from jsonschema import Draft202012Validator
 
 from sound_scout import __version__, doctor, guard, paths, schema
+from sound_scout._schema_messages import schema_errors
 from sound_scout.config import MIB, Config
 from sound_scout.runs import Run
 
@@ -107,9 +107,7 @@ CORRECTIONS_EXIST = "corrections_exist"
 BAD_CORRECTION = "bad_correction"
 REASON_CODES = (BAD_AUDIO, TRANSCRIPT_EXISTS, TRANSCRIPT_MISSING, CORRECTIONS_EXIST, BAD_CORRECTION)
 
-_CORRECTION_VALIDATOR = Draft202012Validator(
-    {"$ref": "#/$defs/correction", "$defs": schema.SCHEMA["$defs"]}
-)
+_CORRECTION_SCHEMA = {"$ref": "#/$defs/correction", "$defs": schema.SCHEMA["$defs"]}
 
 
 class AsrError(Exception):
@@ -296,12 +294,10 @@ def write_corrected(run: Run, config: Config, corrections: list[Mapping[str, obj
         ) from None
     items = []
     for index, correction in enumerate(corrections):
-        errors = sorted(_CORRECTION_VALIDATOR.iter_errors(correction), key=lambda e: e.json_path)
+        errors = schema_errors(_CORRECTION_SCHEMA, correction)
         if errors:
-            raise AsrError(
-                BAD_CORRECTION,
-                f"corrections[{index}]{errors[0].json_path[1:]}: {errors[0].message}",
-            )
+            # Ошибка начинается с JSON path `$`; вместо корня — номер исправления.
+            raise AsrError(BAD_CORRECTION, f"corrections[{index}]{errors[0][1:]}")
         if correction["start"] >= correction["end"]:
             raise AsrError(BAD_CORRECTION, f"corrections[{index}]: start must be less than end")
         items.append(dict(correction))

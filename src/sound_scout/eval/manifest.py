@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from sound_scout.eval._schema import schema_errors
+from sound_scout._schema_messages import schema_errors
 from sound_scout.schema import _non_finite_numbers
 
 SCHEMA_VERSION = "1.0"

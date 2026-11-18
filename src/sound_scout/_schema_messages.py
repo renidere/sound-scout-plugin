@@ -1,7 +1,8 @@
-"""Schema errors of the eval files without their values (R09, R11).
+"""Schema errors without the values they are about (R09, R11).
 
-jsonschema's `error.message` quotes the checked value: an annotator's text, a corpus name, a whole
-manifest object. The message here is built from the JSON path and the violated rule alone.
+jsonschema's `error.message` quotes the checked value: transcript text of a correction, a finding's
+note, an annotator's text, a whole manifest object. The message here is built from the JSON path and
+the violated rule alone; the result contract, transcript corrections and the eval files share it.
 """
 
 from jsonschema import Draft202012Validator
@@ -25,7 +26,7 @@ def schema_message(error) -> str:
                 f"{name!r} is a required property" for name in rule if name not in error.instance
             )
         case "additionalProperties":
-            allowed = sorted(error.schema["properties"])
+            allowed = sorted(error.schema.get("properties", {}))
             return f"Additional properties are not allowed, allowed: {allowed}"
         case "const":
             return f"{rule!r} was expected"
@@ -41,6 +42,12 @@ def schema_message(error) -> str:
             return f"must be greater than {rule}"
         case "minLength":
             return f"must be at least {rule} characters long"
+        case "maxLength":
+            return f"must be at most {rule} characters long"
+        case "minItems":
+            return f"must have at least {rule} items"
+        case "minProperties":
+            return f"must have at least {rule} properties"
         case "uniqueItems":
             return "has non-unique items, every item must be unique"
         case "oneOf":

@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from sound_scout.eval import _schema, labels, manifest
-from sound_scout.eval._schema import schema_errors
+from sound_scout import _schema_messages, asr, schema
+from sound_scout._schema_messages import schema_errors
+from sound_scout.eval import labels, manifest
 from sound_scout.eval.manifest import (
     CATEGORIES,
     MIN_CLIPS,
@@ -426,15 +427,14 @@ def test_each_manifest_schema_rule_is_named_with_its_path(
     assert not any("violates schema rule" in e for e in report.errors), report.errors
 
 
-def test_manifest_and_labels_build_schema_messages_in_one_place() -> None:
-    assert manifest.schema_errors is _schema.schema_errors
-    assert labels.schema_errors is _schema.schema_errors
-    for module in (manifest, labels):
+def test_result_corrections_manifest_and_labels_build_schema_messages_in_one_place() -> None:
+    for module in (schema, asr, manifest, labels):
+        assert module.schema_errors is _schema_messages.schema_errors, module
         assert not hasattr(module, "_schema_message"), module
         assert not hasattr(module, "_json_path"), module
         assert not hasattr(module, "Draft202012Validator"), module
 
 
 def test_rule_without_its_own_message_is_named_without_the_value() -> None:
-    errors = schema_errors({"properties": {"name": {"maxLength": 3}}}, {"name": MANIFEST_TEXT})
-    assert errors == ["$.name: violates schema rule 'maxLength'"]
+    errors = schema_errors({"properties": {"name": {"maxItems": 1}}}, {"name": [MANIFEST_TEXT] * 2})
+    assert errors == ["$.name: violates schema rule 'maxItems'"]

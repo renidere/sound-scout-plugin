@@ -662,12 +662,66 @@ def test_corrections_need_a_raw_transcript_and_the_contract_shape(config: Config
         ({k: v for k, v in good.items() if k != "certainty"}, "certainty"),
         ({**good, "evidence_refs": []}, "evidence_refs"),
         ({**good, "start": 1.0, "end": 1.0}, "start must be less than end"),
-        ({**good, "extra": 1}, "extra"),
+        ({**good, "extra": 1}, "corrections[1]: Additional properties are not allowed"),
     ):
         with pytest.raises(AsrError) as error:
             write_corrected(run, config, [good, bad])
         assert error.value.code == "bad_correction" and where in error.value.message, where
     assert not (run.path / "transcript").exists()
+
+
+CORRECTION_TEXT = "SECRET-слово-из-записи"
+GOOD_CORRECTION = {
+    "start": 0.0,
+    "end": 1.0,
+    "original": "а",
+    "corrected": "б",
+    "source": "transcript",
+    "evidence_refs": [{"type": "transcript", "ref": "raw", "sha256": "ab" * 32}],
+    "certainty": "uncertain",
+    "note": None,
+}
+
+
+@pytest.mark.parametrize(
+    ("bad", "error"),
+    [
+        (
+            {**GOOD_CORRECTION, "original": [CORRECTION_TEXT]},
+            "corrections[1].original: must be of type string",
+        ),
+        (
+            {**GOOD_CORRECTION, "corrected": {"text": CORRECTION_TEXT}},
+            "corrections[1].corrected: must be of type string",
+        ),
+        (
+            {**GOOD_CORRECTION, "certainty": CORRECTION_TEXT},
+            "corrections[1].certainty: must be one of ['clear', 'uncertain']",
+        ),
+        (
+            {**GOOD_CORRECTION, "start": CORRECTION_TEXT},
+            "corrections[1].start: must be of type number",
+        ),
+        (
+            {**GOOD_CORRECTION, "note": [CORRECTION_TEXT]},
+            "corrections[1].note: must be of type ['string', 'null']",
+        ),
+        ({**GOOD_CORRECTION, CORRECTION_TEXT: 1}, "corrections[1]: Additional properties are not"),
+        (CORRECTION_TEXT, "corrections[1]: must be of type object"),
+    ],
+)
+def test_bad_correction_names_path_and_rule_without_the_transcript_text(
+    config: Config, run, bad: object, error: str
+) -> None:
+    (run.path / "asr").mkdir()
+    (run.path / "asr" / "raw.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(AsrError) as refused:
+        write_corrected(run, config, [GOOD_CORRECTION, bad])
+    assert refused.value.code == "bad_correction"
+    assert refused.value.message.startswith(error), refused.value.message
+    assert CORRECTION_TEXT not in refused.value.message
+    assert CORRECTION_TEXT not in str(refused.value)
+    assert not (run.path / "transcript" / "corrected.json").exists()
 
 
 # --- the smoke receipt ------------------------------------------------------------------------

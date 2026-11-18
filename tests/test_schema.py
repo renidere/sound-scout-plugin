@@ -9,6 +9,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from sound_scout import schema
+from sound_scout._schema_messages import schema_errors
 from sound_scout.schema import ResultValidationError, validate, validation_errors
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -265,7 +266,9 @@ def test_measurement_null_value_needs_a_reason_and_other_value_shapes_pass(doc: 
     doc["measurements"][1].update(value=[{"start": 0.5, "end": 3.0}], reason=None)
     validate(doc)
     doc["measurements"][0]["value"] = {}
-    assert_rejected(doc, "$.measurements[0].value: {} is not valid under any of the given schemas")
+    assert_rejected(
+        doc, "$.measurements[0].value: must be a valid nullable number or array or object"
+    )
     doc = deepcopy(EXAMPLE_DOC)
     doc["measurements"][1].update(value=[{"start": 3.0, "end": 3.0}], reason=None)
     assert_rejected(doc, "$.measurements[1].value[0]: start must be less than end, got 3.0 >= 3.0")
@@ -278,7 +281,7 @@ def test_measurement_null_value_needs_a_reason_and_other_value_shapes_pass(doc: 
 
 def test_evidence_basis_outside_the_enumeration_is_rejected(doc: dict) -> None:
     doc["findings"][0]["evidence_basis"] = "model_guess"
-    assert_rejected(doc, "$.findings[0].evidence_basis: 'model_guess' is not one of")
+    assert_rejected(doc, "$.findings[0].evidence_basis: must be one of ['measurement',")
     root = json.loads(ROOT_SCHEMA.read_text(encoding="utf-8"))
     assert root["$defs"]["finding"]["properties"]["evidence_basis"]["enum"] == [
         "measurement",
@@ -293,7 +296,7 @@ def test_evidence_basis_outside_the_enumeration_is_rejected(doc: dict) -> None:
 
 def test_stage_statuses_need_a_reason_unless_completed(doc: dict) -> None:
     doc["stages"]["asr"]["status"] = "done"
-    assert_rejected(doc, "$.stages.asr.status: 'done' is not one of")
+    assert_rejected(doc, "$.stages.asr.status: must be one of ['completed',")
     doc = deepcopy(EXAMPLE_DOC)
     doc["stages"]["asr"].update(status="skipped", reason=None)
     assert_rejected(doc, "$.stages.asr.reason: a reason is required when status is 'skipped'")
@@ -361,7 +364,7 @@ def test_evidence_refs_point_at_known_measurements_and_artifacts(doc: dict) -> N
     doc["artifacts"][2]["sha256"] = HEX64
     validate(doc)
     doc["findings"][1]["evidence_refs"] = []
-    assert_rejected(doc, "$.findings[1].evidence_refs: [] should be non-empty")
+    assert_rejected(doc, "$.findings[1].evidence_refs: must have at least 1 items")
 
 
 def test_evidence_artifacts_must_carry_a_hash(doc: dict) -> None:
@@ -426,7 +429,7 @@ def test_correction_source_needs_matching_evidence(doc: dict) -> None:
     del correction["evidence_refs"]
     assert_rejected(doc, "'evidence_refs' is a required property")
     correction["evidence_refs"] = []
-    assert_rejected(doc, "$.transcript.corrections[0].evidence_refs: [] should be non-empty")
+    assert_rejected(doc, "$.transcript.corrections[0].evidence_refs: must have at least 1 items")
     correction["evidence_refs"] = [
         ref("transcript", "transcript-raw", doc["artifacts"][0]["sha256"])
     ]
@@ -639,10 +642,10 @@ def test_limits_duration_mismatch_flag_must_agree_with_the_measured_gap(doc: dic
 @pytest.mark.parametrize(
     ("key", "value", "fragment"),
     [
-        ("duration_mismatch_tolerance_s", 0, "0 is less than or equal to the minimum of 0"),
-        ("duration_mismatch_tolerance_s", None, "None is not of type 'number'"),
-        ("duration_mismatch_s", "0.5", "'0.5' is not of type 'number', 'null'"),
-        ("duration_mismatch", 1, "1 is not of type 'boolean', 'null'"),
+        ("duration_mismatch_tolerance_s", 0, "must be greater than 0"),
+        ("duration_mismatch_tolerance_s", None, "must be of type number"),
+        ("duration_mismatch_s", "0.5", "must be of type ['number', 'null']"),
+        ("duration_mismatch", 1, "must be of type ['boolean', 'null']"),
     ],
 )
 def test_limits_duration_mismatch_shape_is_enforced_by_the_schema(
@@ -709,8 +712,129 @@ def test_shape_errors_come_alone_without_cross_rule_crashes(doc: dict) -> None:
     doc["source"]["duration_s"] = "long"
     errors = validation_errors(doc)
     assert errors == [
-        "$.source.duration_s: 'long' is not of type 'number'",
-        "$.stages: [] is not of type 'object'",
+        "$.source.duration_s: must be of type number",
+        "$.stages: must be of type object",
     ]
-    assert validation_errors(None) == ["$: None is not of type 'object'"]
-    assert validation_errors([]) == ["$: [] is not of type 'object'"]
+    assert validation_errors(None) == ["$: must be of type object"]
+    assert validation_errors([]) == ["$: must be of type object"]
+
+
+RESULT_TEXT = "SECRET-фраза-из-записи"
+
+
+def set_path(doc: dict, path: tuple, value: object) -> None:
+    target = doc
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "error"),
+    [
+        (("findings", 0, "start"), RESULT_TEXT, "$.findings[0].start: must be of type number"),
+        (("findings", 0, "observation"), [RESULT_TEXT], "$.findings[0].observation: must be of"),
+        (("findings", 0, "evidence_basis"), RESULT_TEXT, "$.findings[0].evidence_basis: must be"),
+        (("transcript", "corrections", 0, "certainty"), RESULT_TEXT, "certainty: must be one of"),
+        (("run_id",), RESULT_TEXT * 20, "$.run_id: must be at most 256 characters long"),
+        (("findings",), RESULT_TEXT, "$.findings: must be of type array"),
+        (("findings",), {"observation": RESULT_TEXT}, "$.findings: must be of type array"),
+        (("stages",), RESULT_TEXT, "$.stages: must be of type object"),
+        (("stages",), {RESULT_TEXT: RESULT_TEXT}, "$.stages: Additional properties are not"),
+        (("transcript", "raw"), RESULT_TEXT, "$.transcript.raw: must be null or object"),
+        (("schema_version",), RESULT_TEXT, "$.schema_version: '1.1' was expected"),
+        (("cost", "currency"), RESULT_TEXT, "$.cost.currency: must be null or string"),
+    ],
+)
+def test_schema_errors_name_the_rule_without_echoing_document_values(
+    doc: dict, path: tuple, value: object, error: str
+) -> None:
+    set_path(doc, path, value)
+    errors = assert_rejected(doc, error)
+    assert not any(RESULT_TEXT in e for e in errors), errors
+    with pytest.raises(ResultValidationError) as excinfo:
+        validate(doc)
+    assert RESULT_TEXT not in str(excinfo.value)
+
+
+def test_non_object_document_is_named_without_its_value() -> None:
+    errors = validation_errors([RESULT_TEXT])
+    assert errors == ["$: must be of type object"]
+
+
+RESULT_SCHEMA_RULES = {
+    "type": (("source", "duration_s"), "long", "$.source.duration_s: must be of type number"),
+    "required": (("source",), {}, "$.source: 'id' is a required property"),
+    "additionalProperties": (
+        ("source", "extra"),
+        1,
+        "$.source: Additional properties are not allowed, allowed: [",
+    ),
+    "const": (("schema_version",), "2.0", "$.schema_version: '1.1' was expected"),
+    "enum": (("stages", "asr", "status"), "done", "$.stages.asr.status: must be one of ["),
+    "minLength": (("source", "id"), "", "$.source.id: must be at least 1 characters long"),
+    "maxLength": (("run_id",), "r" * 257, "$.run_id: must be at most 256 characters long"),
+    "minimum": (("source", "channels"), 0, "$.source.channels: must be at least 1"),
+    "exclusiveMinimum": (
+        ("limits", "duration_mismatch_tolerance_s"),
+        0,
+        "$.limits.duration_mismatch_tolerance_s: must be greater than 0",
+    ),
+    "pattern": (
+        ("errors",),
+        [{"stage": None, "code": "Bad-Code", "message": RESULT_TEXT}],
+        "$.errors[0].code: must match pattern '^[a-z][a-z0-9_]*$'",
+    ),
+    "uniqueItems": (
+        ("provenance", "input_modalities"),
+        ["text", "text"],
+        "$.provenance.input_modalities: has non-unique items, every item must be unique",
+    ),
+    "minItems": (
+        ("findings", 0, "evidence_refs"),
+        [],
+        "$.findings[0].evidence_refs: must have at least 1 items",
+    ),
+    "oneOf": (
+        ("measurements", 0, "value"),
+        {},
+        "$.measurements[0].value: must be a valid nullable number or array or object",
+    ),
+}
+# Ключевые слова, которые сами не нарушаются: ссылки, вложенные схемы и аннотации.
+STRUCTURAL_KEYWORDS = {"$schema", "$id", "$ref", "$defs", "title", "description"}
+STRUCTURAL_KEYWORDS |= {"properties", "items"}
+
+
+def schema_keywords(node: object) -> set[str]:
+    if isinstance(node, list):
+        return set().union(*(schema_keywords(item) for item in node))
+    if not isinstance(node, dict):
+        return set()
+    found = set(node)
+    for key, value in node.items():
+        if key in ("properties", "$defs"):
+            found |= set().union(*(schema_keywords(sub) for sub in value.values()))
+        elif isinstance(value, dict | list):
+            found |= schema_keywords(value)
+    return found
+
+
+def test_every_rule_of_the_result_schema_has_its_own_message() -> None:
+    rules = schema_keywords(schema.SCHEMA) - STRUCTURAL_KEYWORDS
+    assert rules == set(RESULT_SCHEMA_RULES) | {"minProperties"}
+
+
+@pytest.mark.parametrize("rule", sorted(RESULT_SCHEMA_RULES))
+def test_each_result_schema_rule_is_named_with_its_path(doc: dict, rule: str) -> None:
+    path, value, error = RESULT_SCHEMA_RULES[rule]
+    set_path(doc, path, value)
+    errors = assert_rejected(doc, error)
+    assert not any("violates schema rule" in e for e in errors), errors
+    assert not any(RESULT_TEXT in e for e in errors), errors
+
+
+def test_min_properties_reached_only_inside_one_of_has_its_own_message() -> None:
+    # В схеме результата minProperties стоит внутри oneOf и наружу выходит как ошибка oneOf.
+    schema_part = schema.SCHEMA["$defs"]["measurement"]["properties"]["value"]["oneOf"][2]
+    assert schema_errors(schema_part, {}) == ["$: must have at least 1 properties"]
