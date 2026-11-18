@@ -56,6 +56,9 @@ DENIED_NAME = "denied name"
 ROOT_HAS_DENIED_NAME = "allowed root contains a denied name"
 BAD_OUTPUT_NAME = "invalid output name"
 CHANGED_AFTER_RESOLVE = "path changed after resolve"
+INPUT_PLACEHOLDER = "<input>"
+ALLOWED_ROOT_PLACEHOLDER = "<allowed root>"
+DATA_ROOT_PLACEHOLDER = "<data root>"
 
 
 class PathDenied(Exception):
@@ -146,6 +149,21 @@ def open_output(run_dir: Path, name: str, config: Config) -> BinaryIO:
         os.close(fd)
         raise
     return os.fdopen(fd, "wb")
+
+
+def without_paths(message: str, source: str, config: Config) -> str:
+    """`message` with the input's absolute path, the allowed roots and the data root replaced by
+    placeholders: ffprobe and ffmpeg name the file they read in the stderr a refusal quotes."""
+    given = os.path.join(os.getcwd(), source)
+    hidden = {
+        os.path.realpath(given): INPUT_PLACEHOLDER,
+        os.path.normpath(given): INPUT_PLACEHOLDER,
+    }
+    hidden |= {str(root): ALLOWED_ROOT_PLACEHOLDER for root in config.allowed_roots}
+    hidden[str(config.data_root)] = DATA_ROOT_PLACEHOLDER
+    for text in sorted(hidden, key=len, reverse=True):
+        message = message.replace(text, hidden[text])
+    return message
 
 
 def _is_file_path(source: str) -> bool:

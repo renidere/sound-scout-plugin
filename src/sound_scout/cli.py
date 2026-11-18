@@ -14,8 +14,9 @@ their absolute paths (ffprobe and ffmpeg quote them). Stdout carries only the an
 code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`. `compare` calls
 `app.compare` and prints the verdict, its reasons and the file `compare/<id>.json` (`--json`:
 the comparison with `path`), exit 0 whatever the verdict. `doctor` prints `doctor.report` as a
-table or JSON and exits 0 whatever the statuses are: it is a diagnosis, not a check. `serve` is
-not implemented yet (the MCP stdio server) and exits 2.
+table or JSON and exits 0 whatever the statuses are: it is a diagnosis, not a check. `serve` runs
+the MCP stdio server (`sound_scout.mcp_server`) over the same functions until the client closes
+stdin, then exits 0.
 `eval run` counts ready `analyze` results against the human labels of the corpus
 (`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits 0
 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or a
@@ -24,13 +25,12 @@ labels and results are NOT QUALIFIED reasons in the report. `smoke [decoder] [ac
 runs the real components (`sound_scout.smoke`) — `decoder` and `acoustics` on a synthetic signal,
 `asr` on the development recording named by `SOUND_SCOUT_DEV_AUDIO`, only when asked for — and
 saves the smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was
-written, 1 otherwise. `app` and `smoke` are imported only by the subcommands that run them: they
-load Praat and the speech detector.
+written, 1 otherwise. `app`, `smoke` and `mcp_server` are imported only by the subcommands that
+run them: they load Praat and the speech detector.
 """
 
 import argparse
 import json
-import os
 import sys
 import traceback
 
@@ -53,17 +53,11 @@ SMOKE_DEFAULT_COMPONENTS = ("decoder", "acoustics")
 # `app.LAYERS`, repeated so that building the parser does not import `app`.
 ANALYZE_LAYERS = ("content", "measurements", "sound")
 ANALYZE_EXIT_CODES = {"complete": 0, "partial": 3, "blocked": 4, "failed": 1}
-NOT_IMPLEMENTED_EXIT_CODE = 2
 ERROR_EXIT_CODE = 1
 SMOKE_FAILED_EXIT_CODE = 1
 CONFIG_ERROR = "config_error"
 EVAL_ERROR = "eval_error"
 INTERNAL_ERROR = "internal_error"
-NOT_IMPLEMENTED = "not_implemented"
-SERVE_NOT_IMPLEMENTED = "the MCP stdio server is not built yet"
-INPUT_PLACEHOLDER = "<input>"
-ALLOWED_ROOT_PLACEHOLDER = "<allowed root>"
-DATA_ROOT_PLACEHOLDER = "<data root>"
 TABLE_COLUMNS = ("component", "status", "last smoke", "fingerprint", "reason")
 FINGERPRINT_DIGITS = 12
 QUALIFICATION_FLAGS = ("validated_ru", "diction_validated_ru", "prosody_validated_ru")
@@ -225,52 +219,30 @@ def run_doctor(args: argparse.Namespace) -> int:
 
 def run_analyze(args: argparse.Namespace) -> int:
     loaded = _load_config(args)
-    from sound_scout import app, ingest, paths, report, runs
+    from sound_scout import app, ingest, paths, report
 
     fields = {"request_id": args.request_id, "task": args.task}
     if args.layers is not None:
         fields["layers"] = args.layers
-    refusals = (
-        (app.InvalidRequest, "invalid_request"),
-        (paths.PathDenied, "path_denied"),
-        (app.Busy, "busy"),
-        (app.RunIncomplete, "run_incomplete"),
-        (runs.RequestMismatch, "request_mismatch"),
-        (runs.RequestRunMissing, "request_run_missing"),
-        (runs.RequestIndexCorrupt, "request_index_corrupt"),
-    )
     try:
         analysis = app.analyze(app.AnalyzeRequest(args.file, **fields), loaded)
     except ingest.IngestError as error:
-        message = error.message if args.verbose else _without_paths(error.message, args, loaded)
+        message = error.message
+        if not args.verbose:
+            message = paths.without_paths(message, args.file, loaded)
         raise CliError(error.code, message) from error
-    except tuple(kind for kind, _ in refusals) as error:
-        code = next(code for kind, code in refusals if isinstance(error, kind))
+    except tuple(kind for kind, _ in app.REFUSALS) as error:
+        code = next(code for kind, code in app.REFUSALS if isinstance(error, kind))
         raise CliError(code, str(error)) from error
     if args.verbose:
         print(f"run directory: {analysis.run.path}", file=sys.stderr)
     run_dir = analysis.run.path.relative_to(loaded.data_root).as_posix()
-    answer = report.compact(analysis.result)
+    answer = report.compact(analysis.result, run_dir=run_dir)
     if args.json:
-        print(json.dumps({"run_dir": run_dir, **answer}, indent=2, ensure_ascii=False))
+        print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:
         print(format_analysis(answer, run_dir, reused=analysis.reused))
     return ANALYZE_EXIT_CODES[analysis.result["status"]]
-
-
-def _without_paths(message: str, args: argparse.Namespace, loaded: config.Config) -> str:
-    """`message` with the input's absolute path, the allowed roots and the data root replaced:
-    ffprobe and ffmpeg name the file they read in the stderr an ingest refusal quotes."""
-    given = os.path.join(os.getcwd(), args.file)
-    hidden = {
-        os.path.realpath(given): INPUT_PLACEHOLDER,
-        os.path.normpath(given): INPUT_PLACEHOLDER,
-    }
-    hidden |= {str(root): ALLOWED_ROOT_PLACEHOLDER for root in loaded.allowed_roots}
-    hidden[str(loaded.data_root)] = DATA_ROOT_PLACEHOLDER
-    for text in sorted(hidden, key=len, reverse=True):
-        message = message.replace(text, hidden[text])
-    return message
 
 
 def run_compare(args: argparse.Namespace) -> int:
@@ -290,8 +262,11 @@ def run_compare(args: argparse.Namespace) -> int:
 
 
 def run_serve(args: argparse.Namespace) -> int:
-    print(f"sound-scout serve: {NOT_IMPLEMENTED}: {SERVE_NOT_IMPLEMENTED}", file=sys.stderr)
-    return NOT_IMPLEMENTED_EXIT_CODE
+    loaded = _load_config(args)
+    from sound_scout import mcp_server
+
+    mcp_server.serve(loaded)
+    return 0
 
 
 def run_smoke(args: argparse.Namespace) -> int:

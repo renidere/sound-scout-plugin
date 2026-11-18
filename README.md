@@ -81,11 +81,12 @@ uv run sound-scout doctor
 `"development recording, 10.6 s"` — ни текста транскрипта, ни путей. Отказ — переменная не
 задана, модели нет, запись вне `allowed_roots`, в записи нет речи, receipt отклонён — печатает
 `asr: failed: <причина>`, даёт код 1 и не трогает прежний receipt. `doctor` в обоих случаях только
-читает receipt. Подкоманда `serve` (MCP stdio сервер) пока завершается с кодом 2 и строкой
-`sound-scout serve: not_implemented: …`. Локальная конфигурация —
+читает receipt. Подкоманда `serve` запускает MCP stdio сервер с инструментами
+`speech_capabilities`, `speech_analyze`, `speech_compare` (описание и схемы — `docs/mcp.md`).
+Локальная конфигурация —
 `sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor`, `smoke`, `analyze` и
-`compare` читают её через `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; MCP
-будет читать её так же. Обязательны
+`compare` читают её через `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`;
+`serve` читает её так же. Обязательны
 `allowed_roots` и `data_root`, остальное — безопасные умолчания из примера. Без файла — явная
 ошибка (код 1), не умолчания для путей. Ни один флаг CLI не задаёт allowed roots, data root,
 модель, backend или бюджеты: это настройки оператора (R12), такой флаг отклоняется как неизвестный.

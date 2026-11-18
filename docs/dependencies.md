@@ -13,6 +13,7 @@
 
 Источник истины — `pyproject.toml` и `uv.lock` (`uv sync --locked`). Здесь — прямые зависимости и
 версии в lock на дату обновления.
+SHA-256 каждого файла пакета — в `uv.lock`. `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
 
 | Пакет | Версия в `uv.lock` | Зачем | Лицензия |
 |---|---|---|---|
@@ -23,6 +24,8 @@
 | `praat-parselmouth` | 0.4.7 | F0 (Praat), формантный контроль `smoke` | GPL-3.0 |
 | `numpy` | 2.5.5 | сигналы и измерения | BSD-3-Clause |
 | `jsonschema` | 4.26.0 | контракт результата, манифест корпуса, разметка | MIT |
+| `mcp` | 2.3.0 | MCP stdio сервер `sound-scout serve` (`docs/mcp.md`); последний стабильный релиз на 2026-11-18; wheel `mcp-2.3.0-py3-none-any.whl` SHA-256 `dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377` | MIT |
+| `mcp-types` (через mcp) | 2.3.0 | типы протокола MCP; wheel SHA-256 `968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d` | MIT |
 | `pytest` (dev) | 9.2.0 | тесты | MIT |
 | `ruff` (dev) | 0.17.5 | lint и format | MIT |
 

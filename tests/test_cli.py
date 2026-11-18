@@ -72,17 +72,6 @@ def test_help_lists_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         assert name in out
 
 
-def test_serve_is_not_implemented_yet_one_line_with_the_reason_code_and_exit_2(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["serve"]) == 2
-    captured = capsys.readouterr()
-    assert captured.err == (
-        "sound-scout serve: not_implemented: the MCP stdio server is not built yet\n"
-    )
-    assert captured.out == ""
-
-
 def test_missing_subcommand_is_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         main([])
@@ -206,7 +195,6 @@ def test_console_script_module_entry(tmp_path: Path) -> None:
         "offline_env": {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
     }
     assert not (tmp_path / "data" / "receipts").exists()
-    assert run_cli("serve").returncode == 2
 
 
 def offline_env(path: Path) -> dict[str, str]:
@@ -644,15 +632,19 @@ def test_an_unexpected_error_is_one_line_with_its_type_only(
     assert err == "sound-scout analyze: internal_error: RuntimeError\n"
 
 
-@pytest.mark.parametrize("command", ["analyze", "compare"])
-def test_analyze_and_compare_without_configuration_are_one_line_config_error(
+@pytest.mark.parametrize("command", ["analyze", "compare", "serve"])
+def test_analyze_compare_and_serve_without_configuration_are_one_line_config_error(
     command: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv(config.CONFIG_PATH_ENV, str(tmp_path / "missing.toml"))
-    args = ["x.wav"] if command == "analyze" else ["a" * 32, "b" * 32, "--criterion", "x"]
+    args = {
+        "analyze": ["x.wav"],
+        "compare": ["a" * 32, "b" * 32, "--criterion", "x"],
+        "serve": [],
+    }[command]
 
     assert main([command, *args]) == 1
 

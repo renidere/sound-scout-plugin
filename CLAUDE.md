@@ -103,6 +103,7 @@
 | Сквозной анализ `analyze`: lock data root (`Busy`), предварительная проверка входа, request_id и кэш через `runs.open_run`, worker-процесс с deadline и `CancelToken`, записи этапов `work/stage-<этап>.json`, единая сборка результата | `src/sound_scout/app.py` |
 | Отчёт: `write` (полный `result.json` и `report.md` на русском в run-каталоге, без приватных путей), `compact` (ответ ≤ 4 KiB), правило приоритета findings `prioritized`, `cost`; решение — `docs/decisions/0004-report-priority.md` | `src/sound_scout/report.py` |
 | Сравнение исходной и контрольной попыток `app.compare`: критерии, окна по сырому транскрипту, правило вердикта, `conditions_diff`, запись `compare/<id>.json`; схема `schema/compare.v1.schema.json`; решение — `docs/decisions/0006-compare-rules.md` | `src/sound_scout/comparison.py` |
+| MCP stdio сервер `serve`: инструменты `speech_capabilities`/`speech_analyze`/`speech_compare` (`TOOLS` — описания, закрытые JSON-схемы аргументов, аннотации), валидатор аргументов, отказы как результат инструмента, вызовы по одному, stderr-логи с маскированием путей; описание — `docs/mcp.md` | `src/sound_scout/mcp_server.py` |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |

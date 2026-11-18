@@ -125,6 +125,18 @@ class WorkerStopped(BaseException):
     """Raised in the worker by SIGTERM; not an `Exception`, so no stage boundary swallows it."""
 
 
+# The refusals `analyze` raises before any stage runs, with the reason code CLI and MCP report.
+REFUSALS = (
+    (InvalidRequest, "invalid_request"),
+    (paths.PathDenied, "path_denied"),
+    (Busy, "busy"),
+    (RunIncomplete, "run_incomplete"),
+    (runs.RequestMismatch, "request_mismatch"),
+    (runs.RequestRunMissing, "request_run_missing"),
+    (runs.RequestIndexCorrupt, "request_index_corrupt"),
+)
+
+
 _stop_signal: int | None = None
 
 
