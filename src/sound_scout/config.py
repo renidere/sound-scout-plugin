@@ -4,9 +4,10 @@ Allowed roots, the data root, budgets, the network policy and the backend are se
 operator here, never by arguments of a tool call (R09, R10, R12). Secrets do not belong in
 this file: an unknown field is rejected.
 
-`DENIED_NAME_PATTERNS` lives here rather than in `paths` because both modules need it and
-`paths` imports `config`: the loader rejects an allowed root that has a denied component in its
-resolved path, and `paths` refuses every input path whose component below the root matches.
+`DENIED_NAME_PATTERNS` and the root rule `root_denied_name` live here rather than in `paths`
+because both modules need them and `paths` imports `config`: the loader rejects an allowed root
+that `root_denied_name` bars in its resolved path, `paths` refuses every path under such a root
+with `ROOT_HAS_DENIED_NAME` and every input path whose component below the root matches.
 """
 
 import fnmatch
@@ -28,9 +29,10 @@ MIB = 1024 * 1024
 MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*")
 MODEL_REVISION = re.compile(r"[0-9a-f]{7,40}")
 
-# Names never read as input, in any position of the path, even inside an allowed root:
-# operator secrets and config, credential and agent-profile directories, playlist and script
-# sources. Matched case-insensitively against each path component.
+# Names never read as input in any component below an allowed root, and not allowed in the
+# root itself except for the Hermes media directories `root_denied_name` permits: operator
+# secrets and config, credential and agent-profile directories, playlist and script sources.
+# Matched case-insensitively against each path component.
 DENIED_NAME_PATTERNS = (
     ".env*",
     CONFIG_FILE_NAME,
@@ -44,6 +46,13 @@ DENIED_NAME_PATTERNS = (
     "*.ffconcat",
     "*.sdp",
 )
+
+# The only directories under `.hermes` an allowed root may be (issue #66, owner decision A):
+# the media caches where Hermes saves incoming audio, in the home or in a profile home.
+# Credentials and config next to them stay denied, and below the root every name is checked.
+HERMES_DIR = ".hermes"
+HERMES_MEDIA_DIRS = (("cache", "audio"), ("audio_cache",))
+HERMES_PROFILES_DIR = "profiles"
 
 
 class ConfigError(Exception):
@@ -136,16 +145,22 @@ def load() -> Config:
 
 def _parse(data: dict[str, object]) -> Config:
     _reject_unknown(data, {field.name for field in fields(Config)}, prefix="")
-    allowed_roots = _directories(_require(data, "allowed_roots"), "allowed_roots")
+    given_roots = _require(data, "allowed_roots")
+    allowed_roots = _directories(given_roots, "allowed_roots")
     data_root = _directory(_require(data, "data_root"), "data_root")
     for index, root in enumerate(allowed_roots):
         # Запрещённые имена — про чтение входа (R10): корень с таким компонентом не поддерживается
         # `paths` (каждый путь под ним отвечает ROOT_HAS_DENIED_NAME), поэтому отказ здесь, при
         # загрузке. `data_root` не проверяется: оттуда не читают, туда только пишут.
-        denied = next((part for part in root.parts if is_denied_name(part)), None)
+        denied = root_denied_name(root)
         if denied is not None:
             raise ConfigError(
                 f"allowed_roots[{index}]: contains the denied name {denied!r}: {root}"
+            )
+        if not _hermes_dir_given_directly(root, Path(os.path.normpath(given_roots[index]))):
+            raise ConfigError(
+                f"allowed_roots[{index}]: a Hermes media directory must be given by its own "
+                f"path, not through a symlink: {root}"
             )
         if data_root.is_relative_to(root) or root.is_relative_to(data_root):
             raise ConfigError(
@@ -165,6 +180,41 @@ def _parse(data: dict[str, object]) -> Config:
 def is_denied_name(name: str) -> bool:
     lowered = name.lower()
     return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in DENIED_NAME_PATTERNS)
+
+
+def root_denied_name(root: Path) -> str | None:
+    """The component of the resolved `root` that bars it as an allowed root, or `None`.
+
+    Any denied name bars a root, except one `.hermes` followed by exactly a Hermes media
+    directory: `cache/audio`, `audio_cache` or either under `profiles/<name>/`.
+    """
+    parts = root.parts
+    hermes = _hermes_index(root)
+    if hermes is not None and _is_hermes_media_dir(parts[hermes + 1 :]):
+        parts = parts[:hermes] + parts[hermes + 1 :]
+    return next((part for part in parts if is_denied_name(part)), None)
+
+
+def _hermes_index(path: Path) -> int | None:
+    """Index of the only `.hermes` component of `path`; `None` when there is none or several."""
+    found = [index for index, part in enumerate(path.parts) if part.lower() == HERMES_DIR]
+    return found[0] if len(found) == 1 else None
+
+
+def _is_hermes_media_dir(tail: tuple[str, ...]) -> bool:
+    if len(tail) > 2 and tail[0] == HERMES_PROFILES_DIR:
+        tail = tail[2:]
+    return tail in HERMES_MEDIA_DIRS
+
+
+def _hermes_dir_given_directly(root: Path, given: Path) -> bool:
+    """A resolved root under `.hermes` must be spelled from `.hermes` down the same way: a
+    symlink such as `media` -> `.hermes` would let a path without `.hermes` select it."""
+    hermes = _hermes_index(root)
+    if hermes is None:
+        return True
+    tail = root.parts[hermes:]
+    return given.parts[-len(tail) :] == tail
 
 
 def _budgets(value: object) -> Budgets:

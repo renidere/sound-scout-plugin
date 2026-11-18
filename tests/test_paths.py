@@ -253,6 +253,74 @@ def test_allowed_root_with_a_denied_component_fails_loudly(tmp_path: Path, data_
     assert paths.ROOT_HAS_DENIED_NAME != paths.DENIED_NAME
 
 
+@pytest.fixture
+def hermes_media(tmp_path: Path) -> Path:
+    media = tmp_path.resolve() / ".hermes" / "cache" / "audio"
+    media.mkdir(parents=True)
+    (tmp_path.resolve() / ".hermes" / "config.yaml").write_bytes(SECRET)
+    return media
+
+
+def test_hermes_media_root_admits_an_incoming_audio_file(
+    hermes_media: Path, data_root: Path
+) -> None:
+    voice = hermes_media / "audio_0123456789ab.ogg"
+    voice.write_bytes(GOOD)
+    config = Config(allowed_roots=(hermes_media,), data_root=data_root)
+    assert resolve_input(voice, config) == voice
+    with open_input(voice, config) as stream:
+        assert stream.read() == GOOD
+
+
+def test_hermes_media_root_still_refuses_denied_names_and_symlinks_out(
+    hermes_media: Path, data_root: Path
+) -> None:
+    config = Config(allowed_roots=(hermes_media,), data_root=data_root)
+    for name in (".env", "voice.m3u"):
+        (hermes_media / name).write_bytes(GOOD)
+        assert denied(hermes_media / name, config) == paths.DENIED_NAME
+    link = hermes_media / "audio_link.ogg"
+    link.symlink_to(hermes_media.parent.parent / "config.yaml")
+    assert denied(link, config) == paths.SYMLINK_OUT
+
+
+@pytest.mark.parametrize("media_first", [False, True])
+def test_hermes_media_root_inside_an_ancestor_root_works_in_either_order(
+    hermes_media: Path, tmp_path: Path, data_root: Path, media_first: bool
+) -> None:
+    home = tmp_path.resolve()
+    roots = (hermes_media, home) if media_first else (home, hermes_media)
+    config = Config(allowed_roots=roots, data_root=data_root)
+    voice = hermes_media / "audio_0123456789ab.ogg"
+    voice.write_bytes(GOOD)
+    assert resolve_input(voice, config) == voice
+    with open_input(voice, config) as stream:
+        assert stream.read() == GOOD
+    (hermes_media.parent / "voice.wav").write_bytes(GOOD)
+    (hermes_media / ".env").write_bytes(GOOD)
+    for refused in (
+        home / ".hermes" / "config.yaml",
+        hermes_media.parent / "voice.wav",
+        hermes_media / ".env",
+    ):
+        assert denied(refused, config) == paths.DENIED_NAME
+        with pytest.raises(PathDenied) as error:
+            open_input(refused, config)
+        assert error.value.reason == paths.DENIED_NAME
+
+
+def test_hermes_root_outside_the_media_directories_fails_loudly(
+    tmp_path: Path, data_root: Path
+) -> None:
+    for relative in (Path(".hermes"), Path(".hermes") / "cache", Path(".hermes") / "attachments"):
+        root = tmp_path.resolve() / relative
+        root.mkdir(parents=True, exist_ok=True)
+        wav = root / "voice.wav"
+        wav.write_bytes(GOOD)
+        config = Config(allowed_roots=(root,), data_root=data_root)
+        assert denied(wav, config) == paths.ROOT_HAS_DENIED_NAME
+
+
 def test_denied_name_list_lives_in_one_place() -> None:
     for pattern in (".env*", CONFIG_FILE_NAME, ".ssh", ".hermes"):
         assert pattern in paths.DENIED_NAME_PATTERNS

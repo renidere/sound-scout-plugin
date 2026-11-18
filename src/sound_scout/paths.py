@@ -10,9 +10,10 @@ symlink still matches. It must be a regular file (no directory, device or FIFO),
 component below the root may be a denied name (`config.DENIED_NAME_PATTERNS`): `.env*` and the
 operator config, `.ssh` and `.hermes` directories, and — by file name only, a first filter
 before the decoder's own format and protocol whitelists — playlist and script files that would
-make the decoder pull in other files or the network. A denied name is denied in any position,
-so `~/.ssh/*` and `~/.hermes/*` are rejected wherever the home directory is, even inside an
-allowed root. An allowed root that itself contains a denied component is not a supported
+make the decoder pull in other files or the network. A denied name is denied in any position
+below the root, so `~/.ssh/*` and `~/.hermes/*` are rejected wherever the home directory is, even
+inside an allowed root. An allowed root that `config.root_denied_name` bars — one with a denied
+component, except a Hermes media directory such as `~/.hermes/cache/audio` — is not a supported
 configuration: `config.load()` rejects it, and a `Config` built by hand with such a root has
 every path under it refused loudly with `ROOT_HAS_DENIED_NAME` instead of looking like a denied
 file. A path from a transcript gets no exception: the caller resolves it like any other.
@@ -39,7 +40,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from sound_scout.config import DENIED_NAME_PATTERNS as DENIED_NAME_PATTERNS
-from sound_scout.config import Config
+from sound_scout.config import Config, root_denied_name
 from sound_scout.config import is_denied_name as is_denied_name
 
 OUTPUT_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -183,7 +184,10 @@ def _under_any(path: Path, roots: tuple[Path, ...]) -> bool:
 
 
 def _root_of(path: Path, roots: tuple[Path, ...]) -> Path | None:
-    return next((root for root in roots if path.is_relative_to(root)), None)
+    """The most specific root containing `path`, whatever the order of the roots: a Hermes media
+    root nested in an ancestor root admits its files, the rest of `.hermes` stays denied."""
+    containing = (root for root in roots if path.is_relative_to(root))
+    return max(containing, key=lambda root: len(root.parts), default=None)
 
 
 def _outside_reason(lexical: Path, roots: tuple[Path, ...]) -> str:
@@ -192,7 +196,7 @@ def _outside_reason(lexical: Path, roots: tuple[Path, ...]) -> str:
 
 
 def _require_allowed_names(path: Path, root: Path, source: str) -> None:
-    if any(is_denied_name(part) for part in root.parts):
+    if root_denied_name(root) is not None:
         raise PathDenied(source, ROOT_HAS_DENIED_NAME)
     for part in path.relative_to(root).parts:
         if is_denied_name(part):

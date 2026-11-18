@@ -265,6 +265,93 @@ def test_allowed_root_with_an_ordinary_name_loads(
     assert load().allowed_roots == (ordinary.resolve(),)
 
 
+HERMES_MEDIA_ROOTS = [
+    Path(".hermes") / "cache" / "audio",
+    Path(".hermes") / "audio_cache",
+    Path(".hermes") / "profiles" / "work" / "cache" / "audio",
+    Path(".hermes") / "profiles" / "work" / "audio_cache",
+]
+
+
+@pytest.mark.parametrize("relative", HERMES_MEDIA_ROOTS)
+def test_hermes_media_directory_loads_as_an_allowed_root(
+    write_config, roots: tuple[Path, Path], tmp_path: Path, relative: Path
+) -> None:
+    media = tmp_path / relative
+    media.mkdir(parents=True)
+    write_config(f"allowed_roots = [{toml_string(media)}]\ndata_root = {toml_string(roots[1])}\n")
+    assert load().allowed_roots == (media.resolve(),)
+
+
+def test_hermes_media_directory_through_a_symlinked_home_loads(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    media = tmp_path / "real-home" / ".hermes" / "cache" / "audio"
+    media.mkdir(parents=True)
+    (tmp_path / "home").symlink_to(tmp_path / "real-home", target_is_directory=True)
+    given = tmp_path / "home" / ".hermes" / "cache" / "audio"
+    write_config(f"allowed_roots = [{toml_string(given)}]\ndata_root = {toml_string(roots[1])}\n")
+    assert load().allowed_roots == (media.resolve(),)
+
+
+def hermes_root_error(write_config, roots: tuple[Path, Path], given: Path) -> str:
+    write_config(
+        f"allowed_roots = [{toml_string(roots[0])}, {toml_string(given)}]\n"
+        f"data_root = {toml_string(roots[1])}\n"
+    )
+    with pytest.raises(ConfigError) as error:
+        load()
+    message = str(error.value)
+    assert "allowed_roots[1]" in message
+    return message
+
+
+@pytest.mark.parametrize(
+    ("relative", "denied"),
+    [
+        (Path(".hermes"), ".hermes"),
+        (Path(".hermes") / "attachments", ".hermes"),
+        (Path(".hermes") / "sessions", ".hermes"),
+        (Path(".hermes") / "cache", ".hermes"),
+        (Path(".hermes") / "cache" / "audio" / "sub", ".hermes"),
+        (Path(".hermes") / "profiles" / "cache" / "audio", ".hermes"),
+        (Path(".hermes") / "x" / ".hermes" / "cache" / "audio", ".hermes"),
+        (Path(".ssh") / ".hermes" / "cache" / "audio", ".ssh"),
+        (Path(".hermes") / "profiles" / ".env" / "cache" / "audio", ".env"),
+        (Path("sound-scout.toml") / ".hermes" / "audio_cache", "sound-scout.toml"),
+        (Path("list.m3u") / ".hermes" / "cache" / "audio", "list.m3u"),
+    ],
+)
+def test_hermes_root_outside_the_media_directories_is_rejected(
+    write_config, roots: tuple[Path, Path], tmp_path: Path, relative: Path, denied: str
+) -> None:
+    bad = tmp_path / relative
+    bad.mkdir(parents=True)
+    message = hermes_root_error(write_config, roots, bad)
+    assert repr(denied) in message
+    assert str(bad.resolve()) in message
+
+
+def test_symlink_into_hermes_is_not_a_media_root(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    (tmp_path / ".hermes" / "cache" / "audio").mkdir(parents=True)
+    (tmp_path / "media").symlink_to(tmp_path / ".hermes", target_is_directory=True)
+    message = hermes_root_error(write_config, roots, tmp_path / "media" / "cache" / "audio")
+    assert "through a symlink" in message
+
+
+def test_media_directory_symlinked_to_hermes_itself_is_rejected(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    (tmp_path / ".hermes" / "cache").mkdir(parents=True)
+    audio = tmp_path / ".hermes" / "cache" / "audio"
+    audio.symlink_to(tmp_path / ".hermes", target_is_directory=True)
+    message = hermes_root_error(write_config, roots, audio)
+    assert repr(".hermes") in message
+    assert str((tmp_path / ".hermes").resolve()) in message
+
+
 def test_data_root_with_a_denied_component_is_not_checked(
     write_config, roots: tuple[Path, Path], tmp_path: Path
 ) -> None:
@@ -277,6 +364,7 @@ def test_data_root_with_a_denied_component_is_not_checked(
 def test_denied_names_are_shared_with_paths() -> None:
     assert paths.DENIED_NAME_PATTERNS is config.DENIED_NAME_PATTERNS
     assert paths.is_denied_name is config.is_denied_name
+    assert paths.root_denied_name is config.root_denied_name
     assert config.is_denied_name(".HERMES") and config.is_denied_name(config.CONFIG_FILE_NAME)
     assert not config.is_denied_name("recordings")
 
