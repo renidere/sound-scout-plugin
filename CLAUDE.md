@@ -93,6 +93,7 @@
 | Адаптер audio backend: протокол `AudioBackend`, проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели, payload из клипа `clip_from_cut` | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
 | Находки на шкале исходника: `build` (исходы review через `clips/<id>.json` → `findings`, `unlocalized`, неуверенные исправления, `artifacts`, `coverage.reviewed`) и `validate` (правила контракта плюс проверка файлов-доказательств run) | `src/sound_scout/findings.py` |
 | Квалификация Gate 1: манифест корпуса, человеческая разметка, evaluation runner (`eval run`: сопоставление по PROTOCOL.md § 6, метрики, контроли, отчёт `<date>-report.md`/`.json`) | `src/sound_scout/eval/` (`manifest.py`, `labels.py`, `runner.py`) |
+| Отчёт: `write` (полный `result.json` и `report.md` на русском в run-каталоге, без приватных путей), `compact` (ответ ≤ 4 KiB), правило приоритета findings `prioritized`, `cost`; решение — `docs/decisions/0004-report-priority.md` | `src/sound_scout/report.py` |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |
