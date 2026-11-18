@@ -1,7 +1,14 @@
-"""Acceptance checks of issue #65: the ffmpeg install step in CI has bounded time."""
+"""Acceptance checks of issues #65 and #70: the ffmpeg install step in CI has bounded time
+and survives a slow apt mirror by retrying."""
 
+import os
 import re
+import shutil
+import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -19,12 +26,41 @@ def timeout_minutes(block: str) -> int:
     return int(match.group(1))
 
 
+def shell_int(block: str, name: str) -> int:
+    match = re.search(rf"^\s*{name}=(\d+)\s*$", block, re.MULTILINE)
+    assert match, f"{name} is missing"
+    return int(match.group(1))
+
+
 def test_install_ffmpeg_step_has_its_own_timeout_below_the_job_timeout() -> None:
     text = CI.read_text(encoding="utf-8")
     job_timeout = timeout_minutes(text.split("steps:", 1)[0])
     step_timeout = timeout_minutes(step_block(text, "Install ffmpeg"))
-    assert step_timeout <= 5
     assert step_timeout < job_timeout
+
+
+def test_install_ffmpeg_step_retries_the_download_within_its_timeout() -> None:
+    step = step_block(CI.read_text(encoding="utf-8"), "Install ffmpeg")
+    attempts = shell_int(step, "attempts")
+    attempt_minutes = shell_int(step, "attempt_minutes")
+    kill_after = re.search(r"--kill-after=(\d+)s", step)
+    assert kill_after, "kill-after is missing"
+    kill_after_minutes = int(kill_after.group(1)) / 60
+    assert 2 <= attempts <= 5
+    # Худший успешный путь: все попытки, кроме последней, висят до timeout и kill-after,
+    # последняя укладывается в свой предел, затем установка из кэша apt.
+    install_margin_minutes = 2
+    worst_success = (
+        (attempts - 1) * (attempt_minutes + kill_after_minutes)
+        + attempt_minutes
+        + install_margin_minutes
+    )
+    assert worst_success <= timeout_minutes(step)
+    assert attempts * (attempt_minutes + kill_after_minutes) < timeout_minutes(step)
+    assert 'for attempt in $(seq "$attempts")' in step
+    assert 'sudo timeout --kill-after=30s "${attempt_minutes}m"' in step
+    assert re.search(r"install -y --download-only ffmpeg", step)
+    assert re.search(r'apt-get "\$\{apt_opts\[@\]\}" install -y --no-download ffmpeg', step)
 
 
 def test_install_ffmpeg_step_retries_apt_a_bounded_number_of_times() -> None:
@@ -33,8 +69,8 @@ def test_install_ffmpeg_step_retries_apt_a_bounded_number_of_times() -> None:
     assert retries and 1 <= int(retries.group(1)) <= 5
     request_timeout = re.search(r"Acquire::http::Timeout=(\d+)", step)
     assert request_timeout and int(request_timeout.group(1)) <= 60
-    assert re.search(r'apt-get "\$\{apt_opts\[@\]\}" update', step)
-    assert re.search(r'apt-get "\$\{apt_opts\[@\]\}" install -y ffmpeg', step)
+    assert 'apt-get "$@" update && apt-get "$@" install' in step
+    assert '"${apt_opts[@]}"' in step
 
 
 def test_install_ffmpeg_step_fails_the_job_when_apt_gives_up() -> None:
@@ -42,3 +78,111 @@ def test_install_ffmpeg_step_fails_the_job_when_apt_gives_up() -> None:
     assert "continue-on-error" not in step
     assert "|| true" not in step
     assert "set +e" not in step
+    exhausted = r"echo \"::error::ffmpeg packages were not downloaded in .*\n\s*exit 1\n"
+    assert re.search(exhausted, step)
+
+
+def run_script(text: str, name: str) -> str:
+    """The literal `run: |` block of a step, dedented as YAML reads it."""
+    lines = step_block(text, name).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "run: |") + 1
+    body = lines[start:]
+    indent = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    return "\n".join(line[indent:] for line in body) + "\n"
+
+
+FAKE_SUDO = '#!/bin/sh\nexec "$@"\n'
+
+# Записывает пределы, заданные шагом, и исполняет настоящий timeout с теми же сигналами,
+# но в секундах вместо минут.
+FAKE_TIMEOUT = """#!/bin/bash
+echo "timeout $1 $2" >> "$CALLS"
+shift 2
+exec {real} --kill-after=1s 1s "$@"
+"""
+
+# Попытка скачивания номер n ведёт себя по MODES[n]: hang — медленное зеркало, которое
+# игнорирует SIGTERM; fail — ошибка apt; ok — пакеты скачаны.
+FAKE_APT = """#!/bin/bash
+echo "apt-get $*" >> "$CALLS"
+case " $* " in
+  *" --download-only "*)
+    n=$(( $(cat "$COUNT" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$COUNT"
+    read -ra modes <<< "$MODES"
+    case "${modes[n-1]:-ok}" in
+      hang) trap '' TERM; exec sleep 60 ;;
+      fail) exit 100 ;;
+    esac ;;
+esac
+exit 0
+"""
+
+
+def run_install_step(
+    tmp_path: Path, modes: list[str]
+) -> tuple[subprocess.CompletedProcess, list[str]]:
+    script = tmp_path / "install-ffmpeg.sh"
+    script.write_text(run_script(CI.read_text(encoding="utf-8"), "Install ffmpeg"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fakes = {
+        "sudo": FAKE_SUDO,
+        "timeout": FAKE_TIMEOUT.format(real=shutil.which("timeout")),
+        "apt-get": FAKE_APT,
+    }
+    for name, body in fakes.items():
+        fake = bin_dir / name
+        fake.write_text(body)
+        fake.chmod(0o755)
+    calls = tmp_path / "calls"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "CALLS": str(calls),
+        "COUNT": str(tmp_path / "count"),
+        "MODES": " ".join(modes),
+    }
+    # GitHub Actions runs a step without `shell:` as `bash -e {0}`.
+    done = subprocess.run(
+        ["bash", "-e", str(script)], env=env, capture_output=True, text=True, timeout=60
+    )
+    return done, calls.read_text().splitlines()
+
+
+@pytest.mark.parametrize("modes", [["hang"], ["fail"], ["hang", "fail"], ["fail", "hang"]])
+def test_install_ffmpeg_step_survives_one_or_two_slow_or_failing_downloads(
+    tmp_path: Path, modes: list[str]
+) -> None:
+    done, calls = run_install_step(tmp_path, modes)
+    assert done.returncode == 0, done.stdout + done.stderr
+    downloads = [c for c in calls if "--download-only" in c]
+    assert len(downloads) == len(modes) + 1
+    assert all("Acquire::Retries=3" in c for c in downloads)
+    assert [c for c in calls if c.startswith("timeout")] == ["timeout --kill-after=30s 5m"] * (
+        len(modes) + 1
+    )
+    assert done.stdout.count("::warning::ffmpeg download attempt") == len(modes)
+    assert "::error::" not in done.stdout
+    assert calls[-1].startswith("apt-get ") and calls[-1].endswith(
+        "install -y --no-download ffmpeg"
+    )
+    assert sum("install -y --no-download ffmpeg" in c for c in calls) == 1
+
+
+@pytest.mark.parametrize("modes", [["hang", "hang", "hang"], ["fail", "hang", "fail"]])
+def test_install_ffmpeg_step_fails_with_a_reason_after_three_bad_downloads(
+    tmp_path: Path, modes: list[str]
+) -> None:
+    started = time.monotonic()
+    done, calls = run_install_step(tmp_path, modes)
+    elapsed = time.monotonic() - started
+    assert done.returncode == 1
+    assert (
+        "::error::ffmpeg packages were not downloaded in 3 attempts of 5 min each "
+        "(slow or failing apt mirror)"
+    ) in done.stdout
+    assert sum("--download-only" in c for c in calls) == 3
+    assert not any("--no-download" in c for c in calls)
+    # Висящее зеркало, глухое к SIGTERM, обрывает timeout: 1 с + 1 с kill-after на попытку.
+    assert elapsed < 3 * 2 + 5

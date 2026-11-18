@@ -32,11 +32,27 @@ jobs:
 
       - name: Install ffmpeg
         if: steps.pkg.outputs.present == 'true'
-        timeout-minutes: 5
+        # Худший успешный путь: (attempts − 1) × (attempt_minutes + 0,5 мин kill-after) на зависшие
+        # попытки, attempt_minutes на удачную и не меньше 2 мин на локальную установку: 2 × 5,5 + 5 + 2 = 18.
+        # .deb, скачанные попыткой, которую оборвал timeout, остаются в кэше apt, и следующая попытка
+        # продолжает с них.
+        timeout-minutes: 18
         run: |
           apt_opts=(-q -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
-          sudo apt-get "${apt_opts[@]}" update
-          sudo apt-get "${apt_opts[@]}" install -y ffmpeg
+          attempts=3
+          attempt_minutes=5
+          for attempt in $(seq "$attempts"); do
+            if sudo timeout --kill-after=30s "${attempt_minutes}m" bash -c \
+              'apt-get "$@" update && apt-get "$@" install -y --download-only ffmpeg' apt "${apt_opts[@]}"; then
+              break
+            fi
+            echo "::warning::ffmpeg download attempt $attempt of $attempts failed or exceeded ${attempt_minutes} min"
+            if [ "$attempt" -eq "$attempts" ]; then
+              echo "::error::ffmpeg packages were not downloaded in $attempts attempts of ${attempt_minutes} min each (slow or failing apt mirror)"
+              exit 1
+            fi
+          done
+          sudo apt-get "${apt_opts[@]}" install -y --no-download ffmpeg
 
       - name: Sync
         if: steps.pkg.outputs.present == 'true'
