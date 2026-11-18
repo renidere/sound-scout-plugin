@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/renidere/sound-scout-plugin/schema/corpus-manifest.v1.schema.json",
+  "title": "Sound Scout qualification corpus manifest, version 1",
+  "description": "Манифест квалификационного корпуса (Gate 1, T04–T06; docs/eval/PROTOCOL.md): какие клипы входят в корпус, в какую часть (dev/held-out) и какие категории событий в них размечены. Сам корпус лежит в data/corpus/<name>/manifest.json вне git. Правила между записями (одна часть на source_group, уникальные hash, минимальные объёмы) проверяет sound_scout.eval.manifest.validate поверх этой схемы.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name", "records"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "name": { "$ref": "#/$defs/identifier" },
+    "note": { "$ref": "#/$defs/nullable_string" },
+    "records": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullable_string": { "type": ["string", "null"] },
+    "nullable_identifier": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/identifier" }] },
+    "category": {
+      "enum": [
+        "pronunciation",
+        "repetition_self_correction",
+        "semantic_stress",
+        "pause_phrasing",
+        "completeness"
+      ]
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "sha256",
+        "duration_s",
+        "split",
+        "source_group",
+        "categories",
+        "negative_control"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "duration_s": { "type": "number", "exclusiveMinimum": 0 },
+        "split": { "enum": ["dev", "heldout"] },
+        "source_group": { "$ref": "#/$defs/identifier" },
+        "categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/category" }
+        },
+        "negative_control": { "type": "boolean" },
+        "pair_id": { "$ref": "#/$defs/nullable_identifier" },
+        "note": { "$ref": "#/$defs/nullable_string" }
+      }
+    }
+  }
+}

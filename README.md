@@ -18,6 +18,8 @@ https://github.com/users/renidere/projects/1 автономным агентом
 - `docs/spec/AGENT_PROMPT.md` — поручение агенту-разработчику и границы полномочий.
 - `docs/spec/AUDIO_REVIEW_PROMPT.md` — черновик инструкции audio backend и правила использования
   результата в Hermes.
+- `docs/eval/PROTOCOL.md` — протокол квалификации слоя звучания (Gate 1): категории событий,
+  корпус и манифест, dev/held-out, сопоставление интервалов, пороги, abstention, контроли.
 - `docs/workflow.md` — как устроена автономная работа через задачи.
 - `CLAUDE.md` — правила работы в репозитории для агентов.
 
