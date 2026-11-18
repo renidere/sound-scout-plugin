@@ -19,7 +19,7 @@ from sound_scout.eval.labels import (
     validation_report,
 )
 from sound_scout.eval.manifest import CATEGORIES
-from tests.test_schema import EXAMPLE_DOC, finding
+from tests.test_schema import EXAMPLE_DOC, finding, ref
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROOT_SCHEMA = REPO_ROOT / "schema" / "labels.v1.schema.json"
@@ -279,12 +279,16 @@ def test_main_prints_each_file_and_exits_non_zero_on_any_invalid(tmp_path: Path,
     assert main([]) == 2
 
 
-def human_verified_result() -> dict:
+def human_verified_result(label_sha256: str = "ab" * 32) -> dict:
     result = deepcopy(EXAMPLE_DOC)
     result["findings"].append(
-        finding("f-human", "human_verified", [{"type": "human_label", "ref": "labels-1"}])
+        finding("f-human", "human_verified", [ref("human_label", "labels-1", label_sha256)])
     )
     return result
+
+
+def example_artifact(artifact_id: str) -> dict:
+    return next(a for a in EXAMPLE_DOC["artifacts"] if a["id"] == artifact_id)
 
 
 def test_evidence_record_from_a_valid_file_carries_its_hash_and_passes_schema_validate(
@@ -299,7 +303,7 @@ def test_evidence_record_from_a_valid_file_carries_its_hash_and_passes_schema_va
     )
     assert record["kind"] == "human_label"
     assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-    result = human_verified_result()
+    result = human_verified_result(record["sha256"])
     with pytest.raises(schema.ResultValidationError) as excinfo:
         schema.validate(result)
     assert any("unknown artifact 'labels-1'" in error for error in excinfo.value.errors)
@@ -309,7 +313,8 @@ def test_evidence_record_from_a_valid_file_carries_its_hash_and_passes_schema_va
 
 def test_human_verified_without_a_human_label_record_fails_schema_validate() -> None:
     result = human_verified_result()
-    result["findings"][-1]["evidence_refs"] = [{"type": "transcript", "ref": "transcript-raw"}]
+    raw = example_artifact("transcript-raw")
+    result["findings"][-1]["evidence_refs"] = [ref("transcript", raw["id"], raw["sha256"])]
     errors = schema.validation_errors(result)
     assert any(
         "evidence_basis 'human_verified' needs at least one reference of type 'human_label'" in e
