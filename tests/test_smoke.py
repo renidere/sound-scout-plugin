@@ -1,11 +1,15 @@
-"""Smoke runs of `decoder` and `acoustics` (issue #46): the real ffmpeg, Silero VAD and Praat.
+"""Smoke runs of `decoder` and `acoustics` (issue #46): the real ffmpeg, Silero VAD and Praat;
+and of `asr` (issue #54): the real cached model on the development recording.
 
-The success tests run the components for real on synthetic signals and are the capability
-proof behind `ready`. The refusal tests substitute a measurement result, a broken input or a
-sleeping decoder only to show that a failed run neither writes nor touches a receipt; they
-prove the refusal path, not a capability.
+The success tests run the components for real — `decoder` and `acoustics` on synthetic
+signals, `asr` (`slow`) on the recording named by `SOUND_SCOUT_DEV_AUDIO` — and are the
+capability proof behind `ready`. The refusal tests substitute a measurement result, a broken
+input, a sleeping decoder or an ASR model double only to show that a failed run neither writes
+nor touches a receipt; they prove the refusal path, not a capability. Their recordings are
+synthesized in the test's tmp directory.
 """
 
+import errno
 import json
 import os
 import shutil
@@ -19,10 +23,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import acoustics, doctor, guard, ingest, smoke
+from sound_scout import acoustics, asr, doctor, guard, ingest, smoke
+from sound_scout import config as config_module
 from sound_scout.acoustics import VadUnavailable
-from sound_scout.config import MIB, Budgets, Config
+from sound_scout.config import MIB, Asr, Budgets, Config
 from sound_scout.smoke import SmokeFailed
+from tests.test_asr import (
+    REPO,
+    REVISION,
+    FakeModel,
+    fake_snapshot,
+    never_load,
+    restore_offline_env,
+    segment,
+    word,
+)
+from tests.test_ingest import write_wav
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -79,7 +95,7 @@ def stale_receipt(
         real_version = doctor.installed_version
         with monkeypatch.context() as patch:
             patch.setattr(doctor, "installed_version", lambda name: f"{real_version(name)}-earlier")
-            path = doctor.write_receipt("acoustics", config, earlier, now=EARLIER)
+            path = doctor.write_receipt(component, config, earlier, now=EARLIER)
     before = status(config, component)
     assert before["status"] == "unvalidated" and "stale" in before["reason"]
     return path.read_bytes(), before["last_smoke_at"]
@@ -337,8 +353,8 @@ def test_run_goes_on_after_a_failure_and_rejects_unknown_components(
     assert list(outcomes) == ["decoder", "acoustics"]
     assert outcomes["decoder"].reason == "broken on purpose"
     assert outcomes["acoustics"] == Path("ran")
-    with pytest.raises(ValueError, match="asr"):
-        smoke.run(config, ("asr",))
+    with pytest.raises(ValueError, match="audio_review"):
+        smoke.run(config, ("audio_review",))
 
 
 @needs_ffmpeg
@@ -439,3 +455,247 @@ def test_smoke_writes_nothing_outside_the_data_root_under_the_guard(
         "acoustics.json",
         "decoder.json",
     ]
+
+
+# --- asr: the development recording --------------------------------------------------------
+
+
+@pytest.fixture
+def asr_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
+    """A config whose ASR model is a fake snapshot in a fake HF cache, so the probe passes;
+    the model that runs is a test double or none, so these tests prove refusals only."""
+    base = tmp_path.resolve()
+    recordings, data, hf_cache = base / "recordings", base / "data", base / "hf"
+    recordings.mkdir()
+    data.mkdir()
+    fake_snapshot(hf_cache, REVISION)
+    monkeypatch.setenv("HF_HUB_CACHE", str(hf_cache))
+    restore_offline_env(monkeypatch)
+    monkeypatch.delenv(smoke.DEV_AUDIO_ENV, raising=False)
+    return Config(allowed_roots=(recordings,), data_root=data, asr=Asr(model=REPO))
+
+
+def dev_recording(folder: Path, *, silent: bool = False, seconds: float = 2.0) -> Path:
+    rate = 48_000
+    t = np.arange(round(seconds * rate)) / rate
+    tone = np.zeros_like(t) if silent else 0.3 * 32767 * np.sin(2 * np.pi * 180.0 * t)
+    return write_wav(folder / "dev.wav", np.round(tone).astype(np.int16), rate)
+
+
+def point_at(monkeypatch: pytest.MonkeyPatch, recording: Path) -> None:
+    monkeypatch.setenv(smoke.DEV_AUDIO_ENV, str(recording))
+
+
+def test_asr_smoke_without_the_dev_audio_variable_keeps_the_old_receipt(
+    asr_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    monkeypatch.setattr(asr, "_load_model", never_load)
+
+    with pytest.raises(SmokeFailed) as failure:
+        smoke.asr(asr_config)
+
+    assert failure.value.component == "asr"
+    assert failure.value.reason == (
+        "SOUND_SCOUT_DEV_AUDIO is not set; the asr smoke needs a development recording"
+    )
+    assert_kept(asr_config, "asr", saved)
+
+
+def test_asr_smoke_without_the_model_keeps_the_old_receipt(
+    asr_config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    shutil.rmtree(tmp_path / "hf")
+    point_at(monkeypatch, dev_recording(asr_config.allowed_roots[0]))
+    monkeypatch.setattr(asr, "_load_model", never_load)
+
+    with pytest.raises(SmokeFailed) as failure:
+        smoke.asr(asr_config)
+
+    assert failure.value.reason.startswith(doctor.WEIGHTS_NOT_CACHED)
+    assert receipt_path(asr_config, "asr").read_bytes() == saved[0]
+    assert status(asr_config, "asr")["status"] == "unavailable"
+    assert_only_receipts_in_data_root(asr_config)
+
+
+def test_asr_smoke_refuses_a_recording_outside_the_allowed_roots(
+    asr_config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    recording = dev_recording(elsewhere)
+    point_at(monkeypatch, recording)
+    monkeypatch.setattr(asr, "_load_model", never_load)
+
+    with pytest.raises(SmokeFailed) as failure:
+        smoke.asr(asr_config)
+
+    assert failure.value.reason == "recording refused: outside allowed roots"
+    assert_kept(asr_config, "asr", saved)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("silent", "expected"),
+    [
+        (True, "zero_signal: every channel is digital silence"),
+        (False, "receipt refused: transcription has no words"),
+    ],
+    ids=["digital_silence", "no_words"],
+)
+def test_asr_smoke_refuses_a_recording_without_speech(
+    asr_config: Config, monkeypatch: pytest.MonkeyPatch, silent: bool, expected: str
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    point_at(monkeypatch, dev_recording(asr_config.allowed_roots[0], silent=silent))
+    monkeypatch.setattr(asr, "_load_model", lambda snapshot_dir: FakeModel([]))
+
+    with pytest.raises(SmokeFailed) as failure:
+        smoke.asr(asr_config)
+
+    assert failure.value.reason == expected
+    assert_kept(asr_config, "asr", saved)
+
+
+@needs_ffmpeg
+def test_asr_smoke_refuses_a_substituted_model_and_keeps_the_old_receipt(
+    asr_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    point_at(monkeypatch, dev_recording(asr_config.allowed_roots[0]))
+    double = FakeModel([segment(0.0, 1.0, " слово", [word(0.0, 1.0, " слово", 0.9)])])
+    monkeypatch.setattr(asr, "_load_model", lambda snapshot_dir: double)
+
+    with pytest.raises(SmokeFailed) as failure:
+        smoke.asr(asr_config)
+
+    assert failure.value.reason.startswith("receipt refused: transcription came from ")
+    assert "a substituted model proves no capability" in failure.value.reason
+    assert len(double.calls) == 1
+    assert_kept(asr_config, "asr", saved)
+
+
+@needs_ffmpeg
+def test_asr_smoke_names_a_failed_stage(
+    asr_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point_at(monkeypatch, dev_recording(asr_config.allowed_roots[0]))
+
+    def broken(snapshot_dir: Path):
+        raise RuntimeError("cannot load")
+
+    monkeypatch.setattr(asr, "_load_model", broken)
+
+    outcomes = smoke.run(asr_config, ("asr",))
+
+    assert outcomes["asr"].reason == "asr stage is failed: RuntimeError: cannot load"
+    assert sorted(os.listdir(asr_config.data_root)) == []
+
+
+def no_space(*args, **kwargs):
+    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("failing", ["_scratch_run", "prepare.mono16k"])
+def test_asr_smoke_turns_a_work_file_error_into_a_failure_and_cleans_up(
+    failing: str, asr_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = stale_receipt("asr", asr_config, monkeypatch)
+    point_at(monkeypatch, dev_recording(asr_config.allowed_roots[0]))
+    monkeypatch.setattr(asr, "_load_model", never_load)
+    monkeypatch.setattr(f"sound_scout.smoke.{failing}", no_space)
+
+    outcomes = smoke.run(asr_config, ("asr",))
+
+    assert outcomes["asr"].reason == (
+        f"cannot write the smoke work files: {os.strerror(errno.ENOSPC)}"
+    )
+    assert_kept(asr_config, "asr", saved)
+
+
+def test_smoke_runs_asr_only_when_named(config: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[str] = []
+    for name in smoke.COMPONENTS:
+        monkeypatch.setattr(smoke, name, lambda loaded, name=name: ran.append(name) or Path(name))
+
+    assert list(smoke.run(config)) == ["decoder", "acoustics"] == ran
+    assert smoke.DEFAULT_COMPONENTS == ("decoder", "acoustics")
+    assert list(smoke.run(config, ("asr",))) == ["asr"]
+
+
+def test_recording_label_is_what_the_input_is_and_how_long() -> None:
+    assert smoke.recording_label(10.64) == "development recording, 10.6 s"
+
+
+def dev_audio_or_skip() -> Path:
+    dev_audio = os.environ.get(smoke.DEV_AUDIO_ENV)
+    if not dev_audio:
+        pytest.skip(f"{smoke.DEV_AUDIO_ENV} is not set")
+    recording = Path(dev_audio).resolve()
+    if not recording.is_file():
+        pytest.skip(f"{smoke.DEV_AUDIO_ENV} does not name a file")
+    return recording
+
+
+def model_or_skip(loaded: Config) -> None:
+    _, reason = doctor.snapshot(loaded.asr.model, loaded.asr.revision)
+    if reason is not None:
+        pytest.skip(f"model not in the local cache: {reason}")
+
+
+@pytest.mark.slow
+@needs_ffmpeg
+def test_asr_smoke_on_the_dev_recording_writes_only_into_the_given_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording = dev_audio_or_skip()
+    data = tmp_path / "data"
+    data.mkdir()
+    loaded = Config(allowed_roots=(recording.parent,), data_root=data.resolve())
+    model_or_skip(loaded)
+    restore_offline_env(monkeypatch)
+    monkeypatch.delenv(config_module.CONFIG_PATH_ENV, raising=False)
+    monkeypatch.setattr(config_module, "load", never_load)
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    real_transcribe = asr.transcribe
+    transcriptions = []
+
+    def recorded(*args, **kwargs):
+        transcriptions.append(real_transcribe(*args, **kwargs))
+        return transcriptions[-1]
+
+    monkeypatch.setattr(smoke.asr_stage, "transcribe", recorded)
+    recording_state = recording.stat()
+    outside = [path for path in tmp_path.rglob("*") if not path.is_relative_to(data)]
+    before = {str(path): path.lstat().st_mtime_ns for path in outside}
+
+    path = smoke.asr(loaded)
+
+    assert path == receipt_path(loaded, "asr")
+    assert status(loaded, "asr")["status"] == "ready"
+    assert_only_receipts_in_data_root(loaded)
+    assert_private(loaded, path)
+    after = [path for path in tmp_path.rglob("*") if not path.is_relative_to(data)]
+    assert {str(path): path.lstat().st_mtime_ns for path in after} == before
+    assert (recording.stat().st_size, recording.stat().st_mtime_ns) == (
+        recording_state.st_size,
+        recording_state.st_mtime_ns,
+    )
+    text = path.read_text(encoding="utf-8")
+    for forbidden in (str(recording), recording.name, str(recording.parent), "SOUND_SCOUT"):
+        assert forbidden not in text
+    [transcription] = transcriptions
+    raw = transcription.raw
+    assert raw["model"]["implementation"] == asr.MODEL_IMPLEMENTATION
+    spoken = [s["text"].strip() for s in raw["segments"] if s["text"].strip()]
+    assert spoken and all(phrase not in text for phrase in spoken)
+    recorded_smoke = json.loads(text)["smoke"]
+    assert recorded_smoke["test"] == "sound_scout.smoke.asr"
+    assert recorded_smoke["input"] == smoke.recording_label(raw["audio"]["duration_s"])
+    assert recorded_smoke["input"].startswith("development recording, ")
+    assert recorded_smoke["words"] > 0 and recorded_smoke["flags"] == []

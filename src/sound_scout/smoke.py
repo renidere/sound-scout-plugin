@@ -1,4 +1,4 @@
-"""Smoke runs of `decoder` and `acoustics`: the real component on a synthetic signal (R01, R03).
+"""Smoke runs of `decoder`, `acoustics` and `asr`: the real component on a known input (R01, R03).
 
 `doctor` reports a component `ready` only when a smoke-receipt matches its current fingerprint,
 and a receipt proves something only when the component itself ran: a mock or a test double
@@ -13,11 +13,24 @@ every check passes is `doctor.write_receipt` called, with the operator's own con
 the fingerprint is the one `doctor` computes; a failed check raises `SmokeFailed` and leaves an
 existing receipt untouched.
 
-Nothing is downloaded and no recording is read. Everything this module writes goes into a
-temporary `<data_root>/.smoke-*` directory, removed whatever happens, and into
-`<data_root>/receipts/`; onnxruntime, imported for the speech detector, has its telemetry
-switched off before the import (`guard.disable_telemetry`), so it writes nothing either.
-The network guard is the caller's: the `smoke` subcommand installs it like `doctor` does.
+`asr` has no synthetic input that proves hearing: it transcribes the development recording
+named by `SOUND_SCOUT_DEV_AUDIO` with the configured, already cached model (offline, never a
+download), through the same `ingest.decode` → `channels` → `prepare.mono16k` path and input
+policy (allowed roots, input size, duration and channel limits, ffmpeg budgets) as `analyze`,
+but in this process: unlike `analyze` it has no worker, so `budgets.worker_deadline_seconds`
+does not bound it. It hands the transcription to `asr.write_smoke_receipt`, which refuses a
+stage that did not complete, a transcript without words or flagged as a hallucination and a
+substituted model. The receipt describes the input as
+"development recording" and its duration: no transcript text, no path. Because it reads a
+recording and loads the model, `asr` runs only when named; `DEFAULT_COMPONENTS` are the two
+synthetic ones.
+
+Nothing is downloaded, and no recording is read except the one `asr` is pointed at.
+Everything this module writes goes into a temporary `<data_root>/.smoke-*` directory, removed
+whatever happens (the raw transcript of `asr` with it), and into `<data_root>/receipts/`;
+onnxruntime, imported for the speech detector, has its telemetry switched off before the import
+(`guard.disable_telemetry`), so it writes nothing either. The network guard is the caller's: the
+`smoke` subcommand installs it like `doctor` does.
 """
 
 import contextlib
@@ -33,11 +46,13 @@ from pathlib import Path
 import numpy as np
 from parselmouth.praat import call
 
-from sound_scout import channels, doctor, ingest, paths, runs
+from sound_scout import asr as asr_stage
+from sound_scout import channels, doctor, ingest, paths, prepare, runs
 from sound_scout.acoustics import VAD_END_LAG_WINDOWS, VAD_WINDOW_MS, measure
 from sound_scout.config import Config
 
-COMPONENTS = ("decoder", "acoustics")
+COMPONENTS = ("decoder", "acoustics", "asr")
+DEFAULT_COMPONENTS = ("decoder", "acoustics")
 SMOKE_DIR_PREFIX = ".smoke-"
 DIR_MODE = 0o700
 
@@ -60,6 +75,9 @@ F0_TOLERANCE_REL = 0.03
 SPAN_START_TOLERANCE_S = 0.05
 SPAN_END_TOLERANCE_S = VAD_END_LAG_WINDOWS * VAD_WINDOW_MS / 1000
 MIN_VOICED_FRAMES = 50
+
+DEV_AUDIO_ENV = "SOUND_SCOUT_DEV_AUDIO"
+ASR_INPUT_LABEL = "development recording"
 
 VOWEL_FORMANTS = (
     (300, 2300, 3000, 3400),
@@ -118,20 +136,10 @@ def decoder(config: Config) -> Path:
     samples = np.round(
         DECODER_AMPLITUDE * 32767 * np.sin(2 * np.pi * DECODER_FREQUENCY_HZ * t)
     ).astype(np.int16)
-    with _smoke_dir(config) as work:
+    with _smoke_dir(config, "decoder") as work:
         source_path = work / INPUT_NAME
         _write_wav(source_path, samples, DECODER_RATE)
-        run_dir = work / "run"
-        os.mkdir(run_dir, DIR_MODE)
-        run = runs.Run(
-            run_id=f"smoke-{uuid.uuid4().hex}",
-            path=run_dir,
-            request_id="smoke",
-            identity_hash="",
-            reused=False,
-            complete=False,
-            created=True,
-        )
+        run = _scratch_run(work)
         try:
             source = ingest.decode_generated(source_path, run, config)
         except ingest.IngestError as error:
@@ -243,12 +251,68 @@ def acoustics(config: Config) -> Path:
     return _save("acoustics", config, smoke)
 
 
-def run(config: Config, components: tuple[str, ...] = COMPONENTS) -> dict[str, Path | SmokeFailed]:
+def asr(config: Config) -> Path:
+    """Transcribe the development recording with the real cached model and save the receipt."""
+    recording = os.environ.get(DEV_AUDIO_ENV)
+    if not recording:
+        raise SmokeFailed(
+            "asr", f"{DEV_AUDIO_ENV} is not set; the asr smoke needs a development recording"
+        )
+    state = doctor.component_status("asr", config, config.data_root)
+    if state["status"] == "unavailable":
+        raise SmokeFailed("asr", str(state["reason"]))
+    with _smoke_dir(config, "asr") as work:
+        try:
+            run = _scratch_run(work)
+            source = ingest.decode(recording, run, config)
+            audio = channels.load(source)
+            mono, _ = channels.choose_mono(audio, channels.report(audio))
+            mono16k = prepare.mono16k(mono, source.probe.sample_rate, run, config).samples
+            transcription = asr_stage.transcribe(mono16k, run, config)
+        except paths.PathDenied as error:
+            raise SmokeFailed("asr", f"recording refused: {error.reason}") from None
+        except (
+            ingest.IngestError,
+            channels.ChannelError,
+            prepare.PrepareError,
+            asr_stage.AsrError,
+            ValueError,
+        ) as error:
+            raise SmokeFailed("asr", str(error)) from None
+        except OSError as error:
+            raise SmokeFailed(
+                "asr", f"cannot write the smoke work files: {error.strerror or error}"
+            ) from None
+    if transcription.status != "completed":
+        raise SmokeFailed("asr", f"asr stage is {transcription.status}: {transcription.reason}")
+    try:
+        return asr_stage.write_smoke_receipt(
+            transcription,
+            config,
+            test="sound_scout.smoke.asr",
+            input_label=recording_label(source.duration_s),
+        )
+    except doctor.ReceiptRejected as error:
+        raise SmokeFailed("asr", f"receipt refused: {error}") from None
+    except paths.PathDenied as error:
+        raise SmokeFailed("asr", f"receipt path refused: {error.reason}") from None
+    except OSError as error:
+        raise SmokeFailed("asr", f"cannot write the receipt: {error.strerror}") from None
+
+
+def recording_label(duration_s: float) -> str:
+    """The receipt's `input` for a development recording: what it is and how long, no path."""
+    return f"{ASR_INPUT_LABEL}, {duration_s:.1f} s"
+
+
+def run(
+    config: Config, components: tuple[str, ...] = DEFAULT_COMPONENTS
+) -> dict[str, Path | SmokeFailed]:
     """Run the named smoke tests in order; a failure is recorded and the next one still runs."""
     unknown = [name for name in components if name not in COMPONENTS]
     if unknown:
         raise ValueError(f"unknown smoke components {unknown}; known: {list(COMPONENTS)}")
-    smoke_tests = {"decoder": decoder, "acoustics": acoustics}
+    smoke_tests = {"decoder": decoder, "acoustics": acoustics, "asr": asr}
     outcomes: dict[str, Path | SmokeFailed] = {}
     for name in components:
         try:
@@ -311,19 +375,34 @@ def _save(component: str, config: Config, smoke: dict) -> Path:
 
 
 @contextlib.contextmanager
-def _smoke_dir(config: Config) -> Iterator[Path]:
+def _smoke_dir(config: Config, component: str) -> Iterator[Path]:
     if not config.data_root.is_dir():
-        raise SmokeFailed("decoder", "the data root is not an existing directory")
+        raise SmokeFailed(component, "the data root is not an existing directory")
     try:
         work = Path(tempfile.mkdtemp(prefix=SMOKE_DIR_PREFIX, dir=config.data_root))
     except OSError as error:
         raise SmokeFailed(
-            "decoder", f"cannot create a work directory under the data root: {error.strerror}"
+            component, f"cannot create a work directory under the data root: {error.strerror}"
         ) from None
     try:
         yield work
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _scratch_run(work: Path) -> runs.Run:
+    """A run directory inside the smoke work directory; `runs.open_run` would leave a run behind."""
+    run_dir = work / "run"
+    os.mkdir(run_dir, DIR_MODE)
+    return runs.Run(
+        run_id=f"smoke-{uuid.uuid4().hex}",
+        path=run_dir,
+        request_id="smoke",
+        identity_hash="",
+        reused=False,
+        complete=False,
+        created=True,
+    )
 
 
 def _write_wav(path: Path, samples: np.ndarray, rate: int) -> None:

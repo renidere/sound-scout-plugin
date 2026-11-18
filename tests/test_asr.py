@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import asr, channels, doctor, guard, ingest, prepare, schema
+from sound_scout import asr, channels, doctor, guard, ingest, prepare, schema, smoke
 from sound_scout._schema_messages import schema_errors
 from sound_scout.asr import (
     INFERENCE_PARAMETERS,
@@ -1039,12 +1039,13 @@ def test_real_model_transcribes_the_dev_recording_and_writes_the_smoke_receipt(
         result,
         config,
         test=f"{__name__}::dev_recording",
-        input_label="development recording from SOUND_SCOUT_DEV_AUDIO",
+        input_label=smoke.recording_label(source.duration_s),
     )
 
     assert path == config.data_root / "receipts" / "asr.json"
     text = path.read_text(encoding="utf-8")
     assert str(recording) not in text and recording.name not in text
     assert result.raw["text"] not in text
+    assert json.loads(text)["smoke"]["input"] == f"development recording, {source.duration_s:.1f} s"
     assert doctor.component_status("asr", config, config.data_root)["status"] == "ready"
     assert "faster_whisper" in sys.modules

@@ -272,14 +272,66 @@ def test_smoke_without_configuration_is_one_line_on_stderr(
     assert captured.err.count("\n") == 1
 
 
-@pytest.mark.parametrize("component", ["asr", "audio_review"])
-def test_smoke_of_another_component_is_a_usage_error(
-    component: str, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_smoke_of_another_component_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
-        main(["smoke", component])
+        main(["smoke", "audio_review"])
     assert exit_info.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_smoke_components_of_the_parser_are_those_of_the_module() -> None:
+    from sound_scout import cli, smoke
+
+    assert cli.SMOKE_COMPONENTS == smoke.COMPONENTS
+    assert cli.SMOKE_DEFAULT_COMPONENTS == smoke.DEFAULT_COMPONENTS
+
+
+def test_smoke_asr_without_the_dev_recording_exits_1_and_names_the_reason(
+    config_without_guard: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("SOUND_SCOUT_DEV_AUDIO", raising=False)
+
+    assert main(["smoke", "asr"]) == 1
+
+    assert capsys.readouterr().out == (
+        "asr: failed: SOUND_SCOUT_DEV_AUDIO is not set; "
+        "the asr smoke needs a development recording\n"
+    )
+    assert os.listdir(config_without_guard.parent / "data") == []
+
+
+@pytest.mark.slow
+@needs_ffmpeg
+def test_smoke_asr_on_the_dev_recording_then_doctor_reports_asr_ready(tmp_path: Path) -> None:
+    dev_audio = os.environ.get("SOUND_SCOUT_DEV_AUDIO")
+    if not dev_audio or not Path(dev_audio).is_file():
+        pytest.skip("SOUND_SCOUT_DEV_AUDIO does not name a file")
+    _, reason = doctor.snapshot(config.Asr().model, None)
+    if reason is not None:
+        pytest.skip(f"model not in the local cache: {reason}")
+    data = tmp_path / "data"
+    data.mkdir()
+    path = tmp_path / "sound-scout.toml"
+    path.write_text(
+        f"allowed_roots = [{json.dumps(str(Path(dev_audio).resolve().parent))}]\n"
+        f"data_root = {json.dumps(str(data))}\n",
+        encoding="utf-8",
+    )
+    env = offline_env(path)
+
+    result = run_cli("smoke", "asr", env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == ["asr: ok (receipts/asr.json)"]
+    assert sorted(os.listdir(data / doctor.RECEIPTS_DIR_NAME)) == ["asr.json"]
+    before_doctor = tree_state(data)
+    report = run_cli("doctor", "--json", env=env)
+    assert report.returncode == 0, report.stderr
+    assert json.loads(report.stdout)["components"]["asr"]["status"] == "ready"
+    assert sorted(os.listdir(data)) == [doctor.RECEIPTS_DIR_NAME]
+    assert tree_state(data) == before_doctor
 
 
 def test_failed_smoke_exits_1_and_names_the_reason(

@@ -7,11 +7,13 @@ a diagnosis, not a check. A configuration error is one line on stderr and exit c
 (`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits
 0 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or
 a report that already exists, is one line on stderr and exit code 1; missing or invalid labels
-and results are NOT QUALIFIED reasons in the report. `smoke [decoder] [acoustics]` loads the
-same configuration, installs the network guard, runs the real components on a synthetic signal
-(`sound_scout.smoke`, imported only here: it loads Praat and the speech detector) and saves the
-smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was written,
-1 otherwise. The other subcommands are not implemented yet and exit 2.
+and results are NOT QUALIFIED reasons in the report. `smoke [decoder] [acoustics] [asr]` loads
+the same configuration, installs the network guard, runs the real components (`sound_scout.smoke`,
+imported only here: it loads Praat, the speech detector and, for `asr`, the cached ASR model) —
+`decoder` and `acoustics` on a synthetic signal, `asr` on the development recording named by
+`SOUND_SCOUT_DEV_AUDIO`, only when asked for — and saves the smoke-receipts `doctor` reads; one
+line per component, exit 0 when every receipt was written, 1 otherwise. The other subcommands
+are not implemented yet and exit 2.
 """
 
 import argparse
@@ -27,11 +29,13 @@ SUBCOMMANDS = {
     "compare": "compare two analyzed recordings",
     "serve": "run the MCP stdio server",
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
-    "smoke": "run the real decoder and acoustics on synthetic audio and save their "
-    "smoke-receipts for doctor",
+    "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
+    "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
 }
-# The names of `smoke.COMPONENTS`, repeated so that building the parser does not import `smoke`.
-SMOKE_COMPONENTS = ("decoder", "acoustics")
+# `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
+# not import `smoke`.
+SMOKE_COMPONENTS = ("decoder", "acoustics", "asr")
+SMOKE_DEFAULT_COMPONENTS = ("decoder", "acoustics")
 NOT_IMPLEMENTED_EXIT_CODE = 2
 CONFIG_ERROR_EXIT_CODE = 1
 EVAL_ERROR_EXIT_CODE = 1
@@ -61,7 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "components",
                 nargs="*",
                 choices=SMOKE_COMPONENTS,
-                help="components to smoke-test (default: all of them)",
+                help="components to smoke-test (default: decoder and acoustics; asr reads "
+                "the development recording in SOUND_SCOUT_DEV_AUDIO)",
             )
     return parser
 
@@ -96,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "eval":
         return run_eval(args)
     if args.command == "smoke":
-        return run_smoke(tuple(dict.fromkeys(args.components)) or SMOKE_COMPONENTS)
+        return run_smoke(tuple(dict.fromkeys(args.components)) or SMOKE_DEFAULT_COMPONENTS)
     print(f"sound-scout {args.command}: not implemented", file=sys.stderr)
     return NOT_IMPLEMENTED_EXIT_CODE
 

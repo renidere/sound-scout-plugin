@@ -47,10 +47,12 @@ uv run sound-scout --help
 (`<data_root>/receipts/<компонент>.json`), совпадающий с текущим отпечатком компонента; `doctor`
 только читает его, ничего не пишет, не скачивает и не запускает inference.
 
-Receipt для `decoder` и `acoustics` оператор получает командой `smoke`, затем проверяет `doctor`:
+Receipt для `decoder`, `acoustics` и `asr` оператор получает командой `smoke`, затем проверяет
+`doctor`:
 
 ```sh
-uv run sound-scout smoke            # оба компонента; или `smoke decoder`, `smoke acoustics`
+uv run sound-scout smoke            # decoder и acoustics; или `smoke decoder`, `smoke acoustics`
+SOUND_SCOUT_DEV_AUDIO=<development-запись> uv run sound-scout smoke asr
 uv run sound-scout doctor
 ```
 
@@ -64,8 +66,22 @@ uv run sound-scout doctor
 любом `network.allow`, поэтому вне data root ничего не пишется. Receipt пишется только при успехе всех проверок; при неудаче команда печатает `<компонент>: failed: <причина>`, завершается с кодом 1, а
 прежний receipt остаётся нетронутым. Повторяйте `smoke`, когда `doctor` пишет, что receipt
 устарел (`stale`): после обновления FFmpeg или пакетов (`praat-parselmouth`, `onnxruntime`,
-`faster-whisper`, `sound-scout`) и после смены `budgets`. Receipt `asr` эта команда пока не пишет
-(задача #54). Подкоманды `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
+`faster-whisper`, `sound-scout`) и после смены `budgets`.
+
+`smoke asr` запускается только по имени: синтетический сигнал не доказывает, что ASR слышит речь,
+поэтому команда читает development-запись с речью из `SOUND_SCOUT_DEV_AUDIO` (путь внутри
+`allowed_roots`, как у `analyze`) и распознаёт её настоящей моделью из конфигурации — только уже
+установленной в локальном кэше Hugging Face, offline (`local_files_only`), без загрузки. Запись
+проходит тот же путь, что в `analyze` (FFmpeg, выбор канала, 16 кГц, лимиты размера,
+длительности и числа каналов, бюджеты FFmpeg), но в самом процессе команды, без worker'а:
+`budgets.worker_deadline_seconds` на неё не действует. Сырой транскрипт пишется во временный `<data_root>/.smoke-*` и удаляется вместе с ним. Receipt
+`receipts/asr.json` пишет `asr.write_smoke_receipt` через `doctor.write_receipt` и только для
+завершённого распознавания настоящей `WhisperModel` хотя бы с одним словом и без пометки
+`suspect_hallucination`; в нём счётчики, вероятности, время и `input` вида
+`"development recording, 10.6 s"` — ни текста транскрипта, ни путей. Отказ — переменная не
+задана, модели нет, запись вне `allowed_roots`, в записи нет речи, receipt отклонён — печатает
+`asr: failed: <причина>`, даёт код 1 и не трогает прежний receipt. `doctor` в обоих случаях только
+читает receipt. Подкоманды `analyze`, `compare`, `serve` пока завершаются с кодом 2 и сообщением
 `not implemented`. Локальная конфигурация —
 `sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor` читает её через
 `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`; остальные
@@ -118,10 +134,11 @@ uv run pytest             # -m "not slow" пропускает тесты с р�
 Тесты с маркером `slow` используют настоящую модель ASR из локального кэша Hugging Face
 (`~/.cache/huggingface/hub`, без загрузки: нет модели — тест пропускается с причиной) и, для
 проверки на реальной речи, путь к development-записи из `SOUND_SCOUT_DEV_AUDIO` (не задан —
-пропуск). Только такой прогон пишет smoke-receipt `asr` (`asr.write_smoke_receipt`): в
+пропуск). Эти тесты собирают конфигурацию сами и пишут smoke-receipt `asr`
+(`asr.write_smoke_receipt`) только в свой временный `data_root`, даже при заданном
+`SOUND_SCOUT_CONFIG`; в настоящий `data_root` его пишет `sound-scout smoke asr`. В
 `asr/raw.json` записан класс модели, которая реально работала, и receipt для подменённой модели
-отклоняется; контрактные тесты с заглушкой пишут receipt только во временный каталог теста и
-способность ASR не доказывают. Сырой транскрипт лежит в run-каталоге как `asr/raw.json` рядом с
+отклоняется; контрактные тесты с заглушкой способность ASR не доказывают. Сырой транскрипт лежит в run-каталоге как `asr/raw.json` рядом с
 `asr/model-receipt.json` (repo, revision, хеши файлов модели, версии пакетов) и после записи не
 меняется; исправления — отдельный артефакт `transcript/corrected.json` со ссылкой на raw.
 
