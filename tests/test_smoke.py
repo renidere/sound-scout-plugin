@@ -428,9 +428,9 @@ print(json.dumps({{
 def test_smoke_writes_nothing_outside_the_data_root_under_the_guard(
     config: Config, tmp_path: Path, acoustics_present: None
 ) -> None:
-    home, temp = tmp_path / "home", tmp_path / "tmp"
-    home.mkdir()
-    temp.mkdir()
+    home, temp, workdir = tmp_path / "home", tmp_path / "tmp", tmp_path / "cwd"
+    for folder in (home, temp, workdir):
+        folder.mkdir()
     managed = guard.OFFLINE_ENV.keys() | guard.TELEMETRY_OFF_ENV.keys()
     env = {key: value for key, value in os.environ.items() if key not in managed}
     env.update(HOME=str(home), TMPDIR=str(temp))
@@ -441,6 +441,7 @@ def test_smoke_writes_nothing_outside_the_data_root_under_the_guard(
         capture_output=True,
         text=True,
         env=env,
+        cwd=workdir,
         check=False,
     )
 
