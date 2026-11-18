@@ -298,7 +298,11 @@ def _identity(request: AnalyzeRequest, config: Config, preflight: _Preflight) ->
     if description is None:
         backend = "none"
     else:
-        backend = _backend_name(description) | {"settings": dict(description.settings)}
+        backend = _backend_name(description) | {
+            "settings": dict(description.settings),
+            "limits": dict(description.limits),
+            "windows": {"overlap_s": review.WINDOW_OVERLAP_S, "pad_ms": review.WINDOW_PAD_MS},
+        }
     return {
         "audio": preflight.audio_sha256,
         "model": {

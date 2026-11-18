@@ -559,6 +559,68 @@ def test_the_cache_identity_holds_the_resolved_asr_revision_and_the_backend_sett
         analyze(request, config, backend=TunedFakeBackend())
 
 
+def test_the_cache_identity_holds_the_backend_limits_and_the_review_windows(
+    config: Config, wav: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = AnalyzeRequest(str(wav), request_id="req-limits", layers=("measurements",))
+    first = analyze(request, config, backend=RecordingBackend(max_audio_seconds=30.0))
+    result_file = first.run.path / "result.json"
+    before = sha256_of(result_file)
+
+    def no_worker(*args: object) -> None:
+        raise AssertionError("a cached result runs no stage")
+
+    monkeypatch.setattr(app, "_start_worker", no_worker)
+    again = analyze(request, config, backend=RecordingBackend(max_audio_seconds=30.0))
+    assert again.reused is True and again.run.run_id == first.run.run_id
+    with pytest.raises(runs.RequestMismatch):
+        analyze(request, config, backend=RecordingBackend(max_audio_seconds=20.0))
+    monkeypatch.setattr(app.review, "WINDOW_OVERLAP_S", review.WINDOW_OVERLAP_S + 1.0)
+    with pytest.raises(runs.RequestMismatch):
+        analyze(request, config, backend=RecordingBackend(max_audio_seconds=30.0))
+    assert sha256_of(result_file) == before
+    run_dirs = config.data_root / runs.RUNS_DIR_NAME
+    assert sorted(p.name for p in run_dirs.iterdir()) == sorted(
+        [first.run.run_id, runs.INDEX_DIR_NAME]
+    )
+
+
+def test_the_identity_names_the_backend_limits_and_window_parameters(config: Config) -> None:
+    description = RecordingBackend(max_audio_seconds=30.0).describe()
+    preflight = app._Preflight(probe=None, audio_sha256="0" * 64, description=description)  # type: ignore[arg-type]
+    request = AnalyzeRequest("x", request_id="r", layers=("sound",))
+
+    backend = app._identity(request, config, preflight)["model"]["backend"]
+
+    assert backend["limits"] == {review.MAX_AUDIO_SECONDS_LIMIT: 30.0}
+    assert backend["windows"] == {
+        "overlap_s": review.WINDOW_OVERLAP_S,
+        "pad_ms": review.WINDOW_PAD_MS,
+    }
+
+
+def test_with_backend_none_the_identity_carries_no_backend_limits_or_review_windows(
+    config: Config, wav: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dataclasses.replace(config, backend="none")
+    request = AnalyzeRequest(str(wav), request_id="req-none", layers=("measurements",))
+    first = analyze(request, config)
+    preflight = app._Preflight(probe=None, audio_sha256="0" * 64, description=None)  # type: ignore[arg-type]
+    identity = app._identity(request, config, preflight)
+
+    def no_worker(*args: object) -> None:
+        raise AssertionError("a cached result runs no stage")
+
+    monkeypatch.setattr(app, "_start_worker", no_worker)
+    monkeypatch.setattr(app.review, "WINDOW_OVERLAP_S", review.WINDOW_OVERLAP_S + 1.0)
+    monkeypatch.setattr(app.review, "WINDOW_PAD_MS", review.WINDOW_PAD_MS + 100)
+    again = analyze(request, config)
+
+    assert identity["model"]["backend"] == "none"
+    assert app._identity(request, config, preflight) == identity
+    assert again.reused is True and again.run.run_id == first.run.run_id
+
+
 def test_an_asr_model_missing_from_the_cache_has_no_resolved_revision(config: Config) -> None:
     preflight = app._Preflight(probe=None, audio_sha256="0" * 64, description=None)  # type: ignore[arg-type]
     request = AnalyzeRequest("x", request_id="r", layers=("content",))
