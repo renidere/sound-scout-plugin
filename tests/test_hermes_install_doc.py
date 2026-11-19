@@ -40,8 +40,11 @@ REQUIRED_TERMS = (
     "T09b",
 )
 # A path that starts at the filesystem root (after a space, quote, backtick, bracket or `=`) or
-# at a Windows drive; `~/…`, `<placeholder>/…`, relative paths and URLs do not match.
-STATION_PATH = re.compile(r"(?:^|[\s\"'`(\[=])/[\w.-]+/|\b[A-Za-z]:\\", re.MULTILINE)
+# at a Windows drive; `~/…`, `<placeholder>/…`, relative paths, URLs and the generic system
+# program dirs `/usr/bin`, `/usr/local/bin` (the `env.PATH` of the entry, issue #77) do not match.
+STATION_PATH = re.compile(
+    r"(?:^|[\s\"'`(\[=])/(?!usr/(?:local/)?bin\b)[\w.-]+/|\b[A-Za-z]:\\", re.MULTILINE
+)
 TIMEOUT_MARGIN_SECONDS = 60
 
 
@@ -206,3 +209,78 @@ def test_format_advice_check_rejects_flac_and_a_missing_advice() -> None:
     assert advised_format_problems("несжатый WAV — около 2 минут") == [
         "no advice on formats to send"
     ]
+
+
+DEPENDENCIES = REPO / "docs" / "dependencies.md"
+ENTRY_PATH = re.compile(r"^      PATH: (\S+)$", re.MULTILINE)
+
+
+def entry_path_problems(example: str) -> list[str]:
+    """What is wrong with the `env.PATH` of the example entry (issue #77, R09, R11)."""
+    env = example.split("\n    env:\n", 1)[1].split("\n    connect_timeout:", 1)[0]
+    found = ENTRY_PATH.findall(env)
+    if not found:
+        return ["no env.PATH"]
+    dirs = found[0].split(":")
+    problems = [f"Hermes dir: {d}" for d in dirs if ".hermes" in d]
+    problems += [f"not absolute: {d}" for d in dirs if not d.startswith("/")]
+    return problems
+
+
+def test_criterion77_example_entry_sets_env_path_to_system_dirs_without_hermes() -> None:
+    example = EXAMPLE.read_text(encoding="utf-8")
+    assert entry_path_problems(example) == []
+    assert ".hermes" not in ENTRY_PATH.search(example).group(1)
+
+
+def test_criterion77_example_yaml_parses_with_env_path_of_absolute_dirs_without_hermes() -> None:
+    yaml = pytest.importorskip("yaml")
+    entry = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))["mcp_servers"]["speech-review"]
+    dirs = entry["env"]["PATH"].split(":")
+    assert "/usr/bin" in dirs
+    assert [d for d in dirs if not d.startswith("/") or ".hermes" in d] == []
+    assert "SOUND_SCOUT_CONFIG" in entry["env"]
+
+
+def test_entry_path_check_rejects_a_missing_path_and_a_hermes_dir() -> None:
+    example = EXAMPLE.read_text(encoding="utf-8")
+    without = ENTRY_PATH.sub("", example)
+    assert entry_path_problems(without) == ["no env.PATH"]
+    hermes = ENTRY_PATH.sub(
+        "      PATH: ~/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin:/usr/bin", example
+    )
+    assert entry_path_problems(hermes) == [
+        "Hermes dir: ~/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin",
+        "not absolute: ~/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin",
+    ]
+
+
+def test_criterion77_mcp_add_passes_the_same_path_and_the_doc_explains_why() -> None:
+    text = DOC.read_text(encoding="utf-8")
+    entry_path = ENTRY_PATH.search(EXAMPLE.read_text(encoding="utf-8")).group(1)
+    block = section(text, "## Регистрация в Hermes").split("```sh\n", 1)[1].split("```", 1)[0]
+    tokens = block.replace("\\\n", " ").split()
+    env_values = tokens[tokens.index("--env") + 1 : tokens.index("--args")]
+    assert f"PATH={entry_path}" in env_values
+    assert f"hermes config set mcp_servers.speech-review.env.PATH {entry_path}" in text
+    registration = " ".join(section(text, "## Регистрация в Hermes").split())
+    assert "~/.hermes/tools" in registration and "shutil.which" in registration
+    assert "decoder: unvalidated" in registration
+
+
+def test_criterion77_readback_wants_decoder_ready_under_hermes_as_in_doctor() -> None:
+    readback = " ".join(section(DOC.read_text(encoding="utf-8"), "## Readback").split())
+    assert "speech_capabilities" in readback and "sound-scout doctor" in readback
+    assert "`decoder` под Hermes тоже `ready`" in readback
+
+
+def test_criterion77_dependencies_say_ffmpeg_is_found_on_path() -> None:
+    programs = section(DEPENDENCIES.read_text(encoding="utf-8"), "## 2. Системные программы")
+    programs = " ".join(programs.split())
+    assert "ищутся через `PATH`" in programs and "`env.PATH`" in programs
+
+
+def test_doc_lint_allows_only_the_generic_system_program_dirs() -> None:
+    allowed = "`PATH=/usr/local/bin:/usr/bin:/bin`, обычно `/usr/bin`"
+    assert doc_problems(allowed, (), ()) == []
+    assert doc_problems("PATH=/opt/ffmpeg/bin", (), ()) == ["absolute path: =/opt/"]

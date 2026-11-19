@@ -15,6 +15,10 @@ mcp_servers:
       - serve
     env:
       SOUND_SCOUT_CONFIG: <абсолютный путь к sound-scout.toml>
+      # Явный PATH из системных каталогов заменяет PATH процесса Hermes, где первым стоит его
+      # собственный FFmpeg (~/.hermes/tools/…): сервер ищет ffmpeg/ffprobe через PATH и должен
+      # найти системную версию из docs/dependencies.md, иначе doctor покажет decoder: unvalidated.
+      PATH: /usr/local/bin:/usr/bin:/bin
     connect_timeout: 60.0
     # budgets.worker_deadline_seconds (180) + budgets.max_subprocess_seconds (60, ffprobe до
     # запуска worker) + запас 60 с; при других budgets пересчитать.

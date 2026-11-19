@@ -37,6 +37,15 @@ stdio сервер `sound-scout serve` в Hermes под именем `speech-rev
 - H1, «Stdio env filtering»: «Only explicitly configured `env` plus a safe baseline are passed
   through.»
 - `hermes mcp add --help`: «`--args ...` Arguments for stdio command; must be the last option».
+- `tools/mcp_tool_config.py`, `_build_safe_env`: базовый набор берёт `PATH` из окружения процесса
+  Hermes, а ключи `env` записи сервера заменяют его значения целиком («plus the server config's
+  own ``env``»); MCP SDK при запуске сливает так же —
+  `get_default_environment() | (server.env or {})` (`mcp/client/stdio.py`, `mcp` 2.3.0 в окружении
+  Hermes).
+- `pm/install.py`, `store_first_path`: каталоги программ, которые Hermes ставит сам
+  (`~/.hermes/tools/…`), стоят в `PATH` его процесса первыми.
+- `tools/mcp_tool_config.py`, `_resolve_stdio_command`: каталог абсолютного `command` добавляется
+  в начало `PATH` сервера (`tools/mcp_tool_common.py`, `_prepend_path`).
 
 Расхождения, найденные при сверке:
 
@@ -123,6 +132,10 @@ stdio сервер `sound-scout serve` в Hermes под именем `speech-rev
 4. Узнать абсолютный путь к `uv` (`command -v uv`) — он нужен в `--command`: Hermes передаёт серверу
    только безопасный базовый набор переменных окружения, и `PATH` сессии может отличаться.
 
+5. Узнать каталог системного FFmpeg (`command -v ffmpeg ffprobe`, обычно `/usr/bin`) — он нужен в
+   `env.PATH` записи (см. «Регистрация в Hermes»). Версия в нём должна совпадать с записанной в
+   `docs/dependencies.md`, раздел 2 (`ffmpeg -version`).
+
 ## Ограничения вложений Hermes
 
 Hermes не передаёт файлы по MCP: `speech_analyze` получает только строку абсолютного пути к файлу
@@ -159,7 +172,7 @@ Hermes не передаёт файлы по MCP: `speech_analyze` получа�
 hermes mcp add speech-review \
   --command <абсолютный путь к uv> \
   --connect-timeout 60 \
-  --env SOUND_SCOUT_CONFIG=<абсолютный путь к sound-scout.toml> \
+  --env SOUND_SCOUT_CONFIG=<абсолютный путь к sound-scout.toml> PATH=/usr/local/bin:/usr/bin:/bin \
   --args run --directory <абсолютный путь к checkout sound-scout-plugin> --offline sound-scout serve
 ```
 
@@ -178,6 +191,19 @@ hermes mcp add speech-review \
   сессии Hermes. Явный `SOUND_SCOUT_CONFIG` не зависит от того, где лежит toml-файл, и его можно
   держать вне checkout. Если модель ASR лежит не в `~/.cache/huggingface/hub`, добавьте сюда же
   `HF_HUB_CACHE=<абсолютный путь>`: остальные переменные окружения Hermes серверу не передаёт.
+- `PATH=/usr/local/bin:/usr/bin:/bin` — явный `env.PATH` только из системных каталогов. Sound Scout
+  ищет `ffmpeg` и `ffprobe` через `PATH` (`shutil.which` в `src/sound_scout/doctor.py`, имена без
+  пути в `src/sound_scout/proc.py`). Без `env.PATH` сервер получает `PATH` процесса Hermes, а там
+  первым стоит каталог FFmpeg, который Hermes ставит себе сам (в v0.23.1 —
+  `~/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin`). Тогда вход декодирует незаписанная версия, а не
+  системная из `docs/dependencies.md`, и `doctor` под Hermes показывает `decoder: unvalidated`
+  (R09, R11). `env.PATH` заменяет `PATH` Hermes целиком, ничего не добавляя к нему; каталогов
+  `~/.hermes/tools` в нём быть не должно. Если системный FFmpeg лежит в другом каталоге (пункт 5
+  установки), впишите этот каталог. Каталог `--command` (каталог `uv`) Hermes ставит перед
+  `env.PATH` только тогда, когда его там ещё нет; если он уже в `env.PATH` (например,
+  `/usr/bin`), порядок не меняется. Проверьте, что `ffmpeg` и `ffprobe` в итоговом `PATH` — те,
+  что нужны: `env PATH=<каталог uv>:/usr/local/bin:/usr/bin:/bin sh -c 'command -v ffmpeg ffprobe'`
+  должна напечатать пути системного FFmpeg из `docs/dependencies.md`, а не файлы из каталога `uv`.
 - `--args` — последний параметр, всё после него уходит серверу:
   - `run --directory <checkout>` — `uv` находит проект по каталогу, а не по текущему: вне
     checkout `uv run sound-scout` падает с `Failed to spawn: sound-scout`. Поэтому отдельный `cwd`
@@ -216,6 +242,12 @@ hermes config set mcp_servers.speech-review.timeout 300
   `timeout ≥ worker_deadline_seconds + max_subprocess_seconds + 60 с запаса` = 180 + 60 + 60 = 300.
   Если в `[budgets]` значения другие — пересчитайте и задайте timeout заново.
 
+Если запись `speech-review` уже создана без `PATH` в `--env`, `env.PATH` задаётся так же явно:
+
+```sh
+hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bin
+```
+
 Запущенный gateway изменения существующей записи сам не применяет: его фоновая сверка с
 `config.yaml` (`gateway/run_profile_reconcile.py`, `_mcp_config_reconciler` →
 `tools/mcp_tool_discovery.py`, `reconcile_mcp_servers_with_config`) только подключает новые
@@ -228,7 +260,7 @@ hermes config set mcp_servers.speech-review.timeout 300
 ## Итоговая запись
 
 Ожидаемая запись — `docs/examples/hermes-mcp-entry.example.yaml`: `command`, `args`,
-`env.SOUND_SCOUT_CONFIG`, `connect_timeout: 60.0` (`--connect-timeout` сохраняется числом с
+`env.SOUND_SCOUT_CONFIG`, `env.PATH` из системных каталогов, `connect_timeout: 60.0` (`--connect-timeout` сохраняется числом с
 плавающей точкой), `timeout: 300`, `supports_parallel_tool_calls: false`, `sampling.enabled: false`,
 `tools.include` из трёх инструментов, `enabled: true`. Пути в угловых скобках у владельца —
 настоящие абсолютные пути хоста.
@@ -245,7 +277,8 @@ hermes config set mcp_servers.speech-review.timeout 300
    hermes mcp list
    ```
 
-   Расхождение (нет `tools.include`, `sampling.enabled` не `false`, другой `timeout`) исправляется
+   Расхождение (нет `tools.include` или `env.PATH`, в `env.PATH` есть каталог `~/.hermes/tools`,
+   `sampling.enabled` не `false`, другой `timeout`) исправляется
    командами из раздела «Настройка записи», не правкой файла.
 
 2. **Discovery в нужном runtime** — сначала, после того как запись настроена, обязательно
@@ -262,7 +295,10 @@ hermes config set mcp_servers.speech-review.timeout 300
 
 3. **Реальный вызов из новой сессии** — попросить Hermes (не вызывать SDK самому):
    - вызвать `speech_capabilities` — ответ совпадает с
-     `uv run --offline sound-scout doctor --json` на том же хосте;
+     `uv run --offline sound-scout doctor --json` на том же хосте, компонент за компонентом.
+     `decoder` под Hermes тоже `ready`, с той же версией `ffmpeg`/`ffprobe`, что в `doctor`.
+     `decoder: unvalidated` под Hermes при `ready` в терминале значит, что сервер нашёл
+     другой FFmpeg: проверить `env.PATH` записи (раздел «Регистрация в Hermes»);
    - прислать короткую запись **аудиофайлом или документом** и попросить проанализировать её через
      `speech_analyze` — ответ содержит `run_id`, `status` и `run_dir` (путь run-каталога
      относительно data root), а в data root появился `<run_dir>/result.json`;
@@ -284,7 +320,8 @@ R12). Интеграция считается подключённой, толь
       `mcp_servers`;
 - [ ] readback exact entry совпадает с `docs/examples/hermes-mcp-entry.example.yaml`: allowlist из
       трёх инструментов, `sampling.enabled: false`, `supports_parallel_tool_calls: false`, явные
-      `connect_timeout` и `timeout`, `timeout` ≥ worker deadline + `max_subprocess_seconds` + запас;
+      `connect_timeout` и `timeout`, `timeout` ≥ worker deadline + `max_subprocess_seconds` + запас,
+      `env.PATH` без каталогов `~/.hermes/tools`;
 - [ ] `terminal.backend` — `local`;
 - [ ] discovery в новой сессии нужного runtime показывает ровно три инструмента
       `mcp__speech_review__…`;

@@ -7,7 +7,7 @@
 конкретной станции сюда не пишутся; ниже — пути по умолчанию относительно домашнего каталога
 оператора.
 
-Обновлено: 2026-11-18.
+Обновлено: 2026-11-19.
 
 ## 1. Python-пакеты
 
@@ -36,6 +36,12 @@ SHA-256 каждого файла пакета — в `uv.lock`. `mcp` тяне�
 | FFmpeg (`ffmpeg`, `ffprobe`) | 8.0.1 | декодирование входа, ресемплинг, клипы | пакет дистрибутива (`apt install ffmpeg`) |
 | `uv` | 0.13.1 | среда и lock | https://docs.astral.sh/uv/ |
 | llama.cpp | v1.0.0, сборка `b12359` (commit `b1b770d90`) | runtime audio backend (раздел 3) | архив релиза, раздел 3.2 |
+
+`ffmpeg` и `ffprobe` ищутся через `PATH` процесса (`shutil.which` в `src/sound_scout/doctor.py`,
+имена без пути в argv `src/sound_scout/proc.py`): первый найденный в `PATH` и есть используемая
+версия. Под Hermes MCP-сервер получает `PATH` Hermes, где первым стоит его собственный FFmpeg
+(`~/.hermes/tools/…`), поэтому запись `speech-review` задаёт `env.PATH` из системных каталогов
+(`docs/hermes-install.md`, «Регистрация в Hermes»).
 
 CI (`.github/workflows/ci.yml`): `actions/checkout@v7.0.1`, `astral-sh/setup-uv@v10.3.3`, FFmpeg из
 apt runner'а.
