@@ -143,6 +143,31 @@ def test_duration_manipulation_stretches_only_the_word_by_1_6() -> None:
     assert _median_f0(variant, 0.2, 0.9) == pytest.approx(_median_f0(base, 0.2, 0.9), rel=0.02)
 
 
+@pytest.mark.parametrize(("semitones", "duration_factor"), [(0.0, 1.6), (3.0, 1.3), (4.0, 1.0)])
+def test_build_pair_gives_the_same_pcm_on_every_call(semitones, duration_factor) -> None:
+    import parselmouth
+
+    voice = speech_like_control(3.0, gate0.SAMPLE_RATE, f0=130.0)
+    pairs = []
+    for _ in range(3):
+        base, variant, _ = gate0.build_pair(voice, 1.0, 1.5, semitones, duration_factor)
+        pairs.append((base.tobytes(), variant.tobytes()))
+        parselmouth.praat.run(
+            "random_initializeSafelyAndUnpredictably ()\nx = randomUniform (0, 1)\n"
+        )
+    assert pairs[0] == pairs[1] == pairs[2]
+
+
+def test_build_pair_without_the_seed_stretches_differently_each_call(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gate0, "RESYNTHESIS_SEED_SCRIPT", "random_initializeSafelyAndUnpredictably ()\n"
+    )
+    voice = speech_like_control(3.0, gate0.SAMPLE_RATE, f0=130.0)
+    first = gate0.build_pair(voice, 1.0, 1.5, 0.0, 1.6)[1]
+    second = gate0.build_pair(voice, 1.0, 1.5, 0.0, 1.6)[1]
+    assert len(first) == len(second) and first.tobytes() != second.tobytes()
+
+
 def test_a_loud_pair_is_scaled_by_one_factor_to_the_peak_limit() -> None:
     voice = speech_like_control(2.0, gate0.SAMPLE_RATE, f0=130.0) * 2.0
     base, variant, scale = gate0.build_pair(voice, 0.8, 1.2, 4.0, 1.0)
@@ -578,6 +603,23 @@ def test_prepare_builds_nine_clips_and_keeps_the_words_out_of_the_manifest(spike
     assert words["H01"]["target_word"] == "два"
 
 
+def test_two_prepares_of_the_same_sources_give_the_same_pcm_and_record_the_seed(spike) -> None:
+    again = gate0.prepare_clips(
+        "2026-11-19", spike["config"], decision=spike["decision"], transcribe=_fake_transcribe
+    )
+    first = {clip["id"]: clip["pcm_sha256"] for clip in spike["manifest"]["clips"]}
+    second = {clip["id"]: clip["pcm_sha256"] for clip in again["clips"]}
+    assert first == second and len(first) == 9
+    for manifest in (spike["manifest"], again):
+        resynthesis = manifest["resynthesis"]
+        assert resynthesis["praat_random_seed"] == gate0.RESYNTHESIS_SEED == 0
+        assert resynthesis["seed_script"] == "random_initializeWithSeedUnsafelyButPredictably (0)"
+        assert resynthesis["seeded"] == "before each resynthesis"
+        assert resynthesis["praat_version"] and resynthesis["parselmouth_version"]
+    saved = json.loads((spike["out"] / gate0.MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert saved["resynthesis"] == again["resynthesis"]
+
+
 def test_prepare_never_overwrites_a_prepared_day(spike) -> None:
     with pytest.raises(gate0.Gate0Error, match="never overwrites"):
         gate0.prepare_clips("2026-11-18", spike["config"], decision=spike["decision"])
@@ -734,7 +776,7 @@ def test_natural_prepare_builds_six_takes_and_a_51_request_plan(tmp_path: Path) 
     decision = tmp_path / "0007.md"
     decision.write_text(RULE_DOC, encoding="utf-8")
     manifest = gate0.prepare_clips("2026-11-19", config_, natural=pairs_dir, decision=decision)
-    assert manifest["mode"] == "natural"
+    assert manifest["mode"] == "natural" and manifest["resynthesis"] is None
     assert [clip["id"] for clip in manifest["clips"]][:6] == [
         "P1-a", "P1-b", "P2-a", "P2-b", "P3-a", "P3-b",
     ]  # fmt: skip
@@ -1027,3 +1069,12 @@ def test_borealis_decision_document_holds_the_same_rule_as_0007() -> None:
     gemma = (REPO / gate0.DECISION_DOC).read_text(encoding="utf-8")
     assert gate0.rule_sha256(borealis) == gate0.rule_sha256(gemma) == DECISION_RULE_SHA256
     assert not re.search(r"/(home|Users)/|~[/]", borealis)
+
+
+QUESTIONS_SHA256_0007 = "34871259fa7ad301b1cd5ee24182664e79c3b1b7439bb1741204038e56cced82"
+
+
+def test_the_questions_hash_stays_the_one_0007_and_0010_recorded() -> None:
+    assert gate0.questions_sha256() == QUESTIONS_SHA256_0007
+    for name in (gate0.DECISION_DOC, BOREALIS_DOC):
+        assert QUESTIONS_SHA256_0007 in (REPO / name).read_text(encoding="utf-8")

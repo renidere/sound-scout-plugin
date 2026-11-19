@@ -6,12 +6,14 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
 - `prepare --date D [--sources DIR] [--natural DIR]` builds the clips under
   `<data_root>/D/`: three synthetic pairs from the development recordings (a neutral Praat PSOLA
   resynthesis `B<i>` and the same Manipulation with F0 and/or duration changed on one
-  mechanically chosen word, `V<i>`), or with `--natural` the owner's six natural recordings, plus
-  digital silence, pink noise and a pure tone. Word boundaries come from the configured local ASR
-  (`asr.transcribe`, offline); the words and the transcript stay in `words.json`, the manifest
-  carries only hashes, durations, word numbers and intervals. It records the SHA-256 of the
-  verdict rule as the decision document holds it (between `RULE_BEGIN` and `RULE_END`), of the
-  prompt and of the fixed questions. The audio backend is not touched.
+  mechanically chosen word, `V<i>`; each resynthesis seeds Praat's random generator first, so
+  the same sources give the same PCM, and the manifest records how in `resynthesis`), or with
+  `--natural` the owner's six natural recordings, plus digital silence, pink noise and a pure
+  tone. Word boundaries come from the configured local ASR (`asr.transcribe`, offline); the
+  words and the transcript stay in `words.json`, the manifest carries only hashes, durations,
+  word numbers and intervals. It records the SHA-256 of the verdict rule as the decision
+  document holds it (between `RULE_BEGIN` and `RULE_END`), of the prompt and of the fixed
+  questions. The audio backend is not touched.
 - `run --date D [--runtime llama|borealis]` checks the weights, the prompt, the rule and the
   clips against what was recorded, starts the local server — `llama-server` with local
   `-m`/`--mmproj` only, or for `borealis` the `gate0_borealis` module with the local weights
@@ -108,6 +110,8 @@ PITCH_FLOOR_HZ = 75
 PITCH_CEILING_HZ = 600
 PEAK_LIMIT = 0.99
 DURATION_EDGE_S = 0.001
+RESYNTHESIS_SEED = 0
+RESYNTHESIS_SEED_SCRIPT = f"random_initializeWithSeedUnsafelyButPredictably ({RESYNTHESIS_SEED})\n"
 WORD_MIN_PROBABILITY = 0.80
 WORD_MIN_S = 0.25
 WORD_MAX_S = 1.0
@@ -337,13 +341,14 @@ def build_pair(
     samples: np.ndarray, start: float, end: float, semitones: float, duration_factor: float
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """(base, variant, scale): a neutral PSOLA resynthesis and the same Manipulation with the
-    word's F0 raised and/or its duration stretched; both scaled by one factor to a 0.99 peak."""
+    word's F0 raised and/or its duration stretched; both scaled by one factor to a 0.99 peak.
+    The same arguments give the same arrays byte for byte (`_resynthesize`)."""
     import parselmouth
     from parselmouth.praat import call
 
     sound = parselmouth.Sound(np.asarray(samples, dtype=np.float64), sampling_frequency=SAMPLE_RATE)
     manipulation = call(sound, "To Manipulation", PITCH_TIME_STEP, PITCH_FLOOR_HZ, PITCH_CEILING_HZ)
-    base = call(manipulation, "Get resynthesis (overlap-add)").values[0]
+    base = _resynthesize(manipulation)
     if semitones:
         pitch_tier = call(manipulation, "Extract pitch tier")
         call(pitch_tier, "Multiply frequencies", start, end, 2 ** (semitones / 12))
@@ -358,10 +363,34 @@ def build_pair(
         ):
             call(tier, "Add point", time_s, factor)
         call([manipulation, tier], "Replace duration tier")
-    variant = call(manipulation, "Get resynthesis (overlap-add)").values[0]
+    variant = _resynthesize(manipulation)
     peak = max(float(np.max(np.abs(base))), float(np.max(np.abs(variant))))
     scale = PEAK_LIMIT / peak if peak > PEAK_LIMIT else 1.0
     return base * scale, variant * scale, scale
+
+
+def _resynthesize(manipulation) -> np.ndarray:
+    # Overlap-add draws from Praat's process-wide random generator when a DurationTier stretches
+    # the signal; seeding right before each call makes the result the same byte for byte (#86).
+    import parselmouth
+    from parselmouth.praat import call
+
+    parselmouth.praat.run(RESYNTHESIS_SEED_SCRIPT)
+    return call(manipulation, "Get resynthesis (overlap-add)").values[0]
+
+
+def resynthesis_record() -> dict:
+    """How `build_pair` makes its resynthesis deterministic, for the manifest."""
+    import parselmouth
+
+    return {
+        "method": "Praat Get resynthesis (overlap-add)",
+        "praat_random_seed": RESYNTHESIS_SEED,
+        "seed_script": RESYNTHESIS_SEED_SCRIPT.strip(),
+        "seeded": "before each resynthesis",
+        "praat_version": parselmouth.PRAAT_VERSION,
+        "parselmouth_version": parselmouth.__version__,
+    }
 
 
 # --- prepare -------------------------------------------------------------------------------
@@ -438,6 +467,7 @@ def prepare_clips(
         "sources": sources_info,
         "clips": clips,
         "pairs": pairs,
+        "resynthesis": resynthesis_record() if mode == "synthetic" else None,
         "limits": {"max_clips": MAX_CLIPS, "max_clip_seconds": MAX_CLIP_SECONDS},
         "note": "V-клипы синтетически изменены (Praat PSOLA) и не заменяют естественные пары",
     }
