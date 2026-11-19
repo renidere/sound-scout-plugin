@@ -138,14 +138,15 @@ def read_wav(path: Path) -> np.ndarray:
     return np.frombuffer(frames, "<i2") / 32767
 
 
-def test_prepare_writes_22_clips_with_ten_controls_and_twelve_candidates(built) -> None:
+def test_prepare_writes_22_clips_and_lists_19_without_the_speech_backgrounds(built) -> None:
     corpus_dir, result, _ = built
     out = corpus_dir / "pilot-t"
     records = result["records"]
     assert json.loads((out / "manifest.json").read_text(encoding="utf-8")) == result
     assert result["note"] == corpus.MANIFEST_NOTE
-    assert len(records) == 22
-    assert sum(r["negative_control"] for r in records) == 10
+    assert len(list((out / "clips").glob("*.wav"))) == 22
+    assert len(records) == 19
+    assert sum(r["negative_control"] for r in records) == 7
     for record in records:
         data = (out / record["path"]).read_bytes()
         assert hashlib.sha256(data).hexdigest() == record["sha256"]
@@ -154,8 +155,91 @@ def test_prepare_writes_22_clips_with_ten_controls_and_twelve_candidates(built) 
     kinds = {r["id"]: r.get("control_kind") for r in records if r["negative_control"]}
     assert kinds["ctl-silence"] == "silence" and kinds["ctl-pink"] == "noise"
     assert kinds["ctl-asrnoise-0db"] == kinds["ctl-asrnoise-m5db"] == "corrupted_asr"
-    assert [k for k in kinds.values() if k == "noise"] == ["noise"] * 7
+    assert [k for k in kinds.values() if k == "noise"] == ["noise"] * 4
+    statuses = {r["id"]: r.get("asr_error_status") for r in records}
+    assert statuses["ctl-asrnoise-0db"] == statuses["ctl-asrnoise-m5db"] == "candidate"
+    assert [i for i, s in statuses.items() if s is not None] == [i for i, _ in corpus.MIX_SNRS_DB]
     assert not list(corpus_dir.glob(".pilot-t.*")), "the staging directory is gone"
+
+
+def test_speech_backgrounds_keep_their_audio_but_are_no_noise_controls(built) -> None:
+    corpus_dir, result, _ = built
+    out = corpus_dir / "pilot-t"
+    assert corpus.EXCLUDED_CONTROLS == (
+        "ctl-snsd-babble",
+        "ctl-snsd-neighbor-2",
+        "ctl-snsd-neighbor-4",
+    )
+    listed = {r["id"] for r in result["records"]}
+    provenance = {
+        c["id"]: c for c in json.loads((out / "provenance.json").read_text("utf-8"))["clips"]
+    }
+    for clip_id in corpus.EXCLUDED_CONTROLS:
+        assert clip_id not in listed
+        assert clip_id in result["note"]
+        assert (out / "clips" / f"{clip_id}.wav").is_file()
+        assert not (out / "labels" / f"{clip_id}.json").exists()
+        assert provenance[clip_id]["excluded"] == corpus.SPEECH_BACKGROUND
+    assert "разборчивая речь" in result["note"] and "не контроль noise" in result["note"]
+
+
+BACKGROUND_RECORD = {
+    "duration_s": 15.0,
+    "split": "dev",
+    "categories": [],
+    "negative_control": True,
+    "control_kind": "noise",
+}
+
+
+def test_revise_brings_an_earlier_draft_to_the_same_manifest_and_is_idempotent(
+    built, tmp_path: Path, capsys
+) -> None:
+    corpus_dir, result, _ = built
+    provenance = json.loads((corpus_dir / "pilot-t" / "provenance.json").read_text("utf-8"))
+    earlier = {**result, "note": corpus.DRAFT_NOTE, "records": []}
+    for clip in provenance["clips"]:
+        record = next((r for r in result["records"] if r["id"] == clip["id"]), None)
+        if record is None:
+            record = {
+                **BACKGROUND_RECORD,
+                "id": clip["id"],
+                "path": f"clips/{clip['id']}.wav",
+                "sha256": clip["sha256"],
+                "source_group": clip["id"],
+            }
+        earlier["records"].append({k: v for k, v in record.items() if k != "asr_error_status"})
+    assert corpus.revise(earlier) == result
+    assert corpus.revise(result) == result
+
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(earlier, ensure_ascii=False), encoding="utf-8")
+    assert corpus.main(["revise", "--manifest", str(path)]) == 0
+    assert capsys.readouterr().out == (
+        "dropped: ctl-snsd-babble, ctl-snsd-neighbor-2, ctl-snsd-neighbor-4; written: true\n"
+    )
+    assert json.loads(path.read_text("utf-8")) == result
+    assert corpus.main(["revise", "--manifest", str(path)]) == 0
+    assert capsys.readouterr().out == "dropped: none; written: false\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json"]
+    assert corpus.main(["revise", "--manifest", str(tmp_path / "missing.json")]) == 2
+
+
+def test_revise_keeps_a_note_someone_wrote_and_adds_the_exclusion_reason_once() -> None:
+    assert corpus.revise({"records": []})["note"] == corpus.MANIFEST_NOTE
+    assert corpus.revise({"note": None, "records": []})["note"] == corpus.MANIFEST_NOTE
+    revised = corpus.revise({"note": "held-out фиксирует владелец", "records": []})
+    assert revised["note"] == f"held-out фиксирует владелец; {corpus.EXCLUSION_NOTE}"
+    assert corpus.revise(revised) == revised
+    held = {"note": f"{corpus.EXCLUSION_NOTE}; заметка владельца", "records": []}
+    assert corpus.revise(held) == held
+
+
+def test_revise_keeps_a_status_a_person_set_and_never_confirms() -> None:
+    record = {"id": "c", "negative_control": True, "control_kind": "corrupted_asr"}
+    confirmed = {**record, "asr_error_status": "confirmed"}
+    revised = corpus.revise({"records": [record, confirmed]})["records"]
+    assert [r["asr_error_status"] for r in revised] == ["candidate", "confirmed"]
 
 
 def test_candidates_are_bound_to_the_member_and_interval_with_rule_categories(built) -> None:
@@ -232,14 +316,22 @@ def test_mix_scales_down_a_peak_over_the_limit() -> None:
         corpus.mix_at_snr(speech, noise(0.5, 1), 0.0, 3)
 
 
-def test_draft_manifest_passes_check_manifest_draft_only(built, capsys) -> None:
+def test_draft_manifest_names_the_clip_shortfall_and_the_unconfirmed_candidates(
+    built, capsys
+) -> None:
     corpus_dir, result, _ = built
     path = str(corpus_dir / "pilot-t" / "manifest.json")
-    assert cli.main(["eval", "check-manifest", path, "--draft"]) == 0
-    assert capsys.readouterr().out.rstrip().endswith(manifest.DRAFT_SOUND)
+    assert cli.main(["eval", "check-manifest", path, "--draft"]) == 1
+    out = capsys.readouterr().out
+    assert out.rstrip().endswith(manifest.DRAFT_UNSOUND)
     assert cli.main(["eval", "check-manifest", path]) == 1
     report = manifest.validate(path)
-    assert report.errors == report.label_dependent
+    assert [e for e in report.errors if e not in report.label_dependent] == [
+        f"$.records: 19 clips, the corpus needs at least {manifest.MIN_CLIPS}"
+    ]
+    waiting = [e for e in report.label_dependent if "corrupted_asr candidate" in e]
+    assert len(waiting) == 2 and all(e in out for e in waiting)
+    assert not any("negative controls" in e for e in report.errors), "5 confirmed controls remain"
     splits: dict[str, set[str]] = {}
     for record in result["records"]:
         splits.setdefault(record["source_group"], set()).add(record["split"])
@@ -248,8 +340,11 @@ def test_draft_manifest_passes_check_manifest_draft_only(built, capsys) -> None:
         r for r in result["records"] if r["split"] == "heldout" and not r["negative_control"]
     ]
     assert len(heldout_candidates) == corpus.HELDOUT_CANDIDATE_GROUPS
-    plain_controls = [r for r in result["records"] if r.get("control_kind") in ("silence", "noise")]
-    assert sum(r["split"] == "heldout" for r in plain_controls) == len(plain_controls) // 2
+    plain = ["ctl-silence", "ctl-pink", *(c for c, _, _ in corpus.DEMAND_CONTROLS)]
+    plain += list(corpus.EXCLUDED_CONTROLS)
+    split = corpus.split_by_group(plain, len(plain) // 2)
+    listed = [r for r in result["records"] if r.get("control_kind") in ("silence", "noise")]
+    assert {r["id"]: r["split"] for r in listed} == {r["id"]: split[r["id"]] for r in listed}
 
 
 def test_label_templates_are_empty_and_invalid_until_a_person_signs_them(built) -> None:

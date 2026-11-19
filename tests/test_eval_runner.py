@@ -19,7 +19,7 @@ from sound_scout import asr, findings, ingest, review
 from sound_scout.cli import main
 from sound_scout.clips import cut
 from sound_scout.config import Config
-from sound_scout.eval import runner
+from sound_scout.eval import manifest, runner
 from sound_scout.eval.runner import EvalError, candidate, evaluate, qualification, write_report
 from sound_scout.runs import open_run
 from tests.test_clips import RATE
@@ -179,6 +179,7 @@ class Corpus:
         assessed: bool = True,
         control_kind: str = "silence",
         clear_correction: bool = False,
+        asr_error_status: str = "confirmed",
     ) -> None:
         control = not categories
         record = {
@@ -193,10 +194,26 @@ class Corpus:
         }
         if control:
             record["control_kind"] = control_kind
+        if control_kind == "corrupted_asr" and control:
+            record["asr_error_status"] = asr_error_status
+            if asr_error_status == "confirmed":
+                self.write_signed_sheet(clip_id)
         self.records.append(record)
         if not control:
             self.write_labels(clip_id, events)
         self.write_result(clip_id, observations, raw_segments, assessed, clear_correction)
+
+    def write_signed_sheet(self, clip_id: str) -> None:
+        sheets = self.base / manifest.ASR_REVIEW_DIR
+        sheets.mkdir(exist_ok=True)
+        human = {
+            "transcript": "услышанный текст",
+            "verdict": "asr_error",
+            "reviewer": "listener-a",
+            "reviewed_at": "2026-11-20",
+        }
+        sheet = {"clip_id": clip_id, "clip_sha256": sha(clip_id), "human": human}
+        (sheets / f"{clip_id}.json").write_text(json.dumps(sheet), encoding="utf-8")
 
     def write_labels(self, clip_id: str, events: list[dict]) -> None:
         labels = {
@@ -562,6 +579,34 @@ def test_corrupted_asr_control_counts_findings_and_clear_corrections_not_raw_wor
     found = control_report(tmp_path / "found", "corrupted_asr", findings=True)
     assert found["negative_controls"]["confident_fabrications"]["diction"] == 1
     assert fabrication_kinds(found) == ["finding"]
+
+
+@needs_ffmpeg
+def test_unconfirmed_corrupted_asr_candidate_is_not_counted_as_a_control(
+    tmp_path: Path,
+) -> None:
+    corpus = Corpus(tmp_path)
+    observations = [observation("pronunciation", 4.0, 4.5)]
+    corpus.add(
+        "c-candidate",
+        "heldout",
+        [],
+        [],
+        observations,
+        raw_segments=CONTROL_RAW,
+        control_kind="corrupted_asr",
+        clear_correction=True,
+        asr_error_status="candidate",
+    )
+    report = corpus.evaluate()
+    assert report["negative_controls"] == {
+        "clips": 0,
+        "confident_fabrications": {"diction": 0, "prosody": 0, "transcript": 0},
+    }
+    assert report["failures"]["control_fabrications"] == []
+    assert any(
+        "'c-candidate' is a corrupted_asr candidate" in r for r in report["not_qualified_reasons"]
+    )
 
 
 def test_confident_raw_segments_are_the_trusted_ones_by_their_index(tmp_path: Path) -> None:

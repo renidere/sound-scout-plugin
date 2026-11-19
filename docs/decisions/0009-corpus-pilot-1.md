@@ -5,13 +5,19 @@
 - **Решение:** [Decision в #78](https://github.com/renidere/sound-scout-plugin/issues/78#issuecomment-7004896453);
   обзор наборов — комментарий 7004035799 в
   [#29](https://github.com/renidere/sound-scout-plugin/issues/29).
-- **Задача:** [#78](https://github.com/renidere/sound-scout-plugin/issues/78); эпик
+- **Задача:** [#78](https://github.com/renidere/sound-scout-plugin/issues/78), доработка
+  контролей — [#84](https://github.com/renidere/sound-scout-plugin/issues/84) (уточнение владельца
+  [7007076410](https://github.com/renidere/sound-scout-plugin/issues/78#issuecomment-7007076410),
+  прослушивание [7006745989](https://github.com/renidere/sound-scout-plugin/issues/78#issuecomment-7006745989));
+  эпик
   [#4](https://github.com/renidere/sound-scout-plugin/issues/4).
 - **Основание:** `docs/spec/REQUIREMENTS.md` T05, T06, R04, R05, R09, R11;
   `docs/eval/PROTOCOL.md` § 2–5, § 9; `docs/eval/LABELING.md`.
 - **Код:** `src/sound_scout/eval/corpus.py` (`SOURCES`, `RINCO_TIERS`, `TIER_CATEGORIES`,
-  `windows`, `select_candidates`, `prepare`), `scripts/fetch_corpus_sources.py`,
-  `src/sound_scout/eval/manifest.py` (`label_dependent`), `sound-scout eval check-manifest`.
+  `windows`, `select_candidates`, `prepare`, `EXCLUDED_CONTROLS`, `revise`),
+  `scripts/fetch_corpus_sources.py`, `src/sound_scout/eval/manifest.py` (`label_dependent`,
+  `is_unconfirmed`, `sheet_problems`), `src/sound_scout/eval/asr_review.py`,
+  `sound-scout eval check-manifest`.
 - **Источники:** `docs/dependencies.md` § 5.
 
 ## Вопрос
@@ -73,7 +79,8 @@
 5. **Отрицательные контроли (10).** `ctl-silence` (10 с нулей), `ctl-pink` (10 с розового шума,
    seed 78, а не seed 0 клипа Gate 0), `ctl-demand-{dliving,ooffice,dkitchen}` (канал `ch01.wav`,
    60–75 с, без усиления), `ctl-snsd-babble` (`Babble_2.wav`), `ctl-snsd-neighbor-{2,4}`
-   (`NeighborSpeaking_2/4.wav`) — первые 15 с; `ctl-asrnoise-0db` и `ctl-asrnoise-m5db`
+   (`NeighborSpeaking_2/4.wav`) — первые 15 с (с #84 аудио пишется, но в манифест не входит,
+   правило 11); `ctl-asrnoise-0db` и `ctl-asrnoise-m5db`
    (`corrupted_asr`): окно 8–15 с речи первого по пути файла RINCO вне групп кандидатов, смешанное
    с `Babble_6.wav` при SNR 0 и −5 дБ (RMS по окну, смещение шума от seed 78; пик выше 0,99 —
    масштаб всей смеси, коэффициент в `provenance.json`).
@@ -93,8 +100,37 @@
 10. **`check-manifest --draft`.** Ошибки покрытия held-out (категория, события группы, пары)
     перечислены отдельным блоком как ждущие разметки и записей владельца; код 0 только если других
     ошибок нет. Без `--draft` любая ошибка — код 1.
+11. **Фоновый клип с разборчивыми словами — не контроль `noise`** (#84). На шуме инструменту
+    нечего слышать (PROTOCOL § 9), а настоящие слова в фоне ASR распознаёт по праву: иностранный
+    язык не делает их галлюцинацией. Владелец 2026-11-19 услышал разборчивые, преимущественно
+    английские слова в `ctl-snsd-babble`, `ctl-snsd-neighbor-2`, `ctl-snsd-neighbor-4`; они
+    исключены из манифеста (`EXCLUDED_CONTROLS`), причина — в `note` манифеста и в `excluded` их
+    записи `provenance.json`. Аудио этих клипов остаётся в `clips/`: исключение не удаляет
+    оригиналы (новый `prepare` шаблонов разметки для них не пишет; в pilot-1 прежние шаблоны
+    остались нетронутыми). Замены им нет: формально корректная запись без проверенного
+    содержания контролем не становится. Разбиение остальных контролей считается, как до
+    исключения, поэтому их части не меняются. Черновой манифест, собранный до правила,
+    приводится к нему `python -m sound_scout.eval.corpus revise --manifest <путь>` (на месте,
+    повторный запуск ничего не меняет). `revise` меняет только манифест: `provenance.json` он не
+    трогает, и поля `excluded` в нём нет — причину исключения тогда хранит только `note`
+    манифеста. Отсутствующую или черновую заметку #78 `revise` заменяет полной; любую другую
+    сохраняет и дописывает к ней причину исключения, если её там нет.
+12. **Кандидат `corrupted_asr` не контроль, пока человек не сравнил ASR с речью** (#84). Запись
+    `corrupted_asr` несёт `asr_error_status`: `candidate` ставит `prepare`/`revise`, `confirmed` —
+    только человек и только при листе `asr-review/<id>.json` рядом с манифестом, где заполнены
+    `human.transcript`, `human.reviewer`, `human.reviewed_at` и `human.verdict: asr_error`
+    (`manifest.sheet_problems`). Кандидат не засчитывается в минимум контролей, а `eval run` его не
+    загружает и не считает; пока он есть, манифест несёт ошибку, ждущую человека. Лист создаёт
+    `python -m sound_scout.eval.asr_review --manifest <путь>`: только для записей `dev` вида
+    `corrupted_asr`, held-out отбрасывается до любого обращения к файлу (тест
+    `test_only_dev_corrupted_asr_candidates_are_transcribed_and_heldout_is_never_opened`). Клип
+    проходит политику входа и декодер `analyze` (каталог клипов — allowed root конфигурации) и
+    локальный ASR offline; сырой транскрипт и receipt модели остаются в run-каталоге
+    `<data_root>/asr-review/<имя корпуса>/`, лист получает сырой текст и сегменты, человеческие
+    поля пустые. Скрипт тексты не сравнивает и ошибку не объявляет: различие текстов — не
+    подтверждение; существующий лист не перезаписывается.
 
-## Итог прогона pilot-1 (2026-11-19)
+## Итог прогона pilot-1 (2026-11-19, до #84)
 
 22 клипа: 12 кандидатов RINCO (9,1–24,9 с, у всех три категории-кандидата), 10 контролей. Held-out:
 8 кандидатов и 4 контроля. `sound-scout eval check-manifest --draft` — код 0: остались только
@@ -108,8 +144,32 @@ held-out — это ждёт записей и разметки владельц
 - Пар «те же слова, другой акцент» в открытых наборах нет: их записывает владелец (#29).
 - Ошибку ASR на `ctl-asrnoise-*` подтверждает человек на слух: эталона нет, слой Transcribe
   автоматический, а согласие двух прогонов ASR не ground truth (T05). До подтверждения в `note`
-  записи стоит «кандидат, ошибка ASR не подтверждена». Контроль `ctl-snsd-neighbor-*`, в котором
-  слышны разборчивые слова, исключается из манифеста до фиксации.
+  записи стоит «кандидат, ошибка ASR не подтверждена», а в `asr_error_status` — `candidate`
+  (правило 12). Фоновые клипы с разборчивыми словами исключены (правило 11).
 - На `corrupted_asr` любой finding пяти категорий runner считает уверенной выдумкой, даже верное
   наблюдение просодии (PROTOCOL § 9); до прогона владелец может это пересмотреть.
 - Held-out фиксирует владелец (PROTOCOL § 5); разметку делает человек.
+
+## Пересчёт после #84 (2026-11-19)
+
+Манифест pilot-1 приведён к правилам 11–12 (`revise`, копия прежнего — `manifest.json.bak-84`
+рядом, вне git; `provenance.json` pilot-1 собран до правила 11 и поля `excluded` не имеет, причина
+исключения записана только в `note` манифеста): 19 записей — 12 кандидатов RINCO и 7 контролей (`ctl-silence`, `ctl-pink`, три
+DEMAND, два кандидата `corrupted_asr`). Held-out: 8 кандидатов и 2 контроля (`ctl-demand-dliving`,
+`ctl-demand-dkitchen`); прежние held-out контроли `ctl-snsd-neighbor-{2,4}` исключены. Локальный
+ASR прошёл по обоим dev-кандидатам, листы `asr-review/ctl-asrnoise-{0db,m5db}.json` ждут
+сравнения человеком; held-out-кандидатов `corrupted_asr` в манифесте нет.
+
+`sound-scout eval check-manifest --draft` — **код 1**. Минимумы PROTOCOL § 4 против состава:
+
+| Что | Есть | Нужно |
+|---|---|---|
+| клипов | 19 | 20 — **недобор 1**, не зависит от разметки |
+| отрицательных контролей (без неподтверждённых кандидатов) | 5 | 5 |
+| подтверждённых контролей `corrupted_asr` | 0 из 2 кандидатов | вид T05; ждёт сравнения человеком |
+| событий дикции в held-out | 0 | 5 — **недобор**, записи владельца (#29) |
+| записей просодии в held-out (нижняя граница событий) | 24 (8 клипов × 3 категории-кандидата) | 5 событий — по разметке, пока не размечено |
+| `pronunciation` / `repetition_self_correction` в held-out | 0 / 0 | 1 / 1 — **не представлены** |
+| пар «те же слова, другой акцент» в held-out | 0 | 2 — **недобор**, записи владельца (#29) |
+
+`--draft` — проверка черновой структуры, не квалификация.

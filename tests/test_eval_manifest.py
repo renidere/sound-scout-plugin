@@ -80,9 +80,9 @@ def qualifying_manifest() -> dict:
             [
                 ("heldout", "silence"),
                 ("heldout", "noise"),
-                ("heldout", "corrupted_asr"),
+                ("heldout", "noise"),
                 ("dev", "silence"),
-                ("dev", "corrupted_asr"),
+                ("dev", "noise"),
             ]
         )
     ]
@@ -190,9 +190,108 @@ def test_kind_on_a_record_that_is_not_a_control_is_rejected(doc: dict) -> None:
 
 
 @pytest.mark.parametrize("kind", CONTROL_KINDS)
-def test_every_control_kind_is_accepted(doc: dict, kind: str) -> None:
+def test_every_control_kind_is_accepted(tmp_path: Path, doc: dict, kind: str) -> None:
     doc["records"][-1]["control_kind"] = kind
-    assert validation_report(doc).ok
+    if kind == "corrupted_asr":
+        doc["records"][-1]["asr_error_status"] = "confirmed"
+        write_sheet(tmp_path, doc["records"][-1], signed_human())
+    assert validation_report(doc, tmp_path).ok
+
+
+def signed_human(**changes) -> dict:
+    return {
+        "transcript": "услышанный текст",
+        "verdict": "asr_error",
+        "reviewer": "listener-a",
+        "reviewed_at": "2026-11-20",
+        "note": None,
+        **changes,
+    }
+
+
+def write_sheet(root: Path, item: dict, human: dict, **changes) -> Path:
+    path = root / manifest.ASR_REVIEW_DIR / f"{item['id']}.json"
+    path.parent.mkdir(exist_ok=True)
+    sheet = {"clip_id": item["id"], "clip_sha256": item["sha256"], "human": human, **changes}
+    path.write_text(json.dumps(sheet, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def corrupted_asr(status: str | None) -> dict:
+    item = record("nc-asr", "dev", [], negative_control=True, control_kind="corrupted_asr")
+    if status is not None:
+        item["asr_error_status"] = status
+    return item
+
+
+def test_corrupted_asr_candidate_is_no_control_and_waits_for_a_person(doc: dict) -> None:
+    doc["records"].append(corrupted_asr("candidate"))
+    report = validation_report(doc)
+    assert (
+        report.errors
+        == report.label_dependent
+        == [
+            "$.records[20].asr_error_status: 'nc-asr' is a corrupted_asr candidate, not confirmed; "
+            "it counts as no control until a person signs asr-review/nc-asr.json"
+        ]
+    )
+    assert report.draft_ok and not report.ok
+    assert manifest.is_unconfirmed(doc["records"][-1])
+
+    doc = qualifying_manifest()
+    doc["records"][-1] = corrupted_asr("candidate")
+    assert_rejected(
+        doc,
+        f"{MIN_NEGATIVE_CONTROLS - 1} negative controls (unconfirmed corrupted_asr candidates "
+        f"do not count), the corpus needs at least {MIN_NEGATIVE_CONTROLS}",
+    )
+
+
+def test_asr_error_status_is_required_on_corrupted_asr_and_only_there(doc: dict) -> None:
+    doc["records"].append(corrupted_asr(None))
+    report = assert_rejected(
+        doc,
+        "$.records[20].asr_error_status: a corrupted_asr control names its status, one of "
+        "candidate, confirmed",
+    )
+    assert manifest.is_unconfirmed(doc["records"][-1])
+    assert not report.draft_ok
+    doc = qualifying_manifest()
+    doc["records"][-1]["asr_error_status"] = "candidate"
+    assert_rejected(doc, "$.records[19].asr_error_status: only a corrupted_asr control carries it")
+    doc["records"][-1]["asr_error_status"] = "maybe"
+    assert_rejected(doc, "$.records[19].asr_error_status: must be one of")
+
+
+def test_confirmed_needs_a_sheet_a_person_filled_and_signed(tmp_path: Path, doc: dict) -> None:
+    doc["records"][-1] = item = corrupted_asr("confirmed")
+    where = "$.records[19].asr_error_status: 'confirmed' needs asr-review/nc-asr.json"
+    assert validation_report(doc).errors == [
+        f"{where}; the manifest directory is unknown, it is not checked"
+    ]
+    assert validation_report(doc, tmp_path).errors == [
+        f"{where}; it cannot be read (FileNotFoundError)"
+    ]
+    blank = {"transcript": "", "verdict": None, "reviewer": "", "reviewed_at": "", "note": None}
+    write_sheet(tmp_path, item, blank)
+    assert validation_report(doc, tmp_path).errors == [
+        f"{where}; the sheet human.transcript is empty",
+        f"{where}; the sheet human.reviewer is empty",
+        f"{where}; the sheet human.reviewed_at is empty",
+        f"{where}; the sheet human.verdict is not 'asr_error'",
+    ]
+    write_sheet(tmp_path, item, signed_human(verdict="no_asr_error"))
+    assert validation_report(doc, tmp_path).errors == [
+        f"{where}; the sheet human.verdict is not 'asr_error'"
+    ]
+    write_sheet(tmp_path, item, signed_human(), clip_sha256=sha("another clip"))
+    assert validation_report(doc, tmp_path).errors == [
+        f"{where}; the sheet describes another clip (clip_id or clip_sha256)"
+    ]
+    write_sheet(tmp_path, item, signed_human())
+    assert validation_report(doc, tmp_path).ok
+    assert not manifest.is_unconfirmed(item)
+    assert validate(write(tmp_path, doc)).ok
 
 
 def test_unknown_control_kind_is_a_named_schema_error(doc: dict) -> None:
@@ -235,8 +334,8 @@ def test_minimum_clip_and_negative_control_counts(doc: dict) -> None:
     del doc["records"][-1]["control_kind"]
     assert_rejected(
         doc,
-        f"{MIN_NEGATIVE_CONTROLS - 1} negative controls, the corpus needs at least "
-        f"{MIN_NEGATIVE_CONTROLS}",
+        f"{MIN_NEGATIVE_CONTROLS - 1} negative controls (unconfirmed corrupted_asr candidates "
+        f"do not count), the corpus needs at least {MIN_NEGATIVE_CONTROLS}",
     )
 
 
@@ -454,7 +553,8 @@ IDENTIFIER_PATTERN = "'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"
         ),
         (
             lambda d: d["records"][0].update(extra=1),
-            "$.records[0]: Additional properties are not allowed, allowed: ['categories',",
+            "$.records[0]: Additional properties are not allowed, allowed: "
+            "['asr_error_status', 'categories',",
         ),
         (lambda d: d.update(schema_version="2.0"), "$.schema_version: '1.0' was expected"),
         (

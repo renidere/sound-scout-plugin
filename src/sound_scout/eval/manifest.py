@@ -4,6 +4,11 @@ The schema (`schema/corpus-manifest.v1.schema.json`, packaged copy next to this 
 shape of one record; the rules between fields and records — one split per source group, unique
 hashes, categories versus negative controls, a control kind on every control and only there, the
 minimum volumes of docs/eval/PROTOCOL.md — are plain code here, each with its own message.
+A `corrupted_asr` control carries `asr_error_status`: `candidate` until a person compared the
+local ASR with the speech they heard and signed the review sheet `asr-review/<id>.json` next to
+the manifest (`sound_scout.eval.asr_review` writes it with the human fields empty). A candidate
+is no control: it is not counted, and it stays a label-dependent error until a person decides.
+`confirmed` passes only with that sheet filled in by a person; nothing in the code sets it.
 `validate` returns a report instead of raising: the evaluation runner and the owner need the whole
 list of shortfalls, not the first one.
 """
@@ -33,6 +38,10 @@ CATEGORIES = DICTION_CATEGORIES + PROSODY_CATEGORIES
 CATEGORY_GROUPS = {"diction": DICTION_CATEGORIES, "prosody": PROSODY_CATEGORIES}
 PAIR_CATEGORY = "semantic_stress"
 CONTROL_KINDS = ("silence", "noise", "corrupted_asr")
+ASR_ERROR_STATUSES = ("candidate", "confirmed")
+ASR_ERROR_VERDICTS = ("asr_error", "no_asr_error")
+ASR_REVIEW_DIR = "asr-review"
+HUMAN_SHEET_FIELDS = ("transcript", "reviewer", "reviewed_at")
 MIN_CLIPS = 20
 MIN_NEGATIVE_CONTROLS = 5
 MIN_HELDOUT_EVENTS_PER_GROUP = 5
@@ -79,11 +88,15 @@ def validate(path: str | Path) -> ManifestReport:
         manifest = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         return ManifestReport([f"$: not a UTF-8 JSON document: {exc}"], _empty_coverage())
-    return validation_report(manifest)
+    return validation_report(manifest, Path(path).parent)
 
 
-def validation_report(manifest: object) -> ManifestReport:
-    """Every violation as `<json path>: <message>`; record rules run only on a sound shape."""
+def validation_report(manifest: object, root: Path | None = None) -> ManifestReport:
+    """Every violation as `<json path>: <message>`; record rules run only on a sound shape.
+
+    `root` is the manifest's directory: a `confirmed` corrupted_asr control is checked against
+    its review sheet there, and without `root` it cannot be, so it is an error (fails closed).
+    """
     errors = _non_finite_numbers(SCHEMA, manifest)
     errors += schema_errors(SCHEMA, manifest)
     if errors:
@@ -95,9 +108,10 @@ def validation_report(manifest: object) -> ManifestReport:
         + _uniqueness_errors(records)
         + _split_errors(records)
         + _pair_errors(records)
+        + _confirmation_errors(records, root)
     )
     coverage = _heldout_coverage(records)
-    label_dependent = _coverage_errors(records, coverage)
+    label_dependent = _candidate_errors(records) + _coverage_errors(records, coverage)
     return ManifestReport(
         errors + _count_errors(records) + label_dependent, coverage, label_dependent
     )
@@ -138,10 +152,77 @@ def _record_errors(records: list[dict]) -> list[str]:
             )
         if not record["negative_control"] and "control_kind" in record:
             errors.append(f"$.records[{i}].control_kind: only a negative control carries a kind")
+        corrupted_asr = record["negative_control"] and record.get("control_kind") == "corrupted_asr"
+        if corrupted_asr and "asr_error_status" not in record:
+            errors.append(
+                f"$.records[{i}].asr_error_status: a corrupted_asr control names its status, one "
+                "of " + ", ".join(ASR_ERROR_STATUSES)
+            )
+        if not corrupted_asr and "asr_error_status" in record:
+            errors.append(
+                f"$.records[{i}].asr_error_status: only a corrupted_asr control carries it"
+            )
         if record.get("pair_id") is not None and PAIR_CATEGORY not in record["categories"]:
             errors.append(
                 f"$.records[{i}].pair_id: a member of a same-words pair carries {PAIR_CATEGORY!r}"
             )
+    return errors
+
+
+def is_unconfirmed(record: dict) -> bool:
+    """A corrupted_asr control whose ASR error no person has confirmed: not a control yet."""
+    return (
+        record["negative_control"]
+        and record.get("control_kind") == "corrupted_asr"
+        and record.get("asr_error_status") != "confirmed"
+    )
+
+
+def sheet_problems(sheet: object, record: dict) -> list[str]:
+    """Why the review sheet does not confirm the ASR error of `record`; empty when it does."""
+    if not isinstance(sheet, dict):
+        return ["not a JSON object"]
+    problems = []
+    if sheet.get("clip_id") != record["id"] or sheet.get("clip_sha256") != record["sha256"]:
+        problems.append("describes another clip (clip_id or clip_sha256)")
+    human = sheet.get("human")
+    if not isinstance(human, dict):
+        return [*problems, "has no human section"]
+    for field in HUMAN_SHEET_FIELDS:
+        value = human.get(field)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"human.{field} is empty")
+    if human.get("verdict") != "asr_error":
+        problems.append("human.verdict is not 'asr_error'")
+    return problems
+
+
+def _candidate_errors(records: list[dict]) -> list[str]:
+    return [
+        f"$.records[{i}].asr_error_status: {record['id']!r} is a corrupted_asr candidate, not "
+        f"confirmed; it counts as no control until a person signs {ASR_REVIEW_DIR}/"
+        f"{record['id']}.json"
+        for i, record in enumerate(records)
+        if is_unconfirmed(record) and "asr_error_status" in record
+    ]
+
+
+def _confirmation_errors(records: list[dict], root: Path | None) -> list[str]:
+    errors = []
+    for i, record in enumerate(records):
+        if record.get("control_kind") != "corrupted_asr" or is_unconfirmed(record):
+            continue
+        sheet_name = f"{ASR_REVIEW_DIR}/{record['id']}.json"
+        where = f"$.records[{i}].asr_error_status: 'confirmed' needs {sheet_name}"
+        if root is None:
+            errors.append(f"{where}; the manifest directory is unknown, it is not checked")
+            continue
+        try:
+            sheet = json.loads((root / sheet_name).read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            errors.append(f"{where}; it cannot be read ({type(error).__name__})")
+            continue
+        errors += [f"{where}; the sheet {problem}" for problem in sheet_problems(sheet, record)]
     return errors
 
 
@@ -201,11 +282,11 @@ def _count_errors(records: list[dict]) -> list[str]:
     errors = []
     if len(records) < MIN_CLIPS:
         errors.append(f"$.records: {len(records)} clips, the corpus needs at least {MIN_CLIPS}")
-    controls = sum(1 for record in records if record["negative_control"])
+    controls = sum(1 for r in records if r["negative_control"] and not is_unconfirmed(r))
     if controls < MIN_NEGATIVE_CONTROLS:
         errors.append(
-            f"$.records: {controls} negative controls, the corpus needs at least "
-            f"{MIN_NEGATIVE_CONTROLS}"
+            f"$.records: {controls} negative controls (unconfirmed corrupted_asr candidates do "
+            f"not count), the corpus needs at least {MIN_NEGATIVE_CONTROLS}"
         )
     return errors
 

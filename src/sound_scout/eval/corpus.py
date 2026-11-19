@@ -8,10 +8,16 @@ itself is `scripts/fetch_corpus_sources.py`, outside the installed package (R09)
 source against `SOURCES`, then builds `DIR/<name>/`: negative controls (silence, seeded pink
 noise, DEMAND backgrounds, MS-SNSD babble and neighbour speech, RINCO speech mixed with babble),
 prosody candidates cut from RINCO by its Accent / Pause / Int phrase tiers, a draft manifest,
-`provenance.json` and an empty label template per clip. Archive members are read by name into
-temporary files the code names, never extracted by the archive's own paths; the Transcribe tier
-of RINCO (an automatic transcript, a model output) is never read. No model, no ASR, no network.
-The category mapping and the rules are docs/decisions/0009-corpus-pilot-1.md.
+`provenance.json` and an empty label template per clip. The MS-SNSD background clips carry
+intelligible speech (the owner listened on 2026-11-19, #84): their audio is written and kept, but
+they are no noise controls and stay out of the manifest (`EXCLUDED_CONTROLS`); the speech + babble
+mixes enter it as `corrupted_asr` candidates (`asr_error_status: candidate`) until a person
+confirms the ASR error. `revise --manifest PATH` applies the same two rules to a draft manifest
+built before them, in place and idempotently; it replaces a missing or #78 draft `note` with
+`MANIFEST_NOTE` and appends the exclusion reason to any other note. Archive members are read by
+name into temporary files the code names, never extracted by the archive's own paths; the
+Transcribe tier of RINCO (an automatic transcript, a model output) is never read. No model, no
+ASR, no network. The category mapping and the rules are docs/decisions/0009-corpus-pilot-1.md.
 """
 
 import argparse
@@ -286,9 +292,17 @@ DECODE_THREADS = "2"
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 FORMAT_VERSION = 1
-MANIFEST_NOTE = (
-    "черновик #78: разметки нет, категории RINCO не утверждены, held-out не зафиксирован"
+EXCLUDED_CONTROLS = tuple(clip_id for clip_id, _ in SNSD_CONTROLS)
+SPEECH_BACKGROUND = (
+    "в фоне разборчивая речь, преимущественно английская (прослушивание владельца 2026-11-19, "
+    "#84): клип с разборчивыми словами — не контроль noise"
 )
+DRAFT_NOTE = "черновик #78: разметки нет, категории RINCO не утверждены, held-out не зафиксирован"
+EXCLUSION_NOTE = (
+    f"исключены из состава: {', '.join(EXCLUDED_CONTROLS)} — {SPEECH_BACKGROUND}; их аудио "
+    "сохранено в clips/"
+)
+MANIFEST_NOTE = f"{DRAFT_NOTE}; {EXCLUSION_NOTE}"
 ASR_UNCONFIRMED = "кандидат, ошибка ASR не подтверждена"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -666,8 +680,6 @@ def _build(corpus_dir: Path, by_name: dict[str, Source], work: Path) -> tuple[li
         samples = decode(_source_path(corpus_dir, by_name, file_name))
         piece = samples[: round(BACKGROUND_SECONDS * SAMPLE_RATE)]
         note = f"MS-SNSD {file_name}, 0–{len(piece) / SAMPLE_RATE:g} с"
-        if "Neighbor" in file_name:
-            note += "; исключить, если слышны разборчивые слова (PROTOCOL § 9)"
         controls.append((
             clip_id, piece, "noise", note,
             {"source": by_name[file_name].relative_path, "start_s": 0.0,
@@ -789,10 +801,13 @@ def _write(staging: Path, name: str, pending: list, provenance: dict, by_name: d
             "id": clip_id, "path": f"clips/{clip_id}.wav", "sha256": sha256,
             "duration_s": duration, "split": group_split, **fields,
         })  # fmt: skip
-        template = label_template(clip_id, sha256, duration)
-        _write_json(labels_dir / f"{clip_id}.json", template)
+        if clip_id in EXCLUDED_CONTROLS:
+            details = {**details, "excluded": SPEECH_BACKGROUND}
+        else:
+            template = label_template(clip_id, sha256, duration)
+            _write_json(labels_dir / f"{clip_id}.json", template)
         clip_provenance.append({"id": clip_id, "sha256": sha256, **details})
-    manifest = {"schema_version": "1.0", "name": name, "note": MANIFEST_NOTE, "records": records}
+    manifest = revise({"schema_version": "1.0", "name": name, "records": records})
     _write_json(staging / "manifest.json", manifest)
     _write_json(
         staging / "provenance.json",
@@ -820,6 +835,44 @@ def _write(staging: Path, name: str, pending: list, provenance: dict, by_name: d
     return manifest
 
 
+def revise(manifest: dict) -> dict:
+    """The draft without `EXCLUDED_CONTROLS`, every corrupted_asr control with a status.
+
+    Idempotent; a status already present is kept and a missing one is `candidate`: confirming
+    an ASR error is a person's step (`manifest.sheet_problems`), never this function's. A missing
+    note or the #78 draft note becomes `MANIFEST_NOTE`; any other note is kept, with
+    `EXCLUSION_NOTE` appended when it does not hold it yet.
+    """
+    records = []
+    for record in manifest["records"]:
+        if record["id"] in EXCLUDED_CONTROLS:
+            continue
+        if record.get("control_kind") == "corrupted_asr":
+            record = {**record, "asr_error_status": record.get("asr_error_status", "candidate")}
+        records.append(record)
+    note = manifest.get("note")
+    if note in (None, DRAFT_NOTE):
+        note = MANIFEST_NOTE
+    elif EXCLUSION_NOTE not in note:
+        note = f"{note}; {EXCLUSION_NOTE}"
+    return {**manifest, "note": note, "records": records}
+
+
+def revise_file(path: Path) -> tuple[list[str], bool]:
+    """Apply `revise` to the manifest at `path` in place; the ids it dropped, whether it wrote."""
+    path = Path(path)
+    before = json.loads(path.read_text(encoding="utf-8"))
+    after = revise(before)
+    if after == before:
+        return [], False
+    kept = {record["id"] for record in after["records"]}
+    dropped = [record["id"] for record in before["records"] if record["id"] not in kept]
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _write_json(temporary, after)
+    os.replace(temporary, path)
+    return dropped, True
+
+
 def _write_bytes(path: Path, data: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
     with os.fdopen(fd, "wb") as out:
@@ -837,10 +890,18 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("prepare", help="build the draft corpus from verified sources")
     command.add_argument("--corpus-dir", type=Path, required=True)
     command.add_argument("--name", required=True)
+    command = commands.add_parser(
+        "revise", help="drop the excluded controls and mark corrupted_asr candidates in place"
+    )
+    command.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == "revise":
+            dropped, written = revise_file(args.manifest)
+            print(f"dropped: {', '.join(dropped) or 'none'}; written: {str(written).lower()}")
+            return 0
         manifest = prepare(args.corpus_dir, args.name)
-    except (CorpusError, OSError, zipfile.BadZipFile) as error:
+    except (CorpusError, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         print(f"corpus: {error}", file=sys.stderr)
         return 2
     for record in manifest["records"]:

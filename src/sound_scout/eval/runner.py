@@ -29,6 +29,8 @@ finding is a confident claim) and each transcript correction with `certainty: cl
 `suspect_hallucination` (`asr.trusted_segments`, the one rule of docs/decisions/0005); on
 `corrupted_asr` the speech is real, so its raw transcript words are not a fabrication. A
 control without a kind (`manifest.validate` rejects it) is counted as silence: it fails closed.
+A `corrupted_asr` candidate whose ASR error no person confirmed (`manifest.is_unconfirmed`) is no
+control: it is neither loaded nor counted, and the manifest error it carries disqualifies the run.
 
 The thresholds below mirror the protocol's tables; a test asserts they match its text. They are
 the owner's to change in the protocol, never here.
@@ -124,11 +126,17 @@ def evaluate(
     reasons: list[str] = []
     if split != "heldout":
         reasons.append("прогон на dev-наборе: квалификация только на held-out (§ 5)")
-    manifest_errors = manifest.validation_report(json.loads(manifest_bytes)).errors
+    manifest_errors = manifest.validation_report(
+        json.loads(manifest_bytes), Path(manifest_path).parent
+    ).errors
     reasons += [f"манифест: {error}" for error in manifest_errors]
     input_errors: list[str] = []
     evaluated = sorted(
-        (r for r in records if r["split"] == split or r["negative_control"]),
+        (
+            r
+            for r in records
+            if (r["split"] == split or r["negative_control"]) and not manifest.is_unconfirmed(r)
+        ),
         key=lambda r: r["id"],
     )
     clips = [_load_clip(r, Path(labels_dir), Path(results_dir), input_errors) for r in evaluated]
