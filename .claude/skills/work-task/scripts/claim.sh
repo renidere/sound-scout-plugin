@@ -19,6 +19,8 @@
 # usage:
 #   claim.sh acquire <issue-url>              -> `acquired <claim-id>` (exit 0)
 #                                                 `taken <claim-id> <minutes since last seen>` (exit 3)
+#                                                 `orphan <claim-id> <comment-id|->` (exit 5): failed,
+#                                                 and this attempt's claim may be left on the issue
 #   claim.sh heartbeat <issue-url> <claim-id> -> `ok` (exit 0) | `lost` (exit 3)
 #   claim.sh release <issue-url> <claim-id>   -> `released` (exit 0)
 # any other exit code is an error (network, auth): the claim state is unknown, retry.
@@ -27,10 +29,12 @@ set -euo pipefail
 
 STALE=${CLAIM_STALE_MINUTES:-360}
 SETTLE=${CLAIM_SETTLE_SECONDS:-8}
+RETRY=${CLAIM_RETRY_SECONDS:-5}
+ORPHAN=5
 MARK='<!-- work-task-claim id='
 TRUSTED='(.author_association == "OWNER" or .author_association == "COLLABORATOR" or .author_association == "MEMBER")'
 
-usage() { sed -n '20,25p' "$0" >&2; exit 64; }
+usage() { sed -n '20,27p' "$0" >&2; exit 64; }
 
 cmd="${1:-}"
 url="${2:-}"
@@ -66,6 +70,40 @@ live() { awk -F'\t' -v s="$STALE" '$3 < s'; }
 stale() { awk -F'\t' -v s="$STALE" '$3 >= s'; }
 delete_comment() { gh api -X DELETE "repos/$repo/issues/comments/$1" >/dev/null 2>&1 || true; }
 
+# Three tries; a comment already gone (404) counts as deleted.
+delete_with_retries() { # <comment-id>
+  local n out
+  for n in 1 2 3; do
+    out=$(gh api -X DELETE "repos/$repo/issues/comments/$1" 2>&1 >/dev/null) && return 0
+    printf '%s\n' "$out" >&2
+    [[ "$out" == *"HTTP 404"* ]] && return 0
+    [ "$n" = 3 ] || sleep "$RETRY"
+  done
+  return 1
+}
+
+claims_with_retries() {
+  local n out
+  for n in 1 2 3; do
+    out=$(claims) && { printf '%s\n' "$out"; return 0; }
+    [ "$n" = 3 ] || sleep "$RETRY"
+  done
+  return 1
+}
+
+orphan() { # <claim-id> <comment-id|->
+  printf 'orphan %s %s\n' "$1" "$2"
+  exit "$ORPHAN"
+}
+
+# Our claim comment is up, but acquire can't finish: take it down, or name it.
+abandon() {
+  trap - ERR
+  delete_with_retries "$mine" || orphan "$id" "$mine"
+  echo "acquire failed; claim $id removed" >&2
+  exit 1
+}
+
 case "$cmd" in
   acquire)
     host=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-')
@@ -78,16 +116,28 @@ case "$cmd" in
       exit 3
     fi
 
-    mine=$(gh api -X POST "repos/$repo/issues/$number/comments" -f body="$(body_for "$id" "$(now_utc)")" --jq .id)
-    # From here on an error must not leave a claim behind that nobody knows the id of.
-    trap 'delete_comment "$mine"' ERR
+    if ! mine=$(gh api -X POST "repos/$repo/issues/$number/comments" -f body="$(body_for "$id" "$(now_utc)")" --jq .id); then
+      # The response may be lost while the comment went up: look for it by the claim id.
+      sleep "$SETTLE"
+      found=$(claims_with_retries) || orphan "$id" -
+      lost=$(awk -F'\t' -v c="$id" '$2 == c { print $1; exit }' <<<"$found")
+      if [ -n "$lost" ]; then
+        delete_with_retries "$lost" || orphan "$id" "$lost"
+        echo "acquire failed; claim $id was posted and removed" >&2
+      else
+        echo "acquire failed: the claim comment was not posted" >&2
+      fi
+      exit 1
+    fi
+    trap abandon ERR
 
     # Let a claim posted at nearly the same moment become visible before deciding.
     sleep "$SETTLE"
     current=$(claims)
     winner=$(printf '%s\n' "$current" | live | head -n1)
     if [ "$(cut -f2 <<<"$winner")" != "$id" ]; then
-      delete_comment "$mine"
+      trap - ERR
+      delete_with_retries "$mine" || orphan "$id" "$mine"
       printf 'taken %s %s\n' "$(cut -f2 <<<"$winner")" "$(cut -f3 <<<"$winner")"
       exit 3
     fi

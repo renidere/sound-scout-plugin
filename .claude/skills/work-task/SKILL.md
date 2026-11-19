@@ -135,6 +135,11 @@ prints: found from the current directory, a folder inside it, or a task tree und
    - `acquired <claim-id>`: the task is yours. Keep the claim id; it goes in the `started` line.
    - `taken <claim-id> <minutes>`: another agent is on it. Touch nothing — no card move, no
      comment, no release. Log `skipped | claimed by <claim-id>`, end.
+   - `orphan <claim-id> <comment-id|->` (exit 5): the claim failed and its comment could not be
+     removed, so it may still be on the issue, blocking every later attempt as `taken`. Run
+     `claim.sh release <url> <claim-id>` once, log `orphan <claim-id> | released` or
+     `orphan <claim-id> | release failed: <error>`, then log `failed | could not claim: orphan`
+     and end without touching anything else.
    - Any other exit: the network or `gh` failed and nobody knows who holds the task. Try once
      more; still failing, log `failed | could not claim: <error>`, end without touching anything.
 4. **Look again**, now that you hold the claim: read the issue state and `board.sh item <url>`
