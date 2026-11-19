@@ -1,0 +1,30 @@
+# Ожидаемая запись `mcp_servers.speech-review` в конфигурации Hermes после шагов
+# docs/hermes-install.md (Hermes Agent v0.23.1). Это образец для сверки при readback, а не файл
+# для копирования: запись создаётся командами `hermes mcp add` и `hermes config set`, ручное
+# редактирование `mcp_servers` не используется (R12). Значения в угловых скобках — абсолютные пути
+# хоста backend, которые оператор подставляет сам; в репозиторий они не попадают.
+mcp_servers:
+  speech-review:
+    command: <абсолютный путь к uv>
+    args:
+      - run
+      - --directory
+      - <абсолютный путь к checkout sound-scout-plugin>
+      - --offline
+      - sound-scout
+      - serve
+    env:
+      SOUND_SCOUT_CONFIG: <абсолютный путь к sound-scout.toml>
+    connect_timeout: 60.0
+    # budgets.worker_deadline_seconds (180) + budgets.max_subprocess_seconds (60, ffprobe до
+    # запуска worker) + запас 60 с; при других budgets пересчитать.
+    timeout: 300
+    supports_parallel_tool_calls: false
+    sampling:
+      enabled: false
+    tools:
+      include:
+        - speech_capabilities
+        - speech_analyze
+        - speech_compare
+    enabled: true

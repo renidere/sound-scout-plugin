@@ -104,6 +104,7 @@
 | Отчёт: `write` (полный `result.json` и `report.md` на русском в run-каталоге, без приватных путей), `compact` (ответ ≤ 4 KiB), правило приоритета findings `prioritized`, `cost`; решение — `docs/decisions/0004-report-priority.md` | `src/sound_scout/report.py` |
 | Сравнение исходной и контрольной попыток `app.compare`: критерии, окна по сырому транскрипту, правило вердикта, `conditions_diff`, запись `compare/<id>.json`; схема `schema/compare.v1.schema.json`; решение — `docs/decisions/0006-compare-rules.md` | `src/sound_scout/comparison.py` |
 | MCP stdio сервер `serve`: инструменты `speech_capabilities`/`speech_analyze`/`speech_compare` (`TOOLS` — описания, закрытые JSON-схемы аргументов, аннотации), валидатор аргументов, отказы как результат инструмента, вызовы по одному, stderr-логи с маскированием путей; описание — `docs/mcp.md` | `src/sound_scout/mcp_server.py` |
+| Инструкция подключения к Hermes (выполняет владелец) и ожидаемая запись `mcp_servers.speech-review` для readback | `docs/hermes-install.md`, `docs/examples/hermes-mcp-entry.example.yaml` (линтер — `tests/test_hermes_install_doc.py`) |
 | Приёмка T07/T08: таблица отрицательных проверок с именами тестов | `docs/acceptance/T07-T08.md` (тесты — `tests/test_negative_t07_t08.py`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
