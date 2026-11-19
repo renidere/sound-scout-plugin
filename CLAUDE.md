@@ -107,6 +107,7 @@
 | Инструкция подключения к Hermes (выполняет владелец) и ожидаемая запись `mcp_servers.speech-review` для readback | `docs/hermes-install.md`, `docs/examples/hermes-mcp-entry.example.yaml` (линтер — `tests/test_hermes_install_doc.py`) |
 | Hermes skill `speech-review`: когда вызывать инструменты, путь вложения, трактовка результата, пример диалога (устанавливает владелец) | `hermes/skills/speech-review/SKILL.md` (линтер — `tests/test_hermes_skill.py`) |
 | Приёмка T07/T08: таблица отрицательных проверок с именами тестов | `docs/acceptance/T07-T08.md` (тесты — `tests/test_negative_t07_t08.py`) |
+| Приёмка Gate 3: матрица R01–R12/T01–T10 → код/тесты/evidence/blocked, раздельные статусы, evaluation note, что передать владельцу | `docs/ACCEPTANCE.md` (линтер — `tests/test_acceptance_matrix.py`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |
 | Решения (backend, протокол, пороги) | `docs/decisions/` (создаётся задачами) |
