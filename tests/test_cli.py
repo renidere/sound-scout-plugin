@@ -834,3 +834,41 @@ def test_analyze_through_the_console_entry_with_backend_none_exits_3_with_result
     as_json = run_cli("analyze", str(wav), "--json", env=offline_env(path))
     assert as_json.returncode == 3, as_json.stderr
     assert json.loads(as_json.stdout)["status"] == "partial"
+
+
+# --- eval check-manifest (#78) -----------------------------------------------------------
+
+
+def _manifest_file(tmp_path, doc) -> str:
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return str(path)
+
+
+def test_eval_check_manifest_draft_passes_only_label_dependent_shortfalls(tmp_path, capsys):
+    from sound_scout.eval import manifest
+    from tests.test_eval_manifest import draft_manifest, qualifying_manifest
+
+    draft = _manifest_file(tmp_path, draft_manifest())
+    assert main(["eval", "check-manifest", draft, "--draft"]) == 0
+    out = capsys.readouterr().out
+    assert manifest.DRAFT_WAITING in out and out.rstrip().endswith(manifest.DRAFT_SOUND)
+    assert main(["eval", "check-manifest", draft]) == 1
+    assert "manifest does not qualify" in capsys.readouterr().out
+
+    broken = draft_manifest()
+    broken["records"][0]["source_group"] = broken["records"][10]["source_group"]
+    path = _manifest_file(tmp_path, broken)
+    assert main(["eval", "check-manifest", path, "--draft"]) == 1
+    assert manifest.DRAFT_UNSOUND in capsys.readouterr().out
+
+    good = _manifest_file(tmp_path, qualifying_manifest())
+    assert main(["eval", "check-manifest", good]) == 0
+    assert main(["eval", "check-manifest", good, "--draft"]) == 0
+    assert "manifest qualifies" in capsys.readouterr().out
+
+
+def test_eval_check_manifest_unreadable_file_exits_1(tmp_path, capsys):
+    missing = str(tmp_path / "nope.json")
+    assert main(["eval", "check-manifest", missing, "--draft"]) == 1
+    assert "cannot read manifest" in capsys.readouterr().out

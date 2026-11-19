@@ -21,7 +21,10 @@ same functions until the client closes stdin, then exits 0.
 (`sound_scout.eval.runner`), writes `<date>-report.md` and `.json` into `--output-dir` and exits 0
 whatever the qualification flags are. An unreadable or invalid manifest or agreements file, or a
 report that already exists, is a refusal with the reason code `eval_error`; missing or invalid
-labels and results are NOT QUALIFIED reasons in the report. `smoke [decoder] [acoustics] [asr]`
+labels and results are NOT QUALIFIED reasons in the report. `eval check-manifest <manifest>
+[--draft]` prints the whole `sound_scout.eval.manifest` report and exits 1 on any error; with
+`--draft` the errors that wait for human labels or the owner's recordings stand in a block of
+their own and only the others fail. `smoke [decoder] [acoustics] [asr]`
 runs the real components (`sound_scout.smoke`) — `decoder` and `acoustics` on a synthetic signal,
 `asr` on the development recording named by `SOUND_SCOUT_DEV_AUDIO`, only when asked for — and
 saves the smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was
@@ -35,7 +38,7 @@ import sys
 import traceback
 
 from sound_scout import __version__, config, doctor, guard
-from sound_scout.eval import runner
+from sound_scout.eval import manifest, runner
 
 SUBCOMMANDS = {
     "doctor": "report the state of the decoder, ASR, acoustic analysis and audio backend",
@@ -174,6 +177,19 @@ def _add_eval_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         default=str(runner.DEFAULT_OUTPUT_DIR),
         help=f"where the report goes (default: {runner.DEFAULT_OUTPUT_DIR})",
     )
+    check = actions.add_parser(
+        "check-manifest",
+        help="validate a corpus manifest by docs/eval/PROTOCOL.md § 3 and print the whole report",
+        description="validate a corpus manifest by docs/eval/PROTOCOL.md § 3 and print the "
+        "whole report",
+        parents=[common],
+    )
+    check.add_argument("manifest", help="corpus manifest.json")
+    check.add_argument(
+        "--draft",
+        action="store_true",
+        help="exit 0 when only checks that need human labels or the owner's recordings remain",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -290,6 +306,11 @@ def run_smoke(args: argparse.Namespace) -> int:
 
 
 def run_eval(args: argparse.Namespace) -> int:
+    if args.eval_command == "check-manifest":
+        checked = manifest.validate(args.manifest)
+        print(manifest.format_report(checked, draft=args.draft))
+        passed = checked.draft_ok if args.draft else checked.ok
+        return 0 if passed else ERROR_EXIT_CODE
     try:
         report = runner.evaluate(
             args.manifest,

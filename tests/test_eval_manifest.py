@@ -495,3 +495,45 @@ def test_result_corrections_manifest_and_labels_build_schema_messages_in_one_pla
 def test_rule_without_its_own_message_is_named_without_the_value() -> None:
     errors = schema_errors({"properties": {"name": {"maxItems": 1}}}, {"name": [MANIFEST_TEXT] * 2})
     assert errors == ["$.name: violates schema rule 'maxItems'"]
+
+
+# --- draft mode (#78): label-dependent shortfalls apart from structural errors -------------
+
+
+def draft_manifest() -> dict:
+    """Sound structure, enough clips and controls, but held-out coverage only for prosody."""
+    doc = qualifying_manifest()
+    for item in doc["records"]:
+        if item["id"].startswith(("h-pron", "h-rep")):
+            item["categories"] = ["pause_phrasing"]
+        item.pop("pair_id", None)
+    return doc
+
+
+def test_label_dependent_errors_are_a_subset_of_errors(doc: dict) -> None:
+    report = validation_report(draft_manifest())
+    assert not report.ok and report.draft_ok
+    assert report.label_dependent and set(report.label_dependent) <= set(report.errors)
+    assert any("'pronunciation' is not represented" in e for e in report.label_dependent)
+    assert any("same-words pairs" in e for e in report.label_dependent)
+    assert validation_report(doc).label_dependent == []
+
+
+def test_structural_and_count_errors_are_not_label_dependent() -> None:
+    doc = draft_manifest()
+    doc["records"][0]["source_group"] = doc["records"][10]["source_group"]
+    doc["records"] = doc["records"][:-1]
+    report = validation_report(doc)
+    assert not report.draft_ok
+    structural = [e for e in report.errors if e not in report.label_dependent]
+    assert any("present in both dev and heldout" in e for e in structural)
+    assert any("clips, the corpus needs" in e for e in structural)
+
+
+def test_draft_report_puts_label_dependent_errors_in_their_own_block() -> None:
+    report = validation_report(draft_manifest())
+    text = format_report(report, draft=True)
+    head, block = text.split(manifest.DRAFT_WAITING + ":\n")
+    assert "same-words pairs" not in head and "same-words pairs" in block
+    assert text.splitlines()[-1] == manifest.DRAFT_SOUND
+    assert "same-words pairs" in format_report(report)

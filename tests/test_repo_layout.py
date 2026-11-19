@@ -210,3 +210,34 @@ def test_conftest_synthesizes_wav_and_no_media_files_in_git(wav_file: Path) -> N
     assert media == []
     for suffix in sorted(MEDIA_SUFFIXES):
         assert git_ignores(f"anything{suffix}"), suffix
+
+
+CORPUS_CODE = (
+    "scripts/fetch_corpus_sources.py",
+    "src/sound_scout/eval/corpus.py",
+    "tests/test_eval_corpus.py",
+    "tests/test_fetch_corpus_sources.py",
+)
+CORPUS_DATA_SUFFIXES = {".zip", ".eaf", ".pdf", ".textgrid", ".pitchtier", ".f32"}
+
+
+def test_criterion_5_corpus_scripts_and_tests_are_in_git_and_no_corpus_data_is() -> None:
+    """#78 criterion 5: preparation code and its tests are tracked; audio, sources, labels not."""
+    for path in CORPUS_CODE:
+        assert (REPO_ROOT / path).is_file(), path
+        assert not git_ignores(path), path
+    for path in (
+        "data/corpus/sources/rinco/RINCO_Russian_Intonation_Corpus-v01.zip",
+        "data/corpus/pilot-1/manifest.json",
+        "data/corpus/pilot-1/provenance.json",
+        "data/corpus/pilot-1/clips/ctl-silence.wav",
+        "data/corpus/pilot-1/labels/ctl-silence.json",
+    ):
+        assert git_ignores(path), path
+    listed = git("ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    if listed.returncode != 0:
+        pytest.skip(f"git is unavailable here: {listed.stderr.strip()}")
+    paths = [Path(p) for p in listed.stdout.split("\0") if p]
+    assert [p for p in paths if p.parts[0] == "data"] == []
+    assert [p for p in paths if "labels" in p.parts[:-1]] == []
+    assert [p for p in paths if p.suffix.lower() in CORPUS_DATA_SUFFIXES] == []

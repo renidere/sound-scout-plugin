@@ -1,7 +1,7 @@
 # Зависимости
 
 Полный перечень того, от чего зависит Sound Scout: Python-пакеты, системные программы, runtime
-модели и файлы весов. Правило проекта: **любая новая или обновлённая зависимость вносится сюда в
+модели, файлы весов и открытые данные квалификационного корпуса. Правило проекта: **любая новая или обновлённая зависимость вносится сюда в
 том же коммите**, с версией, источником, лицензией и контрольной суммой. Для весов и бинарей
 указывается ровно тот файл, который используется, а не «последняя версия». Абсолютные пути
 конкретной станции сюда не пишутся; ниже — пути по умолчанию относительно домашнего каталога
@@ -115,3 +115,31 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 | Silero VAD (ONNX) | файл из пакета `faster-whisper` 1.2.1 | внутри пакета | речевые интервалы |
 
 Скачивание любых других весов или ревизий требует решения владельца (R09).
+
+## 5. Данные квалификационного корпуса
+
+Открытые наборы для пилотного корпуса `pilot-1` (Gate 1, T06). Загрузку разрешил владелец
+2026-11-19 ([#29](https://github.com/renidere/sound-scout-plugin/issues/29),
+[#78](https://github.com/renidere/sound-scout-plugin/issues/78)) ровно для файлов ниже; другие
+файлы этих наборов не скачиваются. Данные лежат в `data/corpus/sources/<набор>/` вне git. Их
+скачивает `scripts/fetch_corpus_sources.py` по таблице `sound_scout.eval.corpus.SOURCES`:
+размер, сумма издателя и SHA-256 проверяются по потоку и ещё раз по файлу, перечитанному с диска;
+`verify` перехэширует файлы на месте. Расхождение таблицы `SOURCES` и этого раздела ловит
+`tests/test_dependencies_doc.py`. Сумма издателя: у Zenodo — MD5, у MS-SNSD — git blob SHA-1 на
+закреплённом коммите. Лицензия DEMAND расходится: текст записи Zenodo — CC BY-SA 3.0, поле
+лицензии — CC BY 4.0; принята более строгая CC BY-SA 3.0. Шумы MS-SNSD — Freesound CC0 по README
+набора (код MIT); источник отдельного файла README не называет. Как из них собран корпус —
+`docs/decisions/0009-corpus-pilot-1.md`.
+
+| Набор | Версия / ревизия | Файл | Источник (URL) | Лицензия | Байт | Сумма издателя | SHA-256 |
+|---|---|---|---|---|---|---|---|
+| RINCO (Русский интонационный корпус) | v0.1, DOI 10.5281/zenodo.8119302 | `RINCO_Russian_Intonation_Corpus-v01.zip` | https://zenodo.org/records/8119302/files/RINCO_Russian_Intonation_Corpus-v01.zip?download=1 | CC BY 4.0 | 291339598 | `md5:63ff0a4366e82cfaac21a220dba5f27b` | `243688e816bfdf9adbfd65ef5c6104acccd0742ec9bb78b00edb2a299a7148f1` |
+| RINCO (Русский интонационный корпус) | v0.1, DOI 10.5281/zenodo.8119302 | `help-markup-ru.pdf` | https://zenodo.org/records/8119302/files/help-markup-ru.pdf?download=1 | CC BY 4.0 | 101972 | `md5:ba07834ca3e32193198688eb1644e479` | `78ebf0c95050f86abe4aeb9daa142f70dfb1a8f42b6d5357078f37af1e094218` |
+| RINCO (Русский интонационный корпус) | v0.1, DOI 10.5281/zenodo.8119302 | `rubrikator-2011.pdf` | https://zenodo.org/records/8119302/files/rubrikator-2011.pdf?download=1 | CC BY 4.0 | 217274 | `md5:7cf8332d1b7ebf46cce2ef5501f3bee5` | `58eb4b0a4d953f2298486fa3d32ba052d56dd17132e87043419399262fa2e189` |
+| DEMAND | 1.0, DOI 10.5281/zenodo.1227121 | `DLIVING_16k.zip` | https://zenodo.org/records/1227121/files/DLIVING_16k.zip?download=1 | CC BY-SA 3.0 (текст записи; поле Zenodo — CC BY 4.0, берётся более строгая) | 80170627 | `md5:46741384d9e434a0bd8b3ec1830b6052` | `2b1726fe06e41551ce2397f2aaf3e4fb692c912d81914b04708df0bbb5252338` |
+| DEMAND | 1.0, DOI 10.5281/zenodo.1227121 | `OOFFICE_16k.zip` | https://zenodo.org/records/1227121/files/OOFFICE_16k.zip?download=1 | CC BY-SA 3.0 (текст записи; поле Zenodo — CC BY 4.0, берётся более строгая) | 88995191 | `md5:7b61cc2d182d5a654cb9c3101ddd4041` | `7570c952f621990d0d71b8398107d9a78066254f883a5569abec9c233ffda358` |
+| DEMAND | 1.0, DOI 10.5281/zenodo.1227121 | `DKITCHEN_16k.zip` | https://zenodo.org/records/1227121/files/DKITCHEN_16k.zip?download=1 | CC BY-SA 3.0 (текст записи; поле Zenodo — CC BY 4.0, берётся более строгая) | 110501049 | `md5:7ffbf52d7f4699f96927846103dc8788` | `9d68e46d2709847c59580770e2f8aa160607ebff7475788174aa1080332cc845` |
+| MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_test/Babble_2.wav | `Babble_2.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_test/Babble_2.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 981122 | `git-blob-sha1:3c426baec1c75b4866f88e256b4e55165ae24ccb` | `b7f9872b1e4aef0949672d577cdd00132273c2b53efb4a23add549ee0cbbad90` |
+| MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_test/Babble_6.wav | `Babble_6.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_test/Babble_6.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 686764 | `git-blob-sha1:8efd80a6a452657dc7b8097d1a0c59560d195fdf` | `c355c815d3cc34e0826fb1ba72fab8c3d221d7be4b25e629932b8a7e083d4af5` |
+| MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_train/NeighborSpeaking_2.wav | `NeighborSpeaking_2.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_train/NeighborSpeaking_2.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 706052 | `git-blob-sha1:aba9083a05dc576ed56feb5dfa89bd6f67586a31` | `dff6281d248beeff5458b4fcb71387c19f62982eecafd00b78e3a0a6a8c6dc52` |
+| MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_train/NeighborSpeaking_4.wav | `NeighborSpeaking_4.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_train/NeighborSpeaking_4.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 760012 | `git-blob-sha1:f8009b35aff8a2bcbd6a069852a8e773e60c966d` | `8b179254d5b8c039563cf5206531dbcc0bb24ef7bf077456c503d17d4d083d47` |

@@ -8,6 +8,7 @@ minimum volumes of docs/eval/PROTOCOL.md — are plain code here, each with its 
 list of shortfalls, not the first one.
 """
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -37,18 +38,31 @@ MIN_NEGATIVE_CONTROLS = 5
 MIN_HELDOUT_EVENTS_PER_GROUP = 5
 MIN_HELDOUT_PAIRS = 2
 _PATH_SEPARATORS = re.compile(r"[\\/]")
+DRAFT_WAITING = "ждёт человеческой разметки и записей владельца (#29)"
+DRAFT_SOUND = "черновик: структура пригодна, корпус не квалифицирован"
+DRAFT_UNSOUND = "черновик: структура не пригодна, ошибки выше"
 
 
 @dataclass(frozen=True)
 class ManifestReport:
-    """`errors` is empty when the manifest qualifies; `heldout_coverage` lists every category."""
+    """`errors` is empty when the manifest qualifies; `heldout_coverage` lists every category.
+
+    `label_dependent` is the subset of `errors` that only human labels and the owner's recordings
+    can close (held-out coverage, events per group, pairs); a draft corpus may still carry them.
+    """
 
     errors: list[str]
     heldout_coverage: dict[str, int]
+    label_dependent: list[str] = dataclasses.field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+    @property
+    def draft_ok(self) -> bool:
+        """The structure is sound: every remaining error waits for labels or recordings."""
+        return set(self.errors) <= set(self.label_dependent)
 
     @property
     def unrepresented(self) -> list[str]:
@@ -83,7 +97,10 @@ def validation_report(manifest: object) -> ManifestReport:
         + _pair_errors(records)
     )
     coverage = _heldout_coverage(records)
-    return ManifestReport(errors + _volume_errors(records, coverage), coverage)
+    label_dependent = _coverage_errors(records, coverage)
+    return ManifestReport(
+        errors + _count_errors(records) + label_dependent, coverage, label_dependent
+    )
 
 
 def _empty_coverage() -> dict[str, int]:
@@ -179,8 +196,8 @@ def _heldout_pairs(records: list[dict]) -> int:
     return sum(1 for n in counts.values() if n >= 2)
 
 
-def _volume_errors(records: list[dict], coverage: dict[str, int]) -> list[str]:
-    """The minimum volumes of PROTOCOL.md; every shortfall is named, none is averaged away."""
+def _count_errors(records: list[dict]) -> list[str]:
+    """The minimum clip and control counts of PROTOCOL.md § 4."""
     errors = []
     if len(records) < MIN_CLIPS:
         errors.append(f"$.records: {len(records)} clips, the corpus needs at least {MIN_CLIPS}")
@@ -190,6 +207,12 @@ def _volume_errors(records: list[dict], coverage: dict[str, int]) -> list[str]:
             f"$.records: {controls} negative controls, the corpus needs at least "
             f"{MIN_NEGATIVE_CONTROLS}"
         )
+    return errors
+
+
+def _coverage_errors(records: list[dict], coverage: dict[str, int]) -> list[str]:
+    """The held-out minimums of PROTOCOL.md § 4; every shortfall is named, none averaged away."""
+    errors = []
     for name in CATEGORIES:
         if coverage[name] == 0:
             errors.append(
@@ -212,13 +235,23 @@ def _volume_errors(records: list[dict], coverage: dict[str, int]) -> list[str]:
     return errors
 
 
-def format_report(report: ManifestReport) -> str:
+def format_report(report: ManifestReport, *, draft: bool = False) -> str:
+    """The whole report; with `draft` the label-dependent errors stand in a block of their own."""
     lines = ["held-out coverage (records per category):"]
     lines += [f"  {name}: {count}" for name, count in report.heldout_coverage.items()]
     if report.unrepresented:
         lines.append("not represented in held-out: " + ", ".join(report.unrepresented))
     lines.append("manifest qualifies" if report.ok else "manifest does not qualify:")
-    lines += [f"  {error}" for error in report.errors]
+    if not draft:
+        lines += [f"  {error}" for error in report.errors]
+        return "\n".join(lines)
+    waiting = set(report.label_dependent)
+    lines += [f"  {error}" for error in report.errors if error not in waiting]
+    if report.label_dependent:
+        lines.append(f"{DRAFT_WAITING}:")
+        lines += [f"  {error}" for error in report.label_dependent]
+    if not report.ok:
+        lines.append(DRAFT_SOUND if report.draft_ok else DRAFT_UNSOUND)
     return "\n".join(lines)
 
 
