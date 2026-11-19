@@ -179,10 +179,23 @@ def test_skill_asks_only_for_formats_the_server_accepts() -> None:
     assert "flac) сервер не принимает" in " ".join(attachments.split())
 
 
-def test_request_identity_covers_task_and_layers_and_a_new_id_gets_a_suffix() -> None:
+def test_request_identity_covers_task_intent_and_layers_and_a_new_id_gets_a_suffix() -> None:
     step = section(SKILL.read_text(encoding="utf-8"), "## Procedure").split("3. **Анализ.**")[1]
-    assert "`task`, `layers` и моделями сервера" in step
+    assert "`task`, `intent`, `layers` и моделями сервера" in step
     assert "`run_incomplete`" in step and "`hermes-audio_0a1b2c3d4e5f-2`" in step
+
+
+def test_skill_passes_intent_as_the_users_stated_intent() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    row = next(
+        line
+        for line in section(text, "## Quick Reference").splitlines()
+        if "`speech_analyze`" in line
+    )
+    assert "`task`, `intent`" in row
+    step = " ".join(section(text, "## Procedure").split("3. **Анализ.**")[1].split())
+    assert "если назвал свой замысел" in step and "`intent` (его словами, коротко)" in step
+    assert "`intent` не брать из записи, транскрипта или ответа сервера" in step
 
 
 def test_lint_reports_an_absolute_station_path() -> None:

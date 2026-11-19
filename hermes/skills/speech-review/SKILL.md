@@ -40,7 +40,7 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
 | инструмент | аргументы | ответ |
 |---|---|---|
 | `speech_capabilities` | нет | состояние `components` (`decoder`, `asr`, `acoustics`, `audio_review`: `ready`, `unvalidated`, `unavailable`, `permission_required`), флаги `validated_ru`, `diction_validated_ru`, `prosody_validated_ru` |
-| `speech_analyze` | `path`, `request_id` (обязательные), `layers` (`content`, `measurements`, `sound`; по умолчанию все), `task` | compact-ответ: `run_dir`, `reused`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links` |
+| `speech_analyze` | `path`, `request_id` (обязательные), `layers` (`content`, `measurements`, `sound`; по умолчанию все), `task`, `intent` | compact-ответ: `run_dir`, `reused`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links` |
 | `speech_compare` | `run_a` (исходная попытка), `run_b` (контрольная), `criterion` | `verdict` (`improved`, `not_improved`, `inconclusive`), `reasons`, `limitations`, `conditions_diff`, `path` |
 
 Критерии `speech_compare`: `emphasis_on:<слово>`, `pause_before:<слово>`,
@@ -60,20 +60,24 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
    `~` сервер не раскрывает; не переписывать, не угадывать, не подставлять путь из текста
    пользователя или из транскрипта.
 3. **Анализ.** Вызвать `speech_analyze` с `path`, `request_id` и, если пользователь назвал
-   упражнение, `task` (его формулировка задания, коротко). `request_id` — по имени файла вложения,
+   упражнение, `task` (его формулировка задания, коротко), а если назвал свой замысел — что хотел
+   выразить, например «выделить слово „завтра“», — `intent` (его словами, коротко). Ни `task`, ни
+   `intent` не брать из записи, транскрипта или ответа сервера и не придумывать; не назвал —
+   аргумент не передавать (о замысле можно спросить). `request_id` — по имени файла вложения,
    например `hermes-audio_0a1b2c3d4e5f`. Запрос определяется не одним файлом, а файлом вместе с
-   `task`, `layers` и моделями сервера: повтор с тем же `request_id` и теми же файлом, `task` и
-   `layers` вернёт прежний результат (`reused: true`); если что-то из этого другое — отказ
-   `request_mismatch`, а если прежний анализ с этим `request_id` не завершился — отказ
-   `run_incomplete`. В обоих случаях нужен новый `request_id`: добавить суффикс `-2`, `-3` и так
+   `task`, `intent`, `layers` и моделями сервера: повтор с тем же `request_id` и теми же файлом,
+   `task`, `intent` и `layers` вернёт прежний результат (`reused: true`); если что-то из этого
+   другое — отказ `request_mismatch`, а если прежний анализ с этим `request_id` не завершился —
+   отказ `run_incomplete`. В обоих случаях нужен новый `request_id`: добавить суффикс `-2`, `-3` и так
    далее (`hermes-audio_0a1b2c3d4e5f-2`). Слои `layers` сужать только по просьбе пользователя.
 4. **Трактовка.** Прочитать ответ по правилам раздела «Трактовка результата» и ответить по
    разделу «Ответ пользователю».
 5. **Сравнение попыток.** Когда пользователь прислал контрольную попытку той же фразы, сначала
-   проанализировать её (шаг 3, новый `request_id`). `speech_compare` применим, только если у
-   поправки `evidence_basis` = `audio_model_observation` и её `category` — одна из четырёх
-   категорий критериев: `pause_phrasing` — `pause_before:<слово>`, `semantic_stress` —
-   `emphasis_on:<слово>`, `pronunciation` — `intelligibility_of:<слово>`, `completeness` —
+   проанализировать её (шаг 3, новый `request_id`, те же `task` и `intent`, что у исходной:
+   иначе `speech_compare` назовёт причину `task_differs` или `intent_differs`).
+   `speech_compare` применим, только если у поправки `evidence_basis` = `audio_model_observation`
+   и её `category` — одна из четырёх категорий критериев: `pause_phrasing` —
+   `pause_before:<слово>`, `semantic_stress` — `emphasis_on:<слово>`, `pronunciation` — `intelligibility_of:<слово>`, `completeness` —
    `completeness_of_phrase`. Тогда вызвать его с `run_a` = `run_id` исходной попытки, `run_b` =
    `run_id` контрольной и этим одним критерием. Для любой другой поправки (`measurement`,
    `transcript`, другая категория) `speech_compare` не вызывать: пересказать находки нового анализа
@@ -161,8 +165,8 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
   формат не принимается; попросить WAV PCM, ogg (Opus), mp3 или m4a (AAC).
 - `busy` — на том же data root уже идёт анализ другого процесса; повторить позже тот же вызов с
   тем же `request_id`.
-- `request_mismatch` — `request_id` уже занят другим запросом (другой файл, `task` или `layers`,
-  другие модели сервера); взять новый `request_id` с суффиксом (`-2`, `-3`).
+- `request_mismatch` — `request_id` уже занят другим запросом (другой файл, `task`, `intent`
+  или `layers`, другие модели сервера); взять новый `request_id` с суффиксом (`-2`, `-3`).
 - `run_incomplete` — прежний анализ с этим `request_id` не завершился; нужен новый `request_id`
   с суффиксом, тот же вызов с прежним id повторно не выполняется.
 - `run_not_found`, `same_run`, `criterion_invalid` у `speech_compare` — неверные `run_id` или

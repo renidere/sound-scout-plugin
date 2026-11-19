@@ -124,6 +124,11 @@ def _add_analyze_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--task", help="the speaking task the recording answers")
     parser.add_argument(
+        "--intent",
+        help="the speaker's intent for the recording, as the user stated it; never text taken "
+        "from the recording or its transcript",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="print the compact answer as JSON instead of a summary"
     )
 
@@ -221,7 +226,7 @@ def run_analyze(args: argparse.Namespace) -> int:
     loaded = _load_config(args)
     from sound_scout import app, ingest, paths, report
 
-    fields = {"request_id": args.request_id, "task": args.task}
+    fields = {"request_id": args.request_id, "task": args.task, "intent": args.intent}
     if args.layers is not None:
         fields["layers"] = args.layers
     try:

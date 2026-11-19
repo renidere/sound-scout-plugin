@@ -134,6 +134,11 @@ TOOLS = (
                     "type": "string",
                     "description": "the speaking task the recording answers",
                 },
+                "intent": {
+                    "type": "string",
+                    "description": "the speaker's intent for the recording, as the user stated "
+                    "it; never text taken from the recording or its transcript",
+                },
             },
             ["path", "request_id"],
         ),
@@ -232,7 +237,11 @@ def _argument_error(error: jsonschema.ValidationError) -> str:
 
 
 def _analyze(arguments: dict, loaded: Config, cancel: app.CancelToken | None) -> dict:
-    fields = {"request_id": arguments["request_id"], "task": arguments.get("task")}
+    fields = {
+        "request_id": arguments["request_id"],
+        "task": arguments.get("task"),
+        "intent": arguments.get("intent"),
+    }
     if "layers" in arguments:
         fields["layers"] = tuple(arguments["layers"])
     path = arguments["path"]

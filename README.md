@@ -104,9 +104,15 @@ API скачивает вложения до 20 МБ; нужен `terminal.backe
 модель, backend или бюджеты: это настройки оператора (R12), такой флаг отклоняется как неизвестный.
 
 ```sh
-uv run sound-scout analyze <файл> [--request-id ID] [--layers content,measurements,sound] [--task ТЕКСТ] [--json]
+uv run sound-scout analyze <файл> [--request-id ID] [--layers content,measurements,sound] [--task ТЕКСТ] [--intent ТЕКСТ] [--json]
 uv run sound-scout compare <run_id A> <run_id B> --criterion emphasis_on:<слово> [--json]
 ```
+
+`--task` — формулировка упражнения, `--intent` — замысел говорящего (что он хотел выразить),
+если пользователь его назвал; текст из записи или транскрипта в них не подставляется. Оба поля —
+то же, что аргументы `task` и `intent` у `speech_analyze`: они входят в identity запроса
+(`request_mismatch` при повторе `--request-id` с другими значениями), а по `intent` `compare`
+выставляет причину `intent_differs`.
 
 `analyze` вызывает `app.analyze` и печатает итог по compact-ответу (`--json` — сам compact-ответ
 с полями `run_dir` и `reused`); run-каталог печатается относительно data root (`runs/<run_id>`). Код возврата

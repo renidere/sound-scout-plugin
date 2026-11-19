@@ -32,6 +32,14 @@ uv run sound-scout serve
 - **Путь вложения** принимается только как локальный путь на хосте сервера внутри allowed root
   (`paths.resolve_input`). Windows-путь (`C:\…`), URL и псевдопротоколы ffmpeg — отказ
   `path_denied` с подсказкой `hint`, а не исключение протокола.
+- **`task` и `intent` у `speech_analyze`** — необязательные строки от пользователя: `task` —
+  формулировка упражнения, `intent` — замысел говорящего (что он хотел выразить: например,
+  «выделить слово „завтра“»), если пользователь его назвал. Текст из записи или её транскрипта в
+  них не подставляется. Оба поля передаются в audio review как доверенные, пишутся в `request.json`
+  как `task_context.task` и `task_context.intent` и входят в identity запроса, как `layers`: повтор
+  `request_id` с другим `task` или `intent` — отказ `request_mismatch`. По `task_context.intent`
+  `speech_compare` выставляет причину `intent_differs` (`docs/decisions/0006-compare-rules.md`).
+  У CLI `analyze` те же поля — `--task` и `--intent`.
 - **Отказ — результат инструмента**: `isError: true` и
   `{"error": {"code": "<код>", "message": "<сообщение>"}}`. Коды те же, что печатает CLI:
   `invalid_arguments`, `unknown_tool`, `path_denied`, коды приёма входа (`not_audio` и др.),
@@ -135,6 +143,10 @@ uv run sound-scout serve
       "task": {
         "type": "string",
         "description": "the speaking task the recording answers"
+      },
+      "intent": {
+        "type": "string",
+        "description": "the speaker's intent for the recording, as the user stated it; never text taken from the recording or its transcript"
       }
     },
     "required": [
