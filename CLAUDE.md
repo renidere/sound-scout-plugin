@@ -8,9 +8,12 @@
 отдельная задача.
 
 - **Стек:** Python 3.13, `uv` (pyproject + `uv.lock`), `ruff`, `pytest`; системный FFmpeg;
-  `faster-whisper` для ASR; `praat-parselmouth` для F0. Backend слухового анализа — Gemma 4
-  E4B-it (GGUF через llama.cpp, только локально; решение владельца, `docs/spec/REQUIREMENTS.md`
-  раздел 9), пока Gate 0 не скажет иное. Без UI, очередей, БД, provider framework.
+  `faster-whisper` для ASR; `praat-parselmouth` для F0. Backend слухового анализа сейчас не
+  выбран (`backend = none`): Gemma 4 E4B-it (GGUF через llama.cpp, только локально; кандидат по
+  решению владельца, `docs/spec/REQUIREMENTS.md` раздел 9) не прошла Gate 0 — вердикт NOT READY
+  (`docs/decisions/0007-gate0-result.md`), замену выбирает владелец
+  ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Без UI, очередей, БД,
+  provider framework.
 - **Зависимости:** все Python-пакеты, системные программы, runtime и файлы весов записаны в
   `docs/dependencies.md` с версией или ревизией, лицензией и SHA-256. Новая или обновлённая
   зависимость вносится туда в том же коммите; веса и ревизии вне этого файла не скачиваются без

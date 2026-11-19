@@ -44,7 +44,13 @@ apt runner'а.
 
 Решение владельца от 2026-11-18 (`docs/spec/REQUIREMENTS.md` раздел 9,
 `docs/decisions/0001-audio-backend.md`): **Gemma 4 E4B-it** в GGUF через llama.cpp, только локально,
-только CPU на станции разработки.
+только CPU на станции разработки — кандидат для Gate 0.
+
+Gate 0 для неё закончился вердиктом **NOT READY** (`docs/decisions/0007-gate0-result.md` §5):
+backend не упакован, `backend` остаётся `none`, `doctor` для `audio_review` —
+`permission_required`; замену выбирает владелец
+([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Записи о весах и runtime ниже
+остаются: веса лежат на станции разработки, по ним работает `sound_scout.eval.gate0`.
 
 ### 3.1. Веса
 
@@ -92,7 +98,8 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 - Таймкодов модель не выдаёт: локализация строится по клипу и его границам, наблюдение без
   локализации остаётся `unlocalized` (R05).
 - Русский: в техотчёте есть русский ASR (FLEURS ru WER 0.068) и перевод CoVoST ru→en; свидетельств
-  оценки произношения и просодии нет — это проверяет Gate 0 spike.
+  оценки произношения и просодии нет; Gate 0 spike дал NOT READY
+  (`docs/decisions/0007-gate0-result.md` §5).
 
 ## 4. Модели, уже лежащие на станции разработки
 

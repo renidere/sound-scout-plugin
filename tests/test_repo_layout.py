@@ -95,17 +95,27 @@ def test_readme_describes_installation_and_checks() -> None:
         assert fragment in readme, fragment
 
 
-def test_readme_status_names_chosen_backend_and_unpassed_gates() -> None:
+GATE0_DECISION = "`docs/decisions/0007-gate0-result.md`"
+OWNER_CHOICE_ISSUE = "#68"
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_readme_status_says_gemma_failed_gate0_and_no_backend_is_chosen() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    status = " ".join(readme.split("Статус:", 1)[1].split("\n\n", 1)[0].split())
-    assert "не выбран" not in readme
+    status = flat(readme.split("Статус:", 1)[1].split("\n\n", 1)[0])
     for fragment in (
+        "Audio backend сейчас не выбран (`backend = none`)",
         "Gemma 4 E4B-it",
         "llama.cpp",
         "только локально",
         "`docs/decisions/0001-audio-backend.md`",
-        "Gate 0 на реальном аудио не пройден",
-        "русская квалификация (Gate 1) не пройдена",
+        "Gate 0 не прошла — вердикт NOT READY",
+        GATE0_DECISION,
+        OWNER_CHOICE_ISSUE,
+        "Русская квалификация (Gate 1) не пройдена",
         "подключение к Hermes не выполнено",
         "инструмент не считается готовым",
     ):
@@ -116,13 +126,67 @@ def test_readme_status_names_chosen_backend_and_unpassed_gates() -> None:
     assert not re.search(r"/home/|/Users/|[A-Z]:\\", readme)
 
 
-def test_readme_backend_link_resolves_to_owner_decision_and_dependencies() -> None:
+def test_claude_md_stack_line_says_no_backend_is_chosen_after_gate0() -> None:
+    claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    stack = flat(claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0])
+    assert "пока Gate 0 не скажет иное" not in claude_md
+    for fragment in (
+        "Backend слухового анализа сейчас не выбран (`backend = none`)",
+        "Gemma 4 E4B-it",
+        "не прошла Gate 0 — вердикт NOT READY",
+        GATE0_DECISION,
+        "замену выбирает владелец",
+        OWNER_CHOICE_ISSUE,
+    ):
+        assert fragment in stack, fragment
+
+
+def test_dependencies_backend_intro_records_gate0_verdict_and_keeps_weights() -> None:
+    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
+    section = dependencies.split("## 3. Audio-understanding backend", 1)[1].split("\n## ", 1)[0]
+    intro = flat(section.split("### 3.1.", 1)[0])
+    for fragment in (
+        "**Gemma 4 E4B-it** в GGUF через llama.cpp, только локально",
+        "вердиктом **NOT READY**",
+        "`docs/decisions/0007-gate0-result.md` §5",
+        "backend не упакован, `backend` остаётся `none`",
+        OWNER_CHOICE_ISSUE,
+    ):
+        assert fragment in intro, fragment
+    assert "### 3.1. Веса" in section and "SHA-256" in section
+
+
+CANDIDATE_CHOSEN = re.compile(
+    r"выбран[аоы]?[^.]*(?:Borealis|GigaChat|Qwen)|(?:Borealis|GigaChat|Qwen)[^.]*выбран"
+)
+
+
+def test_backend_docs_name_no_replacement_candidate_as_chosen() -> None:
+    for name in ("CLAUDE.md", "README.md", "docs/dependencies.md"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "пока Gate 0 не скажет иное" not in text, name
+        assert not re.search(r"/home/|/Users/|[A-Z]:\\", text), name
+    claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
+    backend_paragraphs = (
+        claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
+        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
+    )
+    for paragraph in backend_paragraphs:
+        assert "Gemma 4 E4B-it" in paragraph
+        assert re.search(r"backend`? (?:= |остаётся `)none", paragraph), paragraph
+        assert not re.search(r"\bready\b|validated_ru", paragraph), paragraph
+        assert not re.search(CANDIDATE_CHOSEN, paragraph), paragraph
+    verdict = (REPO_ROOT / "docs" / "decisions" / "0007-gate0-result.md").read_text("utf-8")
+    assert "**Вердикт: NOT READY**" in verdict
+
+
+def test_readme_backend_link_resolves_to_owner_decision() -> None:
     decision = REPO_ROOT / "docs" / "decisions" / "0001-audio-backend.md"
     assert decision.is_file()
     assert "Gemma 4 E4B-it — **выбрана**" in decision.read_text(encoding="utf-8")
-    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
-    backend = " ".join(dependencies.split("## 3. Audio-understanding backend", 1)[1].split())
-    assert "**Gemma 4 E4B-it** в GGUF через llama.cpp, только локально" in backend
 
 
 def test_readme_makes_no_claim_that_a_model_hears_speech() -> None:

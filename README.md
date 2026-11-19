@@ -8,10 +8,12 @@
 
 Статус: требования зафиксированы (`docs/spec/`), реализация ведётся через задачи на доске
 https://github.com/users/renidere/projects/1 автономным агентом (`docs/workflow.md`). Audio backend
-выбран владельцем 2026-11-18: Gemma 4 E4B-it в GGUF через llama.cpp, только локально
-(`docs/decisions/0001-audio-backend.md`). Gate 0 на реальном аудио не пройден, русская
-квалификация (Gate 1) не пройдена, подключение к Hermes не выполнено — пока это так, инструмент не
-считается готовым (Gate 0–3 в `docs/spec/REQUIREMENTS.md`).
+сейчас не выбран (`backend = none`): Gemma 4 E4B-it в GGUF через llama.cpp, только локально,
+выбранная владельцем 2026-11-18 для Gate 0 (`docs/decisions/0001-audio-backend.md`), Gate 0 не
+прошла — вердикт NOT READY (`docs/decisions/0007-gate0-result.md`); замену выбирает владелец
+([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Русская квалификация (Gate 1)
+не пройдена, подключение к Hermes не выполнено — пока это так, инструмент не считается готовым
+(Gate 0–3 в `docs/spec/REQUIREMENTS.md`).
 
 ## Документы
 
