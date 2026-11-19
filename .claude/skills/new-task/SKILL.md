@@ -1,6 +1,6 @@
 ---
 name: new-task
-description: Files a new task for Sound Scout as a GitHub issue of renidere/sound-scout-plugin in the Backlog column of the board github.com/users/renidere/projects/1, written in Russian the way the owner writes tasks — context, references to the spec (R01–R12, T01–T10), acceptance criteria an agent can prove, dependencies. First looks across the whole board for a task that already covers it and says where that one stands instead of filing a duplicate. Asks the person only for what neither their words nor the code and the spec answer. Use whenever someone in the sound-scout-plugin checkout describes something to build, fix or investigate — "заведи задачу", "запиши в бэклог", "file a task", "add this to the board", "нужно сделать …", or the same in any language. Also used by work-task (in agent mode, no questions) to file the problems its agents run into along the way.
+description: Files a new task for Sound Scout as a GitHub issue of renidere/sound-scout-plugin in the Backlog column of the board github.com/users/renidere/projects/1, written in ASD-STE100 Simplified Technical English the way the owner wants tasks — context, references to the spec (R01–R12, T01–T10), acceptance criteria an agent can prove, dependencies. First looks across the whole board for a task that already covers it and says where that one stands instead of filing a duplicate. Asks the person only for what neither their words nor the code and the spec answer. Use whenever someone in the sound-scout-plugin checkout describes something to build, fix or investigate — "заведи задачу", "запиши в бэклог", "file a task", "add this to the board", "нужно сделать …", or the same in any language. Also used by work-task (in agent mode, no questions) to file the problems its agents run into along the way.
 ---
 
 # File a new task
@@ -29,8 +29,10 @@ Two kinds of callers:
 
 ## Talking to the person
 
-- **Their language**, in chat. The issue itself is in Russian (every task on this board is), with
-  code identifiers, commands and spec IDs as they are.
+- **Their language**, in chat. The issue itself — title, body, acceptance criteria — is in
+  **ASD-STE100 Simplified Technical English** (owner's rule since 2026-11-19, see **3. Write it**),
+  with code identifiers, commands and spec IDs as they are. Older issues on the board are in
+  Russian; don't rewrite them.
 - **Offer, don't interrogate.** You've read the spec and the code, so you can usually guess the
   answer; let them pick it with AskUserQuestion, concrete options built from what the project
   really does. Ask only what neither their message nor the repo answers, up to four questions in
@@ -83,7 +85,7 @@ What a finished task needs:
   "input validation works". A bug's first criterion is the expected behaviour, and one more says
   it stays fixed in the situation it broke in. A spike's criteria name the document, the questions
   it must answer and the sources it must cite.
-- **Dependencies** — tasks that must be closed first, as full issue URLs on a `Зависит от` line.
+- **Dependencies** — tasks that must be closed first, as full issue URLs under a `## Depends on` heading.
 - **Permissions** — what the owner must grant or do, when anything.
 - **Technical notes** — pointers for the agent: modules, the spec sections, what to reuse (the
   existing speech layer is described in `local/HANDOFF.md`, outside git — refer to it by that
@@ -92,27 +94,39 @@ What a finished task needs:
 ## 3. Write it
 
 ```
-<Контекст: два-четыре предложения — зачем, что говорит ТЗ (R…/T…), что уже есть.>
+<Context: two to four sentences — why, what the spec says (R…/T…), what exists now.>
 
-## Критерии приёмки
+## Acceptance criteria
 
 - [ ] …
 
-## Зависит от
+## Depends on
 
-- https://github.com/renidere/sound-scout-plugin/issues/<n>  (или «ничего»)
+- https://github.com/renidere/sound-scout-plugin/issues/<n>  (or "Nothing.")
 
-## Разрешения
+## Permissions
 
-<что нужно от владельца, или раздел опущен>
+<what the owner must grant or do; omit the section when nothing>
 
-## Технические заметки
+## Technical notes
 
-<модули, разделы ТЗ, что переиспользовать; без абсолютных личных путей>
+<modules, spec sections, what to reuse; no absolute personal paths>
 ```
 
-**Title**: the outcome in under 80 characters, Russian, code identifiers as they are:
-"`analyze`: отказ при превышении 180 с / 100 MiB без скрытого усечения".
+**ASD-STE100 rules** (https://www.asd-ste100.org/) for the title and body:
+
+- Use approved words with one meaning each; keep project terms, identifiers, commands and spec IDs
+  as they are. Use the same term for the same thing everywhere.
+- Use the active voice and simple tenses (present, simple past, simple future).
+- Write one instruction per sentence. An instruction has at most 20 words, a descriptive sentence
+  at most 25. A paragraph has at most 6 sentences.
+- Use verbs, not nouns made from verbs ("check the file", not "perform a check of the file"). No
+  filler, no idioms.
+- Acceptance criteria are facts in the present tense: "`analyze` refuses a file over 100 MiB. It
+  writes nothing."
+
+**Title**: the outcome in under 80 characters, ASD-STE100, code identifiers as they are:
+"`analyze`: refuse input over 180 s or 100 MiB without silent truncation".
 
 ## 4. Show it, then file it
 
@@ -160,14 +174,14 @@ yourself from the code on `origin/main` (`git -C <$WS> fetch origin main`, then
 
    ```
    <!-- work-task-found-by: <found-by url> -->
-   Найдено при работе над <found-by url>.
+   Found while working on <found-by url>.
 
    <the body>
 
-   ## Технические заметки
+   ## Technical notes
 
-   <где: файлы со строками, как ссылки на main (https://github.com/renidere/sound-scout-plugin/blob/<main sha>/<path>#L<n>);
-   как проявилось: упавшая проверка, тест или замечание ревью, ошибка в несколько строк>
+   <where: files with lines, as links to main (https://github.com/renidere/sound-scout-plugin/blob/<main sha>/<path>#L<n>);
+   how it showed up: the failed check, test or review finding, the error in a few lines>
    ```
 
    Never paste values from `.env` files, `sound-scout.toml` or secrets, never an absolute

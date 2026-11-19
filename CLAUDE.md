@@ -18,8 +18,12 @@
   `docs/dependencies.md` с версией или ревизией, лицензией и SHA-256. Новая или обновлённая
   зависимость вносится туда в том же коммите; веса и ревизии вне этого файла не скачиваются без
   решения владельца.
-- **Язык:** документация, задачи, комментарии на доске и в коде-пояснениях — русский; код,
-  идентификаторы, commit messages, имена тестов, CI и скилы агента — английский.
+- **Язык:** документация, комментарии на доске и пояснения в коде — русский. Задачи (заголовок и
+  тело issue, критерии приёмки) — английский по ASD-STE100 Simplified Technical English
+  (https://www.asd-ste100.org/): одобренный словарь, одно значение слова, действительный залог,
+  простые времена, инструкция до 20 слов, описание до 25, одна инструкция в предложении; термины
+  проекта и идентификаторы — как есть (решение владельца 2026-11-19). Код, идентификаторы, commit
+  messages, имена тестов, CI и скилы агента — английский.
 - **Доска:** https://github.com/users/renidere/projects/1 — колонки Backlog, In Progress,
   Need a Person, Done. Как устроена автономная работа — `docs/workflow.md`.
 
@@ -107,9 +111,11 @@
 | Отчёт: `write` (полный `result.json` и `report.md` на русском в run-каталоге, без приватных путей), `compact` (ответ ≤ 4 KiB), правило приоритета findings `prioritized`, `cost`; решение — `docs/decisions/0004-report-priority.md` | `src/sound_scout/report.py` |
 | Сравнение исходной и контрольной попыток `app.compare`: критерии, окна по сырому транскрипту, правило вердикта, `conditions_diff`, запись `compare/<id>.json`; схема `schema/compare.v1.schema.json`; решение — `docs/decisions/0006-compare-rules.md` | `src/sound_scout/comparison.py` |
 | MCP stdio сервер `serve`: инструменты `speech_capabilities`/`speech_analyze`/`speech_compare` (`TOOLS` — описания, закрытые JSON-схемы аргументов, аннотации), валидатор аргументов, отказы как результат инструмента, вызовы по одному, stderr-логи с маскированием путей; описание — `docs/mcp.md` | `src/sound_scout/mcp_server.py` |
-| Инструкция подключения к Hermes (выполняет владелец) и ожидаемая запись `mcp_servers.speech-review` для readback | `docs/hermes-install.md`, `docs/examples/hermes-mcp-entry.example.yaml` (линтер — `tests/test_hermes_install_doc.py`) |
-| Hermes skill `speech-review`: когда вызывать инструменты, путь вложения, трактовка результата, пример диалога (устанавливает владелец) | `hermes/skills/speech-review/SKILL.md` (линтер — `tests/test_hermes_skill.py`) |
+| Инструкция подключения к Hermes и ожидаемая запись `mcp_servers.speech-review` для readback; на станции разработки сервер подключён 2026-11-19 ([#40](https://github.com/renidere/sound-scout-plugin/issues/40)) | `docs/hermes-install.md`, `docs/examples/hermes-mcp-entry.example.yaml` (линтер — `tests/test_hermes_install_doc.py`) |
+| Hermes skill `speech-review`: когда вызывать инструменты, путь вложения, трактовка результата, пример диалога; в профиле Hermes лежит копия (`~/.hermes/skills/media/speech-review`), после правки в репозитории её копируют заново | `hermes/skills/speech-review/SKILL.md` (линтер — `tests/test_hermes_skill.py`) |
 | Приёмка T07/T08: таблица отрицательных проверок с именами тестов | `docs/acceptance/T07-T08.md` (тесты — `tests/test_negative_t07_t08.py`) |
+| Чистая установка, сканер истории `main` (медиа, личные пути, ключи) и профиль ресурсов по этапам | `scripts/clean-install-check.sh`, `scripts/scan-history.sh`, `scripts/profile.py` (CI — job `clean-install`, `history-scan`) |
+| Закреплённое окружение, receipts моделей, аппаратная конфигурация и профиль против бюджета R11 | `docs/environment.md` |
 | Приёмка Gate 3: матрица R01–R12/T01–T10 → код/тесты/evidence/blocked, раздельные статусы, evaluation note, что передать владельцу | `docs/ACCEPTANCE.md` (линтер — `tests/test_acceptance_matrix.py`) |
 | Инструкция audio backend и правила Hermes | `docs/spec/AUDIO_REVIEW_PROMPT.md` |
 | Как устроена автономная работа через задачи | `docs/workflow.md` |

@@ -74,8 +74,9 @@ The brief for each agent is in `references/agent-briefs.md` — read it before t
   and release it whatever the outcome. See **Gate** and **The claim while working**.
 - **Temp files** (comment bodies, revmux output) go in a temp directory outside the repo
   (`mktemp -d`), never inside one.
-- **Comments on the issue are in Russian** — the Decision, the outcome, the found-problem issues:
-  the board is read by the owner. Code, commit subjects, test names and the agents' replies to
+- **Comments on the issue are in Russian** — the Decision and the outcome: the board is read by
+  the owner. **New issues** (the found-problem issues) are in ASD-STE100 Simplified Technical
+  English, as the new-task skill says. Code, commit subjects, test names and the agents' replies to
   you are in English.
 - **Log as you go** to **the log**: `$WS/backlog-run.md` (create it if needed). The log is the
   memory that survives a context compaction or a crash — after a compaction, re-read this file
@@ -395,7 +396,7 @@ claim there's no comment and no filing.
 The Filer files them with the **new-task** skill (`<skill dir>/../new-task/SKILL.md`) in its agent
 mode: it checks each problem against the code on main (read only), drops the ones that turn out
 wrong or already fixed, merges duplicates, and looks for an open issue that already covers each
-one. The rest become issues written the way every task on the board is — in Russian, with
+one. The rest become issues written the way new-task writes every task — in ASD-STE100 English, with
 acceptance criteria — plus a `work-task-found-by` marker and technical notes for the next
 Executor. Each new issue goes on the board in Backlog. It doesn't change code.
 
