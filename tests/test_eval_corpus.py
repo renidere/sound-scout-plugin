@@ -323,12 +323,13 @@ def test_draft_manifest_names_the_clip_shortfall_and_the_unconfirmed_candidates(
     path = str(corpus_dir / "pilot-t" / "manifest.json")
     assert cli.main(["eval", "check-manifest", path, "--draft"]) == 1
     out = capsys.readouterr().out
-    assert out.rstrip().endswith(manifest.DRAFT_UNSOUND)
+    shortfall = f"$.records: 19 clips, the corpus needs at least {manifest.MIN_CLIPS}"
+    assert out.splitlines()[-1] == f"{manifest.DRAFT_SHORT}: {shortfall}"
+    assert manifest.DRAFT_UNSOUND not in out
     assert cli.main(["eval", "check-manifest", path]) == 1
     report = manifest.validate(path)
-    assert [e for e in report.errors if e not in report.label_dependent] == [
-        f"$.records: 19 clips, the corpus needs at least {manifest.MIN_CLIPS}"
-    ]
+    assert [e for e in report.errors if e not in report.label_dependent] == [shortfall]
+    assert report.count_shortfalls == [shortfall]
     waiting = [e for e in report.label_dependent if "corrupted_asr candidate" in e]
     assert len(waiting) == 2 and all(e in out for e in waiting)
     assert not any("negative controls" in e for e in report.errors), "5 confirmed controls remain"

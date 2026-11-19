@@ -624,10 +624,34 @@ def test_structural_and_count_errors_are_not_label_dependent() -> None:
     doc["records"][0]["source_group"] = doc["records"][10]["source_group"]
     doc["records"] = doc["records"][:-1]
     report = validation_report(doc)
-    assert not report.draft_ok
+    assert not report.draft_ok and not report.structure_ok
     structural = [e for e in report.errors if e not in report.label_dependent]
     assert any("present in both dev and heldout" in e for e in structural)
     assert any("clips, the corpus needs" in e for e in structural)
+    assert report.count_shortfalls == [
+        f"$.records: {MIN_CLIPS - 1} clips, the corpus needs at least {MIN_CLIPS}",
+        f"$.records: {MIN_NEGATIVE_CONTROLS - 1} negative controls (unconfirmed corrupted_asr "
+        f"candidates do not count), the corpus needs at least {MIN_NEGATIVE_CONTROLS}",
+    ]
+    assert format_report(report, draft=True).splitlines()[-1] == manifest.DRAFT_UNSOUND
+
+
+def test_count_shortfall_alone_keeps_the_structure_sound_but_fails_the_draft() -> None:
+    doc = draft_manifest()
+    doc["records"] = [r for r in doc["records"] if not r["negative_control"]]
+    report = validation_report(doc)
+    clips = f"$.records: {len(doc['records'])} clips, the corpus needs at least {MIN_CLIPS}"
+    controls = (
+        "$.records: 0 negative controls (unconfirmed corrupted_asr candidates do not count), "
+        f"the corpus needs at least {MIN_NEGATIVE_CONTROLS}"
+    )
+    assert report.count_shortfalls == [clips, controls]
+    assert set(report.count_shortfalls) <= set(report.errors)
+    assert not set(report.count_shortfalls) & set(report.label_dependent)
+    assert not report.ok and not report.draft_ok and report.structure_ok
+    text = format_report(report, draft=True)
+    assert text.splitlines()[-1] == f"{manifest.DRAFT_SHORT}: {clips}; {controls}"
+    assert manifest.DRAFT_UNSOUND not in text and manifest.DRAFT_SOUND not in text
 
 
 def test_draft_report_puts_label_dependent_errors_in_their_own_block() -> None:

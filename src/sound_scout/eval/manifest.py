@@ -49,6 +49,7 @@ MIN_HELDOUT_PAIRS = 2
 _PATH_SEPARATORS = re.compile(r"[\\/]")
 DRAFT_WAITING = "ждёт человеческой разметки и записей владельца (#29)"
 DRAFT_SOUND = "черновик: структура пригодна, корпус не квалифицирован"
+DRAFT_SHORT = "черновик: структура пригодна, недобор объёма PROTOCOL.md § 4"
 DRAFT_UNSOUND = "черновик: структура не пригодна, ошибки выше"
 
 
@@ -58,11 +59,15 @@ class ManifestReport:
 
     `label_dependent` is the subset of `errors` that only human labels and the owner's recordings
     can close (held-out coverage, events per group, pairs); a draft corpus may still carry them.
+    `count_shortfalls` is the subset of `errors` below the clip and control minimums: no defect
+    of the structure, but a draft with one still fails. More clips close the clip shortfall; more
+    controls or confirmed `corrupted_asr` review sheets close the control shortfall.
     """
 
     errors: list[str]
     heldout_coverage: dict[str, int]
     label_dependent: list[str] = dataclasses.field(default_factory=list)
+    count_shortfalls: list[str] = dataclasses.field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -72,6 +77,11 @@ class ManifestReport:
     def draft_ok(self) -> bool:
         """The structure is sound: every remaining error waits for labels or recordings."""
         return set(self.errors) <= set(self.label_dependent)
+
+    @property
+    def structure_ok(self) -> bool:
+        """No structural error: what remains waits for labels, recordings or more clips."""
+        return set(self.errors) <= set(self.label_dependent) | set(self.count_shortfalls)
 
     @property
     def unrepresented(self) -> list[str]:
@@ -112,8 +122,9 @@ def validation_report(manifest: object, root: Path | None = None) -> ManifestRep
     )
     coverage = _heldout_coverage(records)
     label_dependent = _candidate_errors(records) + _coverage_errors(records, coverage)
+    shortfalls = _count_errors(records)
     return ManifestReport(
-        errors + _count_errors(records) + label_dependent, coverage, label_dependent
+        errors + shortfalls + label_dependent, coverage, label_dependent, shortfalls
     )
 
 
@@ -331,8 +342,14 @@ def format_report(report: ManifestReport, *, draft: bool = False) -> str:
     if report.label_dependent:
         lines.append(f"{DRAFT_WAITING}:")
         lines += [f"  {error}" for error in report.label_dependent]
-    if not report.ok:
-        lines.append(DRAFT_SOUND if report.draft_ok else DRAFT_UNSOUND)
+    if report.ok:
+        return "\n".join(lines)
+    if report.draft_ok:
+        lines.append(DRAFT_SOUND)
+    elif report.structure_ok:
+        lines.append(f"{DRAFT_SHORT}: " + "; ".join(report.count_shortfalls))
+    else:
+        lines.append(DRAFT_UNSOUND)
     return "\n".join(lines)
 
 

@@ -24,7 +24,10 @@ report that already exists, is a refusal with the reason code `eval_error`; miss
 labels and results are NOT QUALIFIED reasons in the report. `eval check-manifest <manifest>
 [--draft]` prints the whole `sound_scout.eval.manifest` report and exits 1 on any error; with
 `--draft` the errors that wait for human labels or the owner's recordings stand in a block of
-their own and only the others fail. `smoke [decoder] [acoustics] [asr]`
+their own and only the others fail. A qualifying manifest ends with 'manifest qualifies' and
+exits 0; for a manifest that does not qualify, the last `--draft` line is one of three verdicts:
+the structure is sound (exit 0), the structure is sound but short of clips or controls (exit 1),
+or the structure is not sound (exit 1). `smoke [decoder] [acoustics] [asr]`
 runs the real components (`sound_scout.smoke`) — `decoder` and `acoustics` on a synthetic signal,
 `asr` on the development recording named by `SOUND_SCOUT_DEV_AUDIO`, only when asked for — and
 saves the smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was
@@ -188,7 +191,9 @@ def _add_eval_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
     check.add_argument(
         "--draft",
         action="store_true",
-        help="exit 0 when only checks that need human labels or the owner's recordings remain",
+        help="exit 0 when only checks that need human labels or the owner's recordings remain; "
+        "for a manifest that does not qualify, the last line says: structure sound, structure "
+        "sound but short of clips or controls (exit 1), or structure not sound (exit 1)",
     )
 
 

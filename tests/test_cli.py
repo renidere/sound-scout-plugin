@@ -862,6 +862,18 @@ def test_eval_check_manifest_draft_passes_only_label_dependent_shortfalls(tmp_pa
     assert main(["eval", "check-manifest", path, "--draft"]) == 1
     assert manifest.DRAFT_UNSOUND in capsys.readouterr().out
 
+    short = draft_manifest()
+    short["records"] = short["records"][:-1]
+    path = _manifest_file(tmp_path, short)
+    assert main(["eval", "check-manifest", path, "--draft"]) == 1
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith(manifest.DRAFT_SHORT) and "clips, the corpus needs" in last
+
+    broken["records"] = broken["records"][:-1]
+    path = _manifest_file(tmp_path, broken)
+    assert main(["eval", "check-manifest", path, "--draft"]) == 1
+    assert capsys.readouterr().out.splitlines()[-1] == manifest.DRAFT_UNSOUND
+
     good = _manifest_file(tmp_path, qualifying_manifest())
     assert main(["eval", "check-manifest", good]) == 0
     assert main(["eval", "check-manifest", good, "--draft"]) == 0
