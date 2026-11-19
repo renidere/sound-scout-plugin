@@ -192,11 +192,8 @@ BACKGROUND_RECORD = {
 }
 
 
-def test_revise_brings_an_earlier_draft_to_the_same_manifest_and_is_idempotent(
-    built, tmp_path: Path, capsys
-) -> None:
-    corpus_dir, result, _ = built
-    provenance = json.loads((corpus_dir / "pilot-t" / "provenance.json").read_text("utf-8"))
+def earlier_manifest(result: dict, provenance: dict) -> dict:
+    """The #78 draft: every clip listed, the #78 note, no `asr_error_status`."""
     earlier = {**result, "note": corpus.DRAFT_NOTE, "records": []}
     for clip in provenance["clips"]:
         record = next((r for r in result["records"] if r["id"] == clip["id"]), None)
@@ -209,6 +206,15 @@ def test_revise_brings_an_earlier_draft_to_the_same_manifest_and_is_idempotent(
                 "source_group": clip["id"],
             }
         earlier["records"].append({k: v for k, v in record.items() if k != "asr_error_status"})
+    return earlier
+
+
+def test_revise_brings_an_earlier_draft_to_the_same_manifest_and_is_idempotent(
+    built, tmp_path: Path, capsys
+) -> None:
+    corpus_dir, result, _ = built
+    provenance = json.loads((corpus_dir / "pilot-t" / "provenance.json").read_text("utf-8"))
+    earlier = earlier_manifest(result, provenance)
     assert corpus.revise(earlier) == result
     assert corpus.revise(result) == result
 
@@ -216,13 +222,111 @@ def test_revise_brings_an_earlier_draft_to_the_same_manifest_and_is_idempotent(
     path.write_text(json.dumps(earlier, ensure_ascii=False), encoding="utf-8")
     assert corpus.main(["revise", "--manifest", str(path)]) == 0
     assert capsys.readouterr().out == (
-        "dropped: ctl-snsd-babble, ctl-snsd-neighbor-2, ctl-snsd-neighbor-4; written: true\n"
+        "dropped: ctl-snsd-babble, ctl-snsd-neighbor-2, ctl-snsd-neighbor-4; "
+        "marked excluded: none; templates deleted: none\n"
     )
     assert json.loads(path.read_text("utf-8")) == result
     assert corpus.main(["revise", "--manifest", str(path)]) == 0
-    assert capsys.readouterr().out == "dropped: none; written: false\n"
+    assert capsys.readouterr().out == NOTHING_CHANGED
     assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json"]
     assert corpus.main(["revise", "--manifest", str(tmp_path / "missing.json")]) == 2
+
+
+NOTHING_CHANGED = "dropped: none; marked excluded: none; templates deleted: none\n"
+
+
+def old_corpus(built, tmp_path: Path, start: str = "78-draft") -> tuple[Path, Path]:
+    """A copy of the fresh corpus with labels/ and provenance.json in their #78 form.
+
+    The manifest is the #78 draft, or for `start="84-revised"` the one #84 already revised.
+    """
+    corpus_dir, result, _ = built
+    fresh = corpus_dir / "pilot-t"
+    old = shutil.copytree(fresh, tmp_path / "pilot-t")
+    provenance = json.loads((old / "provenance.json").read_text("utf-8"))
+    start_manifest = earlier_manifest(result, provenance) if start == "78-draft" else result
+    (old / "manifest.json").write_text(json.dumps(start_manifest, ensure_ascii=False), "utf-8")
+    for clip in provenance["clips"]:
+        clip.pop("excluded", None)
+    (old / "provenance.json").write_text(json.dumps(provenance, ensure_ascii=False), "utf-8")
+    for clip_id in corpus.EXCLUDED_CONTROLS:
+        audio = old / "clips" / f"{clip_id}.wav"
+        sha256 = hashlib.sha256(audio.read_bytes()).hexdigest()
+        template = corpus.label_template(clip_id, sha256, len(read_wav(audio)) / RATE)
+        (old / "labels" / f"{clip_id}.json").write_text(json.dumps(template), "utf-8")
+    return fresh, old
+
+
+def snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()
+    }
+
+
+@pytest.mark.parametrize("start", ["78-draft", "84-revised"])
+def test_revise_brings_a_78_corpus_to_the_labels_and_provenance_of_a_fresh_prepare(
+    built, tmp_path: Path, capsys, start
+) -> None:
+    fresh, old = old_corpus(built, tmp_path, start)
+    assert len(list((old / "labels").iterdir())) == 22
+    manifest_path = str(old / "manifest.json")
+
+    assert corpus.main(["revise", "--manifest", manifest_path]) == 0
+    excluded = ", ".join(corpus.EXCLUDED_CONTROLS)
+    dropped = excluded if start == "78-draft" else "none"
+    assert capsys.readouterr().out == (
+        f"dropped: {dropped}; marked excluded: {excluded}; templates deleted: {excluded}\n"
+    )
+    manifest = json.loads((old / "manifest.json").read_text("utf-8"))
+    assert manifest == json.loads((fresh / "manifest.json").read_text("utf-8"))
+    label_ids = sorted(p.stem for p in (old / "labels").iterdir())
+    assert label_ids == sorted(r["id"] for r in manifest["records"])
+    assert snapshot(old / "labels") == snapshot(fresh / "labels")
+    assert json.loads((old / "provenance.json").read_text("utf-8")) == json.loads(
+        (fresh / "provenance.json").read_text("utf-8")
+    )
+    assert snapshot(old / "clips") == snapshot(fresh / "clips")
+    assert sorted(p.name for p in old.iterdir()) == sorted(p.name for p in fresh.iterdir())
+
+    before = snapshot(old)
+    assert corpus.main(["revise", "--manifest", manifest_path]) == 0
+    assert capsys.readouterr().out == NOTHING_CHANGED
+    assert snapshot(old) == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(lambda t: {**t, "annotator": "listener-a"}, id="signed"),
+        pytest.param(lambda t: {**t, "events": [{"category": "pause"}]}, id="events"),
+        pytest.param(lambda t: {**t, "clip_sha256": "0" * 64}, id="other-clip"),
+        pytest.param(lambda t: "not json {", id="not-json"),
+    ],
+)
+def test_revise_refuses_a_label_file_a_person_filled_and_changes_nothing(
+    built, tmp_path: Path, capsys, change
+) -> None:
+    _, old = old_corpus(built, tmp_path)
+    label = old / "labels" / "ctl-snsd-neighbor-2.json"
+    changed = change(json.loads(label.read_text("utf-8")))
+    label.write_text(changed if isinstance(changed, str) else json.dumps(changed), "utf-8")
+    before = snapshot(old)
+
+    assert corpus.main(["revise", "--manifest", str(old / "manifest.json")]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "labels/ctl-snsd-neighbor-2.json" in captured.err
+    assert "ctl-snsd-babble" not in captured.err and "changed nothing" in captured.err
+    assert snapshot(old) == before
+
+
+def test_revise_refuses_a_template_whose_audio_is_gone(built, tmp_path: Path) -> None:
+    _, old = old_corpus(built, tmp_path)
+    (old / "clips" / "ctl-snsd-babble.wav").unlink()
+    before = snapshot(old)
+    with pytest.raises(corpus.CorpusError, match=r"labels/ctl-snsd-babble\.json"):
+        corpus.revise_file(old / "manifest.json")
+    assert snapshot(old) == before
 
 
 def test_revise_keeps_a_note_someone_wrote_and_adds_the_exclusion_reason_once() -> None:

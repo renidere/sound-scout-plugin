@@ -12,12 +12,14 @@ prosody candidates cut from RINCO by its Accent / Pause / Int phrase tiers, a dr
 intelligible speech (the owner listened on 2026-11-19, #84): their audio is written and kept, but
 they are no noise controls and stay out of the manifest (`EXCLUDED_CONTROLS`); the speech + babble
 mixes enter it as `corrupted_asr` candidates (`asr_error_status: candidate`) until a person
-confirms the ASR error. `revise --manifest PATH` applies the same two rules to a draft manifest
-built before them, in place and idempotently; it replaces a missing or #78 draft `note` with
-`MANIFEST_NOTE` and appends the exclusion reason to any other note. Archive members are read by
-name into temporary files the code names, never extracted by the archive's own paths; the
-Transcribe tier of RINCO (an automatic transcript, a model output) is never read. No model, no
-ASR, no network. The category mapping and the rules are docs/decisions/0009-corpus-pilot-1.md.
+confirms the ASR error. `revise --manifest PATH` applies the same two rules to a draft corpus
+built before them, in place and idempotently: it replaces a missing or #78 draft `note` with
+`MANIFEST_NOTE` and appends the exclusion reason to any other note, marks the excluded clips in
+`provenance.json` and deletes their label templates, refusing a label file a person filled.
+Archive members are read by name into temporary files the code names, never extracted by the
+archive's own paths; the Transcribe tier of RINCO (an automatic transcript, a model output) is
+never read. No model, no ASR, no network. The category mapping and the rules are
+docs/decisions/0009-corpus-pilot-1.md.
 """
 
 import argparse
@@ -858,19 +860,77 @@ def revise(manifest: dict) -> dict:
     return {**manifest, "note": note, "records": records}
 
 
-def revise_file(path: Path) -> tuple[list[str], bool]:
-    """Apply `revise` to the manifest at `path` in place; the ids it dropped, whether it wrote."""
+def revise_file(path: Path) -> tuple[list[str], list[str], list[str]]:
+    """Bring the corpus of the manifest at `path` in line with a fresh `prepare`, in place.
+
+    Applies `revise` to the manifest, marks each clip of `EXCLUDED_CONTROLS` in the
+    `provenance.json` next to it with `excluded`, and deletes its label template from `labels/`;
+    the audio stays. A label file that is not exactly the empty `label_template` of its clip
+    is a person's work: `CorpusError` names it before anything is written. Idempotent. Returns
+    the ids dropped from the manifest, marked in provenance and whose templates were deleted.
+    """
     path = Path(path)
+    corpus_dir = path.parent
     before = json.loads(path.read_text(encoding="utf-8"))
     after = revise(before)
-    if after == before:
-        return [], False
+    templates = _excluded_templates(corpus_dir)
+    provenance_path = corpus_dir / "provenance.json"
+    provenance, marked = None, []
+    if provenance_path.exists():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        marked = [
+            clip["id"]
+            for clip in provenance["clips"]
+            if clip["id"] in EXCLUDED_CONTROLS and "excluded" not in clip
+        ]
+    if after != before:
+        _replace_json(path, after)
+    if marked:
+        provenance["clips"] = [
+            {**clip, "excluded": SPEECH_BACKGROUND} if clip["id"] in marked else clip
+            for clip in provenance["clips"]
+        ]
+        _replace_json(provenance_path, provenance)
+    for template in templates:
+        template.unlink()
     kept = {record["id"] for record in after["records"]}
     dropped = [record["id"] for record in before["records"] if record["id"] not in kept]
+    return dropped, marked, [template.stem for template in templates]
+
+
+def _excluded_templates(corpus_dir: Path) -> list[Path]:
+    """The label files of `EXCLUDED_CONTROLS` to delete; refuses any a person may have filled."""
+    found, refused = [], []
+    for clip_id in EXCLUDED_CONTROLS:
+        label = corpus_dir / "labels" / f"{clip_id}.json"
+        if not os.path.lexists(label):
+            continue
+        audio = corpus_dir / "clips" / f"{clip_id}.wav"
+        if label.is_symlink() or not label.is_file() or not audio.is_file():
+            refused.append(label)
+            continue
+        data = audio.read_bytes()
+        duration = (len(data) - 44) / 2 / SAMPLE_RATE
+        expected = label_template(clip_id, hashlib.sha256(data).hexdigest(), duration)
+        try:
+            actual = json.loads(label.read_text(encoding="utf-8"))
+        except ValueError:
+            actual = None
+        (found if actual == expected else refused).append(label)
+    if refused:
+        names = ", ".join(f"labels/{label.name}" for label in refused)
+        raise CorpusError(
+            f"{names} is not the empty template prepare writes for its clip in clips/, so a "
+            "person may have filled it; revise changed nothing: move the file out of labels/ "
+            "by hand, then run revise again"
+        )
+    return found
+
+
+def _replace_json(path: Path, data: object) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    _write_json(temporary, after)
+    _write_json(temporary, data)
     os.replace(temporary, path)
-    return dropped, True
 
 
 def _write_bytes(path: Path, data: bytes) -> None:
@@ -891,14 +951,20 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--corpus-dir", type=Path, required=True)
     command.add_argument("--name", required=True)
     command = commands.add_parser(
-        "revise", help="drop the excluded controls and mark corrupted_asr candidates in place"
+        "revise",
+        help="drop the excluded controls from the manifest, labels/ and provenance.json and mark "
+        "corrupted_asr candidates in place",
     )
     command.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "revise":
-            dropped, written = revise_file(args.manifest)
-            print(f"dropped: {', '.join(dropped) or 'none'}; written: {str(written).lower()}")
+            changes = zip(
+                ("dropped", "marked excluded", "templates deleted"),
+                revise_file(args.manifest),
+                strict=True,
+            )
+            print("; ".join(f"{what}: {', '.join(ids) or 'none'}" for what, ids in changes))
             return 0
         manifest = prepare(args.corpus_dir, args.name)
     except (CorpusError, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
