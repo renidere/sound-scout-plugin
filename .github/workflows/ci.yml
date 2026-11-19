@@ -16,7 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Detect the package
+      - &detect-package
+        name: Detect the package
         id: pkg
         run: |
           if [ -f pyproject.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
@@ -30,7 +31,8 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install ffmpeg
+      - &install-ffmpeg
+        name: Install ffmpeg
         if: steps.pkg.outputs.present == 'true'
         # Худший успешный путь: (attempts − 1) × (attempt_minutes + 0,5 мин kill-after) на зависшие
         # попытки, attempt_minutes на удачную и не меньше 2 мин на локальную установку: 2 × 5,5 + 5 + 2 = 18.
@@ -72,3 +74,31 @@ jobs:
           HF_HUB_OFFLINE: "1"
           SOUND_SCOUT_NO_NETWORK: "1"
         run: uv run pytest
+
+  clean-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - *detect-package
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - *install-ffmpeg
+
+      - name: Clean install check
+        run: bash scripts/clean-install-check.sh
+
+  history-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan the history for private data
+        run: bash scripts/scan-history.sh

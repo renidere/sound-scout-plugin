@@ -15,7 +15,8 @@ CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
 def step_block(text: str, name: str) -> str:
-    start = text.index(f"- name: {name}\n")
+    """The first step named `name`, from its `- ` line (which may carry an anchor) to the next."""
+    start = text.rindex("\n      - ", 0, text.index(f"name: {name}\n")) + 1
     end = text.find("\n      - ", start)
     return text[start:] if end == -1 else text[start:end]
 
@@ -186,3 +187,38 @@ def test_install_ffmpeg_step_fails_with_a_reason_after_three_bad_downloads(
     assert not any("--no-download" in c for c in calls)
     # Висящее зеркало, глухое к SIGTERM, обрывает timeout: 1 с + 1 с kill-after на попытку.
     assert elapsed < 3 * 2 + 5
+
+
+# Issue #41: the clean install and the history scan run as jobs of their own.
+
+
+def workflow_jobs() -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(CI.read_text(encoding="utf-8"))["jobs"]
+
+
+def named_step(job: dict, name: str) -> dict:
+    return next(step for step in job["steps"] if step.get("name") == name)
+
+
+def test_clean_install_job_reuses_the_ffmpeg_step_of_checks_and_runs_the_script() -> None:
+    jobs = workflow_jobs()
+    job = jobs["clean-install"]
+    for name in ("Detect the package", "Install ffmpeg"):
+        assert named_step(job, name) == named_step(jobs["checks"], name)
+    text = CI.read_text(encoding="utf-8")
+    assert text.count("name: Install ffmpeg\n") == 1, "the step is aliased, not copied"
+    uses = [step["uses"] for step in job["steps"] if "uses" in step]
+    checks_uses = [step["uses"] for step in jobs["checks"]["steps"] if "uses" in step]
+    assert uses == checks_uses
+    assert job["steps"][-1]["run"] == "bash scripts/clean-install-check.sh"
+    assert job["timeout-minutes"] == 30
+
+
+def test_history_scan_job_checks_out_the_whole_history_and_runs_the_scanner() -> None:
+    job = workflow_jobs()["history-scan"]
+    checkout = job["steps"][0]
+    assert checkout["uses"].startswith("actions/checkout@")
+    assert checkout["with"]["fetch-depth"] == 0
+    assert job["steps"][-1]["run"] == "bash scripts/scan-history.sh"
+    assert all("continue-on-error" not in step for step in job["steps"])

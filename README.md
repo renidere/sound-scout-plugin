@@ -166,6 +166,9 @@ uv run ruff format --check .
 uv run pytest             # -m "not slow" пропускает тесты с реальными моделями
 ```
 
+Чистая установка, проверка истории на приватные данные и ресурсный профиль — `docs/environment.md`:
+`scripts/clean-install-check.sh`, `scripts/scan-history.sh`, `scripts/profile.py`.
+
 Тесты с маркером `slow` используют настоящую модель ASR из локального кэша Hugging Face
 (`~/.cache/huggingface/hub`, без загрузки: нет модели — тест пропускается с причиной) и, для
 проверки на реальной речи, путь к development-записи из `SOUND_SCOUT_DEV_AUDIO` (не задан —
