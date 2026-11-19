@@ -27,6 +27,7 @@ from tests.test_jobs import ABSENT_ASR_MODEL, job_file, needs_ffmpeg, set_job
 from tests.test_proc import process_gone
 
 POLL = 0.02
+BUSY_POLL = 2.0
 
 
 @pytest.fixture
@@ -73,9 +74,11 @@ def substitute(
     return analyze
 
 
-def runner_thread(cfg: Config) -> threading.Thread:
+def runner_thread(cfg: Config, poll_seconds: float = POLL) -> threading.Thread:
     thread = threading.Thread(
-        target=jobs.run_runner, args=(cfg,), kwargs={"exit_when_idle": True, "poll_seconds": POLL}
+        target=jobs.run_runner,
+        args=(cfg,),
+        kwargs={"exit_when_idle": True, "poll_seconds": poll_seconds},
     )
     thread.start()
     return thread
@@ -135,7 +138,9 @@ def test_busy_puts_the_job_back_in_its_place_in_the_queue(
     second = queue(cfg, make_wav("recordings/b.wav", seconds=1.5, frequency=330.0))
 
     with app._analysis_lock(cfg.data_root):
-        runner = runner_thread(cfg)
+        # The runner waits BUSY_POLL after a requeue, so its next claim cannot land between
+        # the reads below and show the job `running` for a moment.
+        runner = runner_thread(cfg, poll_seconds=BUSY_POLL)
         wait_until(lambda: (job_file(cfg, first)["state_reason"] or "").startswith("analyze.lock"))
         time.sleep(10 * POLL)
         for job_id in (first, second):
