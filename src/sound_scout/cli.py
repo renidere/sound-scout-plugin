@@ -14,10 +14,13 @@ their absolute paths (ffprobe and ffmpeg quote them). Stdout carries only the an
 root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`.
 `compare` calls `app.compare` and prints the verdict, its reasons and the file
 `compare/<id>.json` (`--json`: the comparison with `path`), exit 0 whatever the verdict.
-`jobs submit|status|result|cancel` calls `sound_scout.jobs` and prints its answer as
-`key: value` lines (`--json`: the answer); `result` puts `job_id`, `job_state` and `attempt`
-before the summary of the compact answer, as `analyze` prints it. The exit code is 0 whatever
-the job state or the result status is, 1 on a refusal.
+`jobs submit|status|result|cancel|recover` calls `sound_scout.jobs` and prints its answer as
+`key: value` lines (`--json`: the answer; `recover`: one line per recovered job); `result` puts
+`job_id`, `job_state` and `attempt` before the summary of the compact answer, as `analyze` prints
+it. The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
+is the runner in the foreground (`jobs.run_runner`; `--exit-when-idle` returns once no job is
+queued), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
+as the transient unit `jobs.RUNNER_UNIT` with this configuration file.
 `doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
 diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
 same functions until the client closes stdin, then exits 0.
@@ -60,7 +63,8 @@ SUBCOMMANDS = {
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
-    "jobs": "queue an analysis and follow it: submit, status, result, cancel",
+    "jobs": "queue an analysis and follow it: submit, status, result, cancel; run the queue: "
+    "run, start, recover",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -192,6 +196,20 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
             action, help=help_text, description=help_text, parents=[common, as_json]
         )
         command.add_argument("job_id", help="the job_id that submit printed")
+    run_help = "run queued jobs one at a time, oldest first, in the foreground"
+    run = actions.add_parser("run", help=run_help, description=run_help, parents=[common])
+    run.add_argument("--exit-when-idle", action="store_true", help="return once no job is queued")
+    start_help = (
+        "start the runner through systemd-run --user as a transient unit outside the caller's "
+        "cgroup"
+    )
+    actions.add_parser("start", help=start_help, description=start_help, parents=[common, as_json])
+    recover_help = (
+        "mark attempts whose runner is gone interrupted and queue a new attempt of their jobs"
+    )
+    actions.add_parser(
+        "recover", help=recover_help, description=recover_help, parents=[common, as_json]
+    )
 
 
 def _layer_list(text: str) -> tuple[str, ...]:
@@ -348,7 +366,14 @@ def run_jobs(args: argparse.Namespace) -> int:
     from sound_scout import ingest, jobs, paths
 
     try:
-        if args.jobs_command == "submit":
+        if args.jobs_command == "run":
+            jobs.run_runner(loaded, exit_when_idle=args.exit_when_idle)
+            return 0
+        if args.jobs_command == "start":
+            answer = jobs.start_runner_unit(config.config_path())
+        elif args.jobs_command == "recover":
+            answer = jobs.recover(loaded)
+        elif args.jobs_command == "submit":
             fields = {"request_id": args.request_id, "task": args.task, "intent": args.intent}
             if args.layers is not None:
                 fields["layers"] = args.layers
@@ -374,6 +399,9 @@ def run_jobs(args: argparse.Namespace) -> int:
         raise CliError(code, str(error)) from error
     if args.json:
         print(json.dumps(answer, indent=2, ensure_ascii=False))
+    elif args.jobs_command == "recover":
+        for item in answer:
+            print(" ".join(f"{key}: {_plain(value)}" for key, value in item.items()))
     elif args.jobs_command == "result":
         print(f"job_id: {answer['job_id']}\njob_state: {answer['job_state']}")
         print(f"attempt: {_plain(answer['attempt'])}")

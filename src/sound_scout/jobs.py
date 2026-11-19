@@ -27,6 +27,26 @@ keeps its own `status` and `coverage` in `result.json` of the run each attempt n
 Every read-modify-write of the store holds `<data_root>/jobs/jobs.lock` (`flock`, held for
 milliseconds): a submit and its admission count, and a state change such as `queued` to
 `cancelled`, cannot interleave with another one. `job.json` is replaced atomically.
+
+`run_runner` is the one runner: it holds `<data_root>/jobs/runner.lock` (`flock`, no waiting: a
+second runner is `runner_running`) for its whole life, not `analyze.lock`, which `app.analyze`
+takes itself. It takes the oldest `queued` job (by `submitted_at`), moves it to `running` with a
+new attempt `{"number": n, "request_id": "<job_id>-a<n>", "lease": ...}` and calls `app.analyze`
+unchanged with that `request_id`, so a run left incomplete never blocks the next attempt. The
+lease names the runner process: `boot_id`, `pid`, its start time in clock ticks since boot
+(`/proc/<pid>/stat`, against a reused pid) and the attempt number. `Busy` from `app.analyze` (a
+synchronous MCP call holds `analyze.lock`) drops that attempt, which ran nothing, and puts the
+job back to `queued` with its place in the queue; the runner tries again after `poll_seconds`.
+While an attempt runs, a watcher thread turns the job's `cancel.json` into the `CancelToken` of
+`app.analyze`, and the job ends `cancelled`. A refusal of `app.analyze` or an unexpected error
+ends the job `failed` with its reason code; the runner goes on with the next job.
+
+`recover` is the only retry: a `running` job whose lease owner is gone (another boot, no such pid, a
+zombie, or a pid with another start time) gets its attempt marked `interrupted` and goes back to
+`queued`, where the runner takes it as attempt n+1; with a cancel marker it ends `cancelled`.
+Nothing retries on its own. `runner_unit_argv` is the `systemd-run --user` command that starts the
+runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has
+`KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
 """
 
 import contextlib
@@ -36,19 +56,32 @@ import hashlib
 import json
 import os
 import shutil
-from collections.abc import Iterator
+import sys
+import threading
+import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sound_scout import __version__, ingest, paths, report, runs, schema
-from sound_scout.config import Config
+from sound_scout import __version__, ingest, paths, proc, report, runs, schema
+from sound_scout.config import CONFIG_PATH_ENV, Config
 
 JOBS_DIR_NAME = "jobs"
 INDEX_DIR_NAME = "by-request"
 JOB_FILE_NAME = "job.json"
 CANCEL_MARKER_NAME = "cancel.json"
 LOCK_FILE_NAME = "jobs.lock"
+RUNNER_LOCK_NAME = "runner.lock"
+RUNNER_UNIT = "sound-scout-jobs-runner"
+# Passed on to the transient unit when set: the decoder on PATH and the ASR model cache.
+RUNNER_ENV = ("PATH", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "XDG_CACHE_HOME")
+SYSTEMD_RUN_TIMEOUT_SECONDS = 30.0
+SYSTEMD_RUN_MAX_OUTPUT_BYTES = 64 * 1024
+POLL_SECONDS = 1.0
+CANCEL_POLL_SECONDS = 0.1
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+DEAD_PROCESS_STATES = ("Z", "X", "x")
 QUEUED = "queued"
 RUNNING = "running"
 FINISHED = "finished"
@@ -56,6 +89,7 @@ CANCELLED = "cancelled"
 FAILED = "failed"
 STATES = (QUEUED, RUNNING, FINISHED, CANCELLED, FAILED)
 NOT_ENDED = (QUEUED, RUNNING)
+INTERRUPTED = "interrupted"
 # `app.LAYERS`, `app.LAYER_STAGES` and `app.WORKER_STAGES`, repeated so that a submit does not
 # import `app` (it loads Praat and the speech detector) and answers within a second.
 LAYERS = ("content", "measurements", "sound")
@@ -68,6 +102,8 @@ QUEUE_FULL = "queue_full"
 STAGING_FULL = "staging_full"
 JOB_NOT_FOUND = "job_not_found"
 NO_RESULT = "no_result"
+RUNNER_RUNNING = "runner_running"
+RUNNER_START_FAILED = "runner_start_failed"
 
 
 class JobError(Exception):
@@ -232,6 +268,309 @@ def cancel(job_id: str, config: Config) -> dict:
         return _view(job_dir, job) | {"cancel": outcome}
 
 
+def run_runner(
+    config: Config, *, exit_when_idle: bool = False, poll_seconds: float = POLL_SECONDS
+) -> None:
+    """Run queued jobs one at a time, oldest first, until stopped; see the module docstring.
+
+    With `exit_when_idle` it returns once no job is `queued`. Raises `JobError`
+    (`runner_running`) when another runner holds `runner.lock`.
+    """
+    from sound_scout import app
+
+    with _runner_lock(config.data_root):
+        while True:
+            claimed = _claim_next(config)
+            if claimed is None:
+                if exit_when_idle:
+                    return
+                time.sleep(poll_seconds)
+                continue
+            job, attempt = claimed
+            outcome = _run_attempt(app, job, attempt, config)
+            _log(f"job {job['job_id']} attempt {attempt['number']}: {outcome}")
+            if outcome == QUEUED:
+                time.sleep(poll_seconds)
+
+
+def recover(config: Config) -> list[dict]:
+    """Mark the attempts of `running` jobs whose lease owner is gone `interrupted` and queue the
+    job again (or end it `cancelled` when a cancel was requested); one entry per recovered job:
+    `{job_id, interrupted_attempt, state, next_attempt}`. A live lease is left alone."""
+    recovered = []
+    with _store(config.data_root) as (jobs_dir, _):
+        for job_dir in _job_dirs(jobs_dir):
+            job = _load(job_dir)
+            if job["state"] != RUNNING or not job["attempts"]:
+                continue
+            attempt = job["attempts"][-1]
+            if _lease_alive(attempt.get("lease")):
+                continue
+            number = attempt["number"]
+            attempt.update(
+                outcome=INTERRUPTED,
+                ended_at=_now(),
+                run_id=_run_id_of(attempt["request_id"], config),
+            )
+            if (job_dir / CANCEL_MARKER_NAME).exists():
+                state = CANCELLED
+                reason = f"attempt {number} was interrupted (its runner is gone) after a cancel"
+                next_attempt = None
+            else:
+                state = QUEUED
+                next_attempt = f"{job['job_id']}-a{number + 1}"
+                reason = (
+                    f"attempt {number} was interrupted (its runner is gone); jobs recover queued "
+                    f"attempt {number + 1} ({next_attempt})"
+                )
+            job.update(state=state, state_reason=reason, updated_at=_now())
+            _save(job_dir, job)
+            recovered.append(
+                {
+                    "job_id": job["job_id"],
+                    "interrupted_attempt": number,
+                    "state": state,
+                    "next_attempt": next_attempt,
+                }
+            )
+    return recovered
+
+
+def runner_unit_argv(
+    config_path: Path, environ: Mapping[str, str], *, python: str = sys.executable
+) -> list[str]:
+    """The `systemd-run --user` command that starts the runner as the transient unit `RUNNER_UNIT`.
+
+    The unit gets the absolute configuration file and the `RUNNER_ENV` variables set in
+    `environ`, nothing else of the caller's environment; `--collect` frees the fixed name after
+    the runner ends, whatever its exit code.
+    """
+    argv = [
+        "systemd-run",
+        "--user",
+        f"--unit={RUNNER_UNIT}",
+        "--collect",
+        "--description=Sound Scout jobs runner",
+        f"--setenv={CONFIG_PATH_ENV}={Path(config_path).absolute()}",
+    ]
+    argv += [f"--setenv={name}={environ[name]}" for name in RUNNER_ENV if name in environ]
+    return [*argv, python, "-m", "sound_scout", "jobs", "run"]
+
+
+def start_runner_unit(config_path: Path) -> dict:
+    """Start the runner through `systemd-run --user`; `{unit, started}` or `runner_start_failed`
+    with what systemd-run said (for example, the unit is already running)."""
+    argv = runner_unit_argv(config_path, os.environ)
+    try:
+        outcome = proc.run(
+            argv,
+            timeout=SYSTEMD_RUN_TIMEOUT_SECONDS,
+            max_output_bytes=SYSTEMD_RUN_MAX_OUTPUT_BYTES,
+        )
+    except OSError as error:
+        raise JobError(RUNNER_START_FAILED, f"cannot run systemd-run: {error.strerror}") from None
+    if outcome.timed_out or outcome.returncode != 0:
+        said = " ".join(outcome.stderr.decode("utf-8", "replace").split())
+        raise JobError(
+            RUNNER_START_FAILED,
+            f"systemd-run exited {outcome.returncode}"
+            + (" (timed out)" if outcome.timed_out else "")
+            + (f": {said}" if said else ""),
+        )
+    return {"unit": RUNNER_UNIT, "started": True}
+
+
+def _claim_next(config: Config) -> tuple[dict, dict] | None:
+    """The oldest `queued` job, now `running` with a new attempt and its lease; None if none."""
+    with _store(config.data_root) as (jobs_dir, _):
+        queued = [job for job in map(_load, _job_dirs(jobs_dir)) if job["state"] == QUEUED]
+        if not queued:
+            return None
+        job = min(queued, key=lambda item: (item["submitted_at"], item["job_id"]))
+        number = len(job["attempts"]) + 1
+        attempt = {
+            "number": number,
+            "request_id": f"{job['job_id']}-a{number}",
+            "run_id": None,
+            "started_at": _now(),
+            "ended_at": None,
+            "outcome": None,
+            "lease": _lease(number),
+        }
+        job["attempts"].append(attempt)
+        job.update(state=RUNNING, state_reason=None, updated_at=_now())
+        _save(jobs_dir / job["job_id"], job)
+        return job, attempt
+
+
+def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
+    """Run one attempt through `app.analyze` and record how it ended; the new job state."""
+    job_dir = config.data_root / JOBS_DIR_NAME / job["job_id"]
+    request = job["request"]
+    token = app.CancelToken()
+    done = threading.Event()
+    watcher = threading.Thread(target=_watch_cancel, args=(job_dir, token, done), daemon=True)
+    watcher.start()
+    run_id, state, reason = None, FINISHED, None
+    try:
+        analysis = app.analyze(
+            app.AnalyzeRequest(
+                request["input"]["path"],
+                request_id=attempt["request_id"],
+                layers=tuple(request["layers"]),
+                task=request["task"],
+                intent=request["intent"],
+            ),
+            config,
+            cancel=token,
+        )
+        run_id = analysis.run.run_id
+        if token.cancelled and not analysis.run.complete:
+            state, reason = CANCELLED, "cancelled while running; the run keeps what was done"
+    except app.Busy:
+        state = QUEUED
+    except ingest.IngestError as error:
+        state, reason = FAILED, f"{error.code}: {_private(error.message, request, config)}"
+    except tuple(kind for kind, _ in app.REFUSALS) as error:
+        code = next(code for kind, code in app.REFUSALS if isinstance(error, kind))
+        state, reason = FAILED, f"{code}: {_private(str(error), request, config)}"
+    except Exception as error:
+        # Only the type: the message of an unexpected error may carry a path or a transcript.
+        state, reason = FAILED, f"internal_error: {type(error).__name__}"
+    finally:
+        done.set()
+        watcher.join()
+    return _end_attempt(job_dir, attempt, state, reason, run_id, config)
+
+
+def _private(message: str, request: dict, config: Config) -> str:
+    """The reason as `status` shows it: the input, the roots and the data root by placeholders."""
+    return paths.without_paths(message, request["input"]["path"], config)
+
+
+def _end_attempt(
+    job_dir: Path,
+    attempt: dict,
+    state: str,
+    reason: str | None,
+    run_id: str | None,
+    config: Config,
+) -> str:
+    """Record how the attempt ended and answer the job's new state.
+
+    Under `jobs.lock`, so a `cancel` cannot land between the cancel-marker check of a `Busy`
+    attempt and its requeue.
+    """
+    with _store(config.data_root):
+        job = _load(job_dir)
+        current = job["attempts"][-1] if job["attempts"] else None
+        if job["state"] != RUNNING or current is None or current["number"] != attempt["number"]:
+            return job["state"]  # `jobs recover` took this attempt from a runner it saw as gone.
+        if state == QUEUED and (job_dir / CANCEL_MARKER_NAME).exists():
+            state, reason = CANCELLED, "cancelled while waiting for analyze.lock"
+        if state == QUEUED:
+            job["attempts"].pop()
+            reason = "analyze.lock is held by another analysis; the job waits in the queue"
+        else:
+            current.update(
+                run_id=run_id or _run_id_of(current["request_id"], config),
+                ended_at=_now(),
+                outcome=state,
+            )
+        job.update(state=state, state_reason=reason, updated_at=_now())
+        _save(job_dir, job)
+        return state
+
+
+def _watch_cancel(job_dir: Path, token, done: threading.Event) -> None:
+    while not done.wait(CANCEL_POLL_SECONDS):
+        if (job_dir / CANCEL_MARKER_NAME).exists():
+            token.cancel()
+            return
+
+
+@contextlib.contextmanager
+def _runner_lock(data_root: Path) -> Iterator[None]:
+    jobs_dir = data_root / JOBS_DIR_NAME
+    runs._ensure_private_dir(jobs_dir)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(jobs_dir / RUNNER_LOCK_NAME, flags, runs.FILE_MODE)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise JobError(
+                RUNNER_RUNNING, "another jobs runner holds runner.lock on this data root"
+            ) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _lease(number: int) -> dict:
+    pid = os.getpid()
+    return {
+        "boot_id": _boot_id(),
+        "pid": pid,
+        "process_start": _process_start(pid),
+        "attempt": number,
+        "started_at": _now(),
+    }
+
+
+def _lease_alive(lease: object) -> bool:
+    """Whether the lease's runner still runs: this boot, its pid, the same process start."""
+    if not isinstance(lease, dict) or not isinstance(lease.get("pid"), int):
+        return False
+    if lease.get("boot_id") != _boot_id():
+        return False
+    started = lease.get("process_start")
+    return started is not None and _process_start(lease["pid"]) == started
+
+
+def _boot_id() -> str | None:
+    try:
+        return BOOT_ID_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+
+
+def _process_start(pid: int) -> int | None:
+    """Field 22 of `/proc/<pid>/stat`, the start in clock ticks since boot; None without it or
+    when the process is a zombie or dead (it exited, only its parent has not reaped it yet)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    fields = stat.rpartition(")")[2].split()
+    if fields[0] in DEAD_PROCESS_STATES:
+        return None
+    return int(fields[19])
+
+
+def _run_id_of(request_id: str, config: Config) -> str | None:
+    index = config.data_root / runs.RUNS_DIR_NAME / runs.INDEX_DIR_NAME
+    entry = index / hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    try:
+        run_id = entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return run_id if runs.RUN_ID_PATTERN.fullmatch(run_id) else None
+
+
+def _job_dirs(jobs_dir: Path) -> list[Path]:
+    """The job directories; one without job.json is a submit that died before its rollback."""
+    return [
+        job_dir
+        for job_dir in jobs_dir.iterdir()
+        if runs.RUN_ID_PATTERN.fullmatch(job_dir.name) and (job_dir / JOB_FILE_NAME).exists()
+    ]
+
+
+def _log(line: str) -> None:
+    print(f"sound-scout jobs run: {line}", file=sys.stderr, flush=True)
+
+
 def _hashed_input(path: str, config: Config) -> tuple[Path, int, str]:
     if not isinstance(path, str) or not path:
         raise JobError(INVALID_REQUEST, "path must be a non-empty string")
@@ -246,13 +585,7 @@ def _hashed_input(path: str, config: Config) -> tuple[Path, int, str]:
 
 def _admit(jobs_dir: Path, size: int, config: Config) -> None:
     queued, staged = 0, size
-    for job_dir in jobs_dir.iterdir():
-        # A directory without job.json is a submit that died before its rollback: no job.
-        if (
-            not runs.RUN_ID_PATTERN.fullmatch(job_dir.name)
-            or not (job_dir / JOB_FILE_NAME).exists()
-        ):
-            continue
+    for job_dir in _job_dirs(jobs_dir):
         job = _load(job_dir)
         if job["state"] == QUEUED:
             queued += 1
