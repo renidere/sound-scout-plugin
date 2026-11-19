@@ -1,0 +1,7 @@
+{
+  "name": "sound-scout",
+  "label": "Sound Scout",
+  "version": "0.0.1",
+  "tab": { "hidden": true },
+  "api": "plugin_api.py"
+}
