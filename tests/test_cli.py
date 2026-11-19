@@ -15,7 +15,7 @@ from sound_scout import config, doctor, guard
 from sound_scout.cli import SUBCOMMANDS, main
 from tests.conftest import WavFactory
 
-EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve", "eval", "smoke"]
+EXPECTED_SUBCOMMANDS = ["doctor", "analyze", "compare", "serve", "eval", "smoke", "jobs"]
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg and ffprobe are not installed",

@@ -114,7 +114,11 @@ API скачивает вложения до 20 МБ; нужен `terminal.backe
 ```sh
 uv run sound-scout analyze <файл> [--request-id ID] [--layers content,measurements,sound] [--task ТЕКСТ] [--intent ТЕКСТ] [--json]
 uv run sound-scout compare <run_id A> <run_id B> --criterion emphasis_on:<слово> [--json]
+uv run sound-scout jobs submit <файл> [--request-id ID] [--layers …] [--task ТЕКСТ] [--intent ТЕКСТ] [--connection …] [--profile …] [--session-id …] [--submitter cli] [--json]
+uv run sound-scout jobs status|result|cancel <job_id> [--json]
 ```
+
+`jobs` — файловая очередь заданий (`sound_scout.jobs`, решение 0013 § 3.6): `submit` за доли секунды пишет `<data_root>/jobs/<job_id>/job.json` и печатает `job_id`; проверка входа (ffprobe) — первая стадия runner, не `submit`. Повтор `--request-id` с тем же запросом возвращает то же задание, с другим — `request_mismatch`. Сверх `jobs.max_queued_jobs` или `jobs.max_staging_bytes` — отказ `queue_full` или `staging_full`. `cancel` переводит задание из `queued` в `cancelled` сразу, у `running` оставляет маркер отмены. Состояние задания (`queued/running/finished/cancelled/failed`) отдельно от `status` результата: `result` печатает compact-ответ run последней попытки, у которой есть результат, с полями `job_state` и `attempt` (номер этой попытки); новая попытка без результата не скрывает результат прежней. Runner, исполняющий задания, — отдельная задача (#98).
 
 `--task` — формулировка упражнения, `--intent` — замысел говорящего (что он хотел выразить),
 если пользователь его назвал; текст из записи или транскрипта в них не подставляется. Оба поля —
@@ -134,7 +138,7 @@ run-каталога и трассировку. Stdout содержит толь
 
 Анализ выполняет `sound_scout.app.analyze` — общая точка входа CLI и MCP. На один data root
 одновременно идёт один анализ: lock `<data_root>/analyze.lock`, второй запрос сразу получает
-`Busy`, очереди нет. Этапы выполняет дочерний процесс-worker; его срок —
+`Busy` без ожидания (очередь заданий — `jobs`, выше). Этапы выполняет дочерний процесс-worker; его срок —
 `budgets.worker_deadline_seconds`, по истечении worker и его дочерние процессы останавливаются, а
 результат собирается из готовых этапов (`work/stage-<этап>.json`) как `partial`, а если не
 завершился даже `prepare` — как `failed`. Отмена через

@@ -87,6 +87,16 @@ def decoded_samples_limit(budgets: Budgets, sample_rate: int, channels: int) -> 
 
 
 @dataclass(frozen=True)
+class Jobs:
+    """Admission of the job queue (`sound_scout.jobs`, decision 0013 § 6): a submit that would
+    put more than `max_queued_jobs` jobs in `queued`, or more than `max_staging_bytes` of input
+    in the jobs not yet ended (`queued`, `running`), is refused with its reason."""
+
+    max_queued_jobs: int = 10
+    max_staging_bytes: int = 1024 * MIB
+
+
+@dataclass(frozen=True)
 class Network:
     allow: bool = False
 
@@ -113,6 +123,7 @@ class Config:
     network: Network = Network()
     backend: str = "none"
     asr: Asr = Asr()
+    jobs: Jobs = Jobs()
 
 
 def config_path() -> Path:
@@ -174,6 +185,7 @@ def _parse(data: dict[str, object]) -> Config:
         network=_network(data.get("network", {})),
         backend=_backend(data.get("backend", "none")),
         asr=_asr(data.get("asr", {})),
+        jobs=_jobs(data.get("jobs", {})),
     )
 
 
@@ -229,6 +241,12 @@ def _budgets(value: object) -> Budgets:
             f"got {budgets.max_channels}"
         )
     return budgets
+
+
+def _jobs(value: object) -> Jobs:
+    table = _table(value, "jobs")
+    _reject_unknown(table, {field.name for field in fields(Jobs)}, prefix="jobs")
+    return Jobs(**{name: _positive_int(item, f"jobs.{name}") for name, item in table.items()})
 
 
 def _network(value: object) -> Network:

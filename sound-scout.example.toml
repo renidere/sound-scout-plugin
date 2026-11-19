@@ -61,6 +61,14 @@
 # max_subprocess_seconds = 60
 # max_subprocess_memory_mib = 2048
 
+# Приём заданий в очередь (`sound-scout jobs submit`, `src/sound_scout/jobs.py`, решение 0013 § 6).
+# `max_queued_jobs` — сколько заданий может ждать в состоянии `queued`; `max_staging_bytes` —
+# сумма размеров входов у незавершённых заданий (`queued` и `running`) вместе с новым. Сверх
+# любого предела `submit` отказывает с причиной `queue_full` или `staging_full`.
+# [jobs]
+# max_queued_jobs = 10
+# max_staging_bytes = 1073741824
+
 # Сеть по умолчанию запрещена: без загрузок моделей, без внешнего inference, без телеметрии (R09).
 # При `allow = false` процесс ставит audit hook на сокеты (`guard.install_network_guard`, снять его
 # до конца процесса нельзя) и выставляет `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; у декодера

@@ -14,6 +14,10 @@ their absolute paths (ffprobe and ffmpeg quote them). Stdout carries only the an
 root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`.
 `compare` calls `app.compare` and prints the verdict, its reasons and the file
 `compare/<id>.json` (`--json`: the comparison with `path`), exit 0 whatever the verdict.
+`jobs submit|status|result|cancel` calls `sound_scout.jobs` and prints its answer as
+`key: value` lines (`--json`: the answer); `result` puts `job_id`, `job_state` and `attempt`
+before the summary of the compact answer, as `analyze` prints it. The exit code is 0 whatever
+the job state or the result status is, 1 on a refusal.
 `doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
 diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
 same functions until the client closes stdin, then exits 0.
@@ -56,6 +60,7 @@ SUBCOMMANDS = {
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
+    "jobs": "queue an analysis and follow it: submit, status, result, cancel",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -97,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="command")
     for name, help_text in SUBCOMMANDS.items():
-        parents = [] if name == "eval" else [common]
+        parents = [] if name in ("eval", "jobs") else [common]
         subparser = subparsers.add_parser(
             name, help=help_text, description=help_text, parents=parents
         )
@@ -111,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_compare_arguments(subparser)
         if name == "eval":
             _add_eval_arguments(subparser, common)
+        if name == "jobs":
+            _add_jobs_arguments(subparser, common)
         if name == "smoke":
             subparser.add_argument(
                 "components",
@@ -122,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_analyze_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_analyze_arguments(parser: argparse.ArgumentParser, *, with_json: bool = True) -> None:
     parser.add_argument("file", help="the recording, inside one of the configured allowed roots")
     parser.add_argument(
         "--request-id",
@@ -139,9 +146,12 @@ def _add_analyze_arguments(parser: argparse.ArgumentParser) -> None:
         help="the speaker's intent for the recording, as the user stated it; never text taken "
         "from the recording or its transcript",
     )
-    parser.add_argument(
-        "--json", action="store_true", help="print the compact answer as JSON instead of a summary"
-    )
+    if with_json:
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            help="print the compact answer as JSON instead of a summary",
+        )
 
 
 def _add_compare_arguments(parser: argparse.ArgumentParser) -> None:
@@ -156,6 +166,32 @@ def _add_compare_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--json", action="store_true", help="print the comparison as JSON instead of a summary"
     )
+
+
+def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.ArgumentParser) -> None:
+    actions = parser.add_subparsers(dest="jobs_command", required=True, metavar="action")
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true", help="print the answer as JSON")
+    submit_help = "queue one recording for analysis and print its job_id at once"
+    submit = actions.add_parser(
+        "submit", help=submit_help, description=submit_help, parents=[common, as_json]
+    )
+    _add_analyze_arguments(submit, with_json=False)
+    submit.add_argument("--connection", help="the connection the job came through, stored as is")
+    submit.add_argument("--profile", help="the agent profile of the chat, stored as is")
+    submit.add_argument("--session-id", help="the stored session ID of the chat, stored as is")
+    submit.add_argument(
+        "--submitter", default="cli", help="who submitted the job, stored as is (default: cli)"
+    )
+    for action, help_text in (
+        ("status", "print the state of a job"),
+        ("result", "print the compact answer of the run of a job"),
+        ("cancel", "cancel a job: a queued job at once, a running one by its cancel marker"),
+    ):
+        command = actions.add_parser(
+            action, help=help_text, description=help_text, parents=[common, as_json]
+        )
+        command.add_argument("job_id", help="the job_id that submit printed")
 
 
 def _layer_list(text: str) -> tuple[str, ...]:
@@ -225,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         "serve": run_serve,
         "eval": run_eval,
         "smoke": run_smoke,
+        "jobs": run_jobs,
     }
     try:
         return commands[args.command](args)
@@ -303,6 +340,46 @@ def run_compare(args: argparse.Namespace) -> int:
         print(json.dumps({"path": path, **compared.result}, indent=2, ensure_ascii=False))
     else:
         print(format_comparison(compared.result, path))
+    return 0
+
+
+def run_jobs(args: argparse.Namespace) -> int:
+    loaded = _load_config(args)
+    from sound_scout import ingest, jobs, paths
+
+    try:
+        if args.jobs_command == "submit":
+            fields = {"request_id": args.request_id, "task": args.task, "intent": args.intent}
+            if args.layers is not None:
+                fields["layers"] = args.layers
+            binding = jobs.Binding(
+                submitter=args.submitter,
+                connection=args.connection,
+                profile=args.profile,
+                session_id=args.session_id,
+            )
+            answer = jobs.submit(jobs.SubmitRequest(args.file, **fields), binding, loaded)
+        else:
+            call = {"status": jobs.status, "result": jobs.result, "cancel": jobs.cancel}
+            answer = call[args.jobs_command](args.job_id, loaded)
+    except jobs.JobError as error:
+        raise CliError(error.code, error.message) from error
+    except ingest.IngestError as error:
+        message = error.message
+        if not args.verbose:
+            message = paths.without_paths(message, args.file, loaded)
+        raise CliError(error.code, message) from error
+    except tuple(kind for kind, _ in jobs.REFUSALS) as error:
+        code = next(code for kind, code in jobs.REFUSALS if isinstance(error, kind))
+        raise CliError(code, str(error)) from error
+    if args.json:
+        print(json.dumps(answer, indent=2, ensure_ascii=False))
+    elif args.jobs_command == "result":
+        print(f"job_id: {answer['job_id']}\njob_state: {answer['job_state']}")
+        print(f"attempt: {_plain(answer['attempt'])}")
+        print(format_analysis(answer, answer["run_dir"], reused=False))
+    else:
+        print("\n".join(f"{key}: {_plain(value)}" for key, value in answer.items()))
     return 0
 
 
@@ -457,6 +534,10 @@ def _state_line(label: str, status: str, reason: str | None) -> str:
 
 def _seconds(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+def _plain(value: object) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
 def _one_line(text: str) -> str:

@@ -384,6 +384,20 @@ def test_compact_stays_under_4_kib_without_pcm_base64_or_absolute_paths(
     assert not any(BASE64_RUN.search(s) for s in strings(answer))
 
 
+def test_compact_counts_the_head_of_the_caller_in_the_4_kib_limit(heard: dict) -> None:
+    template = heard["findings"][0]
+    heard["findings"] = [
+        {**template, "id": f"f-{n}", "observation": "о" * 3000, "impact": "в" * 3000}
+        for n in range(30)
+    ]
+    heard["provenance"]["limitations"] = ["л" * 2000] * 20
+    head = {"job_id": "j" * 32, "job_state": "finished", "attempt": 1, "note": "н" * 300}
+    answer = report.compact(heard, run_dir="runs/x", reused=False, head=head)
+    assert compact_size(answer) <= COMPACT_MAX_BYTES
+    assert list(answer)[:6] == ["job_id", "job_state", "attempt", "note", "run_dir", "reused"]
+    assert answer["note"] == head["note"]
+
+
 def test_priority_is_impact_on_intelligibility_then_confidence_then_time() -> None:
     def item(id_: str, polarity: str, category: str, basis: str, start: float = 1.0) -> dict:
         return {

@@ -140,15 +140,24 @@ def write(run: Run, result: dict, *, config: Config) -> dict:
     return document
 
 
-def compact(result: dict, *, run_dir: str | None = None, reused: bool | None = None) -> dict:
+def compact(
+    result: dict,
+    *,
+    run_dir: str | None = None,
+    reused: bool | None = None,
+    head: dict | None = None,
+) -> dict:
     """The tool response: at most `COMPACT_MAX_BYTES` of UTF-8 JSON, links relative to the run.
 
-    `run_dir`, the run directory relative to the data root, and `reused`, whether the result is
-    the one of an earlier request with the same `request_id` and input (R11), go first and count
-    in the limit: `analyze --json` and `speech_analyze` answer with the same document.
+    `head`, fields of the caller such as the job of `jobs.result`, then `run_dir`, the run
+    directory relative to the data root, and `reused`, whether the result is the one of an
+    earlier request with the same `request_id` and input (R11), go first and count in the limit:
+    `analyze --json` and `speech_analyze` answer with the same document.
     """
     document = _private_values_removed(result, [])
-    head = {} if run_dir is None else {"run_dir": run_dir}
+    head = dict(head or {})
+    if run_dir is not None:
+        head["run_dir"] = run_dir
     if reused is not None:
         head["reused"] = reused
     for limit in _TEXT_LIMITS:

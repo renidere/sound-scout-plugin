@@ -12,6 +12,7 @@ from sound_scout.config import (
     Budgets,
     Config,
     ConfigError,
+    Jobs,
     Network,
     decoded_samples_limit,
     load,
@@ -101,6 +102,30 @@ def test_all_fields_are_read_with_explicit_types(write_config, minimal_toml: str
     assert loaded.budgets == Budgets(30, 1024, 1, 60, 10, 256)
     assert loaded.network.allow is True
     assert loaded.asr == Asr(model="Systran/faster-whisper-small", revision="0a363e91abcdef0")
+
+
+def test_jobs_admission_limits_are_read_and_default(write_config, minimal_toml: str) -> None:
+    write_config(minimal_toml)
+    assert load().jobs == Jobs() == Jobs(max_queued_jobs=10, max_staging_bytes=1024 * config.MIB)
+    write_config(minimal_toml + "[jobs]\nmax_queued_jobs = 3\nmax_staging_bytes = 4096\n")
+    assert load().jobs == Jobs(max_queued_jobs=3, max_staging_bytes=4096)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("[jobs]\nmax_queued_jobs = 0\n", "jobs.max_queued_jobs: expected a positive integer"),
+        ('[jobs]\nmax_staging_bytes = "1G"\n', "jobs.max_staging_bytes: expected a positive"),
+        ("[jobs]\nrunners = 2\n", "unknown field: jobs.runners"),
+        ("jobs = 3\n", "jobs: expected a table"),
+    ],
+)
+def test_invalid_jobs_table_is_rejected_by_field(
+    write_config, minimal_toml: str, extra: str, message: str
+) -> None:
+    write_config(minimal_toml + extra)
+    with pytest.raises(ConfigError, match=message):
+        load()
 
 
 def test_asr_model_alone_leaves_revision_unset(write_config, minimal_toml: str) -> None:
@@ -495,7 +520,8 @@ def test_example_config_documents_every_field() -> None:
     text = example_config_text(Path("/a"), Path("/b"))
     for field in dataclasses.fields(Config):
         assert re.search(rf"^\[?{field.name}\b", text, re.MULTILINE), field.name
-    for section, dataclass_type in (("budgets", Budgets), ("network", Network), ("asr", Asr)):
+    sections = (("budgets", Budgets), ("network", Network), ("asr", Asr), ("jobs", Jobs))
+    for section, dataclass_type in sections:
         body = text.split(f"[{section}]", 1)[1]
         for field in dataclasses.fields(dataclass_type):
             assert re.search(rf"^{field.name} = ", body, re.MULTILINE), f"{section}.{field.name}"
