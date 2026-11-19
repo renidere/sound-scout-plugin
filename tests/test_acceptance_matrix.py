@@ -127,14 +127,15 @@ def test_statuses_name_five_layers_each_with_a_date_and_evidence(text: str) -> N
 
 
 def test_statuses_follow_gate0_and_the_open_blockers(text: str) -> None:
-    statuses = {cells[0]: cells[1] for cells in table_rows(sections(text)["Статусы"])}
+    rows = {cells[0]: cells for cells in table_rows(sections(text)["Статусы"])}
     by_layer = {
-        layer: next(value for name, value in statuses.items() if name.startswith(layer))
+        layer: next(cells for name, cells in rows.items() if name.startswith(layer))
         for layer in STATUS_LAYERS
     }
-    assert by_layer["Audio capability"] == "NOT READY"
-    assert by_layer["Русская квалификация"] == "NOT QUALIFIED"
-    assert by_layer["Hermes (T09b)"] == "blocked"
+    assert by_layer["Audio capability"][1] == "NOT READY"
+    assert by_layer["Русская квалификация"][1] == "NOT QUALIFIED"
+    assert by_layer["Hermes (T09b)"][1] == "partial"
+    assert "мессенджера через gateway" in by_layer["Hermes (T09b)"][3]
     assert "0007-gate0-result.md" in sections(text)["Статусы"]
 
 
@@ -208,3 +209,55 @@ def test_lint_reports_a_bad_status_and_a_blocked_row_without_its_blocker() -> No
 
 def test_lint_reports_a_document_without_the_matrix() -> None:
     assert matrix_problems("# Приёмка\n\n## Статусы\n", set()) == ["no section «Матрица»"]
+
+
+ISSUE_40 = "[#40](https://github.com/renidere/sound-scout-plugin/issues/40)"
+T09B_EVIDENCE = (
+    "Hermes v0.23.1 (`3b4215785882`)",
+    "`2d37c3158ab94ed7894ccaa69624a592`",
+    "`3e85aec94e234233ae5068b0ee39f74b`",
+    "`compare/dee942d962c84a78b6b3602e75e73f6b.json`",
+)
+GATEWAY_GAP = "вызов из сессии мессенджера через gateway"
+
+
+def status_row(text: str, layer: str) -> list[str]:
+    rows = table_rows(sections(text)["Статусы"])
+    return next(cells for cells in rows if cells[0].startswith(layer))
+
+
+def matrix_row(text: str, item: str) -> list[str]:
+    return next(cells for cells in table_rows(sections(text)["Матрица"]) if cells[0] == item)
+
+
+def test_t09b_status_shows_the_issue_40_run_ids_hermes_version_and_date(text: str) -> None:
+    _, status, date, evidence = status_row(text, "Hermes (T09b)")
+    assert status == "partial"
+    assert date == "2026-11-19"
+    for fact in T09B_EVIDENCE:
+        assert fact in evidence, fact
+    assert f"{ISSUE_40}, закрыта" in evidence
+    assert "2026-11-19" in matrix_row(text, "T09")[4]
+
+
+def test_acceptance_doc_copies_no_private_absolute_path(text: str) -> None:
+    for marker in ("/home/", "/Users/", "~/", ".hermes/"):
+        assert marker not in text, marker
+
+
+def test_matrix_states_the_gap_no_call_from_a_messenger_session_through_the_gateway(
+    text: str,
+) -> None:
+    assert GATEWAY_GAP in status_row(text, "Hermes (T09b)")[3]
+    for item in ("R12", "T09"):
+        blocked = matrix_row(text, item)[4].split("blocked:", 1)[1]
+        assert GATEWAY_GAP in blocked, item
+    assert "через gateway не проверен" in text.split("## Матрица", 1)[0]
+
+
+def test_r12_and_t09_rows_do_not_refer_to_issue_40_as_open(text: str) -> None:
+    for item in ("R12", "T09"):
+        evidence = matrix_row(text, item)[4]
+        assert ISSUE_40 not in evidence.split("blocked:", 1)[1], item
+        closed = re.findall(re.escape(ISSUE_40) + r",? закрыта", evidence)
+        assert evidence.count(ISSUE_40) == len(closed) >= 1, item
