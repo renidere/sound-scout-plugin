@@ -230,6 +230,13 @@ found problems (step 5), post an outcome comment `skipped` in the shape of **6**
 Need a Person (`board.sh status <item> need-a-person`) — no run picks Need a Person — log
 `skipped`, release the claim, print the result line `skipped` and go on to **7**.
 
+**What goes to the owner** (owner rule of 2026-11-20, #94): only decisions on substance, permissions
+(downloads, spending, changes to the live system and their time window) and human checks an agent
+cannot do (listening, labelling, actions in the owner's Windows client). Technical checks, commands,
+evidence and reports are the agents' work even on the live host once the operation is permitted —
+never hand the owner a list of commands to run. A task that waits for another open issue is
+`blocked`, not `held`.
+
 **Needs a permission** — the task, or part of it, needs what the spec reserves to the owner
 (`permission-required` label, or the Decision finds it): a model download, external inference,
 uploading recordings, spending, connecting to the running Hermes, approving a corpus. Nobody here
