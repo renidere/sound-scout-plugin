@@ -3,12 +3,15 @@
 import re
 from pathlib import Path
 
-from sound_scout import cli, mcp_server
+import pytest
+
+from sound_scout import cli, ingest, mcp_server
 from sound_scout.config import Budgets
 
 REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs" / "hermes-install.md"
 EXAMPLE = REPO / "docs" / "examples" / "hermes-mcp-entry.example.yaml"
+CONFIG_EXAMPLE = REPO / "sound-scout.example.toml"
 REQUIRED_SECTIONS = (
     "## Источники",
     "## Установка на хосте backend",
@@ -167,3 +170,39 @@ def test_doc_states_that_a_config_error_makes_doctor_exit_with_the_error_code() 
     assert (
         f"`sound-scout doctor: {cli.CONFIG_ERROR}: …` в stderr и код {cli.ERROR_EXIT_CODE}" in text
     )
+
+
+# Advice for recordings over ~2 minutes: «присылайте» up to `;` or `.` (issue #75, R02).
+ADVICE = re.compile(r"присылайте ([^;.]+)")
+ACCEPTED_ADVICE = "ogg (Opus), mp3 или m4a (AAC)"
+
+
+def advised_format_problems(text: str) -> list[str]:
+    """Every format name the advice to send recordings names that ingest does not accept."""
+    accepted = {
+        name
+        for container, codecs in ingest.SUPPORTED_FORMATS.items()
+        for name in (*container.split(","), *codecs)
+    }
+    clauses = ADVICE.findall(" ".join(text.split()))
+    if not clauses:
+        return ["no advice on formats to send"]
+    names = [name for clause in clauses for name in re.findall(r"[a-z0-9]+", clause.lower())]
+    return [f"not accepted: {name}" for name in names if name not in accepted]
+
+
+@pytest.mark.parametrize("path", [DOC, CONFIG_EXAMPLE], ids=["install-doc", "config-example"])
+def test_advice_names_only_formats_ingest_accepts(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert advised_format_problems(text) == []
+    assert ACCEPTED_ADVICE in " ".join(ADVICE.findall(" ".join(text.split())))
+
+
+def test_format_advice_check_rejects_flac_and_a_missing_advice() -> None:
+    old_doc = "превышает предел примерно через 2 минуты — присылайте ogg/mp3/flac."
+    old_config = "#   длиннее присылайте ogg/mp3/flac;"
+    assert advised_format_problems(old_doc) == ["not accepted: flac"]
+    assert advised_format_problems(old_config) == ["not accepted: flac"]
+    assert advised_format_problems("несжатый WAV — около 2 минут") == [
+        "no advice on formats to send"
+    ]

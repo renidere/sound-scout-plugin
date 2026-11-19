@@ -139,7 +139,8 @@ Hermes не передаёт файлы по MCP: `speech_analyze` получа�
    приёма входа run-каталог в data root самодостаточен.
 3. **Telegram — до 20 МБ**: Bot API скачивает вложения только до 20 МБ
    (`plugins/platforms/telegram/adapter.py`, `_max_doc_bytes`). Несжатый WAV 44,1 кГц/16 бит/стерео
-   превышает предел примерно через 2 минуты — присылайте ogg/mp3/flac.
+   превышает предел примерно через 2 минуты — присылайте ogg (Opus), mp3 или m4a (AAC); другие
+   сжатые форматы (например, flac) сервер не принимает (R02).
 4. **Нужен `terminal.backend: local`**: при docker/ssh и других удалённых backend модель видит путь,
    переведённый в контейнер или на удалённый хост (`tools/credential_files.py`,
    `to_agent_visible_cache_path`), MCP-сервер обратно его не переводит, и вызов получает
