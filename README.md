@@ -13,7 +13,11 @@ https://github.com/users/renidere/projects/1 автономным агентом
 прошла — вердикт NOT READY (`docs/decisions/0007-gate0-result.md`); замену выбирает владелец
 ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат Borealis-5b-it,
 проверенный по решению владельца тем же протоколом, тоже получил NOT READY
-(`docs/decisions/0010-gate0-borealis.md`); следующий шаг — за владельцем. Русская квалификация (Gate 1)
+(`docs/decisions/0010-gate0-borealis.md`). Кандидат вне бюджета памяти GigaChat3.1-Audio-10B-A1.8B,
+проверенный по разрешению владельца тем же протоколом и правилом под потолком 26 GB, тоже получил
+NOT READY (`docs/decisions/0011-gate0-gigachat-audio.md`): не выполнено предусловие P3 правила
+(20 аудиотокенов на секунду при 6,25 позиции в секунду у его энкодера), о слухе модели это не
+говорит; следующий шаг — за владельцем. Русская квалификация (Gate 1)
 не пройдена, подключение к Hermes не выполнено — пока это так, инструмент не считается готовым
 (Gate 0–3 в `docs/spec/REQUIREMENTS.md`).
 

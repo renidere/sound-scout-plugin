@@ -11,45 +11,60 @@ DEPENDENCIES = REPO_ROOT / "docs" / "dependencies.md"
 ROW = re.compile(r"^\| `([A-Za-z0-9_.-]+)`[^|]*\| ([^|]+?) \|", re.MULTILINE)
 
 
-def documented_packages(text: str) -> dict[str, str]:
+def documented_packages(text: str) -> set[tuple[str, str]]:
     section = text.split("## 1. ", 1)[1].split("\n## ", 1)[0]
-    return {name.lower(): version for name, version in ROW.findall(section)}
+    return {(name.lower(), version) for name, version in ROW.findall(section)}
 
 
-def locked_packages() -> dict[str, str]:
+def locked_packages() -> set[tuple[str, str]]:
+    """(name, version) of every package in uv.lock; one name may be locked at several versions
+    (the conflicting extras `gate0-borealis` and `gate0-gigachat`, platform builds of torch)."""
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
-    return {package["name"]: package["version"] for package in lock["package"]}
+    return {(package["name"], package["version"]) for package in lock["package"]}
 
 
 def direct_dependencies() -> set[str]:
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    requirements = project["project"]["dependencies"] + [
-        item for group in project["dependency-groups"].values() for item in group
-    ]
+    requirements = (
+        project["project"]["dependencies"]
+        + [item for group in project["dependency-groups"].values() for item in group]
+        + [item for extra in project["project"]["optional-dependencies"].values() for item in extra]
+    )
     return {re.match(r"[A-Za-z0-9_.-]+", item).group(0).lower() for item in requirements}
+
+
+def public(version: str) -> str:
+    """The release without a local build label: `2.11.0+cpu` -> `2.11.0`."""
+    return version.split("+", 1)[0]
 
 
 def test_section_1_lists_every_direct_dependency() -> None:
     documented = documented_packages(DEPENDENCIES.read_text(encoding="utf-8"))
-    assert direct_dependencies() <= set(documented)
+    assert direct_dependencies() <= {name for name, _ in documented}
 
 
 def test_section_1_versions_are_the_locked_versions() -> None:
     documented = documented_packages(DEPENDENCIES.read_text(encoding="utf-8"))
-    locked = locked_packages()
     assert documented, "no package rows found in section 1"
-    drift = {
-        name: (version, locked.get(name))
-        for name, version in documented.items()
-        if locked.get(name) != version
+    assert documented - locked_packages() == set(), "docs/dependencies.md §1 rows not in uv.lock"
+
+
+def test_every_locked_release_of_a_direct_dependency_is_documented() -> None:
+    documented = documented_packages(DEPENDENCIES.read_text(encoding="utf-8"))
+    missing = {
+        (name, version)
+        for name, version in locked_packages()
+        if name in direct_dependencies()
+        and public(version) not in {public(v) for n, v in documented if n == name}
     }
-    assert drift == {}, "docs/dependencies.md §1 (documented, locked)"
+    assert missing == set(), "uv.lock releases without a docs/dependencies.md §1 row"
 
 
 def test_a_drifted_row_is_caught() -> None:
     text = "## 1. Python-пакеты\n\n| `numpy` | 0.0.1 | x | BSD |\n\n## 2. Other\n| `uv` | 9 |\n"
-    assert documented_packages(text) == {"numpy": "0.0.1"}
-    assert locked_packages()["numpy"] != "0.0.1"
+    assert documented_packages(text) == {("numpy", "0.0.1")}
+    assert ("numpy", "0.0.1") not in locked_packages()
+    assert any(name == "numpy" for name, _ in locked_packages())
 
 
 DATA_ROW = re.compile(

@@ -166,8 +166,8 @@ def wav_pcm(audio: dict) -> bytes:
     return pcm
 
 
-def text_of(body: object) -> str:
-    """The rendered prompt of a text-only message (`/apply-template`)."""
+def text_of(engine, body: object) -> str:
+    """The rendered prompt of a text-only message (`/apply-template`); `engine` is unused."""
     parts = user_parts(body)
     if any(isinstance(part, bytes) for part in parts):
         raise BadRequest("/apply-template takes text parts only")
@@ -252,6 +252,8 @@ def complete(engine, body: object) -> dict:
 
 class Server(HTTPServer):
     engine = None
+    complete = staticmethod(complete)
+    text_of = staticmethod(text_of)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -274,13 +276,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise BadRequest("the body is empty or too large")
             body = json.loads(self.rfile.read(length))
             if self.path == "/apply-template":
-                answer = {"prompt": text_of(body)}
+                answer = {"prompt": self.server.text_of(engine, body)}
             elif self.path == "/tokenize":
                 if not isinstance(body, dict) or not isinstance(body.get("content"), str):
                     raise BadRequest("content must be a string")
                 answer = {"tokens": engine.tokenize(body["content"])}
             elif self.path == "/v1/chat/completions":
-                answer = complete(engine, body)
+                answer = self.server.complete(engine, body)
             else:
                 return self._send(404, {"error": "not found"})
         except BadRequest as error:
@@ -301,30 +303,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def serve(host: str, port: int, load) -> int:
+def serve(host: str, port: int, load, *, server_class=Server, name: str = "gate0_borealis") -> int:
     """Bind, install the network guard or refuse to start, then load the model (`/health` 503)."""
     if host != HOST:
-        print(f"gate0_borealis: host must be {HOST}, got {host!r}", file=sys.stderr)
+        print(f"{name}: host must be {HOST}, got {host!r}", file=sys.stderr)
         return 2
     os.environ.update(OFFLINE_ENV)
     try:
         settings = config.load()
     except config.ConfigError as error:
-        print(f"gate0_borealis: {error}", file=sys.stderr)
+        print(f"{name}: {error}", file=sys.stderr)
         return 2
-    server = Server((host, port), Handler)
+    server = server_class((host, port), Handler)
     if not guard.install_network_guard(settings):
         server.server_close()
-        print("gate0_borealis: the network guard is off ([network] allow = true)", file=sys.stderr)
+        print(f"{name}: the network guard is off ([network] allow = true)", file=sys.stderr)
         return 2
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         server.engine = load()
     except LoadError as error:
-        print(f"gate0_borealis: {error}", file=sys.stderr)
+        print(f"{name}: {error}", file=sys.stderr)
         server.shutdown()
         return 3
-    print("gate0_borealis: ready", file=sys.stderr, flush=True)
+    print(f"{name}: ready", file=sys.stderr, flush=True)
     threading.Event().wait()
     return 0
 

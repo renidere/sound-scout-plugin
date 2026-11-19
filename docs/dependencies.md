@@ -13,7 +13,7 @@
 
 Источник истины — `pyproject.toml` и `uv.lock` (`uv sync --locked`). Здесь — прямые зависимости и
 версии в lock на дату обновления.
-SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-borealis` (`uv sync --locked --extra gate0-borealis`) нужен только для Gate 0 spike Borealis-5b-it (#68) и по умолчанию не ставится, CI его не тянет; кроме трёх пакетов ниже он приносит `sympy`, `networkx`, `jinja2`, `setuptools`, `regex`, `typer`/`rich` (через `transformers`), а `tokenizers` и `huggingface-hub` уже были в lock через faster-whisper. `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
+SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-borealis` (`uv sync --locked --extra gate0-borealis`) нужен только для Gate 0 spike Borealis-5b-it (#68) и по умолчанию не ставится, CI его не тянет; кроме трёх пакетов ниже он приносит `sympy`, `networkx`, `jinja2`, `setuptools`, `regex`, `typer`/`rich` (через `transformers`), а `tokenizers` и `huggingface-hub` уже были в lock через faster-whisper. Extra `gate0-gigachat` (`uv sync --locked --extra gate0-gigachat`) нужен только для Gate 0 spike GigaChat3.1-Audio-10B-A1.8B (#85), тоже не ставится по умолчанию и в CI; он объявлен в `[tool.uv] conflicts` с `gate0-borealis` (разные `torch` и `transformers`), поэтому в lock у `torch` и `transformers` по две версии. Кроме четырёх пакетов ниже он приносит `transformers` 4.57.6 со своими зависимостями: `tokenizers` 0.22.2 (wheel `cp39-abi3-manylinux_2_17_x86_64` SHA-256 `369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67`) и `huggingface-hub` 0.36.2 (SHA-256 `48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270`) вместо версий faster-whisper, `requests`, `urllib3`, `certifi`, `charset-normalizer`, `setuptools`, `sympy`, `networkx`, `jinja2`, `regex`. Пины `==`: `torchaudio` 2.11.0 — последний CPU-wheel для cp313 в `https://download.pytorch.org/whl/cpu`, и он требует ровно `torch` 2.11.0; `transformers` 4.57.6 — версия, на которой upstream проверил код модели (карточка), а в `transformers` 5 слои MoE `DeepseekV3` хранят экспертов слитыми тензорами, и ключи checkpoint не совпадут с каркасом (`docs/decisions/0011-gate0-gigachat-audio.md` §1). `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
 
 | Пакет | Версия в `uv.lock` | Зачем | Лицензия |
 |---|---|---|---|
@@ -29,6 +29,10 @@ SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-bo
 | `torch` (extra `gate0-borealis`) | 2.15.0+cpu | runtime Borealis-5b-it для Gate 0 spike #68 (раздел 3.1); CPU-сборка из индекса `https://download.pytorch.org/whl/cpu`, wheel `torch-2.15.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl` SHA-256 `0f6f69701b2d38ddc412364dfb92e2e13e74960d33fa3573b4930ced626e81c7` | BSD-3-Clause и др. (`license_expression` PyPI: Apache-2.0, BSD-2/3-Clause, MIT, BSL-1.0, ISC, Zlib) |
 | `transformers` (extra `gate0-borealis`) | 5.23.0 | Whisper-энкодер, Qwen3 и токенизатор для Borealis-5b-it; wheel SHA-256 `018e82fd07490ad5bb58414f65e31576033dc7f36bed10c574843f69b90991bf` | Apache-2.0 |
 | `safetensors` (extra `gate0-borealis`) | 0.8.0 | потоковое чтение `model.safetensors` Borealis-5b-it; wheel (`cp310-abi3-manylinux_2_17_x86_64`) SHA-256 `fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774` | Apache-2.0 |
+| `torch` (extra `gate0-gigachat`) | 2.11.0+cpu | runtime GigaChat3.1-Audio-10B-A1.8B для Gate 0 spike #85 (раздел 3.1); CPU-сборка из индекса `https://download.pytorch.org/whl/cpu`, wheel `torch-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl` SHA-256 `45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86`; для macOS в lock — `torch` 2.11.0 того же индекса | BSD-3-Clause и др. (как `torch` выше) |
+| `torchaudio` (extra `gate0-gigachat`) | 2.11.0+cpu | log-mel (`MelSpectrogram`) процессора GigaChat3.1-Audio; CPU-сборка из того же индекса, wheel `torchaudio-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl` SHA-256 `3c0175d0ed054bf0dc3b154a744b1a127c94291b3f3b7bdd0639b4b238c89445`; для macOS в lock — `torchaudio` 2.11.0 | BSD-2-Clause |
+| `transformers` (extra `gate0-gigachat`) | 4.57.6 | `DeepseekV3ForCausalLM`, токенизатор и шаблон GigaChat3.1-Audio; wheel SHA-256 `4c9e9de11333ddfe5114bc872c9f370509198acf0b87a832a0ab9458e2bd0550` | Apache-2.0 |
+| `safetensors` (extra `gate0-gigachat`) | 0.8.0 | потоковое чтение шардов декодера GigaChat3.1-Audio; тот же wheel, что выше | Apache-2.0 |
 | `pytest` (dev) | 9.2.0 | тесты | MIT |
 | `ruff` (dev) | 0.17.5 | lint и format | MIT |
 
@@ -64,7 +68,17 @@ backend не упакован, `backend` остаётся `none`, `doctor` дл�
 Запасной кандидат **Borealis-5b-it** (`docs/spec/REQUIREMENTS.md` раздел 9; решение владельца на
 [#68](https://github.com/renidere/sound-scout-plugin/issues/68)) проверен тем же протоколом и тоже
 получил **NOT READY** (`docs/decisions/0010-gate0-borealis.md` §5): ничего не упаковано, `backend`
-остаётся `none`. Его веса и runtime записаны ниже (3.1, 3.2) и остаются на станции разработки.
+остаётся `none`. Его веса удалены со станции разработки 2026-11-19 (техническая заметка
+[#85](https://github.com/renidere/sound-scout-plugin/issues/85), чтобы освободить место); их
+SHA-256 и runtime остаются записанными ниже (3.1, 3.2).
+
+Кандидат вне бюджета памяти **GigaChat3.1-Audio-10B-A1.8B** (разрешение владельца на
+[#85](https://github.com/renidere/sound-scout-plugin/issues/85), потолок 26 GB) проверен тем же
+протоколом и правилом и тоже получил **NOT READY** (`docs/decisions/0011-gate0-gigachat-audio.md`
+§5): не выполнено предусловие P3 правила (≥ 20 аудиотокенов на секунду клипа, у энкодера модели —
+6,25 позиции в секунду); о слухе модели этот вердикт ничего не говорит. Ничего не упаковано,
+`backend` остаётся `none`. Веса (23,7 GB) лежат на станции разработки (3.1), удалить их — решение
+владельца.
 
 ### 3.1. Веса
 
@@ -84,6 +98,53 @@ backend не упакован, `backend` остаётся `none`, `doctor` дл�
 
 Не используются: `gemma-4-E4B-it-BF16.gguf` (15 GB, вне бюджета), `Q4_0` и `mmproj-…-Q8_0`
 (запасной облегчённый вариант, решение владельца), `mtp-*` (speculative decoding, не нужен).
+
+#### GigaChat3.1-Audio-10B-A1.8B — кандидат Gate 0 #85 (разрешение владельца 2026-11-19)
+
+Разрешение владельца — тело [#85](https://github.com/renidere/sound-scout-plugin/issues/85)
+(2026-11-19): кандидат вне бюджета памяти `docs/spec/REQUIREMENTS.md` §9 (≈ 22,5 GB в bf16),
+загрузка файлов одной закреплённой ревизии на станцию разработки, прогон offline на CPU под
+жёстким потолком 26 GB. Репозиторий `ai-sage/GigaChat3.1-Audio-10B-A1.8B` на Hugging Face,
+ревизия `bf73d03a43bdf5118f5a4dbdc24ba6f56ac31cfb`. Лицензия MIT (карточка модели), не gated.
+Каталог по умолчанию:
+`~/.cache/sound-scout/models/ai-sage--GigaChat3.1-Audio-10B-A1.8B/<ревизия>/`. Итог spike —
+`docs/decisions/0011-gate0-gigachat-audio.md`.
+
+Хэшируемый набор — 14 файлов (23 723 198 064 байт, из них шесть файлов весов — 23 711 959 176);
+эталон — LFS sha256 или git blob oid из
+`GET https://huggingface.co/api/models/ai-sage/GigaChat3.1-Audio-10B-A1.8B/tree/<ревизия>?recursive=1`
+(ответ лежит рядом с весами как `.hf-tree.json`):
+
+| Файл | Байт | SHA-256 | Эталон HF API |
+|---|---|---|---|
+| `config.json` | 4 826 | `2a83735f1a6499f159b78aea6d1f88f773236a0ff2002be73610cd6676671f54` | git blob `392051491cdd7bfded5e0ba42be198fbd8531437` |
+| `chat_template.jinja` | 28 973 | `12f52c126f74ffd3c3c38cc843bec48906b37b353b227c8c040a9e8e5bfc4a79` | git blob `b848e79669731649d6b6484387de5bd1462e6e11` |
+| `modeling_gigachat_audio.py` | 61 057 | `ec96f0f9052b88616e427c9b75ed1cff6df98ed43176cdc11655ed6633b72e61` | git blob `b400917e009f3811aecc9e5a1795f1738f106b81` |
+| `audio_encoder.safetensors` | 2 366 253 232 | `95b6fe65562c5b87d48b518f97a912dfb8860adf51783af39e5d13a0ce021965` | LFS sha256 (тот же) |
+| `decoder/config.json` | 1 270 | `1bba4d4a6a9d6d3465f68166e7b3551383094cd8f993f7f964d5245deb14c2ea` | git blob `7e133ee0496f6c1ad6c39c6204e92598ed609fab` |
+| `decoder/model.safetensors.index.json` | 458 679 | `8491cb6db08c983f6b47fc65c90d3906686bda59517474ea8b8e20d95bceb7f6` | git blob `5eff8858729525e46e316e6da142ce4c4acf5c14` |
+| `decoder/model-00001-of-00005.safetensors` | 4 999 793 776 | `5a98fcd9ce4f563eac0bd3aa33587a90e546ffa0b585813a30f0b4ad52b5e489` | LFS sha256 (тот же) |
+| `decoder/model-00002-of-00005.safetensors` | 4 996 400 960 | `9186d95fd53aa261847e2b4e707e87f03df0332269c2a27782120cafa0fdc206` | LFS sha256 (тот же) |
+| `decoder/model-00003-of-00005.safetensors` | 4 996 401 664 | `2c0a0dda91744d0eb9358455660f568d0b4483bdecc3ce5b5e7441f039211f4e` | LFS sha256 (тот же) |
+| `decoder/model-00004-of-00005.safetensors` | 4 996 401 664 | `af3668891d8be7bafb3bd7caa47c473139a39b78698840af92ed0db6d65a47c1` | LFS sha256 (тот же) |
+| `decoder/model-00005-of-00005.safetensors` | 1 356 707 880 | `5e3f313efe2c60c1cefa2420e910792bd05d68b7ccb87cbf03495b49aad6175c` | LFS sha256 (тот же) |
+| `decoder/tokenizer.json` | 10 680 799 | `9b12bf74d46dff311b65556c116167cb33f0e94cf2a4e2b7f82feeeae8eef596` | LFS sha256 (тот же) |
+| `decoder/tokenizer_config.json` | 3 008 | `de7f61f4bd0b8241cf627a9002c3f0aa850ff16ca392f1ff548a24701f176994` | git blob `eee5447eca9f017a59b707e9160df5841d8db90f` |
+| `decoder/special_tokens_map.json` | 276 | `5d4a6b397eb900972536128341670e9a499823c21291ffc3bf7f29f7a69dae0a` | git blob `d91fcde70f007f758e57bf674b33e7c820bdb514` |
+
+Правило загрузки: файлы весов — официальным клиентом `huggingface_hub` (`hf_hub_download`,
+`token=False`, ревизия закреплена, `local_dir` — каталог выше, без второй копии в общем кэше HF,
+транспорт Xet выключен `HF_HUB_DISABLE_XET=1`, докачка неполного файла, повтор при обрыве); сразу
+после загрузки сверяются размер и LFS sha256, только потом файл становится read-only. При
+расхождении файл качается ещё один раз, второе расхождение — стоп. У малых файлов сверяется
+`git hash-object --no-filters` с git blob oid. Перед smoke SHA-256 всех 14 файлов сверяются ещё
+раз (`sha256sum -c`), а `gate0 run --runtime gigachat` пересчитывает их перед стартом сервера
+(предусловие P2) по константе `GIGACHAT_WEIGHTS`, равной этой таблице.
+`modeling_gigachat_audio.py` исполняется (энкодер, адаптер, процессор и `generate` модели),
+поэтому входит в хэшируемый набор; сервер исполняет его только после сверки SHA-256 с константой
+`MODELING_SHA256` и именно проверенные байты. Не читаются: `README.md`, `.gitattributes`,
+`vllm_gigachat_audio.py`, `tokenizer.json`, `tokenizer_config.json` и `special_tokens_map.json`
+верхнего уровня (по oid — копии файлов `decoder/`; токенизатор берётся из `decoder/`).
 
 #### Borealis-5b-it — кандидат Gate 0 spike #68 (решение владельца 7003859372)
 
@@ -159,6 +220,22 @@ GGUF и llama.cpp для этой архитектуры нет. Runtime — `to
 `systemd-run --user --scope -p MemoryMax=20000000000 -p MemorySwapMax=0 -- …` (иначе отказ до
 попытки). Подробности и измерения — `docs/decisions/0010-gate0-borealis.md`.
 
+#### Runtime GigaChat3.1-Audio-10B-A1.8B (Gate 0 spike #85)
+
+GGUF с аудиопроектором для этой модели нет, vLLM-путь карточки рассчитан на GPU. Runtime —
+`torch` и `torchaudio` CPU + `transformers` 4.57.6 из extra `gate0-gigachat` (раздел 1) и
+локальный HTTP-сервер `python -m sound_scout.eval.gate0_gigachat --model-dir <веса> --host
+127.0.0.1 --port <свободный> --threads <N>` с теми же маршрутами, что у `gate0_borealis`.
+Штатный `from_pretrained` модели не используется: ему нужен `trust_remote_code`, а пик его загрузки
+≈ 26 GB. Энкодер и адаптер строятся классами модели и приводятся к bf16 первыми, декодер —
+`DeepseekV3ForCausalLM` из `transformers` на `meta`, тензоры читаются по одному; `trust_remote_code`
+не используется. Сеть: те же `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`,
+`HF_HUB_DISABLE_TELEMETRY=1`, guard процесса после bind; если за загрузку guard запретил connect,
+резолв или отправку (не `socket.bind`), сервер не стартует (код 3). Запуск `gate0 run --runtime gigachat` возможен только внутри cgroup
+`systemd-run --user --scope -p MemoryMax=26000000000 -p MemorySwapMax=0 -- …` (иначе отказ до
+попытки) и когда у хоста `MemAvailable` ≥ 22,5e9 байт; сторож RSS сервера — 25,5e9 байт.
+Подробности и измерения — `docs/decisions/0011-gate0-gigachat-audio.md`.
+
 ### 3.3. Ограничения модели, влияющие на код
 
 - Один аудиовход — не длиннее 30 с (Gemma audio guide); вход 16 kHz mono. Длинная запись режется
@@ -175,6 +252,18 @@ Borealis-5b-it (spike #68):
   в языковую модель всегда идут 375 аудиопозиций, независимо от длины клипа.
 - Таймкодов нет; JSON-режима нет — `response_format` не применяется, ответ проверяет только
   `review.validate_response`.
+- Один аудиовход на запрос; вход 16 kHz mono.
+
+GigaChat3.1-Audio-10B-A1.8B (spike #85):
+
+- Шаг энкодера с адаптером — 160 мс: 6,25 аудиопозиции в секунду клипа (63 позиции на 10 с).
+  В аудиоблок модель сама вписывает метки времени `HH:MM:SS` (каждые 60 с) и длительность, а
+  шаблон — блок файла `<|file|>{"id": …, "name": …, "type": "audio"}<|/file|>`.
+- JSON-режима нет: `response_format` не применяется, ответ проверяет только
+  `review.validate_response`. Шаблон без системного сообщения вставляет штатный developer system
+  модели (≈ 1 000 токенов).
+- В `config.json` модели есть `n_fft 320` и `center false`, но код модели их не читает: он берёт
+  `n_fft = win_length = 400` и `center=True`; это штатное поведение, сервер его не меняет.
 - Один аудиовход на запрос; вход 16 kHz mono.
 
 ## 4. Модели, уже лежащие на станции разработки

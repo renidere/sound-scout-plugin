@@ -14,10 +14,12 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   word numbers and intervals. It records the SHA-256 of the verdict rule as the decision
   document holds it (between `RULE_BEGIN` and `RULE_END`), of the prompt and of the fixed
   questions. The audio backend is not touched.
-- `run --date D [--runtime llama|borealis]` checks the weights, the prompt, the rule and the
-  clips against what was recorded, starts the local server — `llama-server` with local
+- `run --date D [--runtime llama|borealis|gigachat]` checks the weights, the prompt, the rule
+  and the clips against what was recorded, starts the local server — `llama-server` with local
   `-m`/`--mmproj` only, or for `borealis` the `gate0_borealis` module with the local weights
-  directory (#68), which must run inside a cgroup capped at 20e9 bytes without swap — on
+  directory (#68), which must run inside a cgroup capped at 20e9 bytes without swap, or for
+  `gigachat` the `gate0_gigachat` module (#85), capped at 26e9 bytes without swap and started
+  only when the host has `GIGACHAT_MIN_AVAILABLE_BYTES` available — on
   127.0.0.1 and a free port, sends the fixed list of requests one at a time and once each, and
   stops the server whatever happens. The empty input `E0` goes through the same
   `review.check_payload` as every audio request and is refused before any HTTP call. Every
@@ -56,7 +58,7 @@ from pathlib import Path
 import numpy as np
 
 from sound_scout import asr, channels, config, guard, ingest, paths, prepare, proc, review, runs
-from sound_scout.eval import gate0_borealis
+from sound_scout.eval import gate0_borealis, gate0_gigachat
 
 MODEL_REPO = "ggml-org/gemma-4-E4B-it-GGUF"
 MODEL_REVISION = "8903cb408c7df39cde2ed15fac397e6d7be92951"
@@ -87,9 +89,52 @@ BOREALIS_MODEL_DIR = (
     Path.home() / ".cache/sound-scout/models/Vikhrmodels--Borealis-5b-it" / BOREALIS_REVISION
 )
 BOREALIS_MODULE = "sound_scout.eval.gate0_borealis"
-RUNTIMES = ("llama", "borealis")
+GIGACHAT_REVISION = gate0_gigachat.REVISION
+GIGACHAT_WEIGHTS = {
+    "config.json": "2a83735f1a6499f159b78aea6d1f88f773236a0ff2002be73610cd6676671f54",
+    "chat_template.jinja": "12f52c126f74ffd3c3c38cc843bec48906b37b353b227c8c040a9e8e5bfc4a79",
+    "modeling_gigachat_audio.py": gate0_gigachat.MODELING_SHA256,
+    "audio_encoder.safetensors": "95b6fe65562c5b87d48b518f97a912dfb8860adf51783af39e5d13a0ce021965",
+    "decoder/config.json": "1bba4d4a6a9d6d3465f68166e7b3551383094cd8f993f7f964d5245deb14c2ea",
+    "decoder/model.safetensors.index.json": (
+        "8491cb6db08c983f6b47fc65c90d3906686bda59517474ea8b8e20d95bceb7f6"
+    ),
+    "decoder/model-00001-of-00005.safetensors": (
+        "5a98fcd9ce4f563eac0bd3aa33587a90e546ffa0b585813a30f0b4ad52b5e489"
+    ),
+    "decoder/model-00002-of-00005.safetensors": (
+        "9186d95fd53aa261847e2b4e707e87f03df0332269c2a27782120cafa0fdc206"
+    ),
+    "decoder/model-00003-of-00005.safetensors": (
+        "2c0a0dda91744d0eb9358455660f568d0b4483bdecc3ce5b5e7441f039211f4e"
+    ),
+    "decoder/model-00004-of-00005.safetensors": (
+        "af3668891d8be7bafb3bd7caa47c473139a39b78698840af92ed0db6d65a47c1"
+    ),
+    "decoder/model-00005-of-00005.safetensors": (
+        "5e3f313efe2c60c1cefa2420e910792bd05d68b7ccb87cbf03495b49aad6175c"
+    ),
+    "decoder/tokenizer.json": "9b12bf74d46dff311b65556c116167cb33f0e94cf2a4e2b7f82feeeae8eef596",
+    "decoder/tokenizer_config.json": (
+        "de7f61f4bd0b8241cf627a9002c3f0aa850ff16ca392f1ff548a24701f176994"
+    ),
+    "decoder/special_tokens_map.json": (
+        "5d4a6b397eb900972536128341670e9a499823c21291ffc3bf7f29f7a69dae0a"
+    ),
+}
+GIGACHAT_MODEL_DIR = (
+    Path.home()
+    / ".cache/sound-scout/models/ai-sage--GigaChat3.1-Audio-10B-A1.8B"
+    / GIGACHAT_REVISION
+)
+GIGACHAT_MODULE = "sound_scout.eval.gate0_gigachat"
+RUNTIMES = ("llama", "borealis", "gigachat")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+MEMINFO = Path("/proc/meminfo")
 MEMORY_CAP_BYTES = 20 * 10**9
+GIGACHAT_MEMORY_CAP_BYTES = 26 * 10**9
+GIGACHAT_RSS_LIMIT_BYTES = 25_500_000_000
+GIGACHAT_MIN_AVAILABLE_BYTES = 22_500_000_000
 PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca"
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
 RULE_BEGIN = "<!-- gate0-rule:begin -->"
@@ -136,6 +181,12 @@ REQUEST_TIMEOUT_S = 600.0
 SERVICE_TIMEOUT_S = 60.0
 RSS_LIMIT_BYTES = 18 * 10**9
 RSS_POLL_S = 0.5
+# runtime -> (memory.max ceiling of its cgroup or None, RSS watchdog of its server)
+RUNTIME_LIMITS = {
+    "llama": (None, RSS_LIMIT_BYTES),
+    "borealis": (MEMORY_CAP_BYTES, RSS_LIMIT_BYTES),
+    "gigachat": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
+}
 STOP_GRACE_S = 10.0
 DOWNLOAD_FLAGS = frozenset(
     {"-hf", "-hfr", "--hf-repo", "-hff", "--hf-file", "-mu", "--model-url", "-mmu", "--mmproj-url"}
@@ -788,10 +839,14 @@ def server_argv(binary: Path, model_dir: Path, port: int, threads: int) -> list[
 
 
 def borealis_argv(model_dir: Path, port: int, threads: int) -> list[str]:
+    return module_argv(BOREALIS_MODULE, model_dir, port, threads)
+
+
+def module_argv(module: str, model_dir: Path, port: int, threads: int) -> list[str]:
     return [
         sys.executable,
         "-m",
-        BOREALIS_MODULE,
+        module,
         "--model-dir",
         str(model_dir),
         "--host",
@@ -818,16 +873,41 @@ def memory_cap(cgroup_root: Path = CGROUP_ROOT) -> dict:
     return found
 
 
-def check_memory_cap(cap: Mapping) -> None:
-    """`Gate0Error` unless the cgroup caps memory at `MEMORY_CAP_BYTES` or less without swap."""
-    limit = cap.get("memory_max")
-    capped = isinstance(limit, str) and limit.isdigit() and int(limit) <= MEMORY_CAP_BYTES
+def check_memory_cap(cap: Mapping, limit: int = MEMORY_CAP_BYTES, runtime="borealis") -> None:
+    """`Gate0Error` unless the cgroup caps memory at `limit` or less without swap."""
+    found = cap.get("memory_max")
+    capped = isinstance(found, str) and found.isdigit() and int(found) <= limit
     if not capped or cap.get("memory_swap_max") != "0":
         raise Gate0Error(
-            f"the borealis runtime runs only under memory.max <= {MEMORY_CAP_BYTES} and "
-            f"memory.swap.max = 0 (systemd-run --user --scope -p MemoryMax={MEMORY_CAP_BYTES} "
-            f"-p MemorySwapMax=0); this cgroup has {limit} and {cap.get('memory_swap_max')}"
+            f"the {runtime} runtime runs only under memory.max <= {limit} and "
+            f"memory.swap.max = 0 (systemd-run --user --scope -p MemoryMax={limit} "
+            f"-p MemorySwapMax=0); this cgroup has {found} and {cap.get('memory_swap_max')}"
         )
+
+
+def host_memory(meminfo: Path = MEMINFO) -> dict:
+    """`MemAvailable` and `SwapFree` of the host in bytes (None if unreadable)."""
+    found: dict = {"mem_available_bytes": None, "swap_free_bytes": None}
+    keys = {"MemAvailable": "mem_available_bytes", "SwapFree": "swap_free_bytes"}
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        for line in meminfo.read_text().splitlines():
+            name, _, rest = line.partition(":")
+            if name in keys:
+                found[keys[name]] = int(rest.split()[0]) * 1024
+    return found
+
+
+def check_host_memory(minimum: int, meminfo: Path = MEMINFO) -> dict:
+    """`Gate0Error` unless the host has `minimum` bytes available, so the run does not push
+    other processes into swap; returns what `host_memory` read."""
+    found = host_memory(meminfo)
+    available = found["mem_available_bytes"]
+    if available is None or available < minimum:
+        raise Gate0Error(
+            f"the host has MemAvailable {available} bytes, the run needs {minimum}; "
+            "stop other heavy work first"
+        )
+    return found
 
 
 def memory_usage(cap: Mapping, cgroup_root: Path = CGROUP_ROOT) -> dict:
@@ -969,18 +1049,26 @@ def run_spike(
     llama_dir: Path = DEFAULT_LLAMA_DIR,
     threads: int | None = None,
     weights: Mapping[str, str] | None = None,
-    rss_limit: int = RSS_LIMIT_BYTES,
+    rss_limit: int | None = None,
     request_timeout: float = REQUEST_TIMEOUT_S,
     load_timeout: float = LOAD_TIMEOUT_S,
     cgroup_root: Path = CGROUP_ROOT,
+    meminfo: Path = MEMINFO,
 ) -> dict:
     """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict."""
     if runtime not in RUNTIMES:
         raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
     llama = runtime == "llama"
-    model_dir = model_dir or (DEFAULT_MODEL_DIR if llama else BOREALIS_MODEL_DIR)
+    defaults = {
+        "llama": (DEFAULT_MODEL_DIR, WEIGHTS),
+        "borealis": (BOREALIS_MODEL_DIR, BOREALIS_WEIGHTS),
+        "gigachat": (GIGACHAT_MODEL_DIR, GIGACHAT_WEIGHTS),
+    }
+    model_dir = model_dir or defaults[runtime][0]
     if weights is None:
-        weights = WEIGHTS if llama else BOREALIS_WEIGHTS
+        weights = defaults[runtime][1]
+    cap_limit, runtime_rss_limit = RUNTIME_LIMITS[runtime]
+    rss_limit = runtime_rss_limit if rss_limit is None else rss_limit
     out = output_dir(day, config_)
     manifest = _read_json(out / MANIFEST_FILE)
     words = _read_json(out / WORDS_FILE)
@@ -992,8 +1080,12 @@ def run_spike(
         reason = getattr(error, "strerror", None) or error
         raise Gate0Error(f"cannot read the decision document {decision.name}: {reason}") from None
     cgroup = memory_cap(cgroup_root)
-    if not llama:
-        check_memory_cap(cgroup)
+    if cap_limit is not None:
+        check_memory_cap(cgroup, cap_limit, runtime)
+    if runtime == "gigachat":
+        host = check_host_memory(GIGACHAT_MIN_AVAILABLE_BYTES, meminfo)
+    else:
+        host = host_memory(meminfo)
     attempt = _new_attempt(out, config_)
     record: dict = {
         "format_version": FORMAT_VERSION,
@@ -1004,6 +1096,7 @@ def run_spike(
         "decision_sha256": hashlib.sha256(document).hexdigest(),
         "runtime": runtime,
         "cgroup": cgroup,
+        "host_memory": host,
     }
     found = {name: _sha256_file(model_dir / name) for name in weights}
     clips_found = {
@@ -1038,9 +1131,12 @@ def run_spike(
         binary = llama_dir / SERVER_BINARY
         argv = server_argv(binary, model_dir, port, threads)
         version_argv = [str(binary), "--version"]
-    else:
+    elif runtime == "borealis":
         argv = borealis_argv(model_dir, port, threads)
         version_argv = [sys.executable, "-m", BOREALIS_MODULE, "--version"]
+    else:
+        argv = module_argv(GIGACHAT_MODULE, model_dir, port, threads)
+        version_argv = [sys.executable, "-m", GIGACHAT_MODULE, "--version"]
     record.update(
         {
             "argv": argv,
@@ -1496,6 +1592,9 @@ def _output(argv: list[str], *, timeout: float, stderr: bool = False) -> str | N
     return (done.stdout + (done.stderr if stderr else b"")).decode("utf-8", "replace")
 
 
+SERVER_MODULES = (BOREALIS_MODULE, GIGACHAT_MODULE)
+
+
 def _other_inference() -> list[str]:
     found = []
     for entry in Path("/proc").iterdir():
@@ -1504,8 +1603,9 @@ def _other_inference() -> list[str]:
                 name = (entry / "comm").read_text().strip()
                 if name.startswith("llama-"):
                     found.append(name)
-                elif BOREALIS_MODULE.encode() in (entry / "cmdline").read_bytes().split(b"\0"):
-                    found.append(BOREALIS_MODULE)
+                    continue
+                argv = (entry / "cmdline").read_bytes().split(b"\0")
+                found += [module for module in SERVER_MODULES if module.encode() in argv]
     return sorted(found)
 
 

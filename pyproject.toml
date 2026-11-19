@@ -23,6 +23,12 @@ gate0-borealis = [
     "torch>=2.15.0",
     "transformers>=5.23.0",
 ]
+gate0-gigachat = [
+    "safetensors>=0.8.0",
+    "torch==2.11.0",
+    "torchaudio==2.11.0",
+    "transformers==4.57.6",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
@@ -43,6 +49,9 @@ markers = [
     "slow: tests that run a real model or a long synthesis; deselect with -m \"not slow\"",
 ]
 
+[tool.uv]
+conflicts = [[{ extra = "gate0-borealis" }, { extra = "gate0-gigachat" }]]
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
@@ -50,6 +59,7 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
 
 [dependency-groups]
 dev = [

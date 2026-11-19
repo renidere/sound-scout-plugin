@@ -257,3 +257,20 @@ def test_criterion_5_corpus_scripts_and_tests_are_in_git_and_no_corpus_data_is()
     assert [p for p in paths if p.parts[0] == "data"] == []
     assert [p for p in paths if "labels" in p.parts[:-1]] == []
     assert [p for p in paths if p.suffix.lower() in CORPUS_DATA_SUFFIXES] == []
+
+
+def test_backend_status_records_that_gigachat_failed_gate0_on_p3() -> None:
+    claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
+    for paragraph in (
+        claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
+        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
+    ):
+        text = flat(paragraph)
+        assert "GigaChat3.1-Audio-10B-A1.8B" in text and "NOT READY" in text, text
+        assert "`docs/decisions/0011-gate0-gigachat-audio.md`" in text, text
+        assert "P3" in text and "о слухе модели" in text, text
+    verdict = (REPO_ROOT / "docs" / "decisions" / "0011-gate0-gigachat-audio.md").read_text("utf-8")
+    assert "**Вердикт: NOT READY**" in verdict

@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import sys
+import tomllib
 import wave
 from pathlib import Path
 
@@ -1078,3 +1079,223 @@ def test_the_questions_hash_stays_the_one_0007_and_0010_recorded() -> None:
     assert gate0.questions_sha256() == QUESTIONS_SHA256_0007
     for name in (gate0.DECISION_DOC, BOREALIS_DOC):
         assert QUESTIONS_SHA256_0007 in (REPO / name).read_text(encoding="utf-8")
+
+
+# --- the gigachat runtime of #85 (docs/decisions/0011-gate0-gigachat-audio.md) -------------
+
+GIGACHAT_DOC = Path("docs/decisions/0011-gate0-gigachat-audio.md")
+GIGACHAT_CAP = "25999998976"  # memory.max of MemoryMax=26000000000 after the kernel's rounding
+
+
+def _meminfo(path: Path, available: int) -> Path:
+    path.write_text(
+        f"MemTotal:       32045412 kB\nMemAvailable:   {available // 1024} kB\n"
+        "SwapFree:       15928092 kB\n"
+    )
+    return path
+
+
+def _gigachat_run(spike, tmp_path, monkeypatch, memory_max=GIGACHAT_CAP, swap_max="0", **kw):
+    root = _cgroup(tmp_path / "cgroup", memory_max, swap_max)
+    meminfo = _meminfo(tmp_path / "meminfo", kw.pop("available", 24 * 10**9))
+    server = spike["kwargs"]["llama_dir"] / gate0.SERVER_BINARY
+    seen = {}
+
+    def argv(module, model_dir, port, threads):
+        seen.update(module=module, model_dir=model_dir, threads=threads)
+        return [str(server), "--port", str(port)]
+
+    monkeypatch.setattr(gate0, "module_argv", argv)
+    kwargs = {**spike["kwargs"], **kw}
+    result = gate0.run_spike(
+        "2026-11-18",
+        spike["config"],
+        runtime="gigachat",
+        cgroup_root=root,
+        meminfo=meminfo,
+        **kwargs,
+    )
+    return result, seen
+
+
+def test_gigachat_argv_is_local_with_host_port_threads_and_no_hub_id() -> None:
+    argv = gate0.module_argv(gate0.GIGACHAT_MODULE, Path("/models/gigachat"), 4321, 12)
+    assert argv[:3] == [sys.executable, "-m", "sound_scout.eval.gate0_gigachat"]
+    assert argv[argv.index("--model-dir") + 1] == "/models/gigachat"
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv[argv.index("--port") + 1] == "4321"
+    assert argv[argv.index("--threads") + 1] == "12"
+    assert not any("ai-sage" in arg or "huggingface" in arg for arg in argv)
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+    assert gate0.borealis_argv(Path("/m"), 1, 2) == gate0.module_argv(gate0.BOREALIS_MODULE,
+                                                                     Path("/m"), 1, 2)  # fmt: skip
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max", "available", "message"),
+    [
+        ("max", "0", 24 * 10**9, "MemoryMax=26000000000"),
+        ("26000000001", "0", 24 * 10**9, "MemoryMax=26000000000"),
+        (GIGACHAT_CAP, "max", 24 * 10**9, "MemoryMax=26000000000"),
+        (GIGACHAT_CAP, "0", gate0.GIGACHAT_MIN_AVAILABLE_BYTES - 4096, "MemAvailable"),
+    ],
+)
+def test_gigachat_run_without_the_cap_or_the_free_memory_is_refused_before_any_attempt(
+    spike, tmp_path, monkeypatch, memory_max, swap_max, available, message
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match=message):
+        _gigachat_run(spike, tmp_path, monkeypatch, memory_max, swap_max, available=available)
+    assert not (spike["out"] / gate0.ATTEMPTS_DIR).exists()
+    assert not spike["marker"].exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_gigachat_one_wrong_weight_hash_of_fourteen_stops_before_the_server_start(
+    spike, tmp_path, monkeypatch
+) -> None:
+    models = spike["kwargs"]["model_dir"]
+    weights = {}
+    for name in gate0.GIGACHAT_WEIGHTS:
+        (models / name).parent.mkdir(parents=True, exist_ok=True)
+        (models / name).write_bytes(name.encode())
+        weights[name] = hashlib.sha256(name.encode()).hexdigest()
+    weights["decoder/model-00003-of-00005.safetensors"] = "0" * 64
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        _gigachat_run(spike, tmp_path, monkeypatch, weights=weights)
+    assert not spike["marker"].exists()
+    record = json.loads((spike["out"] / gate0.ATTEMPTS_DIR / "1" / gate0.RUN_FILE).read_text())
+    assert record["runtime"] == "gigachat" and record["preconditions"]["checks"]["weights"] is False
+    assert len(record["preconditions"]["weights_sha256"]) == 14
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_gigachat_run_under_the_cap_records_its_limits_host_memory_and_the_same_plan(
+    spike, tmp_path, monkeypatch
+) -> None:
+    available = gate0.GIGACHAT_MIN_AVAILABLE_BYTES + 1024  # meminfo counts in kB
+    result, seen = _gigachat_run(spike, tmp_path, monkeypatch, available=available)
+    attempt = spike["out"] / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert seen["module"] == gate0.GIGACHAT_MODULE
+    assert seen["model_dir"] == spike["kwargs"]["model_dir"]
+    assert record["limits"]["rss_limit_bytes"] == 25_500_000_000
+    assert record["host_memory"]["mem_available_bytes"] == available // 1024 * 1024
+    assert record["host_memory"]["swap_free_bytes"] == 15928092 * 1024
+    assert record["cgroup"]["memory_max"] == GIGACHAT_CAP
+    assert record["server_version"].startswith(f"version: gigachat-{gate0.GIGACHAT_REVISION}")
+    assert record["requests_planned"] == 42
+    lines = (attempt / gate0.TRACE_FILE).read_text().splitlines()
+    assert len(lines) == 43 and result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+
+
+def test_llama_run_keeps_the_18e9_rss_limit_and_records_the_host_memory(spike) -> None:
+    gate0.run_spike("2026-11-18", spike["config"], **spike["kwargs"])
+    record = json.loads((spike["out"] / gate0.ATTEMPTS_DIR / "1" / gate0.RUN_FILE).read_text())
+    assert record["limits"]["rss_limit_bytes"] == 18 * 10**9
+    assert set(record["host_memory"]) == {"mem_available_bytes", "swap_free_bytes"}
+    assert gate0.RUNTIME_LIMITS["borealis"] == (20 * 10**9, 18 * 10**9)
+    assert gate0.RUNTIME_LIMITS["gigachat"] == (26 * 10**9, 25_500_000_000)
+
+
+def test_host_memory_check_reads_meminfo_and_refuses_an_unreadable_one(tmp_path) -> None:
+    meminfo = _meminfo(tmp_path / "meminfo", 30 * 10**9)
+    assert gate0.check_host_memory(29 * 10**9, meminfo)["mem_available_bytes"] > 29 * 10**9
+    with pytest.raises(gate0.Gate0Error, match="MemAvailable None"):
+        gate0.check_host_memory(1, tmp_path / "missing")
+
+
+def test_check_memory_cap_names_the_runtime_and_its_ceiling() -> None:
+    with pytest.raises(gate0.Gate0Error, match="the gigachat runtime .* MemoryMax=26000000000"):
+        gate0.check_memory_cap(
+            {"memory_max": "26000004096", "memory_swap_max": "0"}, 26 * 10**9, "gigachat"
+        )
+    gate0.check_memory_cap({"memory_max": GIGACHAT_CAP, "memory_swap_max": "0"}, 26 * 10**9)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux /proc")
+def test_other_inference_sees_a_running_gigachat_server() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", gate0.GIGACHAT_MODULE]
+    )
+    try:
+        assert gate0.GIGACHAT_MODULE in gate0._other_inference()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_gigachat_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    section = weights[weights.index("#### GigaChat3.1") : weights.index("#### Borealis")]
+    rows = dict(re.findall(r"^\| `([^`]+)` \| [\d ]+ \| `([0-9a-f]{64})` \|", section, re.M))
+    assert rows == gate0.GIGACHAT_WEIGHTS and len(rows) == 14
+    assert gate0.GIGACHAT_REVISION in section
+
+
+def test_gigachat_decision_document_holds_the_same_rule_as_0007() -> None:
+    gigachat = (REPO / GIGACHAT_DOC).read_text(encoding="utf-8")
+    assert gate0.rule_sha256(gigachat) == DECISION_RULE_SHA256
+    assert QUESTIONS_SHA256_0007 in gigachat
+    assert not re.search(r"/(home|Users)/|~[/]", gigachat)
+
+
+def _gigachat_dependencies() -> str:
+    """The GigaChat weights subsection of §3.1 and its runtime subsection of §3.2."""
+    text = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = text[text.index("#### GigaChat3.1") : text.index("#### Borealis-5b-it")]
+    runtime = text[text.index("#### Runtime GigaChat3.1") : text.index("### 3.3.")]
+    return weights + runtime
+
+
+def test_gigachat_dependencies_record_one_revision_the_licence_and_the_pinned_runtime() -> None:
+    section = re.sub(r"\s+", " ", _gigachat_dependencies())
+    assert gate0.GIGACHAT_REVISION == "bf73d03a43bdf5118f5a4dbdc24ba6f56ac31cfb"
+    assert f"ревизия `{gate0.GIGACHAT_REVISION}`" in section
+    assert "`ai-sage/GigaChat3.1-Audio-10B-A1.8B`" in section
+    assert set(re.findall(r"\b[0-9a-f]{40}\b", section)) - {gate0.GIGACHAT_REVISION} <= set(
+        re.findall(r"git blob `([0-9a-f]{40})`", section)
+    ), "a second model revision in the GigaChat section"
+    assert "Лицензия MIT" in section
+    assert "#### Runtime GigaChat3.1-Audio-10B-A1.8B" in section
+    assert "`transformers` 4.57.6" in section and "extra `gate0-gigachat`" in section
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    extra = project["project"]["optional-dependencies"]["gate0-gigachat"]
+    assert {"torch==2.11.0", "torchaudio==2.11.0", "transformers==4.57.6"} <= set(extra)
+    packages = (REPO / "docs/dependencies.md").read_text(encoding="utf-8").split("## 2.", 1)[0]
+    for name, version in (
+        ("torch", "2.11.0+cpu"),
+        ("torchaudio", "2.11.0+cpu"),
+        ("transformers", "4.57.6"),
+        ("safetensors", "0.8.0"),
+    ):
+        assert f"| `{name}` (extra `gate0-gigachat`) | {version} |" in packages
+
+
+def test_gigachat_decision_records_the_cap_peak_memory_latency_and_the_cli_verdict() -> None:
+    gigachat = (REPO / GIGACHAT_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", gigachat)
+    assert "systemd-run --user --scope -q -p MemoryMax=26000000000 -p MemorySwapMax=0" in flat_doc
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    assert "**Пиковая память** (критерий 3)" in results and "`memory.peak`" in results
+    assert "**Задержка на клип** (критерий 3" in results and "медиана" in results
+    assert "**Второй слот простаивал:**" in results and "`other_inference: []`" in results
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("## 6.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-19 --attempt 2`" in verdict
+    answer = json.dumps(
+        {"verdict": "NOT READY", "reason": "протокол не выполнен: ['P3']"}, ensure_ascii=False
+    )
+    assert f"`{answer}`" in verdict
+
+
+def test_gigachat_not_ready_packages_nothing_and_names_the_next_owner_step() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    assert config.Config.__dataclass_fields__["backend"].default == "none"
+    example = (REPO / "sound-scout.example.toml").read_text(encoding="utf-8")
+    assert "gigachat" not in example.lower()
+    gigachat = (REPO / GIGACHAT_DOC).read_text(encoding="utf-8")
+    assert "**Вердикт: NOT READY**" in gigachat
+    assert "ничего не упаковывается, `backend` остаётся `none`" in re.sub(r"\s+", " ", gigachat)
+    owner = gigachat.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    assert re.search(r"^1\. \*\*Решить судьбу GigaChat3\.1-Audio-10B-A1\.8B\*\*", owner, re.M)
