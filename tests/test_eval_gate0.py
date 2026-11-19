@@ -897,3 +897,133 @@ def test_criterion_e_raw_outputs_are_gitignored_and_no_personal_path_is_committe
     for path in (gate0.DECISION_DOC, Path("src/sound_scout/eval/gate0.py"), Path(__file__)):
         text = (REPO / path).read_text(encoding="utf-8")
         assert not re.search(r"/(home|Users)/|~[/]", text), path
+
+
+# --- the borealis runtime of #68 (docs/decisions/0010-gate0-borealis.md) -------------------
+
+BOREALIS_DOC = Path("docs/decisions/0010-gate0-borealis.md")
+
+
+def _cgroup(root: Path, memory_max: str, swap_max: str) -> Path:
+    """A fake cgroup v2 tree at the path of this process's own cgroup."""
+    line = next(
+        line for line in Path("/proc/self/cgroup").read_text().splitlines() if line[:3] == "0::"
+    )
+    directory = root / line[3:].lstrip("/")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "memory.max").write_text(memory_max + "\n")
+    (directory / "memory.swap.max").write_text(swap_max + "\n")
+    (directory / "memory.peak").write_text("123456\n")
+    (directory / "memory.events").write_text("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+    return root
+
+
+def test_borealis_argv_is_local_with_host_port_threads_and_no_hub_id() -> None:
+    argv = gate0.borealis_argv(Path("/models/borealis"), 4321, 12)
+    assert argv[:3] == [sys.executable, "-m", "sound_scout.eval.gate0_borealis"]
+    assert argv[argv.index("--model-dir") + 1] == "/models/borealis"
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv[argv.index("--port") + 1] == "4321"
+    assert argv[argv.index("--threads") + 1] == "12"
+    assert not any(hub in arg for arg in argv for hub in ("Vikhrmodels/", "Qwen", "openai/"))
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+    llama = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
+    assert llama[1:3] == ["-m", "/models/gemma-4-E4B-it-Q8_0.gguf"]
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max"),
+    [("max", "0"), ("20000000001", "0"), ("21474836480", "0"), ("20000000000", "max")],
+)
+def test_borealis_run_without_the_memory_cap_is_refused_before_any_attempt(
+    spike, tmp_path, memory_max, swap_max
+) -> None:
+    root = _cgroup(tmp_path / "cgroup", memory_max, swap_max)
+    with pytest.raises(gate0.Gate0Error, match="MemoryMax=20000000000"):
+        gate0.run_spike(
+            "2026-11-18", spike["config"], runtime="borealis", cgroup_root=root, **spike["kwargs"]
+        )
+    assert not (spike["out"] / gate0.ATTEMPTS_DIR).exists()
+    assert not spike["marker"].exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_borealis_weight_mismatch_stops_before_the_server_start(spike, tmp_path) -> None:
+    root = _cgroup(tmp_path / "cgroup", "19999997952", "0")
+    kwargs = {**spike["kwargs"], "weights": {"model.safetensors": "0" * 64}}
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        gate0.run_spike(
+            "2026-11-18", spike["config"], runtime="borealis", cgroup_root=root, **kwargs
+        )
+    assert not spike["marker"].exists()
+    record = json.loads((spike["out"] / gate0.ATTEMPTS_DIR / "1" / gate0.RUN_FILE).read_text())
+    assert record["runtime"] == "borealis" and record["preconditions"]["checks"]["weights"] is False
+    assert record["cgroup"]["memory_max"] == "19999997952"
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_borealis_run_under_the_cap_records_the_cgroup_peak_and_the_same_plan(
+    spike, tmp_path, monkeypatch
+) -> None:
+    root = _cgroup(tmp_path / "cgroup", "19999997952", "0")
+    server = spike["kwargs"]["llama_dir"] / gate0.SERVER_BINARY
+    seen = {}
+
+    def argv(model_dir, port, threads):
+        seen.update(model_dir=model_dir, threads=threads)
+        return [str(server), "--port", str(port)]
+
+    monkeypatch.setattr(gate0, "borealis_argv", argv)
+    result = gate0.run_spike(
+        "2026-11-18", spike["config"], runtime="borealis", cgroup_root=root, **spike["kwargs"]
+    )
+    attempt = spike["out"] / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["runtime"] == "borealis" and seen["model_dir"] == spike["kwargs"]["model_dir"]
+    assert record["cgroup"]["memory_peak"] == 123456
+    assert record["cgroup"]["memory_events"]["oom_kill"] == 0
+    assert record["server_version"].startswith(f"version: borealis-{gate0.BOREALIS_REVISION}")
+    assert record["requests_planned"] == 42
+    lines = (attempt / gate0.TRACE_FILE).read_text().splitlines()
+    assert len(lines) == 43 and result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+
+
+def test_memory_usage_without_a_cgroup_is_empty_and_llama_runs_need_no_cap() -> None:
+    assert gate0.memory_usage({"path": None}) == {"memory_peak": None, "memory_events": None}
+    gate0.check_memory_cap({"memory_max": "20000000000", "memory_swap_max": "0"})
+    with pytest.raises(gate0.Gate0Error):
+        gate0.check_memory_cap({"memory_max": None, "memory_swap_max": None})
+
+
+def test_unknown_runtime_is_refused(spike) -> None:
+    with pytest.raises(gate0.Gate0Error, match="--runtime"):
+        gate0.run_spike("2026-11-18", spike["config"], runtime="vllm", **spike["kwargs"])
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux /proc")
+def test_other_inference_sees_a_running_borealis_server() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", gate0.BOREALIS_MODULE]
+    )
+    try:
+        assert gate0.BOREALIS_MODULE in gate0._other_inference()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_borealis_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    borealis = weights[weights.index("Borealis-5b-it") :]
+    rows = dict(re.findall(r"^\| `([^`]+)` \| [\d ]+ \| `([0-9a-f]{64})` \|", borealis, re.M))
+    assert rows == gate0.BOREALIS_WEIGHTS
+    assert gate0.BOREALIS_REVISION in borealis
+
+
+def test_borealis_decision_document_holds_the_same_rule_as_0007() -> None:
+    borealis = (REPO / BOREALIS_DOC).read_text(encoding="utf-8")
+    gemma = (REPO / gate0.DECISION_DOC).read_text(encoding="utf-8")
+    assert gate0.rule_sha256(borealis) == gate0.rule_sha256(gemma) == DECISION_RULE_SHA256
+    assert not re.search(r"/(home|Users)/|~[/]", borealis)

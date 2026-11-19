@@ -183,6 +183,22 @@ def test_backend_docs_name_no_replacement_candidate_as_chosen() -> None:
     assert "**Вердикт: NOT READY**" in verdict
 
 
+def test_backend_status_records_that_borealis_failed_gate0_too() -> None:
+    claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
+    for paragraph in (
+        claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
+        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
+    ):
+        text = flat(paragraph)
+        assert "Borealis-5b-it" in text and "NOT READY" in text, text
+        assert "`docs/decisions/0010-gate0-borealis.md`" in text, text
+    verdict = (REPO_ROOT / "docs" / "decisions" / "0010-gate0-borealis.md").read_text("utf-8")
+    assert "**Вердикт: NOT READY**" in verdict
+
+
 def test_readme_backend_link_resolves_to_owner_decision() -> None:
     decision = REPO_ROOT / "docs" / "decisions" / "0001-audio-backend.md"
     assert decision.is_file()

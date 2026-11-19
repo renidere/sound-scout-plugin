@@ -12,8 +12,10 @@
   выбран (`backend = none`): Gemma 4 E4B-it (GGUF через llama.cpp, только локально; кандидат по
   решению владельца, `docs/spec/REQUIREMENTS.md` раздел 9) не прошла Gate 0 — вердикт NOT READY
   (`docs/decisions/0007-gate0-result.md`), замену выбирает владелец
-  ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Без UI, очередей, БД,
-  provider framework.
+  ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат
+  Borealis-5b-it, проверенный по решению владельца на #68 тем же протоколом, тоже получил NOT
+  READY (`docs/decisions/0010-gate0-borealis.md`); следующий шаг — за владельцем. Без UI,
+  очередей, БД, provider framework.
 - **Зависимости:** все Python-пакеты, системные программы, runtime и файлы весов записаны в
   `docs/dependencies.md` с версией или ревизией, лицензией и SHA-256. Новая или обновлённая
   зависимость вносится туда в том же коммите; веса и ревизии вне этого файла не скачиваются без
@@ -106,7 +108,7 @@
 | Клипы по исходным offsets: `clips/<id>.wav` + `clips/<id>.json` из `work/decoded.f32` без усиления, усиленная копия для прослушивания `listen/<id>.wav` с записанным `gain_db`, записи `artifacts[]` для контракта результата, `load` клипа и его PCM-payload `pcm_f32le` | `src/sound_scout/clips.py` |
 | Адаптер audio backend: протокол `AudioBackend`, окна по лимиту backend `windows` и обход окон `cover` (перекрытие 2 с, сбой вызова останавливает обход), проверка audio payload, `review/<clip>/provenance.json`, валидатор ответа модели, payload из клипа `clip_from_cut` | `src/sound_scout/review.py` (упакованная копия промпта — `src/sound_scout/AUDIO_REVIEW_PROMPT.md`) |
 | Находки на шкале исходника: `build` (исходы review через `clips/<id>.json` → `findings`, `unlocalized`, неуверенные исправления, `artifacts`, `coverage.reviewed`; слияние дублей на перекрытиях окон и пометка `window_boundary`) и `validate` (правила контракта плюс проверка файлов-доказательств run) | `src/sound_scout/findings.py` |
-| Квалификация Gate 1: манифест корпуса, человеческая разметка, evaluation runner (`eval run`: сопоставление по PROTOCOL.md § 6, метрики, контроли, отчёт `<date>-report.md`/`.json`); spike Gate 0: `prepare`/`run`/`verdict`, решение — `docs/decisions/0007-gate0-result.md` | `src/sound_scout/eval/` (`manifest.py`, `labels.py`, `runner.py`, `gate0.py`) |
+| Квалификация Gate 1: манифест корпуса, человеческая разметка, evaluation runner (`eval run`: сопоставление по PROTOCOL.md § 6, метрики, контроли, отчёт `<date>-report.md`/`.json`); spike Gate 0: `prepare`/`run`/`verdict` (`run --runtime llama|borealis`), решения — `docs/decisions/0007-gate0-result.md` (Gemma 4 E4B-it), `docs/decisions/0010-gate0-borealis.md` (Borealis-5b-it: локальный сервер на `torch` CPU из extra `gate0-borealis`, потоковый загрузчик) | `src/sound_scout/eval/` (`manifest.py`, `labels.py`, `runner.py`, `gate0.py`, `gate0_borealis.py`) |
 | Корпус pilot-1 из открытых наборов: закреплённая таблица источников `SOURCES`, `prepare` (контроли, кандидаты RINCO по слоям Accent/Pause/Int phrase, черновой манифест, `provenance.json`, пустые шаблоны разметки), `eval check-manifest [--draft]`; решение — `docs/decisions/0009-corpus-pilot-1.md` | `src/sound_scout/eval/corpus.py`, `src/sound_scout/eval/manifest.py`, `src/sound_scout/cli.py` |
 | Загрузка и проверка источников корпуса по `SOURCES` (HTTPS, сумма издателя и SHA-256 по потоку и по диску, `verify`); данные — `data/corpus/sources/` вне git | `scripts/fetch_corpus_sources.py` |
 | Сквозной анализ `analyze`: lock data root (`Busy`), предварительная проверка входа, request_id и кэш через `runs.open_run`, worker-процесс с deadline и `CancelToken`, записи этапов `work/stage-<этап>.json` (у `audio_review` — checkpoint после каждого окна), единая сборка результата | `src/sound_scout/app.py` |

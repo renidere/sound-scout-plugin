@@ -12,16 +12,18 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   carries only hashes, durations, word numbers and intervals. It records the SHA-256 of the
   verdict rule as the decision document holds it (between `RULE_BEGIN` and `RULE_END`), of the
   prompt and of the fixed questions. The audio backend is not touched.
-- `run --date D` checks the weights, the prompt, the rule and the clips against what was
-  recorded, starts the local `llama-server` with local `-m`/`--mmproj` only, on 127.0.0.1 and a
-  free port, sends the fixed list of requests one at a time and once each, and stops the server
-  whatever happens. The empty input `E0` goes through the same `review.check_payload` as every
-  audio request and is refused before any HTTP call. Every request leaves a trace line with the
-  SHA-256 of the WAV and of the PCM actually sent, the server's token counts and timings, the
-  client wall time and the server's RSS; the raw answer is kept verbatim. A request over the
-  wall time limit or a server RSS over the limit ends the run: the rest are recorded as not sent.
-  The run talks to nothing but the server it started (no proxy); the process-wide network guard
-  is not installed here because it refuses loopback too.
+- `run --date D [--runtime llama|borealis]` checks the weights, the prompt, the rule and the
+  clips against what was recorded, starts the local server — `llama-server` with local
+  `-m`/`--mmproj` only, or for `borealis` the `gate0_borealis` module with the local weights
+  directory (#68), which must run inside a cgroup capped at 20e9 bytes without swap — on
+  127.0.0.1 and a free port, sends the fixed list of requests one at a time and once each, and
+  stops the server whatever happens. The empty input `E0` goes through the same
+  `review.check_payload` as every audio request and is refused before any HTTP call. Every
+  request leaves a trace line with the SHA-256 of the WAV and of the PCM actually sent, the
+  server's token counts and timings, the client wall time and the server's RSS; the raw answer
+  is kept verbatim. A request over the wall time limit or a server RSS over the limit ends the
+  run: the rest are recorded as not sent. The run talks to nothing but the server it started (no
+  proxy); the process-wide network guard is not installed here because it refuses loopback too.
 - `verdict --date D` recomputes the verdict from the saved answers alone (`decide`).
 
 A test with a fake server proves this contract only, never what the model hears (CLAUDE.md).
@@ -52,6 +54,7 @@ from pathlib import Path
 import numpy as np
 
 from sound_scout import asr, channels, config, guard, ingest, paths, prepare, proc, review, runs
+from sound_scout.eval import gate0_borealis
 
 MODEL_REPO = "ggml-org/gemma-4-E4B-it-GGUF"
 MODEL_REVISION = "8903cb408c7df39cde2ed15fac397e6d7be92951"
@@ -66,6 +69,25 @@ DEFAULT_MODEL_DIR = (
 )
 DEFAULT_LLAMA_DIR = Path.home() / ".local/opt/llama.cpp/b12359/llama-b12359"
 SERVER_BINARY = "llama-server"
+BOREALIS_REVISION = gate0_borealis.REVISION
+BOREALIS_WEIGHTS = {
+    "model.safetensors": "ceaafa32e56e93bc43eb4807c226ef08942718a3b37747f2f9183f7d5d063b11",
+    "tokenizer.json": "fcb4fb9e735fe694250e8eb740459e5a7d515387a7497ae78af2177fa3fc8a21",
+    "config.json": "c5708c8e3f02672adccee2e9399f5c6e26d2fbec5bc3e9cd4964755af9a6ed01",
+    "tokenizer_config.json": "5712797be9e1c0d5cde3fe07400b3aff5ae4b895d2f785fdaa33c1e4e010ed45",
+    "special_tokens_map.json": "54c79929443cd1849332ad1d811acab82dd00a876b74b2e520d40b1ccae48ea1",
+    "added_tokens.json": "3bed5ae134cddb1f871e4143159dbc898fa2f1e63da4850d4fbfe136c5ef46c4",
+    "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+    "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+    "modeling_borealis.py": "802073ea6547cc122e92ed3912a209dfedd13268143f15d7fe1eb07d739c0a02",
+}
+BOREALIS_MODEL_DIR = (
+    Path.home() / ".cache/sound-scout/models/Vikhrmodels--Borealis-5b-it" / BOREALIS_REVISION
+)
+BOREALIS_MODULE = "sound_scout.eval.gate0_borealis"
+RUNTIMES = ("llama", "borealis")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+MEMORY_CAP_BYTES = 20 * 10**9
 PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca"
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
 RULE_BEGIN = "<!-- gate0-rule:begin -->"
@@ -735,6 +757,63 @@ def server_argv(binary: Path, model_dir: Path, port: int, threads: int) -> list[
     return argv
 
 
+def borealis_argv(model_dir: Path, port: int, threads: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        BOREALIS_MODULE,
+        "--model-dir",
+        str(model_dir),
+        "--host",
+        HOST,
+        "--port",
+        str(port),
+        "--threads",
+        str(threads),
+    ]
+
+
+def memory_cap(cgroup_root: Path = CGROUP_ROOT) -> dict:
+    """The cgroup v2 of this process, its `memory.max` and `memory.swap.max` (None if absent)."""
+    found: dict = {"path": None, "memory_max": None, "memory_swap_max": None}
+    with contextlib.suppress(OSError):
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                found["path"] = line[3:]
+    if found["path"] is not None:
+        directory = cgroup_root / found["path"].lstrip("/")
+        for key, name in (("memory_max", "memory.max"), ("memory_swap_max", "memory.swap.max")):
+            with contextlib.suppress(OSError):
+                found[key] = (directory / name).read_text().strip()
+    return found
+
+
+def check_memory_cap(cap: Mapping) -> None:
+    """`Gate0Error` unless the cgroup caps memory at `MEMORY_CAP_BYTES` or less without swap."""
+    limit = cap.get("memory_max")
+    capped = isinstance(limit, str) and limit.isdigit() and int(limit) <= MEMORY_CAP_BYTES
+    if not capped or cap.get("memory_swap_max") != "0":
+        raise Gate0Error(
+            f"the borealis runtime runs only under memory.max <= {MEMORY_CAP_BYTES} and "
+            f"memory.swap.max = 0 (systemd-run --user --scope -p MemoryMax={MEMORY_CAP_BYTES} "
+            f"-p MemorySwapMax=0); this cgroup has {limit} and {cap.get('memory_swap_max')}"
+        )
+
+
+def memory_usage(cap: Mapping, cgroup_root: Path = CGROUP_ROOT) -> dict:
+    """`memory.peak` (bytes) and `memory.events` of the cgroup `memory_cap` found."""
+    usage: dict = {"memory_peak": None, "memory_events": None}
+    if cap.get("path") is None:
+        return usage
+    directory = cgroup_root / cap["path"].lstrip("/")
+    with contextlib.suppress(OSError, ValueError):
+        usage["memory_peak"] = int((directory / "memory.peak").read_text())
+    with contextlib.suppress(OSError, ValueError):
+        lines = (directory / "memory.events").read_text().splitlines()
+        usage["memory_events"] = {name: int(value) for name, value in map(str.split, lines)}
+    return usage
+
+
 class Client:
     """HTTP to the local server only, without proxies; `calls` counts every request made."""
 
@@ -855,15 +934,23 @@ def run_spike(
     config_: config.Config,
     *,
     decision: Path = DECISION_DOC,
-    model_dir: Path = DEFAULT_MODEL_DIR,
+    runtime: str = "llama",
+    model_dir: Path | None = None,
     llama_dir: Path = DEFAULT_LLAMA_DIR,
     threads: int | None = None,
-    weights: Mapping[str, str] = WEIGHTS,
+    weights: Mapping[str, str] | None = None,
     rss_limit: int = RSS_LIMIT_BYTES,
     request_timeout: float = REQUEST_TIMEOUT_S,
     load_timeout: float = LOAD_TIMEOUT_S,
+    cgroup_root: Path = CGROUP_ROOT,
 ) -> dict:
     """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict."""
+    if runtime not in RUNTIMES:
+        raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
+    llama = runtime == "llama"
+    model_dir = model_dir or (DEFAULT_MODEL_DIR if llama else BOREALIS_MODEL_DIR)
+    if weights is None:
+        weights = WEIGHTS if llama else BOREALIS_WEIGHTS
     out = output_dir(day, config_)
     manifest = _read_json(out / MANIFEST_FILE)
     words = _read_json(out / WORDS_FILE)
@@ -874,6 +961,9 @@ def run_spike(
     except (OSError, UnicodeDecodeError) as error:
         reason = getattr(error, "strerror", None) or error
         raise Gate0Error(f"cannot read the decision document {decision.name}: {reason}") from None
+    cgroup = memory_cap(cgroup_root)
+    if not llama:
+        check_memory_cap(cgroup)
     attempt = _new_attempt(out, config_)
     record: dict = {
         "format_version": FORMAT_VERSION,
@@ -882,6 +972,8 @@ def run_spike(
         "started_at": _now(),
         "code": _code_identity(),
         "decision_sha256": hashlib.sha256(document).hexdigest(),
+        "runtime": runtime,
+        "cgroup": cgroup,
     }
     found = {name: _sha256_file(model_dir / name) for name in weights}
     clips_found = {
@@ -909,15 +1001,20 @@ def run_spike(
         raise Gate0Error(f"run refused before the server start: {failed} do not match")
 
     entries = plan(manifest, words, prompt)
-    binary = llama_dir / SERVER_BINARY
     others = _other_inference()
     threads = threads or (THREADS_BUSY if others else THREADS_IDLE)
     port = _free_port()
-    argv = server_argv(binary, model_dir, port, threads)
+    if llama:
+        binary = llama_dir / SERVER_BINARY
+        argv = server_argv(binary, model_dir, port, threads)
+        version_argv = [str(binary), "--version"]
+    else:
+        argv = borealis_argv(model_dir, port, threads)
+        version_argv = [sys.executable, "-m", BOREALIS_MODULE, "--version"]
     record.update(
         {
             "argv": argv,
-            "server_version": _server_version(binary),
+            "server_version": _server_version(version_argv),
             "threads": threads,
             "other_inference": others,
             "cpu": _cpu_model(),
@@ -973,6 +1070,7 @@ def run_spike(
                     "http_calls": client.calls,
                 }
             )
+            record["cgroup"].update(memory_usage(cgroup, cgroup_root))
             _write_json(attempt, RUN_FILE, record, config_)
     result = evaluate(attempt)
     _write_json(attempt, VERDICT_FILE, result, config_)
@@ -1351,8 +1449,8 @@ def _code_identity() -> dict:
     return identity
 
 
-def _server_version(binary: Path) -> str | None:
-    output = _output([str(binary), "--version"], timeout=30, stderr=True)
+def _server_version(argv: list[str]) -> str | None:
+    output = _output(argv, timeout=30, stderr=True)
     lines = (output or "").splitlines()
     return next((line.strip() for line in lines if line.startswith("version:")), None)
 
@@ -1376,6 +1474,8 @@ def _other_inference() -> list[str]:
                 name = (entry / "comm").read_text().strip()
                 if name.startswith("llama-"):
                     found.append(name)
+                elif BOREALIS_MODULE.encode() in (entry / "cmdline").read_bytes().split(b"\0"):
+                    found.append(BOREALIS_MODULE)
     return sorted(found)
 
 
@@ -1402,7 +1502,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--decision", type=Path, default=DECISION_DOC)
     commands.choices["prepare"].add_argument("--sources", type=Path)
     commands.choices["prepare"].add_argument("--natural", type=Path)
-    commands.choices["run"].add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    commands.choices["run"].add_argument("--runtime", choices=RUNTIMES, default="llama")
+    commands.choices["run"].add_argument("--model-dir", type=Path)
     commands.choices["run"].add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR)
     commands.choices["run"].add_argument("--threads", type=int)
     commands.choices["verdict"].add_argument("--attempt")
@@ -1428,6 +1529,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.date,
                 config_,
                 decision=args.decision,
+                runtime=args.runtime,
                 model_dir=args.model_dir,
                 llama_dir=args.llama_dir,
                 threads=args.threads,

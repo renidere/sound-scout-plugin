@@ -11,7 +11,9 @@ https://github.com/users/renidere/projects/1 автономным агентом
 сейчас не выбран (`backend = none`): Gemma 4 E4B-it в GGUF через llama.cpp, только локально,
 выбранная владельцем 2026-11-18 для Gate 0 (`docs/decisions/0001-audio-backend.md`), Gate 0 не
 прошла — вердикт NOT READY (`docs/decisions/0007-gate0-result.md`); замену выбирает владелец
-([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Русская квалификация (Gate 1)
+([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат Borealis-5b-it,
+проверенный по решению владельца тем же протоколом, тоже получил NOT READY
+(`docs/decisions/0010-gate0-borealis.md`); следующий шаг — за владельцем. Русская квалификация (Gate 1)
 не пройдена, подключение к Hermes не выполнено — пока это так, инструмент не считается готовым
 (Gate 0–3 в `docs/spec/REQUIREMENTS.md`).
 

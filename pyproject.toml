@@ -17,6 +17,13 @@ dependencies = [
 [project.scripts]
 sound-scout = "sound_scout.cli:main"
 
+[project.optional-dependencies]
+gate0-borealis = [
+    "safetensors>=0.8.0",
+    "torch>=2.15.0",
+    "transformers>=5.23.0",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
 build-backend = "uv_build"
@@ -35,6 +42,14 @@ addopts = "--strict-markers"
 markers = [
     "slow: tests that run a real model or a long synthesis; deselect with -m \"not slow\"",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 [dependency-groups]
 dev = [

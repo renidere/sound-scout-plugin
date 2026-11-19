@@ -13,7 +13,7 @@
 
 Источник истины — `pyproject.toml` и `uv.lock` (`uv sync --locked`). Здесь — прямые зависимости и
 версии в lock на дату обновления.
-SHA-256 каждого файла пакета — в `uv.lock`. `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
+SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-borealis` (`uv sync --locked --extra gate0-borealis`) нужен только для Gate 0 spike Borealis-5b-it (#68) и по умолчанию не ставится, CI его не тянет; кроме трёх пакетов ниже он приносит `sympy`, `networkx`, `jinja2`, `setuptools`, `regex`, `typer`/`rich` (через `transformers`), а `tokenizers` и `huggingface-hub` уже были в lock через faster-whisper. `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
 
 | Пакет | Версия в `uv.lock` | Зачем | Лицензия |
 |---|---|---|---|
@@ -26,6 +26,9 @@ SHA-256 каждого файла пакета — в `uv.lock`. `mcp` тяне�
 | `jsonschema` | 4.26.0 | контракт результата, манифест корпуса, разметка | MIT |
 | `mcp` | 2.3.0 | MCP stdio сервер `sound-scout serve` (`docs/mcp.md`); последний стабильный релиз на 2026-11-18; wheel `mcp-2.3.0-py3-none-any.whl` SHA-256 `dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377` | MIT |
 | `mcp-types` (через mcp) | 2.3.0 | типы протокола MCP; wheel SHA-256 `968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d` | MIT |
+| `torch` (extra `gate0-borealis`) | 2.15.0+cpu | runtime Borealis-5b-it для Gate 0 spike #68 (раздел 3.1); CPU-сборка из индекса `https://download.pytorch.org/whl/cpu`, wheel `torch-2.15.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl` SHA-256 `0f6f69701b2d38ddc412364dfb92e2e13e74960d33fa3573b4930ced626e81c7` | BSD-3-Clause и др. (`license_expression` PyPI: Apache-2.0, BSD-2/3-Clause, MIT, BSL-1.0, ISC, Zlib) |
+| `transformers` (extra `gate0-borealis`) | 5.23.0 | Whisper-энкодер, Qwen3 и токенизатор для Borealis-5b-it; wheel SHA-256 `018e82fd07490ad5bb58414f65e31576033dc7f36bed10c574843f69b90991bf` | Apache-2.0 |
+| `safetensors` (extra `gate0-borealis`) | 0.8.0 | потоковое чтение `model.safetensors` Borealis-5b-it; wheel (`cp310-abi3-manylinux_2_17_x86_64`) SHA-256 `fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774` | Apache-2.0 |
 | `pytest` (dev) | 9.2.0 | тесты | MIT |
 | `ruff` (dev) | 0.17.5 | lint и format | MIT |
 
@@ -58,6 +61,11 @@ backend не упакован, `backend` остаётся `none`, `doctor` дл�
 ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Записи о весах и runtime ниже
 остаются: веса лежат на станции разработки, по ним работает `sound_scout.eval.gate0`.
 
+Запасной кандидат **Borealis-5b-it** (`docs/spec/REQUIREMENTS.md` раздел 9; решение владельца на
+[#68](https://github.com/renidere/sound-scout-plugin/issues/68)) проверен тем же протоколом и тоже
+получил **NOT READY** (`docs/decisions/0010-gate0-borealis.md` §5): ничего не упаковано, `backend`
+остаётся `none`. Его веса и runtime записаны ниже (3.1, 3.2) и остаются на станции разработки.
+
 ### 3.1. Веса
 
 Репозиторий `ggml-org/gemma-4-E4B-it-GGUF` на Hugging Face, ревизия
@@ -76,6 +84,45 @@ backend не упакован, `backend` остаётся `none`, `doctor` дл�
 
 Не используются: `gemma-4-E4B-it-BF16.gguf` (15 GB, вне бюджета), `Q4_0` и `mmproj-…-Q8_0`
 (запасной облегчённый вариант, решение владельца), `mtp-*` (speculative decoding, не нужен).
+
+#### Borealis-5b-it — кандидат Gate 0 spike #68 (решение владельца 7003859372)
+
+Решение владельца — [комментарий 7003859372](https://github.com/renidere/sound-scout-plugin/issues/68#issuecomment-7003859372)
+(2026-11-19): запасной кандидат `docs/spec/REQUIREMENTS.md` §9, загрузка весов на станцию
+разработки разрешена, ревизия — head репозитория на момент загрузки. Репозиторий
+`Vikhrmodels/Borealis-5b-it` на Hugging Face, ревизия `66e8899f74a7cfa8931dbdbb8a907534b927ddb4`
+(head на 2026-11-19, lastModified 2025-12-19). Лицензия Apache-2.0, не gated. Каталог по
+умолчанию: `~/.cache/sound-scout/models/Vikhrmodels--Borealis-5b-it/<ревизия>/`. Итог spike —
+`docs/decisions/0010-gate0-borealis.md`.
+
+Загружены ровно 9 файлов (10 149 393 702 байт); эталон — LFS sha256 или git blob oid из
+`GET https://huggingface.co/api/models/Vikhrmodels/Borealis-5b-it/tree/<ревизия>?recursive=1`
+(ответ лежит рядом с весами как `.hf-tree.json`):
+
+| Файл | Байт | SHA-256 | Эталон HF API |
+|---|---|---|---|
+| `model.safetensors` | 10 133 495 512 | `ceaafa32e56e93bc43eb4807c226ef08942718a3b37747f2f9183f7d5d063b11` | LFS sha256 (тот же) |
+| `tokenizer.json` | 11 423 035 | `fcb4fb9e735fe694250e8eb740459e5a7d515387a7497ae78af2177fa3fc8a21` | LFS sha256 (тот же) |
+| `config.json` | 1 083 | `c5708c8e3f02672adccee2e9399f5c6e26d2fbec5bc3e9cd4964755af9a6ed01` | git blob `0410b9706bf1fa3de8830cc21ff49e068e590776` |
+| `tokenizer_config.json` | 5 808 | `5712797be9e1c0d5cde3fe07400b3aff5ae4b895d2f785fdaa33c1e4e010ed45` | git blob `28b71d84daf75258197d80be453d4c4d64c049f4` |
+| `special_tokens_map.json` | 2 546 | `54c79929443cd1849332ad1d811acab82dd00a876b74b2e520d40b1ccae48ea1` | git blob `b200b5ea3fa3bb994448f8042ef732d101b2d55a` |
+| `added_tokens.json` | 762 | `3bed5ae134cddb1f871e4143159dbc898fa2f1e63da4850d4fbfe136c5ef46c4` | git blob `739eb403f448db705e6412b5c1e8df4c4d187487` |
+| `vocab.json` | 2 776 833 | `ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910` | git blob `4783fe10ac3adce15ac8f358ef5462739852c569` |
+| `merges.txt` | 1 671 853 | `8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5` | git blob `31349551d90c7606f325fe0f11bbb8bd5fa0d7c7` |
+| `modeling_borealis.py` | 16 270 | `802073ea6547cc122e92ed3912a209dfedd13268143f15d7fe1eb07d739c0a02` | git blob `98f1f9b561ee9259f98435ac44a6c821ccdaf5ad` |
+
+Правило загрузки: каждый файл — `curl -fL --proto =https` по прямому URL
+`https://huggingface.co/Vikhrmodels/Borealis-5b-it/resolve/<ревизия>/<файл>` в `<файл>.part`;
+сразу после загрузки проверяются размер и LFS sha256 (`sha256sum`) или git blob oid
+(`git hash-object --no-filters`), только потом файл переименовывается и становится read-only.
+При расхождении файл качается ещё один раз, второе расхождение — стоп. Перед загрузкой модели
+SHA-256 сверяются ещё раз (`sha256sum -c`), а `gate0 run --runtime borealis` пересчитывает их
+перед стартом сервера (предусловие P2) по константе `BOREALIS_WEIGHTS`, равной этой таблице.
+`modeling_borealis.py` исполняется (сервер импортирует его по пути), поэтому входит в
+хэшируемый набор. Не загружаются `processing_borealis.py`, `push_model.py`,
+`Borealis_Demo.ipynb`, `README.md`, `generation_config.json`, `vllm_borealis/*`; из
+`Qwen/Qwen3-4B` и `openai/whisper-large-v3` не загружается ничего — нужные числа их конфигов
+записаны константами в `src/sound_scout/eval/gate0_borealis.py`.
 
 ### 3.2. Runtime
 
@@ -97,6 +144,21 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 
 Сервер слушает только `127.0.0.1` на свободном порту, один анализ за раз (`--parallel 1`).
 
+#### Runtime Borealis-5b-it (Gate 0 spike #68)
+
+GGUF и llama.cpp для этой архитектуры нет. Runtime — `torch` CPU + `transformers` из extra
+`gate0-borealis` (раздел 1) и локальный HTTP-сервер `python -m sound_scout.eval.gate0_borealis
+--model-dir <веса> --host 127.0.0.1 --port <свободный> --threads <N>`, который отвечает на те же
+маршруты, что `llama-server` у `gate0` (`/health`, `/apply-template`, `/tokenize`,
+`/v1/chat/completions`). Штатный `from_pretrained` модели не используется: он загружает конфиги
+и токенизатор из чужих репозиториев и строит fp32-скелет (пик ≈ 29 GB). Каркас строится на
+`meta` из констант, тензоры F16 читаются из `model.safetensors` по одному и приводятся к bf16;
+`trust_remote_code` не используется. До импорта `transformers` выставляются `HF_HUB_OFFLINE=1`,
+`TRANSFORMERS_OFFLINE=1`, `HF_HUB_DISABLE_TELEMETRY=1`; после bind сокета ставится сетевой guard
+процесса; без него (`[network] allow = true`) сервер не стартует. Запуск `gate0 run --runtime borealis` возможен только внутри cgroup с потолком памяти:
+`systemd-run --user --scope -p MemoryMax=20000000000 -p MemorySwapMax=0 -- …` (иначе отказ до
+попытки). Подробности и измерения — `docs/decisions/0010-gate0-borealis.md`.
+
 ### 3.3. Ограничения модели, влияющие на код
 
 - Один аудиовход — не длиннее 30 с (Gemma audio guide); вход 16 kHz mono. Длинная запись режется
@@ -106,6 +168,14 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 - Русский: в техотчёте есть русский ASR (FLEURS ru WER 0.068) и перевод CoVoST ru→en; свидетельств
   оценки произношения и просодии нет; Gate 0 spike дал NOT READY
   (`docs/decisions/0007-gate0-result.md` §5).
+
+Borealis-5b-it (spike #68):
+
+- Аудио всегда дополняется или обрезается до 30 с (`prepare_audio` модели, `padding="max_length"`):
+  в языковую модель всегда идут 375 аудиопозиций, независимо от длины клипа.
+- Таймкодов нет; JSON-режима нет — `response_format` не применяется, ответ проверяет только
+  `review.validate_response`.
+- Один аудиовход на запрос; вход 16 kHz mono.
 
 ## 4. Модели, уже лежащие на станции разработки
 
