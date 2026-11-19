@@ -224,7 +224,11 @@ def evaluate(
             },
         },
         "warning": SMALL_SAMPLE_WARNING,
-        "clips": {"scored": len(scored), "negative_controls": len(controls)},
+        "clips": {
+            "scored": len(scored),
+            "synthetic": sum(1 for clip in scored if clip.record.get("synthetic")),
+            "negative_controls": len(controls),
+        },
         "categories": counts,
         "groups": groups,
         "negative_controls": {"clips": len(controls), "confident_fabrications": fabrications},
@@ -671,7 +675,8 @@ def format_markdown(report: dict) -> str:
         f"> **Предупреждение.** {report['warning']}",
         "",
         f"- **Часть корпуса:** `{report['split']}`; "
-        f"клипов в подсчёте: {report['clips']['scored']}; "
+        f"клипов в подсчёте: {report['clips']['scored']}, "
+        f"из них синтетических (TTS): {report['clips']['synthetic']}; "
         f"отрицательных контролей (обе части): {report['clips']['negative_controls']}.",
         f"- **Манифест:** `{report['manifest']['name']}`, sha256 `{report['manifest']['sha256']}`.",
         f"- **Пороги (docs/eval/PROTOCOL.md § 7):** precision ≥ {PRECISION_MIN:.2f}, "

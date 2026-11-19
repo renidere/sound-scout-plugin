@@ -259,6 +259,44 @@ def test_criterion_5_corpus_scripts_and_tests_are_in_git_and_no_corpus_data_is()
     assert [p for p in paths if p.suffix.lower() in CORPUS_DATA_SUFFIXES] == []
 
 
+SYNTHETIC_OPENSTT_CODE = (
+    "src/sound_scout/eval/synthetic.py",
+    "src/sound_scout/eval/openstt.py",
+    "tests/test_eval_synthetic.py",
+    "tests/test_eval_openstt.py",
+)
+
+
+def test_criterion_5_of_81_tests_synthesize_audio_and_no_tts_or_openstt_data_is_in_git() -> None:
+    """#81 criterion 5: TTS and Open STT outputs, the voice and the archive stay out of git."""
+    for path in SYNTHETIC_OPENSTT_CODE:
+        assert (REPO_ROOT / path).is_file(), path
+        assert not git_ignores(path), path
+    for name in SYNTHETIC_OPENSTT_CODE[2:]:
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "pilot-1" not in text and "openstt-pool" not in text, name
+    for path in (
+        "data/corpus/sources/piper-denis/ru_RU-denis-medium.onnx",
+        "data/corpus/sources/open-stt/asr_calls_2_val.tar.gz",
+        "data/corpus/pilot-1/clips/syn-stress-zamok.wav",
+        "data/corpus/pilot-1/synthetic/syn-stress-zamok.json",
+        "data/corpus/pilot-1/labels/syn-stress-zamok.json",
+        "data/corpus/pilot-1/openstt-pool/0123456789ab.wav",
+        "data/corpus/pilot-1/openstt-selection.json",
+        "data/corpus/pilot-1/asr-review/ostt-0123456789ab.json",
+    ):
+        assert git_ignores(path), path
+    listed = git("ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    if listed.returncode != 0:
+        pytest.skip(f"git is unavailable here: {listed.stderr.strip()}")
+    paths = [Path(p) for p in listed.stdout.split("\0") if p]
+    assert [p for p in paths if p.parts[0] == "data"] == []
+    assert [p for p in paths if p.suffix.lower() in {".onnx", ".gz", ".tar"}] == []
+    assert [p for p in paths if p.suffix.lower() in MEDIA_SUFFIXES] == []
+    data_dirs = {"labels", "synthetic", "asr-review", "openstt-pool"}
+    assert [p for p in paths if data_dirs & set(p.parts[:-1])] == []
+
+
 def test_backend_status_records_that_gigachat_failed_gate0_on_p3() -> None:
     claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")

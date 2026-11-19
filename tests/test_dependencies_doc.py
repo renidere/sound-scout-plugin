@@ -4,7 +4,7 @@ import re
 import tomllib
 from pathlib import Path
 
-from sound_scout.eval.corpus import MS_SNSD_COMMIT, SOURCES
+from sound_scout.eval.corpus import EXTRA_SOURCES, MS_SNSD_COMMIT, SOURCES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPO_ROOT / "docs" / "dependencies.md"
@@ -73,8 +73,8 @@ DATA_ROW = re.compile(
 )
 
 
-def documented_sources(text: str) -> dict[str, tuple[int, str, str]]:
-    section = text.split("## 5. ", 1)[1].split("\n## ", 1)[0]
+def documented_sources(text: str, number: int = 5) -> dict[str, tuple[int, str, str]]:
+    section = text.split(f"## {number}. ", 1)[1].split("\n## ", 1)[0]
     return {
         name: (int(size), checksum, sha) for name, size, checksum, sha in DATA_ROW.findall(section)
     }
@@ -128,3 +128,40 @@ def test_criterion_1_only_open_licensed_files_are_pinned_with_source_version_and
         if len(cells) == 8 and cells[2].startswith("`"):
             rows[cells[2].strip("`")] = (cells[1], cells[3], cells[4])
     assert rows == {s.name: (s.version, s.url, s.license) for s in SOURCES}
+
+
+def test_section_6_pins_the_tts_voice_and_the_open_stt_archive_like_extra_sources() -> None:
+    """#81 criterion 4: the TTS voice and the Open STT archive with version, licence, SHA-256."""
+    text = DEPENDENCIES.read_text(encoding="utf-8")
+    documented = documented_sources(text, 6)
+    pinned = {s.name: (s.size, s.checksum, s.sha256) for s in EXTRA_SOURCES}
+    assert all(sha256 for _, _, sha256 in pinned.values()), "an EXTRA_SOURCES row has no SHA-256"
+    assert documented == pinned
+    section = text.split("## 6. ", 1)[1].split("\n## ", 1)[0]
+    rows = {}
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 8 and cells[2].startswith("`"):
+            rows[cells[2].strip("`")] = (cells[1], cells[3], cells[4])
+    assert rows == {s.name: (s.version, s.url, s.license) for s in EXTRA_SOURCES}
+    assert all(
+        s.license.startswith("CC BY-NC 4.0") for s in EXTRA_SOURCES if s.dataset == "open-stt"
+    )
+
+
+def test_a_drifted_section_6_row_is_caught() -> None:
+    source = EXTRA_SOURCES[0]
+    row = (
+        f"| Piper | rev | `{source.name}` | {source.url} | MIT | {source.size} | "
+        f"`{source.checksum}` | `{'0' * 64}` |"
+    )
+    documented = documented_sources(f"## 6. Голос\n\n{row}\n", 6)
+    assert documented[source.name] != (source.size, source.checksum, source.sha256)
+
+
+def test_section_1_names_the_tts_runtime_and_its_alignment_package_at_locked_versions() -> None:
+    documented = documented_packages(DEPENDENCIES.read_text(encoding="utf-8"))
+    locked = locked_packages()
+    for name in ("piper-tts", "onnx"):
+        versions = {version for n, version in documented if n == name}
+        assert versions and all((name, version) in locked for version in versions), name

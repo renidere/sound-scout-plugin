@@ -1,18 +1,22 @@
-"""Download and verify the open datasets of the pilot corpus (#78) by the pinned table `SOURCES`.
+"""Download and verify the pinned files of the pilot corpus (#78, #81) by `ALL_SOURCES`.
 
     uv run python scripts/fetch_corpus_sources.py fetch --corpus-dir data/corpus [NAME...]
     uv run python scripts/fetch_corpus_sources.py verify --corpus-dir data/corpus
 
-`fetch` downloads each file of `sound_scout.eval.corpus.SOURCES` (or only the NAMEs given), one
-after another, into `<corpus-dir>/sources/<dataset>/<file>`: HTTPS only, directories 0700, files
-0600, no symlink anywhere in the path. The body streams into `<file>.part` while its publisher
-checksum (Zenodo MD5, git blob SHA-1) and SHA-256 are computed; after `fsync` the file is read
-back from disk and both are computed again. The file is renamed into place only when the size,
-the publisher checksum, the stream and the disk digests and, once pinned, the SHA-256 all agree;
-otherwise `.part` is removed and the exit code is 1. No automatic retry. A file already in place
-is verified, not downloaded again. On the first download the SHA-256 is not pinned yet: the file
-is accepted by the publisher checksum and its SHA-256 is printed, to be written into `SOURCES`
-and docs/dependencies.md § 5. `verify` re-hashes every file from disk against the table.
+`fetch` downloads each file of `sound_scout.eval.corpus.ALL_SOURCES` — the open datasets of
+`SOURCES` (#78) and the Piper voice and Open STT archive of `EXTRA_SOURCES` (#81) — or only the
+NAMEs given, one after another, into `<corpus-dir>/sources/<dataset>/<file>`: HTTPS only,
+directories 0700, files 0600, no symlink anywhere in the path. Before the first byte, the free
+space under `<corpus-dir>/sources` must hold every missing file plus `DISK_MARGIN`; otherwise the
+exit code is 1 and no file is downloaded. The body streams into `<file>.part` while its publisher
+checksum (Zenodo MD5, git blob SHA-1, the SHA-256 of a Hugging Face LFS object) and SHA-256 are
+computed; after `fsync` the file is read back from disk and both are computed again. The file is
+renamed into place only when the size, the publisher checksum, the stream and the disk digests
+and, once pinned, the SHA-256 all agree; otherwise `.part` is removed and the exit code is 1. No
+automatic retry. A file already in place is verified, not downloaded again. On the first download
+the SHA-256 is not pinned yet: the file is accepted by the publisher checksum and its SHA-256 is
+printed, to be written into the table and docs/dependencies.md (§ 5 for `SOURCES`, § 6 for
+`EXTRA_SOURCES`). `verify` re-hashes every file from disk against the table.
 
 The network code lives here, outside the installed package (R09); only the corpus directory is
 written, and only under file names taken from the table.
@@ -21,6 +25,7 @@ written, and only under file names taken from the table.
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 import urllib.parse
 import urllib.request
@@ -28,8 +33,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from sound_scout.eval.corpus import (
+    ALL_SOURCES,
     HASH_CHUNK,
-    SOURCES,
     Source,
     check_source,
     digest_mismatches,
@@ -41,6 +46,7 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 TIMEOUT_S = 60.0
 USER_AGENT = "sound-scout-corpus-fetch"
+DISK_MARGIN = 2 << 30
 
 Opener = Callable[[str], object]
 
@@ -126,11 +132,22 @@ def _download(source: Source, part: Path, opener: Opener) -> tuple[int, str, str
 
 
 def selected(names: list[str]) -> list[Source]:
-    known = {source.name: source for source in SOURCES}
+    known = {source.name: source for source in ALL_SOURCES}
     unknown = [name for name in names if name not in known]
     if unknown:
-        raise FetchError(f"not in SOURCES: {', '.join(unknown)}")
-    return [known[name] for name in names] if names else list(SOURCES)
+        raise FetchError(f"not in ALL_SOURCES: {', '.join(unknown)}")
+    return [known[name] for name in names] if names else list(ALL_SOURCES)
+
+
+def check_free_space(corpus_dir: Path, sources: list[Source]) -> None:
+    """Refuse before the first byte when the missing files and `DISK_MARGIN` do not fit."""
+    missing = [s for s in sources if not os.path.lexists(corpus_dir / s.relative_path)]
+    if not missing:
+        return
+    need = sum(source.size for source in missing) + DISK_MARGIN
+    free = shutil.disk_usage(safe_dir(corpus_dir, "sources")).free
+    if free < need:
+        raise FetchError(f"not enough free space: need {need} B, free {free} B")
 
 
 def main(argv: list[str] | None = None, opener: Opener = default_opener) -> int:
@@ -138,13 +155,13 @@ def main(argv: list[str] | None = None, opener: Opener = default_opener) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     fetch = commands.add_parser("fetch", help="download and verify the pinned files")
     fetch.add_argument("--corpus-dir", type=Path, required=True)
-    fetch.add_argument("names", nargs="*", help="file names from SOURCES (default: all)")
+    fetch.add_argument("names", nargs="*", help="file names from ALL_SOURCES (default: all)")
     verify = commands.add_parser("verify", help="re-hash every pinned file from disk")
     verify.add_argument("--corpus-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.command == "verify":
         failed = False
-        for source in SOURCES:
+        for source in ALL_SOURCES:
             problems = check_source(args.corpus_dir, source)
             failed = failed or bool(problems)
             print("\n".join(problems) if problems else f"{source.relative_path}: ok")
@@ -154,6 +171,11 @@ def main(argv: list[str] | None = None, opener: Opener = default_opener) -> int:
     except FetchError as error:
         print(f"fetch: {error}", file=sys.stderr)
         return 2
+    try:
+        check_free_space(args.corpus_dir, sources)
+    except (FetchError, OSError) as error:
+        print(f"fetch: {error}", file=sys.stderr)
+        return 1
     for source in sources:
         try:
             sha256 = fetch_one(args.corpus_dir, source, opener)

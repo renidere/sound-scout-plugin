@@ -93,20 +93,36 @@ def review(manifest_path: str | Path, config_: config.Config) -> dict:
     return {"reviewed": outcomes, "skipped_heldout": heldout}
 
 
+def transcribe_file(
+    path: Path, sha256: str, name: str, runs_dir: Path, config_: config.Config, kind=RUNS_DIR
+) -> tuple[str | None, asr.Transcription | None, Path]:
+    """The `analyze` way from `path` to a completed local ASR in a run of its own under `runs_dir`.
+
+    Returns (problem, transcription, run directory): a problem and no transcription when the
+    file's SHA-256 is not `sha256`, the input is refused or the ASR stage did not complete.
+    """
+    run_dir = _mkdir(runs_dir / f"{name}-{uuid.uuid4().hex[:12]}", config_)
+    run = runs.Run(f"{kind}-{uuid.uuid4().hex}", run_dir, kind, "", False, False, True)
+    try:
+        loaded = gate0.load_mono16k(path, run, config_)
+        if loaded["sha256"] != sha256:
+            return "the clip's sha256 differs from its manifest record", None, run_dir
+        transcription = asr.transcribe(loaded["samples"], run, config_)
+    except _LOAD_ERRORS as error:
+        return f"{type(error).__name__}: {error}", None, run_dir
+    if transcription.status != "completed":
+        return f"asr is {transcription.status}: {transcription.reason}", None, run_dir
+    return None, transcription, run_dir
+
+
 def _transcribe(
     record: dict, root: Path, runs_dir: Path, config_: config.Config
 ) -> tuple[str | None, dict]:
-    run_dir = _mkdir(runs_dir / f"{record['id']}-{uuid.uuid4().hex[:12]}", config_)
-    run = runs.Run(f"asr-review-{uuid.uuid4().hex}", run_dir, RUNS_DIR, "", False, False, True)
-    try:
-        loaded = gate0.load_mono16k(root / record["path"], run, config_)
-        if loaded["sha256"] != record["sha256"]:
-            return "the clip's sha256 differs from its manifest record", {}
-        transcription = asr.transcribe(loaded["samples"], run, config_)
-    except _LOAD_ERRORS as error:
-        return f"{type(error).__name__}: {error}", {}
-    if transcription.status != "completed":
-        return f"asr is {transcription.status}: {transcription.reason}", {}
+    problem, transcription, run_dir = transcribe_file(
+        root / record["path"], record["sha256"], record["id"], runs_dir, config_
+    )
+    if transcription is None:
+        return problem, {}
     raw = transcription.raw
     return None, {
         "format_version": FORMAT_VERSION,

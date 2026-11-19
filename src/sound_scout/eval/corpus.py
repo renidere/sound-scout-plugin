@@ -55,7 +55,7 @@ _MS_SNSD = f"https://raw.githubusercontent.com/microsoft/MS-SNSD/{MS_SNSD_COMMIT
 
 @dataclass(frozen=True)
 class Source:
-    """One pinned file; `checksum` is the publisher's `algorithm:hex` (md5 or git-blob-sha1)."""
+    """One pinned file; `checksum` is the publisher's `algorithm:hex` (md5, git blob, sha256)."""
 
     dataset: str
     name: str
@@ -178,6 +178,58 @@ SOURCES: tuple[Source, ...] = (
 )
 
 
+# Files of #81, kept apart from `SOURCES` so that `prepare` and the #78 table stay as they were:
+# the Piper voice for the synthetic diction clips and the Open STT archive for the ASR control.
+PIPER_REVISION = "04ca88f5685ca5253c701af3687e155b113bd512"
+PIPER_VERSION = f"rhasspy/piper-voices @ {PIPER_REVISION}, ru/ru_RU/denis/medium"
+PIPER_LICENSE = "MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0"
+_PIPER = (
+    f"https://huggingface.co/rhasspy/piper-voices/resolve/{PIPER_REVISION}/ru/ru_RU/denis/medium/"
+)
+OPEN_STT_ARCHIVE = "asr_calls_2_val.tar.gz"
+OPEN_STT_VERSION = "v1.0, DOI 10.5281/zenodo.4899885"
+OPEN_STT_LICENSE = "CC BY-NC 4.0 (README open_stt; поле Zenodo — CC BY 4.0, берётся более строгая)"
+
+
+def _piper(name: str, size: int, checksum: str, sha256: str | None) -> Source:
+    return Source(
+        "piper-denis", name, _PIPER + name, size, checksum, sha256, PIPER_VERSION, PIPER_LICENSE
+    )
+
+
+EXTRA_SOURCES: tuple[Source, ...] = (
+    _piper(
+        "ru_RU-denis-medium.onnx",
+        63221984,
+        "sha256:879bc365cb14d1380e3f5ed6044162ccf54c99f6161871569b7f830aec3ce841",
+        "879bc365cb14d1380e3f5ed6044162ccf54c99f6161871569b7f830aec3ce841",
+    ),
+    _piper(
+        "ru_RU-denis-medium.onnx.json",
+        6196,
+        "git-blob-sha1:59da8d82e1416c9b53095278419c410ad2ed324b",
+        "5891b94580ae739a8cdc5d17591db6800333f85164d13599aca893883d99b9eb",
+    ),
+    _piper(
+        "MODEL_CARD",
+        418,
+        "git-blob-sha1:a97e89d1da2fcbced2e4a42ac49a670a1c19c8a8",
+        "917110d5056810771fd3daea2644bbadf1341816b7631f2043b33be245903432",
+    ),
+    _zenodo(
+        4899885,
+        "open-stt",
+        OPEN_STT_ARCHIVE,
+        805251737,
+        "5146eef0aa64af41e17c5ec18a9cab5c",
+        "aea64611133129e8c9b5d829953f5bfb9cc2d1bd95b9e429fa8e00e2c83f6461",
+        OPEN_STT_VERSION,
+        OPEN_STT_LICENSE,
+    ),
+)
+ALL_SOURCES = SOURCES + EXTRA_SOURCES
+
+
 class CorpusError(Exception):
     """The corpus cannot be built or a source does not match its pin; the message says why."""
 
@@ -187,6 +239,8 @@ def publisher_hasher(source: Source):
     algorithm, _ = source.checksum.split(":", 1)
     if algorithm == "md5":
         return hashlib.md5(usedforsecurity=False)
+    if algorithm == "sha256":
+        return hashlib.sha256()
     if algorithm == "git-blob-sha1":
         digest = hashlib.sha1(usedforsecurity=False)
         digest.update(f"blob {source.size}\0".encode())

@@ -180,6 +180,7 @@ class Corpus:
         control_kind: str = "silence",
         clear_correction: bool = False,
         asr_error_status: str = "confirmed",
+        synthetic: bool = False,
     ) -> None:
         control = not categories
         record = {
@@ -194,6 +195,8 @@ class Corpus:
         }
         if control:
             record["control_kind"] = control_kind
+        if synthetic:
+            record["synthetic"] = True
         if control_kind == "corrupted_asr" and control:
             record["asr_error_status"] = asr_error_status
             if asr_error_status == "confirmed":
@@ -396,6 +399,7 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         ["pronunciation"],
         [event("pronunciation", 1.0, 3.4)],
         [observation("pronunciation", 0.6, 3.8)],
+        synthetic=True,
     )
     corpus.add(
         "h-abstain",
@@ -490,7 +494,7 @@ def test_dev_clips_stay_out_of_a_heldout_run(report: dict) -> None:
     referenced = {f["clip_id"] for f in report["failures"]["false_findings"]}
     referenced |= {e["clip_id"] for e in report["failures"]["missed_events"]}
     assert "d-dev" not in referenced
-    assert report["clips"] == {"scored": 5, "negative_controls": 2}
+    assert report["clips"] == {"scored": 5, "synthetic": 1, "negative_controls": 2}
 
 
 @needs_ffmpeg
@@ -705,6 +709,7 @@ def test_a_judgement_of_no_candidate_pair_is_reported(corpus: Corpus, tmp_path: 
 def test_dev_run_is_not_qualified(corpus: Corpus) -> None:
     report = corpus.evaluate("dev")
     assert report["clips"]["scored"] == 2
+    assert report["clips"]["synthetic"] == 0
     assert any("dev-наборе" in r for r in report["not_qualified_reasons"])
 
 
@@ -745,6 +750,7 @@ def test_report_files_carry_the_warning_flags_and_failures(report: dict, tmp_pat
     for flag in ("validated_ru", "diction_validated_ru", "prosody_validated_ru"):
         assert f"`{flag}`: `false`" in text
     assert "`h-long`" in text and "too_long" in text and "`c-silence`" in text
+    assert "клипов в подсчёте: 5, из них синтетических (TTS): 1;" in text
     assert "синтетическое" not in text  # observation and label texts stay out of the report
     with pytest.raises(EvalError, match="already exists"):
         write_report(report, tmp_path / "out")

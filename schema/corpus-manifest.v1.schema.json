@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/renidere/sound-scout-plugin/schema/corpus-manifest.v1.schema.json",
   "title": "Sound Scout qualification corpus manifest, version 1",
-  "description": "Манифест квалификационного корпуса (Gate 1, T04–T06; docs/eval/PROTOCOL.md): какие клипы входят в корпус, в какую часть (dev/held-out) и какие категории событий в них размечены, какой вид у отрицательного контроля. Сам корпус лежит в data/corpus/<name>/manifest.json вне git. Правила между записями (одна часть на source_group, уникальные hash, вид только у контроля и у каждого контроля, asr_error_status у каждого контроля corrupted_asr и только у него, confirmed — только по заполненному человеком листу asr-review/<id>.json, минимальные объёмы) проверяет sound_scout.eval.manifest.validate поверх этой схемы.",
+  "description": "Манифест квалификационного корпуса (Gate 1, T04–T06; docs/eval/PROTOCOL.md): какие клипы входят в корпус, в какую часть (dev/held-out) и какие категории событий в них размечены, какой вид у отрицательного контроля. Сам корпус лежит в data/corpus/<name>/manifest.json вне git. Правила между записями (одна часть на source_group, уникальные hash, вид только у контроля и у каждого контроля, asr_error_status у каждого контроля corrupted_asr и только у него, confirmed — только по заполненному человеком листу asr-review/<id>.json, synthetic только у записи, которая не контроль, минимальные объёмы) проверяет sound_scout.eval.manifest.validate поверх этой схемы.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "name", "records"],
@@ -54,6 +54,10 @@
         "negative_control": { "type": "boolean" },
         "control_kind": { "enum": ["silence", "noise", "corrupted_asr"] },
         "asr_error_status": { "enum": ["candidate", "confirmed"] },
+        "synthetic": {
+          "type": "boolean",
+          "description": "речь синтезирована TTS, дефект внесён по построению (#81); категории такой записи не утверждены разметкой"
+        },
         "pair_id": { "$ref": "#/$defs/nullable_identifier" },
         "note": { "$ref": "#/$defs/nullable_string" }
       }

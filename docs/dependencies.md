@@ -15,6 +15,10 @@
 версии в lock на дату обновления.
 SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-borealis` (`uv sync --locked --extra gate0-borealis`) нужен только для Gate 0 spike Borealis-5b-it (#68) и по умолчанию не ставится, CI его не тянет; кроме трёх пакетов ниже он приносит `sympy`, `networkx`, `jinja2`, `setuptools`, `regex`, `typer`/`rich` (через `transformers`), а `tokenizers` и `huggingface-hub` уже были в lock через faster-whisper. Extra `gate0-gigachat` (`uv sync --locked --extra gate0-gigachat`) нужен только для Gate 0 spike GigaChat3.1-Audio-10B-A1.8B (#85), тоже не ставится по умолчанию и в CI; он объявлен в `[tool.uv] conflicts` с `gate0-borealis` (разные `torch` и `transformers`), поэтому в lock у `torch` и `transformers` по две версии. Кроме четырёх пакетов ниже он приносит `transformers` 4.57.6 со своими зависимостями: `tokenizers` 0.22.2 (wheel `cp39-abi3-manylinux_2_17_x86_64` SHA-256 `369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67`) и `huggingface-hub` 0.36.2 (SHA-256 `48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270`) вместо версий faster-whisper, `requests`, `urllib3`, `certifi`, `charset-normalizer`, `setuptools`, `sympy`, `networkx`, `jinja2`, `regex`. Пины `==`: `torchaudio` 2.11.0 — последний CPU-wheel для cp313 в `https://download.pytorch.org/whl/cpu`, и он требует ровно `torch` 2.11.0; `transformers` 4.57.6 — версия, на которой upstream проверил код модели (карточка), а в `transformers` 5 слои MoE `DeepseekV3` хранят экспертов слитыми тензорами, и ключи checkpoint не совпадут с каркасом (`docs/decisions/0011-gate0-gigachat-audio.md` §1). `mcp` тянет `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, `pyjwt`, `opentelemetry-api` (без SDK и экспортёра); stdio сервер использует только `mcp.server.stdio`, middleware OpenTelemetry у него убран.
 
+Extra `corpus-tts` (`uv sync --locked --extra corpus-tts`) нужен только для синтеза клипов
+корпуса (`python -m sound_scout.eval.synthetic`, #81) и по умолчанию не ставится, CI его не тянет;
+`protobuf` и `typing-extensions` для `onnx` уже были в lock.
+
 | Пакет | Версия в `uv.lock` | Зачем | Лицензия |
 |---|---|---|---|
 | `faster-whisper` | 1.2.1 | локальный ASR; поставляет ONNX-файл Silero VAD | MIT |
@@ -33,6 +37,10 @@ SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-bo
 | `torchaudio` (extra `gate0-gigachat`) | 2.11.0+cpu | log-mel (`MelSpectrogram`) процессора GigaChat3.1-Audio; CPU-сборка из того же индекса, wheel `torchaudio-2.11.0+cpu-cp313-cp313-manylinux_2_28_x86_64.whl` SHA-256 `3c0175d0ed054bf0dc3b154a744b1a127c94291b3f3b7bdd0639b4b238c89445`; для macOS в lock — `torchaudio` 2.11.0 | BSD-2-Clause |
 | `transformers` (extra `gate0-gigachat`) | 4.57.6 | `DeepseekV3ForCausalLM`, токенизатор и шаблон GigaChat3.1-Audio; wheel SHA-256 `4c9e9de11333ddfe5114bc872c9f370509198acf0b87a832a0ab9458e2bd0550` | Apache-2.0 |
 | `safetensors` (extra `gate0-gigachat`) | 0.8.0 | потоковое чтение шардов декодера GigaChat3.1-Audio; тот же wheel, что выше | Apache-2.0 |
+| `piper-tts` (extra `corpus-tts`) | 1.8.0 | TTS для синтетических клипов с дефектами дикции корпуса `pilot-1` (#81, раздел 6), только CPU (`use_cuda=False`); espeak-ng встроен в wheel; последний стабильный релиз на 2026-11-19; wheel `piper_tts-1.8.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl` SHA-256 `25b4d3f31ff70c8fa7151908e00aaa5650cbdf16bca8fcf21299f3941b89a7d3` | GPL-3.0-or-later |
+| `onnx` (extra `corpus-tts`) | 1.23.2 | extra `alignment` у piper-tts: патч модели в памяти, чтобы Piper отдал выравнивание (отсчёты на фонему); файл модели не меняется; последний стабильный релиз на 2026-11-19; wheel `onnx-1.23.2-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` SHA-256 `7abf381d278f31ac62487fddedc9dd42da842dce94d5d43536836ee3efdf4a2b` | Apache-2.0 |
+| `ml-dtypes` (через onnx) | 0.7.0 | типы данных onnx; wheel (`cp313-manylinux_2_27_x86_64`) SHA-256 `5fb56999e1a03f47af5583af4089e00d04b68f87d4fadd659a5927ecd7687c3d` | Apache-2.0 |
+| `pathvalidate` (через piper-tts) | 3.3.1 | проверка имён файлов в piper-tts; wheel `pathvalidate-3.3.1-py3-none-any.whl` SHA-256 `5263baab691f8e1af96092fa5137ee17df5bdfbd6cff1fcac4d6ef4bc2e1735f` | MIT |
 | `pytest` (dev) | 9.2.0 | тесты | MIT |
 | `ruff` (dev) | 0.17.5 | lint и format | MIT |
 
@@ -49,6 +57,9 @@ SHA-256 каждого файла пакета — в `uv.lock`. Extra `gate0-bo
 версия. Под Hermes MCP-сервер получает `PATH` Hermes, где первым стоит его собственный FFmpeg
 (`~/.hermes/tools/…`), поэтому запись `speech-review` задаёт `env.PATH` из системных каталогов
 (`docs/hermes-install.md`, «Регистрация в Hermes»).
+
+espeak-ng отдельно не ставится: фонемизатор и его данные встроены в wheel `piper-tts` (extra
+`corpus-tts`, раздел 1), системный пакет не нужен.
 
 CI (`.github/workflows/ci.yml`): `actions/checkout@v7.0.1`, `astral-sh/setup-uv@v10.3.3`, FFmpeg из
 apt runner'а.
@@ -302,3 +313,31 @@ GigaChat3.1-Audio-10B-A1.8B (spike #85):
 | MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_test/Babble_6.wav | `Babble_6.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_test/Babble_6.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 686764 | `git-blob-sha1:8efd80a6a452657dc7b8097d1a0c59560d195fdf` | `c355c815d3cc34e0826fb1ba72fab8c3d221d7be4b25e629932b8a7e083d4af5` |
 | MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_train/NeighborSpeaking_2.wav | `NeighborSpeaking_2.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_train/NeighborSpeaking_2.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 706052 | `git-blob-sha1:aba9083a05dc576ed56feb5dfa89bd6f67586a31` | `dff6281d248beeff5458b4fcb71387c19f62982eecafd00b78e3a0a6a8c6dc52` |
 | MS-SNSD | commit fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742, noise_train/NeighborSpeaking_4.wav | `NeighborSpeaking_4.wav` | https://raw.githubusercontent.com/microsoft/MS-SNSD/fe61c4ba0d9ac8dd7e23d719cc79f8947e1dc742/noise_train/NeighborSpeaking_4.wav | CC0 (шумы Freesound по README MS-SNSD; код MIT) | 760012 | `git-blob-sha1:f8009b35aff8a2bcbd6a069852a8e773e60c966d` | `8b179254d5b8c039563cf5206531dbcc0bb24ef7bf077456c503d17d4d083d47` |
+
+## 6. Голос TTS и данные NC для синтетики и контроля ASR (#81)
+
+Файлы для двух дополнений черновика `pilot-1`: синтетических клипов с известными ошибками
+ударения и искажениями слов (`sound_scout.eval.synthetic`) и контроля «речь с ошибками ASR» из
+Open STT (`sound_scout.eval.openstt`). Загрузку ровно этих файлов разрешил владелец 2026-11-19
+([#81](https://github.com/renidere/sound-scout-plugin/issues/81)); лицензии NC и синтетику для
+квалификационного корпуса владелец принял в
+[#29](https://github.com/renidere/sound-scout-plugin/issues/29). Использование — только локальная
+квалификация; файлы лежат в `data/corpus/sources/<набор>/` вне git. Голос Piper — не audio
+backend и в `analyze` не входит: он только создаёт синтетические клипы. Их скачивает тот же
+`scripts/fetch_corpus_sources.py` по таблице `sound_scout.eval.corpus.EXTRA_SOURCES` (размер, сумма
+издателя и SHA-256 — по потоку и по диску), расхождение таблицы и этого раздела ловит
+`tests/test_dependencies_doc.py`. Отдельный раздел нужен потому, что раздел 5 обязан совпадать с
+`SOURCES` (#78). Сумма издателя у `.onnx` — LFS oid Hugging Face (SHA-256 содержимого), у
+`.onnx.json` и `MODEL_CARD` — git blob SHA-1 на закреплённой ревизии, у Open STT — MD5 Zenodo
+(совпадает с `md5sum.lst` репозитория open_stt). Лицензия Open STT расходится: README open_stt —
+CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более строгая CC BY-NC 4.0. Голос `denis` дообучен
+от базовой модели `rdh` (CC0) и по `MODEL_CARD` требует Piper ≥ 1.5. Манифест
+`asr_calls_2_val.csv` не скачивается: пары wav/txt берутся из самого архива. Правила —
+`docs/decisions/0012-synthetic-diction-and-openstt.md`.
+
+| Набор | Версия / ревизия | Файл | Источник (URL) | Лицензия | Байт | Сумма издателя | SHA-256 |
+|---|---|---|---|---|---|---|---|
+| Piper, голос `ru_RU-denis-medium` | rhasspy/piper-voices @ 04ca88f5685ca5253c701af3687e155b113bd512, ru/ru_RU/denis/medium | `ru_RU-denis-medium.onnx` | https://huggingface.co/rhasspy/piper-voices/resolve/04ca88f5685ca5253c701af3687e155b113bd512/ru/ru_RU/denis/medium/ru_RU-denis-medium.onnx | MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0 | 63221984 | `sha256:879bc365cb14d1380e3f5ed6044162ccf54c99f6161871569b7f830aec3ce841` | `879bc365cb14d1380e3f5ed6044162ccf54c99f6161871569b7f830aec3ce841` |
+| Piper, голос `ru_RU-denis-medium` | rhasspy/piper-voices @ 04ca88f5685ca5253c701af3687e155b113bd512, ru/ru_RU/denis/medium | `ru_RU-denis-medium.onnx.json` | https://huggingface.co/rhasspy/piper-voices/resolve/04ca88f5685ca5253c701af3687e155b113bd512/ru/ru_RU/denis/medium/ru_RU-denis-medium.onnx.json | MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0 | 6196 | `git-blob-sha1:59da8d82e1416c9b53095278419c410ad2ed324b` | `5891b94580ae739a8cdc5d17591db6800333f85164d13599aca893883d99b9eb` |
+| Piper, голос `ru_RU-denis-medium` | rhasspy/piper-voices @ 04ca88f5685ca5253c701af3687e155b113bd512, ru/ru_RU/denis/medium | `MODEL_CARD` | https://huggingface.co/rhasspy/piper-voices/resolve/04ca88f5685ca5253c701af3687e155b113bd512/ru/ru_RU/denis/medium/MODEL_CARD | MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0 | 418 | `git-blob-sha1:a97e89d1da2fcbced2e4a42ac49a670a1c19c8a8` | `917110d5056810771fd3daea2644bbadf1341816b7631f2043b33be245903432` |
+| Open STT `asr_calls_2_val` | v1.0, DOI 10.5281/zenodo.4899885 | `asr_calls_2_val.tar.gz` | https://zenodo.org/records/4899885/files/asr_calls_2_val.tar.gz?download=1 | CC BY-NC 4.0 (README open_stt; поле Zenodo — CC BY 4.0, берётся более строгая) | 805251737 | `md5:5146eef0aa64af41e17c5ec18a9cab5c` | `aea64611133129e8c9b5d829953f5bfb9cc2d1bd95b9e429fa8e00e2c83f6461` |

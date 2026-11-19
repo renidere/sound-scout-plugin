@@ -173,6 +173,11 @@ def _record_errors(records: list[dict]) -> list[str]:
             errors.append(
                 f"$.records[{i}].asr_error_status: only a corrupted_asr control carries it"
             )
+        if record["negative_control"] and record.get("synthetic"):
+            errors.append(
+                f"$.records[{i}].synthetic: synthetic speech carries a defect by construction, "
+                "it is no negative control"
+            )
         if record.get("pair_id") is not None and PAIR_CATEGORY not in record["categories"]:
             errors.append(
                 f"$.records[{i}].pair_id: a member of a same-words pair carries {PAIR_CATEGORY!r}"

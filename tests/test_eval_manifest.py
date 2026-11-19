@@ -661,3 +661,22 @@ def test_draft_report_puts_label_dependent_errors_in_their_own_block() -> None:
     assert "same-words pairs" not in head and "same-words pairs" in block
     assert text.splitlines()[-1] == manifest.DRAFT_SOUND
     assert "same-words pairs" in format_report(report)
+
+
+def test_synthetic_marks_a_speech_record_and_is_a_boolean(doc: dict) -> None:
+    """#81: a synthetic clip is marked in the manifest; the schema takes only a boolean."""
+    doc["records"][0]["synthetic"] = True
+    assert validation_report(doc).ok
+    doc["records"][0]["synthetic"] = "yes"
+    report = validation_report(doc)
+    assert any(error.startswith("$.records[0].synthetic") for error in report.errors)
+
+
+def test_synthetic_on_a_negative_control_is_rejected(doc: dict) -> None:
+    doc["records"][-1]["synthetic"] = True
+    report = assert_rejected(
+        doc,
+        "$.records[19].synthetic: synthetic speech carries a defect by construction, it is no "
+        "negative control",
+    )
+    assert len(report.errors) == 1

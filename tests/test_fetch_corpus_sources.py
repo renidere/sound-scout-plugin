@@ -103,7 +103,7 @@ def test_a_mismatch_removes_the_part_file_and_keeps_nothing(tmp_path, source, re
 
 def test_main_exits_1_and_names_the_mismatch(tmp_path, monkeypatch, capsys) -> None:
     bad = md5_source(checksum="md5:" + "0" * 32)
-    monkeypatch.setattr(fetch, "SOURCES", (bad,))
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (bad,))
     code = fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY))
     assert code == 1
     assert "publisher checksum" in capsys.readouterr().err
@@ -170,24 +170,88 @@ def test_a_symlink_in_the_path_is_refused(tmp_path: Path) -> None:
 def test_verify_rehashes_every_pinned_file(tmp_path, monkeypatch, capsys) -> None:
     good = md5_source(sha256=hashlib.sha256(BODY).hexdigest())
     missing = dataclasses.replace(good, name="OTHER_16k.zip")
-    monkeypatch.setattr(fetch, "SOURCES", (good,))
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (good,))
     assert fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY)) == 0
     assert fetch.main(["verify", "--corpus-dir", str(tmp_path)]) == 0
     assert "TEST_16k.zip: ok" in capsys.readouterr().out
-    monkeypatch.setattr(fetch, "SOURCES", (good, missing))
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (good, missing))
     assert fetch.main(["verify", "--corpus-dir", str(tmp_path)]) == 1
     assert "OTHER_16k.zip: missing" in capsys.readouterr().out
 
 
 def test_unknown_names_are_refused(tmp_path: Path, capsys) -> None:
     assert fetch.main(["fetch", "--corpus-dir", str(tmp_path), "nope.zip"]) == 2
-    assert "not in SOURCES" in capsys.readouterr().err
+    assert "not in ALL_SOURCES" in capsys.readouterr().err
 
 
 def test_the_committed_table_pins_every_file_over_https() -> None:
-    names = [source.name for source in corpus.SOURCES]
+    names = [source.name for source in corpus.ALL_SOURCES]
     assert len(names) == len(set(names))
-    for source in corpus.SOURCES:
+    assert corpus.ALL_SOURCES == corpus.SOURCES + corpus.EXTRA_SOURCES
+    for source in corpus.ALL_SOURCES:
         assert source.url.startswith("https://")
         assert source.sha256 is not None and len(source.sha256) == 64, source.name
-        assert source.dataset in ("rinco", "demand", "ms-snsd")
+    assert {s.dataset for s in corpus.SOURCES} == {"rinco", "demand", "ms-snsd"}
+    assert {s.dataset for s in corpus.EXTRA_SOURCES} == {"piper-denis", "open-stt"}
+
+
+def test_the_extra_table_holds_exactly_the_files_the_owner_allowed_for_81() -> None:
+    revision = corpus.PIPER_REVISION
+    piper = f"https://huggingface.co/rhasspy/piper-voices/resolve/{revision}/ru/ru_RU/denis/medium/"
+    assert {s.url for s in corpus.EXTRA_SOURCES} == {
+        piper + "ru_RU-denis-medium.onnx",
+        piper + "ru_RU-denis-medium.onnx.json",
+        piper + "MODEL_CARD",
+        "https://zenodo.org/records/4899885/files/asr_calls_2_val.tar.gz?download=1",
+    }
+    onnx = next(s for s in corpus.EXTRA_SOURCES if s.name.endswith(".onnx"))
+    assert onnx.checksum == f"sha256:{onnx.sha256}"
+
+
+def test_a_sha256_publisher_checksum_is_the_plain_sha256_of_the_body(tmp_path: Path) -> None:
+    source = md5_source(
+        dataset="piper-denis",
+        name="voice.onnx",
+        checksum="sha256:" + hashlib.sha256(BODY).hexdigest(),
+    )
+    sha256 = fetch.fetch_one(tmp_path, source, opener_for(BODY))
+    assert sha256 == hashlib.sha256(BODY).hexdigest()
+    assert (tmp_path / "sources" / "piper-denis" / "voice.onnx").read_bytes() == BODY
+    bad = dataclasses.replace(source, name="other.onnx", checksum="sha256:" + "0" * 64)
+    with pytest.raises(fetch.FetchError, match="publisher checksum"):
+        fetch.fetch_one(tmp_path, bad, opener_for(BODY))
+
+
+def test_without_free_space_for_the_missing_files_nothing_is_fetched(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    source = md5_source()
+    calls: list[str] = []
+    usage = fetch.shutil.disk_usage(tmp_path)
+    free = len(BODY) + fetch.DISK_MARGIN - 1
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (source,))
+    monkeypatch.setattr(fetch.shutil, "disk_usage", lambda path: usage._replace(free=free))
+    code = fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY, calls))
+    assert code == 1
+    assert f"need {len(BODY) + fetch.DISK_MARGIN} B, free {free} B" in capsys.readouterr().err
+    assert calls == []
+    assert not (tmp_path / source.relative_path).exists()
+    monkeypatch.setattr(fetch.shutil, "disk_usage", lambda path: usage._replace(free=free + 1))
+    assert fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY)) == 0
+
+
+def test_files_in_place_need_no_free_space(tmp_path, monkeypatch) -> None:
+    source = md5_source(sha256=hashlib.sha256(BODY).hexdigest())
+    fetch.fetch_one(tmp_path, source, opener_for(BODY))
+    usage = fetch.shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (source,))
+    monkeypatch.setattr(fetch.shutil, "disk_usage", lambda path: usage._replace(free=0))
+    assert fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY)) == 0
+
+
+def test_fetch_without_names_takes_the_extra_sources_too(tmp_path, monkeypatch) -> None:
+    extra = dataclasses.replace(md5_source(), dataset="open-stt", name="asr_calls_2_val.tar.gz")
+    monkeypatch.setattr(fetch, "ALL_SOURCES", (md5_source(), extra))
+    assert fetch.main(["fetch", "--corpus-dir", str(tmp_path)], opener=opener_for(BODY)) == 0
+    assert (tmp_path / "sources" / "open-stt" / "asr_calls_2_val.tar.gz").read_bytes() == BODY
+    assert (tmp_path / "sources" / "demand" / "TEST_16k.zip").read_bytes() == BODY
