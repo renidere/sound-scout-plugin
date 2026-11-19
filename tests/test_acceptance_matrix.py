@@ -261,3 +261,49 @@ def test_r12_and_t09_rows_do_not_refer_to_issue_40_as_open(text: str) -> None:
         assert ISSUE_40 not in evidence.split("blocked:", 1)[1], item
         closed = re.findall(re.escape(ISSUE_40) + r",? закрыта", evidence)
         assert evidence.count(ISSUE_40) == len(closed) >= 1, item
+
+
+ISSUE_82 = "[#82](https://github.com/renidere/sound-scout-plugin/issues/82)"
+EPIC_7 = "sound-scout-plugin/issues/7)"
+
+
+def hermes_risk_item(text: str) -> str:
+    risks = next(part for title, part in sections(text).items() if title.startswith("Риски"))
+    items = re.split(r"^- ", risks, flags=re.MULTILINE)
+    return next(item for item in items if item.startswith("**Hermes"))
+
+
+def test_r08_cites_the_issue_40_evidence_instead_of_an_unchecked_hermes_session(
+    text: str,
+) -> None:
+    status, evidence = matrix_row(text, "R08")[1], matrix_row(text, "R08")[4]
+    assert status == "проверено"
+    assert "не проверено — это T09b" not in evidence
+    assert "2026-11-19" in evidence
+    assert f"{ISSUE_40}, закрыта" in evidence
+    for fact in T09B_EVIDENCE:
+        assert fact in evidence, fact
+    if "мессенджер" in evidence:
+        assert ISSUE_82 in evidence
+
+
+def test_issue_82_not_epic_7_blocks_the_messenger_gap(text: str) -> None:
+    gap_texts = {
+        "R12": matrix_row(text, "R12")[4].split("blocked:", 1)[1],
+        "T09": matrix_row(text, "T09")[4].split("blocked:", 1)[1],
+        "Hermes (T09b)": status_row(text, "Hermes (T09b)")[3],
+        "Hermes risk item": hermes_risk_item(text),
+    }
+    for place, gap in gap_texts.items():
+        assert ISSUE_82 in gap, place
+        assert EPIC_7 not in gap, place
+
+
+def test_r08_names_as_unchecked_only_the_messenger_session(text: str) -> None:
+    evidence = matrix_row(text, "R08")[4]
+    unchecked = [part for part in re.split(r"(?<=[.:])\s+", evidence) if "не провер" in part]
+    assert unchecked, "R08 must still name the messenger gap"
+    for sentence in unchecked:
+        assert "мессенджера через gateway" in sentence, sentence
+        assert ISSUE_82 in sentence, sentence
+    assert "в настоящей сессии Hermes 2026-11-19" in evidence
