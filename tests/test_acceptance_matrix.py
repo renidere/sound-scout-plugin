@@ -134,8 +134,8 @@ def test_statuses_follow_gate0_and_the_open_blockers(text: str) -> None:
     }
     assert by_layer["Audio capability"][1] == "NOT READY"
     assert by_layer["Русская квалификация"][1] == "NOT QUALIFIED"
-    assert by_layer["Hermes (T09b)"][1] == "partial"
-    assert "мессенджера через gateway" in by_layer["Hermes (T09b)"][3]
+    assert by_layer["Hermes (T09b)"][1] == "проверено"
+    assert "`c70d7c00363e4c6d8427b0101730505b`" in by_layer["Hermes (T09b)"][3]
     assert "0007-gate0-result.md" in sections(text)["Статусы"]
 
 
@@ -218,7 +218,6 @@ T09B_EVIDENCE = (
     "`3e85aec94e234233ae5068b0ee39f74b`",
     "`compare/dee942d962c84a78b6b3602e75e73f6b.json`",
 )
-GATEWAY_GAP = "вызов из сессии мессенджера через gateway"
 
 
 def status_row(text: str, layer: str) -> list[str]:
@@ -232,7 +231,7 @@ def matrix_row(text: str, item: str) -> list[str]:
 
 def test_t09b_status_shows_the_issue_40_run_ids_hermes_version_and_date(text: str) -> None:
     _, status, date, evidence = status_row(text, "Hermes (T09b)")
-    assert status == "partial"
+    assert status == "проверено"
     assert date == "2026-11-19"
     for fact in T09B_EVIDENCE:
         assert fact in evidence, fact
@@ -245,26 +244,19 @@ def test_acceptance_doc_copies_no_private_absolute_path(text: str) -> None:
         assert marker not in text, marker
 
 
-def test_matrix_states_the_gap_no_call_from_a_messenger_session_through_the_gateway(
-    text: str,
-) -> None:
-    assert GATEWAY_GAP in status_row(text, "Hermes (T09b)")[3]
-    for item in ("R12", "T09"):
-        blocked = matrix_row(text, item)[4].split("blocked:", 1)[1]
-        assert GATEWAY_GAP in blocked, item
-    assert "через gateway не проверен" in text.split("## Матрица", 1)[0]
-
-
 def test_r12_and_t09_rows_do_not_refer_to_issue_40_as_open(text: str) -> None:
     for item in ("R12", "T09"):
         evidence = matrix_row(text, item)[4]
-        assert ISSUE_40 not in evidence.split("blocked:", 1)[1], item
+        assert ISSUE_40 not in evidence.partition("blocked:")[2], item
         closed = re.findall(re.escape(ISSUE_40) + r",? закрыта", evidence)
         assert evidence.count(ISSUE_40) == len(closed) >= 1, item
 
 
 ISSUE_82 = "[#82](https://github.com/renidere/sound-scout-plugin/issues/82)"
 EPIC_7 = "sound-scout-plugin/issues/7)"
+DESKTOP_RUN = "`c70d7c00363e4c6d8427b0101730505b`"
+DESKTOP_CALL = "issues/82#issuecomment-7006876118"
+OWNER_DECISION = "issues/82#issuecomment-7006985134"
 
 
 def hermes_risk_item(text: str) -> str:
@@ -287,23 +279,63 @@ def test_r08_cites_the_issue_40_evidence_instead_of_an_unchecked_hermes_session(
         assert ISSUE_82 in evidence
 
 
-def test_issue_82_not_epic_7_blocks_the_messenger_gap(text: str) -> None:
-    gap_texts = {
-        "R12": matrix_row(text, "R12")[4].split("blocked:", 1)[1],
-        "T09": matrix_row(text, "T09")[4].split("blocked:", 1)[1],
+def desktop_places(text: str) -> dict[str, str]:
+    return {
+        "R12": matrix_row(text, "R12")[4],
+        "T09": matrix_row(text, "T09")[4],
         "Hermes (T09b)": status_row(text, "Hermes (T09b)")[3],
         "Hermes risk item": hermes_risk_item(text),
     }
-    for place, gap in gap_texts.items():
-        assert ISSUE_82 in gap, place
-        assert EPIC_7 not in gap, place
 
 
-def test_r08_names_as_unchecked_only_the_messenger_session(text: str) -> None:
+def test_the_desktop_native_call_is_the_t09b_evidence_and_no_messenger_gap_blocks(
+    text: str,
+) -> None:
+    for place, body in desktop_places(text).items():
+        assert DESKTOP_RUN in body, place
+        assert DESKTOP_CALL in body, place
+        assert OWNER_DECISION in body, place
+        blocked = body.partition("blocked:")[2]
+        assert "мессенджер" not in blocked, place
+        assert ISSUE_82 not in blocked, place
+        assert EPIC_7 not in body, place
+    assert "не проверен" not in text.split("## Матрица", 1)[0]
+    assert DESKTOP_RUN in text.split("## Матрица", 1)[0]
+
+
+def test_desktop_rows_keep_the_missing_audio_backend_limit(text: str) -> None:
+    for place, body in desktop_places(text).items():
+        assert "`diction` и `prosody` — `not_assessed`" in body, place
+    assert matrix_row(text, "R12")[1] == "проверено"
+    t09 = matrix_row(text, "T09")
+    assert t09[1] == "partial"
+    assert "issues/68" in t09[4].partition("blocked:")[2]
+
+
+def test_r08_cites_the_desktop_call_and_names_nothing_unchecked(text: str) -> None:
     evidence = matrix_row(text, "R08")[4]
-    unchecked = [part for part in re.split(r"(?<=[.:])\s+", evidence) if "не провер" in part]
-    assert unchecked, "R08 must still name the messenger gap"
-    for sentence in unchecked:
-        assert "мессенджера через gateway" in sentence, sentence
-        assert ISSUE_82 in sentence, sentence
+    assert "не провер" not in evidence
+    assert DESKTOP_RUN in evidence
+    assert DESKTOP_CALL in evidence
     assert "в настоящей сессии Hermes 2026-11-19" in evidence
+
+
+def test_criterion1_the_four_places_name_the_messenger_only_as_not_required(text: str) -> None:
+    for place, body in desktop_places(text).items():
+        mentions = [s for s in re.split(r"(?<=[.;:])\s+", body) if "мессенджер" in s]
+        assert mentions, place
+        for sentence in mentions:
+            assert sentence.startswith("вызов через мессенджер не требуется"), (place, sentence)
+
+
+def test_criterion1_the_desktop_call_claims_no_speech_compare_and_no_hearing(text: str) -> None:
+    for place, body in desktop_places(text).items():
+        assert re.search(
+            r"`speech_compare`[^.]*Desktop[^.]*не вызывался|"
+            r"`speech_compare` в этой сессии не вызывался",
+            body,
+        ), place
+        assert "`partial`" in body, place
+    for item in ("R12", "T09"):
+        assert "`audio_review` — `unavailable` (`backend = none`)" in matrix_row(text, item)[4]
+    assert "validated_ru` — true" not in text
