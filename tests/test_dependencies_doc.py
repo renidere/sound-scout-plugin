@@ -4,7 +4,7 @@ import re
 import tomllib
 from pathlib import Path
 
-from sound_scout.eval.corpus import SOURCES
+from sound_scout.eval.corpus import MS_SNSD_COMMIT, SOURCES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPO_ROOT / "docs" / "dependencies.md"
@@ -80,3 +80,36 @@ def test_a_drifted_source_row_is_caught() -> None:
     )
     documented = documented_sources(f"## 5. Данные\n\n{row}\n\n## 6. Other\n")
     assert documented[source.name] != (source.size, source.checksum, source.sha256)
+
+
+OPEN_LICENSES = ("CC BY 4.0", "CC BY-SA 3.0", "CC0")
+NO_REGISTRATION_URLS = {
+    "rinco": "https://zenodo.org/records/8119302/files/",
+    "demand": "https://zenodo.org/records/1227121/files/",
+    "ms-snsd": f"https://raw.githubusercontent.com/microsoft/MS-SNSD/{MS_SNSD_COMMIT}/",
+}
+
+
+def test_criterion_1_only_open_licensed_files_are_pinned_with_source_version_and_license() -> None:
+    """#78 criterion 1: RINCO, 2-3 DEMAND rooms, MS-SNSD Babble/NeighborSpeaking, open licenses."""
+    by_dataset: dict[str, list[str]] = {}
+    for source in SOURCES:
+        by_dataset.setdefault(source.dataset, []).append(source.name)
+        assert source.license.startswith(OPEN_LICENSES), source.name
+        assert source.url.startswith(NO_REGISTRATION_URLS[source.dataset]), source.name
+    assert set(by_dataset) == {"rinco", "demand", "ms-snsd"}
+    assert "RINCO_Russian_Intonation_Corpus-v01.zip" in by_dataset["rinco"]
+    assert 2 <= len(by_dataset["demand"]) <= 3
+    assert all(re.fullmatch(r"[A-Z]+_16k\.zip", name) for name in by_dataset["demand"])
+    assert {name.split("_", 1)[0] for name in by_dataset["ms-snsd"]} == {
+        "Babble",
+        "NeighborSpeaking",
+    }
+
+    section = DEPENDENCIES.read_text(encoding="utf-8").split("## 5. ", 1)[1].split("\n## ", 1)[0]
+    rows = {}
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 8 and cells[2].startswith("`"):
+            rows[cells[2].strip("`")] = (cells[1], cells[3], cells[4])
+    assert rows == {s.name: (s.version, s.url, s.license) for s in SOURCES}
