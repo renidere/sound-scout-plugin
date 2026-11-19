@@ -27,12 +27,17 @@ labels and results are NOT QUALIFIED reasons in the report. `eval check-manifest
 their own and only the others fail. A qualifying manifest ends with 'manifest qualifies' and
 exits 0; for a manifest that does not qualify, the last `--draft` line is one of three verdicts:
 the structure is sound (exit 0), the structure is sound but short of clips or controls (exit 1),
-or the structure is not sound (exit 1). `smoke [decoder] [acoustics] [asr]`
-runs the real components (`sound_scout.smoke`) — `decoder` and `acoustics` on a synthetic signal,
-`asr` on the development recording named by `SOUND_SCOUT_DEV_AUDIO`, only when asked for — and
-saves the smoke-receipts `doctor` reads; one line per component, exit 0 when every receipt was
-written, 1 otherwise. `app`, `smoke` and `mcp_server` are imported only by the subcommands that
-run them: they load Praat and the speech detector.
+or the structure is not sound (exit 1). `eval import-labels <submission> --package <package>`
+imports one returned working copy of a blind labeling package (`sound_scout.eval.label_import`):
+on success it prints the counts and the new `<package>-returns/<NNN>` directory, exit 0; each
+refusal is one `refused: <file>: <code>` line on stderr (a file may have several; validator errors
+indented below it), nothing is written and the command ends with `eval_error`, exit 1.
+`smoke [decoder] [acoustics] [asr]` runs the real components (`sound_scout.smoke`) — `decoder`
+and `acoustics` on a synthetic signal, `asr` on the development recording named by
+`SOUND_SCOUT_DEV_AUDIO`, only when asked for — and saves the smoke-receipts `doctor` reads; one
+line per component, exit 0 when every receipt was written, 1 otherwise. `app`, `smoke` and
+`mcp_server` are imported only by the subcommands that run them: they load Praat and the speech
+detector.
 """
 
 import argparse
@@ -41,7 +46,7 @@ import sys
 import traceback
 
 from sound_scout import __version__, config, doctor, guard
-from sound_scout.eval import manifest, runner
+from sound_scout.eval import label_import, manifest, runner
 
 SUBCOMMANDS = {
     "doctor": "report the state of the decoder, ASR, acoustic analysis and audio backend",
@@ -195,6 +200,20 @@ def _add_eval_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         "for a manifest that does not qualify, the last line says: structure sound, structure "
         "sound but short of clips or controls (exit 1), or structure not sound (exit 1)",
     )
+    imports = actions.add_parser(
+        "import-labels",
+        help="import one returned working copy of a blind labeling package into "
+        "<package>-returns/<NNN>/ next to the package",
+        description="import one returned working copy of a blind labeling package into "
+        "<package>-returns/<NNN>/ next to the package; any refused file writes nothing",
+        parents=[common],
+    )
+    imports.add_argument("submission", help="the returned folder holding labels/ and review.csv")
+    imports.add_argument(
+        "--package",
+        required=True,
+        help="the blind labeling package holding operator-private/alias-map.json",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -316,6 +335,8 @@ def run_eval(args: argparse.Namespace) -> int:
         print(manifest.format_report(checked, draft=args.draft))
         passed = checked.draft_ok if args.draft else checked.ok
         return 0 if passed else ERROR_EXIT_CODE
+    if args.eval_command == "import-labels":
+        return run_import_labels(args)
     try:
         report = runner.evaluate(
             args.manifest,
@@ -331,6 +352,24 @@ def run_eval(args: argparse.Namespace) -> int:
         print(f"{flag}: {json.dumps(report[flag])}")
     print(f"report: {markdown_path}")
     print(f"report json: {json_path}")
+    return 0
+
+
+def run_import_labels(args: argparse.Namespace) -> int:
+    try:
+        summary = label_import.import_submission(args.submission, args.package)
+    except label_import.ImportRefused as error:
+        for refusal in error.refusals:
+            print(f"refused: {refusal.file}: {refusal.code}", file=sys.stderr)
+            for detail in refusal.details:
+                print(f"  {_one_line(detail)}", file=sys.stderr)
+        raise CliError(EVAL_ERROR, str(error)) from error
+    except label_import.LabelImportError as error:
+        raise CliError(EVAL_ERROR, str(error)) from error
+    print(f"imported: {summary.imported}")
+    print(f"unsigned: {summary.unsigned}")
+    print(f"already imported: {summary.already_imported}")
+    print(f"output: {summary.output}")
     return 0
 
 
