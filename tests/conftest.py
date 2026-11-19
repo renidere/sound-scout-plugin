@@ -1,6 +1,8 @@
 import functools
+import os
 import shutil
 import subprocess
+import tempfile
 import wave
 from collections.abc import Callable
 from pathlib import Path
@@ -8,8 +10,43 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sound_scout.config import root_denied_name
+
 WavFactory = Callable[..., Path]
 Encoder = Callable[..., Path]
+
+TEMP_DIR_VARIABLES = ("TMPDIR", "TEMP", "TMP")
+
+
+def temp_dir_bars_tmp_path(temp_dir: Path) -> bool:
+    """Whether the root rule refuses a `tmp_path` below `temp_dir`, not `temp_dir` itself.
+
+    A Hermes media dir such as `.hermes/cache/audio` is an allowed root, but pytest puts
+    `tmp_path` in a directory below it, and there `.hermes` is denied.
+    """
+    return root_denied_name(temp_dir / "pytest-of-probe") is not None
+
+
+def use_a_temp_dir_outside_denied_names() -> None:
+    """Move TMPDIR to the system temp dir when the inherited one has a denied name (issue #89).
+
+    Hermes runs commands with TMPDIR under `~/.hermes`. Tests use `tmp_path` as an allowed root,
+    and the root rule of #66 refuses a root there. Child processes inherit the new TMPDIR.
+    """
+    if not temp_dir_bars_tmp_path(Path(tempfile.gettempdir()).resolve()):
+        return
+    for variable in TEMP_DIR_VARIABLES:
+        os.environ.pop(variable, None)
+    tempfile.tempdir = None
+    fallback = Path(tempfile.gettempdir()).resolve()
+    if temp_dir_bars_tmp_path(fallback):
+        raise pytest.UsageError(f"no temp dir outside a denied name, last tried: {fallback}")
+    os.environ["TMPDIR"] = str(fallback)
+    tempfile.tempdir = str(fallback)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    use_a_temp_dir_outside_denied_names()
 
 
 @functools.cache
