@@ -39,7 +39,10 @@ synchronous MCP call holds `analyze.lock`) drops that attempt, which ran nothing
 job back to `queued` with its place in the queue; the runner tries again after `poll_seconds`.
 While an attempt runs, a watcher thread turns the job's `cancel.json` into the `CancelToken` of
 `app.analyze`, and the job ends `cancelled`. A refusal of `app.analyze` or an unexpected error
-ends the job `failed` with its reason code; the runner goes on with the next job.
+ends the job `failed` with its reason code; the runner goes on with the next job. A run that
+recorded another input SHA-256 than the one submitted (`source` of its result, `source.json`)
+ends the job `failed` with `input_changed`: it analysed other audio than the job names, so its
+attempt is marked `input_changed` and `result` never answers with it (R02).
 
 `recover` is the only retry: a `running` job whose lease owner is gone (another boot, no such pid, a
 zombie, or a pid with another start time) gets its attempt marked `interrupted` and goes back to
@@ -223,13 +226,18 @@ def result(job_id: str, config: Config) -> dict:
     state and that attempt's number.
 
     A newer attempt still without `result.json` (running, or ended without a result) does not
-    hide the result of an earlier one; `attempt` and `run_dir` name which one answers.
+    hide the result of an earlier one; `attempt` and `run_dir` name which one answers. A run that
+    analysed other audio than the submitted SHA-256 never answers: an `input_changed` attempt, or
+    one whose `result.json` records another `source` (a recovered attempt is not checked by the
+    runner).
     `job_state` is the queue's, `status` and `coverage` are the result's own. A job with no run
     result yet is `no_result`, whatever its state.
     """
     job_dir = _job_dir(job_id, config)
     job = _load(job_dir)
     for attempt in reversed(job["attempts"]):
+        if attempt.get("input_changed"):
+            continue
         run_id = attempt.get("run_id")
         if not isinstance(run_id, str) or not runs.RUN_ID_PATTERN.fullmatch(run_id):
             continue
@@ -238,6 +246,8 @@ def result(job_id: str, config: Config) -> dict:
         if not result_path.is_file():
             continue
         document = json.loads(result_path.read_text(encoding="utf-8"))
+        if document.get("source", {}).get("sha256") != job["request"]["input"]["sha256"]:
+            continue
         run_rel = run_dir.relative_to(config.data_root).as_posix()
         head = {"job_id": job_id, "job_state": job["state"], "attempt": attempt.get("number")}
         return report.compact(document, run_dir=run_rel, head=head)
@@ -395,6 +405,7 @@ def _claim_next(config: Config) -> tuple[dict, dict] | None:
             "started_at": _now(),
             "ended_at": None,
             "outcome": None,
+            "input_changed": False,
             "lease": _lease(number),
         }
         job["attempts"].append(attempt)
@@ -411,7 +422,7 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
     done = threading.Event()
     watcher = threading.Thread(target=_watch_cancel, args=(job_dir, token, done), daemon=True)
     watcher.start()
-    run_id, state, reason = None, FINISHED, None
+    run_id, state, reason, changed = None, FINISHED, None, False
     try:
         analysis = app.analyze(
             app.AnalyzeRequest(
@@ -425,7 +436,11 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
             cancel=token,
         )
         run_id = analysis.run.run_id
-        if token.cancelled and not analysis.run.complete:
+        changed = _recorded_sha256s(analysis) != {request["input"]["sha256"]}
+        if changed:
+            message = "the run read another file than the one submitted (its SHA-256 differs)"
+            state, reason = FAILED, f"{ingest.INPUT_CHANGED}: {_private(message, request, config)}"
+        elif token.cancelled and not analysis.run.complete:
             state, reason = CANCELLED, "cancelled while running; the run keeps what was done"
     except app.Busy:
         state = QUEUED
@@ -440,7 +455,17 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
     finally:
         done.set()
         watcher.join()
-    return _end_attempt(job_dir, attempt, state, reason, run_id, config)
+    return _end_attempt(job_dir, attempt, state, reason, run_id, config, input_changed=changed)
+
+
+def _recorded_sha256s(analysis) -> set[object]:
+    """Every input SHA-256 the run recorded: its result's `source` and, once the input was
+    decoded, `source.json`, which a worker stopped before its stage record still leaves."""
+    recorded = {analysis.result.get("source", {}).get("sha256")}
+    source_path = analysis.run.path / ingest.SOURCE_FILE_NAME
+    if source_path.is_file():
+        recorded.add(json.loads(source_path.read_text(encoding="utf-8")).get("sha256"))
+    return recorded
 
 
 def _private(message: str, request: dict, config: Config) -> str:
@@ -455,6 +480,8 @@ def _end_attempt(
     reason: str | None,
     run_id: str | None,
     config: Config,
+    *,
+    input_changed: bool = False,
 ) -> str:
     """Record how the attempt ended and answer the job's new state.
 
@@ -476,6 +503,7 @@ def _end_attempt(
                 run_id=run_id or _run_id_of(current["request_id"], config),
                 ended_at=_now(),
                 outcome=state,
+                input_changed=input_changed,
             )
         job.update(state=state, state_reason=reason, updated_at=_now())
         _save(job_dir, job)

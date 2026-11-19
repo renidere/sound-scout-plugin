@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import app, config, jobs, runs
+from sound_scout import app, config, ingest, jobs, runs
 from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
 from tests.conftest import WavFactory
@@ -47,7 +47,8 @@ def queue(cfg: Config, wav: Path, **fields: object) -> str:
 def substitute(
     calls: list[str], *, until_cancelled: bool = False, fail_first: bool = False
 ) -> Callable[..., app.Analysis]:
-    """Stands in for `app.analyze`: claims a real run for the request ID and returns it."""
+    """Stands in for `app.analyze`: claims a real run for the request ID and returns it with the
+    `source` of the file it was given, as the real result records it."""
 
     def analyze(
         request: app.AnalyzeRequest,
@@ -60,13 +61,14 @@ def substitute(
         if fail_first and len(calls) == 1:
             raise RuntimeError(f"unexpected failure reading {request.path}")
         run = runs.open_run(request.request_id, {}, config.data_root)
+        result = {"source": {"sha256": ingest.input_sha256(request.path, config)}}
         if until_cancelled:
             deadline = time.monotonic() + 10
             while not cancel.cancelled:
                 assert time.monotonic() < deadline, "the cancel marker never reached the token"
                 time.sleep(POLL)
-            return app.Analysis({}, run, False)
-        return app.Analysis({}, runs.complete_run(run), False)
+            return app.Analysis(result, run, False)
+        return app.Analysis(result, runs.complete_run(run), False)
 
     return analyze
 
@@ -256,6 +258,171 @@ def test_a_cancel_marker_stops_a_running_real_analyze_through_the_cancel_token(
     assert ("audio_review", "cancelled") in codes(result)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["complete"] is False
+
+
+def replace_with_other_audio(wav: Path, make_wav: WavFactory) -> None:
+    """Put other synthesized audio at `wav`'s path, as an editor saving over it would."""
+    other = make_wav("other.wav", seconds=1.5, frequency=440.0)
+    os.replace(other, wav)
+
+
+def assert_failed_input_changed(cfg: Config, job_id: str, wav: Path) -> None:
+    job = job_file(cfg, job_id)
+    assert job["state"] == "failed"
+    [attempt] = job["attempts"]
+    assert attempt["outcome"] == "failed" and attempt["input_changed"] is True
+    assert attempt["run_id"] is not None
+    reason = jobs.status(job_id, cfg)["state_reason"]
+    assert reason.startswith("input_changed: ")
+    for private in (str(wav), wav.name, str(cfg.allowed_roots[0]), str(cfg.data_root)):
+        assert private not in reason
+    with pytest.raises(JobError) as refused:
+        jobs.result(job_id, cfg)
+    assert refused.value.code == "no_result"
+
+
+@needs_ffmpeg
+def test_an_input_replaced_after_submit_fails_the_job_input_changed_without_its_result(
+    cfg: Config, make_wav: WavFactory, tmp_path: Path
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    job_id = queue(cfg, wav)
+    submitted = job_file(cfg, job_id)["request"]["input"]["sha256"]
+    replace_with_other_audio(wav, make_wav)
+    assert ingest.input_sha256(wav, cfg) != submitted
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert_failed_input_changed(cfg, job_id, wav)
+    run_dir = cfg.data_root / runs.RUNS_DIR_NAME / job_file(cfg, job_id)["attempts"][0]["run_id"]
+    result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["source"]["sha256"] != submitted
+
+
+@needs_ffmpeg
+def test_an_input_replaced_after_analyze_checked_it_fails_the_job_input_changed(
+    cfg: Config, make_wav: WavFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    job_id = queue(cfg, wav)
+    submitted = job_file(cfg, job_id)["request"]["input"]["sha256"]
+    real_input_sha256 = ingest.input_sha256
+
+    def replaced_after_the_check(path: str, config: Config) -> str:
+        checked = real_input_sha256(path, config)
+        replace_with_other_audio(wav, make_wav)
+        return checked
+
+    monkeypatch.setattr(ingest, "input_sha256", replaced_after_the_check)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert_failed_input_changed(cfg, job_id, wav)
+    run_dir = cfg.data_root / runs.RUNS_DIR_NAME / job_file(cfg, job_id)["attempts"][0]["run_id"]
+    source = json.loads((run_dir / ingest.SOURCE_FILE_NAME).read_text(encoding="utf-8"))
+    assert source["sha256"] != submitted
+
+
+def test_a_source_json_of_another_input_fails_the_job_input_changed(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = queue(cfg, wav)
+    analyze = substitute([])
+
+    def decoded_another_input(request: app.AnalyzeRequest, config: Config, **kwargs: object):
+        analysis = analyze(request, config, **kwargs)
+        assert (
+            analysis.result["source"]["sha256"]
+            == job_file(cfg, job_id)["request"]["input"]["sha256"]
+        )
+        source = {"sha256": "0" * 64}
+        (analysis.run.path / ingest.SOURCE_FILE_NAME).write_text(json.dumps(source), "utf-8")
+        return analysis
+
+    monkeypatch.setattr(app, "analyze", decoded_another_input)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert_failed_input_changed(cfg, job_id, wav)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("replaced", [True, False], ids=["replaced", "unchanged"])
+def test_result_answers_a_recovered_attempt_only_when_its_run_read_the_submitted_input(
+    cfg: Config, make_wav: WavFactory, replaced: bool
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    job_id = queue(cfg, wav)
+    request = job_file(cfg, job_id)["request"]
+    if replaced:
+        replace_with_other_audio(wav, make_wav)
+    app.analyze(
+        app.AnalyzeRequest(
+            str(wav),
+            request_id=f"{job_id}-a1",
+            layers=tuple(request["layers"]),
+            task=request["task"],
+            intent=request["intent"],
+        ),
+        cfg,
+    )
+    lease = jobs._lease(1) | {"boot_id": "another-boot"}
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": None, "lease": lease}
+    set_job(cfg, job_id, state="running", attempts=[attempt])
+    [recovered] = jobs.recover(cfg)
+    assert recovered["interrupted_attempt"] == 1
+
+    if replaced:
+        with pytest.raises(JobError) as refused:
+            jobs.result(job_id, cfg)
+        assert refused.value.code == "no_result"
+    else:
+        answer = jobs.result(job_id, cfg)
+        assert answer["attempt"] == 1 and answer["job_state"] == "queued"
+
+
+@needs_ffmpeg
+def test_an_unchanged_input_ends_the_job_finished_with_its_result(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    job_id = queue(cfg, wav)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished" and job["state_reason"] is None
+    assert job["attempts"][0]["input_changed"] is False
+    answer = jobs.result(job_id, cfg)
+    assert answer["job_state"] == "finished" and answer["attempt"] == 1
+    run_dir = cfg.data_root / answer["run_dir"]
+    result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["source"]["sha256"] == job["request"]["input"]["sha256"]
+
+
+@needs_ffmpeg
+def test_an_input_changed_attempt_does_not_hide_the_result_of_an_earlier_attempt(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    job_id = queue(cfg, wav)
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    first = jobs.result(job_id, cfg)
+    replace_with_other_audio(wav, make_wav)
+    set_job(cfg, job_id, state="queued")
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "failed" and job["state_reason"].startswith("input_changed: ")
+    assert [(a["outcome"], a["input_changed"]) for a in job["attempts"]] == [
+        ("finished", False),
+        ("failed", True),
+    ]
+    answer = jobs.result(job_id, cfg)
+    assert answer["attempt"] == 1 and answer["run_dir"] == first["run_dir"]
+    assert answer["job_state"] == "failed"
 
 
 def test_a_refused_or_crashed_attempt_fails_its_job_and_the_runner_goes_on(
