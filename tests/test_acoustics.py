@@ -113,6 +113,25 @@ def test_pure_tone_is_not_speech_for_the_detector_so_f0_stays_null_with_a_reason
     assert values["f0_hz"]["value"] is None and values["f0_hz"]["reason"]
 
 
+@pytest.mark.parametrize("frequency", [220.0, 330.0])
+def test_a_1_5_s_tone_has_no_speech_so_its_level_is_null_and_says_why(frequency: float) -> None:
+    """#125: the 1.5 s tones the control note test used before. Level is over speech frames only."""
+    tone = np.round(sine(frequency, seconds=1.5, amplitude=0.5) * np.iinfo(np.int16).max)
+    mono = (tone.astype(np.int16) / 32768).astype(np.float32)
+
+    result = measure(mono, RATE)
+    again = measure(mono.copy(), RATE)
+
+    assert_contract(result)
+    values = by_name(result)
+    assert values["speech_spans"]["value"] == []
+    assert values["rms_dbfs"]["settings"]["speech_frames"] == 0
+    assert values["rms_dbfs"]["value"] is None
+    assert values["rms_dbfs"]["reason"] == "no speech frames with signal"
+    assert np.nanmedian(acoustic_track(mono, RATE, [])["rms_dbfs"]) > -10.0  # signal is there
+    assert by_name(again)["rms_dbfs"] == values["rms_dbfs"]
+
+
 def test_signal_shorter_than_a_tenth_of_a_second_gives_null_with_the_reason() -> None:
     result = measure(np.full(int(0.05 * RATE), 0.1, dtype=np.float32), RATE)
 

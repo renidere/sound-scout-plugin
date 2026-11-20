@@ -5,14 +5,19 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
+import wave
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from sound_scout import app, config, delivery, jobs, mcp_server
 from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
+from sound_scout.smoke import speech_like_control
 from tests.conftest import WavFactory
 
 ABSENT_ASR_MODEL = "absent/model"
@@ -577,11 +582,21 @@ def test_criterion_2_each_accepted_jobs_redeliver_is_recorded_in_job_json_with_i
 # --- the comparison block of a control job's note (#110) -------------------------------------
 
 
-def control_job(cfg: Config, make_wav: WavFactory) -> str:
+def speech_wav(cfg: Config, name: str, f0: float) -> Path:
+    """A 1.5 s formant-synthesised 16-bit WAV the Silero VAD hears as one speech span."""
+    samples = np.round(speech_like_control(1.5, 16_000, f0=f0) * np.iinfo(np.int16).max)
+    path = cfg.allowed_roots[0] / name
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(16_000)
+        out.writeframes(samples.astype(np.int16).tobytes())
+    return path
+
+
+def control_job(cfg: Config, initial_wav: Path, wav: Path) -> str:
     """A control job the real runner analyzed and compared; `backend = none`."""
-    initial_wav = make_wav("recordings/initial.wav", seconds=1.5)
     initial = app.analyze(app.AnalyzeRequest(str(initial_wav), request_id="initial"), cfg)
-    wav = make_wav("recordings/control.wav", seconds=1.5, frequency=330.0)
     request = SubmitRequest(
         str(wav), previous_run_id=initial.run.run_id, criterion="completeness_of_phrase"
     )
@@ -592,9 +607,10 @@ def control_job(cfg: Config, make_wav: WavFactory) -> str:
 
 @needs_ffmpeg
 def test_note_of_a_control_job_without_a_backend_says_inconclusive_and_why(
-    setup: Config, make_wav: WavFactory
+    setup: Config,
 ) -> None:
-    job_id = control_job(setup, make_wav)
+    initial_wav = speech_wav(setup, "initial.wav", 130.0)
+    job_id = control_job(setup, initial_wav, speech_wav(setup, "control.wav", 180.0))
     summary = job_file(setup, job_id)["attempts"][-1]["compare"]
     document = json.loads((setup.data_root / summary["path"]).read_text(encoding="utf-8"))
 
@@ -614,12 +630,96 @@ def test_note_of_a_control_job_without_a_backend_says_inconclusive_and_why(
             f"попытка {side}: audio review `unavailable` — audio backend не выбран "
             "(`backend = none`)"
         ) in reasons
-    missing = [item for item in document["reasons"] if item["code"] == "audio_review_missing"]
-    assert len(missing) == 2
-    for item in missing:  # its message quotes the stage reason; the note never does
+    level = document["conditions_diff"]["level_dbfs"]
+    assert isinstance(level["a"], float) and isinstance(level["b"], float), level
+    assert "уровень речи не измерен" not in text
+    assert [(item["code"], item["attempt"]) for item in document["reasons"]] == [
+        ("audio_review_missing", "a"),
+        ("audio_review_missing", "b"),
+    ]
+    for item in document["reasons"]:  # its message quotes the stage reason; the note never does
         assert item["message"] not in text
     assert not any(phrase in text.lower() for phrase in ALL_DONE)
     assert str(setup.data_root) not in text
+
+
+FRESH_ANALYSIS = textwrap.dedent(
+    """
+    import json, sys
+    from pathlib import Path
+    from sound_scout import app, config
+    from sound_scout.config import Config
+
+    model, roots, data_root, *wavs = sys.argv[1:]
+    cfg = Config(
+        allowed_roots=(Path(roots),), data_root=Path(data_root), asr=config.Asr(model=model)
+    )
+    levels = {}
+    for wav in wavs:
+        result = app.analyze(app.AnalyzeRequest(wav, request_id=Path(wav).stem), cfg).result
+        levels[Path(wav).name] = {m["name"]: m for m in result["measurements"]}
+    print(json.dumps(levels))
+    """
+)
+
+
+def level_of(measurements: dict) -> tuple:
+    rms, spans = measurements["rms_dbfs"], measurements["speech_spans"]
+    return rms["value"], rms["reason"], rms["settings"]["speech_frames"], spans["value"]
+
+
+def analyzed_alone(cfg: Config, wavs: list[Path]) -> dict:
+    """The same analyses in a fresh interpreter with a minimal environment: no other test ran."""
+    data_root = Path(tempfile.mkdtemp(dir=cfg.data_root.parent))
+    env = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR") if name in os.environ}
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", FRESH_ANALYSIS, ABSENT_ASR_MODEL]
+        + [str(cfg.allowed_roots[0]), str(data_root)]
+        + [str(wav) for wav in wavs],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    ).stdout
+    return {name: level_of(item) for name, item in json.loads(out).items()}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("recording", ["tone", "speech_like"])
+def test_the_level_of_each_attempt_is_the_same_in_the_suite_and_alone(
+    setup: Config, make_wav: WavFactory, recording: str
+) -> None:
+    """#125: the former (tone) and current (speech_like) control note inputs give one level each."""
+    if recording == "tone":
+        wavs = [
+            make_wav("recordings/initial.wav", seconds=1.5),
+            make_wav("recordings/control.wav", seconds=1.5, frequency=330.0),
+        ]
+    else:
+        wavs = [speech_wav(setup, "initial.wav", 130.0), speech_wav(setup, "control.wav", 180.0)]
+    in_suite = {
+        wav.name: level_of(
+            {
+                m["name"]: m
+                for m in app.analyze(app.AnalyzeRequest(str(wav)), setup).result["measurements"]
+            }
+        )
+        for wav in wavs
+    }
+
+    assert analyzed_alone(setup, wavs) == in_suite
+    for value, reason, speech_frames, spans in in_suite.values():
+        if recording == "tone":  # a pure tone is not speech for the VAD: null with its reason
+            assert (value, reason, speech_frames, spans) == (
+                None,
+                "no speech frames with signal",
+                0,
+                [],
+            )
+        else:
+            assert reason is None and spans and speech_frames > 0
+            assert -30.0 < value["p50"] < -10.0
 
 
 @pytest.mark.parametrize(
