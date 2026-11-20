@@ -9,6 +9,10 @@
 | `speech_capabilities` | `doctor.report` | только чтение | отчёт `doctor --json` |
 | `speech_analyze` | `app.analyze` | пишет `runs/<run_id>/` под data root | `report.compact` с `run_dir` и `reused` — тот же документ, что `analyze --json` |
 | `speech_compare` | `app.compare` | пишет `compare/<compare_id>.json` под data root | сравнение с полем `path` — тот же документ, что `compare --json` |
+| `speech_job_submit` | `jobs.submit` (submitter `mcp`) | пишет задание `jobs/<job_id>/` под data root, анализ не запускает | `{job_id, request_id, state, reused}` — тот же документ, что `jobs submit --json` |
+| `speech_job_status` | `jobs.status` | только чтение | состояние задания — тот же документ, что `jobs status --json` |
+| `speech_job_result` | `jobs.result` | только чтение | `report.compact` run последней попытки с результатом и полями `job_id`, `job_state`, `attempt` — тот же документ, что `jobs result --json` |
+| `speech_job_cancel` | `jobs.cancel` | `queued` → `cancelled` сразу, у `running` — маркер `cancel.json` для runner | состояние задания с полем `cancel` — тот же документ, что `jobs cancel --json` |
 
 ## Запуск
 
@@ -52,11 +56,25 @@ uv run sound-scout serve
   `report.compact(result, run_dir=…, reused=…)`: не больше 4096 байт UTF-8 вместе с `run_dir` и
   `reused` (`true` — ответ прежнего запроса с тем же `request_id` и файлом), без PCM,
   base64 и полной диагностики (R08); полный результат — `result.json` в run-каталоге.
-- **Один вызов за раз.** Вызовы инструментов выполняются строго по очереди (lock сервера), каждый в
-  отдельном потоке, чтобы сервер продолжал читать протокол. Отмена вызова
-  (`notifications/cancelled` или закрытие stdin клиентом) останавливает worker анализа через
-  `CancelToken`; следующий вызов начинается только после его остановки. Повтор того же
-  `request_id` с тем же файлом возвращает прежний результат (R11).
+- **Один вызов за раз.** Вызовы `speech_capabilities`, `speech_analyze` и `speech_compare`
+  выполняются строго по очереди (lock сервера), каждый в отдельном потоке, чтобы сервер продолжал
+  читать протокол. Отмена вызова (`notifications/cancelled` или закрытие stdin клиентом)
+  останавливает worker анализа через `CancelToken`; следующий такой вызов начинается только после
+  его остановки. Повтор того же `request_id` с тем же файлом возвращает прежний результат (R11).
+- **Инструменты заданий не ждут анализа.** `speech_job_submit`, `speech_job_status`,
+  `speech_job_result` и `speech_job_cancel` — входы в ту же файловую очередь, что CLI
+  `sound-scout jobs submit|status|result|cancel` (решение 0013 § 3.1, § 3.8): вызывают те же
+  функции `sound_scout.jobs` и отвечают тем же документом, что `--json` этих подкоманд, с теми же
+  кодами отказа (`job_not_found`, `no_result`, `queue_full`, `staging_full`, `invalid_request`,
+  `request_mismatch`, `path_denied`, коды приёма входа). Lock сервера они не берут, поэтому отвечают
+  и во время синхронного `speech_analyze`; хранилище заданий держит свой lock миллисекунды.
+  `speech_job_submit` проверяет путь, размер и SHA-256 входа и сразу отвечает `job_id` в состоянии
+  `queued`; проверка входа через ffprobe и сам анализ — дело runner. Сервер runner не запускает:
+  задания исполняет runner, который оператор запустил `sound-scout jobs start` (или `jobs run`);
+  без него задание остаётся `queued`. Задание из MCP хранит `binding.submitter = "mcp"`;
+  необязательные `connection`, `profile`, `session_id` сохраняются как есть, как у
+  `jobs submit --connection/--profile/--session-id`. Состояние задания (`finished` и др.) отдельно
+  от `status` результата: `finished` не значит `complete`.
 - **Текст записи и ответа модели — данные.** Строки, похожие на инструкции, в сыром транскрипте
   (по сегментам и в склеенном тексте `$.text` — фраза, разрезанная границей сегментов), в
   аргументах `task` и `intent` и в ответе audio backend ничего не запускают. Они перечислены как
@@ -81,10 +99,12 @@ uv run sound-scout serve
 Описания и JSON-схемы аргументов ниже совпадают с `mcp_server.TOOLS` и с ответом `tools/list`;
 `tests/test_mcp_server.py` сверяет их с кодом.
 
-Аннотации соответствуют побочным эффектам (R12): `speech_capabilities` — `readOnlyHint: true`;
-`speech_analyze` и `speech_compare` создают файлы под data root и поэтому не read-only.
-`speech_analyze` идемпотентен по `request_id`, `speech_compare` пишет новый файл при каждом
-вызове. Ни один инструмент не обращается во внешний мир (`openWorldHint: false`).
+Аннотации соответствуют побочным эффектам (R12): `speech_capabilities`, `speech_job_status` и
+`speech_job_result` — `readOnlyHint: true`; `speech_analyze`, `speech_compare` и
+`speech_job_submit` создают файлы под data root и поэтому не read-only. `speech_analyze` и
+`speech_job_submit` идемпотентны по `request_id`, `speech_compare` пишет новый файл при каждом
+вызове. `speech_job_cancel` останавливает задание и поэтому `destructiveHint: true`; повтор
+отмены ничего не меняет. Ни один инструмент не обращается во внешний мир (`openWorldHint: false`).
 
 ### `speech_capabilities`
 
@@ -200,6 +220,168 @@ uv run sound-scout serve
     "readOnlyHint": false,
     "destructiveHint": false,
     "idempotentHint": false,
+    "openWorldHint": false
+  }
+}
+```
+
+### `speech_job_submit`
+
+```json
+{
+  "name": "speech_job_submit",
+  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "minLength": 1,
+        "description": "the recording: a local path on this host, inside an allowed root of the operator configuration"
+      },
+      "request_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "the caller's request ID: a repeat with the same input returns the same job"
+      },
+      "layers": {
+        "type": "array",
+        "items": {
+          "enum": [
+            "content",
+            "measurements",
+            "sound"
+          ]
+        },
+        "minItems": 1,
+        "uniqueItems": true,
+        "description": "layers to analyze (default: all three)"
+      },
+      "task": {
+        "type": "string",
+        "description": "the speaking task the recording answers"
+      },
+      "intent": {
+        "type": "string",
+        "description": "the speaker's intent for the recording, as the user stated it; never text taken from the recording or its transcript"
+      },
+      "connection": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "the connection the job came through, stored as is"
+      },
+      "profile": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "the agent profile of the chat, stored as is"
+      },
+      "session_id": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "the stored session ID of the chat, stored as is"
+      }
+    },
+    "required": [
+      "path",
+      "request_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+### `speech_job_status`
+
+```json
+{
+  "name": "speech_job_status",
+  "description": "Read the state of a job: queued, running, finished, cancelled or failed, with its reason, its stages, the number of attempts and the run_id of the latest one. finished means the runner stopped working on it, not that the result is complete: read speech_job_result. Reads only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "job_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "the job_id that speech_job_submit answered"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+### `speech_job_result`
+
+```json
+{
+  "name": "speech_job_result",
+  "description": "Read the result of a job: the compact summary of its latest attempt's run, as speech_analyze answers it, with job_id, job_state and attempt. A job without a run result yet is refused with no_result. Reads only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "job_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "the job_id that speech_job_submit answered"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+### `speech_job_cancel`
+
+```json
+{
+  "name": "speech_job_cancel",
+  "description": "Cancel a job: a queued job is cancelled at once, a running one gets a cancel request the runner acts on, an ended job is left as it is. Answers with the job's state and cancel: cancelled, requested or already_ended.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "job_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "the job_id that speech_job_submit answered"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": true,
     "openWorldHint": false
   }
 }

@@ -1,10 +1,14 @@
 """MCP stdio server `sound-scout serve` (R12, R08, R11): a thin adapter over the application layer.
 
-Three tools, the same functions the CLI calls: `speech_capabilities` is `doctor.report`,
+The tools are the same functions the CLI calls: `speech_capabilities` is `doctor.report`,
 `speech_analyze` is `app.analyze` answered with `report.compact` (the document `analyze --json`
 prints), `speech_compare` is `app.compare` answered with the comparison and its file (the document
-`compare --json` prints). The descriptions and argument schemas in `TOOLS` are the ones
-`docs/mcp.md` lists. Every schema closes its object (`additionalProperties: false`) and
+`compare --json` prints). The job tools (decision 0013 § 3.1) are the queue of `sound-scout jobs`:
+`speech_job_submit` is `jobs.submit` with the submitter `mcp`; `speech_job_status`,
+`speech_job_result` and `speech_job_cancel` are `jobs.status`, `jobs.result` and `jobs.cancel`.
+Each answers with the document `jobs <action> --json` prints, and none runs the analysis: the
+runner of `sound-scout jobs run|start` does. The descriptions and argument schemas in `TOOLS` are
+the ones `docs/mcp.md` lists. Every schema closes its object (`additionalProperties: false`) and
 `call` validates the arguments against it before anything runs: no argument names an allowed
 root, the data root, a model, the backend or a budget, and an extra one is refused, so the
 operator's `sound-scout.toml` is never overridden by a tool call (R12).
@@ -15,17 +19,21 @@ tool result with `isError: true` and `{"error": {"code", "message"}}`, never a p
 the caller reads the reason; the codes are those the CLI prints. An unexpected error is
 `internal_error` with the type only: its message may carry a path or a transcript. The
 annotations say what a tool does: `speech_capabilities` reads, `speech_analyze` and
-`speech_compare` write run and comparison files under the data root, so neither is read-only.
+`speech_compare` write run and comparison files under the data root, so neither is read-only;
+`speech_job_status` and `speech_job_result` read, `speech_job_submit` writes the job and
+`speech_job_cancel` stops one, so it is the one destructive tool.
 
-One tool call at a time: calls are serialized by a lock, and each runs in a thread so the server
-keeps reading the protocol. A cancelled call (`notifications/cancelled`, or the client closing
-stdin) cancels `app.analyze` through its `CancelToken` and the lock is held until the worker has
-stopped. The server never asks the client for sampling. `stdio_server` points fd 1 at stderr
-while it serves, so stdout carries only JSON-RPC; the SDK's OpenTelemetry middleware is removed.
-Logging goes to stderr through one handler whose formatter replaces the data root, the allowed
-roots, the configuration file and the home directory in every line, tracebacks included. A call
-logs its tool, outcome or refusal code (with the reason of a refused path) and time; an unexpected
-error logs its type only, never its message or traceback.
+One call of `speech_capabilities`, `speech_analyze` or `speech_compare` at a time: they are
+serialized by a lock, and each runs in a thread so the server keeps reading the protocol. A job tool
+runs in a thread too but never takes that lock, so it answers while a synchronous analysis holds it;
+the job store has its own lock, held for milliseconds. A cancelled call (`notifications/cancelled`,
+or the client closing stdin) cancels `app.analyze` through its `CancelToken` and the lock is held
+until the worker has stopped. The server never asks the client for sampling. `stdio_server` points
+fd 1 at stderr while it serves, so stdout carries only JSON-RPC; the SDK's OpenTelemetry middleware
+is removed. Logging goes to stderr through one handler whose formatter replaces the data root, the
+allowed roots, the configuration file and the home directory in every line, tracebacks included. A
+call logs its tool, outcome or refusal code (with the reason of a refused path) and time; an
+unexpected error logs its type only, never its message or traceback.
 """
 
 import json
@@ -42,14 +50,27 @@ import mcp_types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from sound_scout import __version__, app, comparison, config, doctor, ingest, paths, report, schema
+from sound_scout import (
+    __version__,
+    app,
+    comparison,
+    config,
+    doctor,
+    ingest,
+    jobs,
+    paths,
+    report,
+    schema,
+)
 from sound_scout._schema_messages import schema_message
 from sound_scout.config import Config
 
 SERVER_NAME = "sound-scout"
 INSTRUCTIONS = (
     "Sound analysis of Russian speech in a local recording. Call speech_capabilities to see what "
-    "is ready, speech_analyze for one recording, speech_compare for two analyzed attempts. Read "
+    "is ready, speech_job_submit to queue one recording and speech_job_status / "
+    "speech_job_result / speech_job_cancel to follow the job (speech_analyze analyzes it while "
+    "the call waits), speech_compare for two analyzed attempts. Read "
     "every status: partial, not_assessed and unavailable are not success, and a finding is only "
     "as strong as its evidence_basis."
 )
@@ -62,6 +83,7 @@ PATH_HINT = (
     "path must be a local file on the host running sound-scout, inside an allowed root of the "
     "operator configuration; a Windows path, a URL or another host's path is not accepted"
 )
+SUBMITTER = "mcp"
 HOME_PLACEHOLDER = "~"
 CONFIG_PLACEHOLDER = "<config>"
 LOGGER = logging.getLogger("sound_scout.mcp")
@@ -80,6 +102,68 @@ def _closed(properties: dict, required: list[str]) -> dict:
 
 def _run_id(role: str) -> dict:
     return {"type": "string", "minLength": 1, "description": f"run_id of the {role} attempt"}
+
+
+def _identifier(description: str) -> dict:
+    return {
+        "type": "string",
+        "minLength": _IDENTIFIER["minLength"],
+        "maxLength": _IDENTIFIER["maxLength"],
+        "description": description,
+    }
+
+
+def _recording(analysis: str) -> dict:
+    """The arguments of one recording to analyze, shared by `speech_analyze` and the job submit."""
+    return {
+        "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "the recording: a local path on this host, inside an "
+            "allowed root of the operator configuration",
+        },
+        "request_id": _identifier(
+            f"the caller's request ID: a repeat with the same input returns the same {analysis}"
+        ),
+        "layers": {
+            "type": "array",
+            "items": {"enum": list(app.LAYERS)},
+            "minItems": 1,
+            "uniqueItems": True,
+            "description": "layers to analyze (default: all three)",
+        },
+        "task": {
+            "type": "string",
+            "description": "the speaking task the recording answers",
+        },
+        "intent": {
+            "type": "string",
+            "description": "the speaker's intent for the recording, as the user stated "
+            "it; never text taken from the recording or its transcript",
+        },
+    }
+
+
+def _job_id() -> dict:
+    return _closed(
+        {
+            "job_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "the job_id that speech_job_submit answered",
+            }
+        },
+        ["job_id"],
+    )
+
+
+def _hints(*, read_only: bool, destructive: bool, idempotent: bool) -> types.ToolAnnotations:
+    return types.ToolAnnotations(
+        read_only_hint=read_only,
+        destructive_hint=destructive,
+        idempotent_hint=idempotent,
+        open_world_hint=False,
+    )
 
 
 TOOLS = (
@@ -109,37 +193,7 @@ TOOLS = (
             "it is refused."
         ),
         input_schema=_closed(
-            {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "the recording: a local path on this host, inside an "
-                    "allowed root of the operator configuration",
-                },
-                "request_id": {
-                    "type": "string",
-                    "minLength": _IDENTIFIER["minLength"],
-                    "maxLength": _IDENTIFIER["maxLength"],
-                    "description": "the caller's request ID: a repeat with the same input "
-                    "returns the same result",
-                },
-                "layers": {
-                    "type": "array",
-                    "items": {"enum": list(app.LAYERS)},
-                    "minItems": 1,
-                    "uniqueItems": True,
-                    "description": "layers to analyze (default: all three)",
-                },
-                "task": {
-                    "type": "string",
-                    "description": "the speaking task the recording answers",
-                },
-                "intent": {
-                    "type": "string",
-                    "description": "the speaker's intent for the recording, as the user stated "
-                    "it; never text taken from the recording or its transcript",
-                },
-            },
+            _recording("result"),
             ["path", "request_id"],
         ),
         annotations=types.ToolAnnotations(
@@ -177,8 +231,63 @@ TOOLS = (
             open_world_hint=False,
         ),
     ),
+    types.Tool(
+        name="speech_job_submit",
+        description=(
+            "Queue one recording of Russian speech for analysis and answer at once with its "
+            "job_id and state (queued); the analysis runs later in the operator's job runner "
+            "(sound-scout jobs start), never in this call; without a running runner the job stays "
+            "queued. Follow it with speech_job_status and read it with speech_job_result. "
+            "The same request_id with the same request returns the same job; with another file "
+            "or other arguments it is refused. A full queue is refused with queue_full or "
+            "staging_full."
+        ),
+        input_schema=_closed(
+            {
+                **_recording("job"),
+                "connection": _identifier("the connection the job came through, stored as is"),
+                "profile": _identifier("the agent profile of the chat, stored as is"),
+                "session_id": _identifier("the stored session ID of the chat, stored as is"),
+            },
+            ["path", "request_id"],
+        ),
+        annotations=_hints(read_only=False, destructive=False, idempotent=True),
+    ),
+    types.Tool(
+        name="speech_job_status",
+        description=(
+            "Read the state of a job: queued, running, finished, cancelled or failed, with its "
+            "reason, its stages, the number of attempts and the run_id of the latest one. "
+            "finished means the runner stopped working on it, not that the result is complete: "
+            "read speech_job_result. Reads only."
+        ),
+        input_schema=_job_id(),
+        annotations=_hints(read_only=True, destructive=False, idempotent=True),
+    ),
+    types.Tool(
+        name="speech_job_result",
+        description=(
+            "Read the result of a job: the compact summary of its latest attempt's run, as "
+            "speech_analyze answers it, with job_id, job_state and attempt. A job without a run "
+            "result yet is refused with no_result. Reads only."
+        ),
+        input_schema=_job_id(),
+        annotations=_hints(read_only=True, destructive=False, idempotent=True),
+    ),
+    types.Tool(
+        name="speech_job_cancel",
+        description=(
+            "Cancel a job: a queued job is cancelled at once, a running one gets a cancel "
+            "request the runner acts on, an ended job is left as it is. Answers with the job's "
+            "state and cancel: cancelled, requested or already_ended."
+        ),
+        input_schema=_job_id(),
+        annotations=_hints(read_only=False, destructive=True, idempotent=True),
+    ),
 )
 _TOOLS = {tool.name: tool for tool in TOOLS}
+# They never wait for the analysis, so they never wait for the lock a synchronous one holds.
+JOB_TOOLS = ("speech_job_submit", "speech_job_status", "speech_job_result", "speech_job_cancel")
 
 
 class Refused(Exception):
@@ -209,7 +318,7 @@ def call(
         kind = type(error).__name__
         LOGGER.error("%s failed: %s in %.2f s", name, kind, time.monotonic() - started)
         return _error(INTERNAL_ERROR, kind, name), True
-    outcome = answer.get("status", "ok")
+    outcome = answer.get("status", answer.get("state", "ok"))
     LOGGER.info("%s: %s in %.2f s", name, outcome, time.monotonic() - started)
     return answer, False
 
@@ -228,7 +337,9 @@ def _dispatch(name: str, arguments: dict, loaded: Config, cancel: app.CancelToke
         return doctor.report(loaded)
     if name == "speech_analyze":
         return _analyze(arguments, loaded, cancel)
-    return _compare(arguments, loaded)
+    if name == "speech_compare":
+        return _compare(arguments, loaded)
+    return _job(name, arguments, loaded)
 
 
 def _argument_error(error: jsonschema.ValidationError) -> str:
@@ -267,9 +378,40 @@ def _compare(arguments: dict, loaded: Config) -> dict:
     return {"path": compared.path.relative_to(loaded.data_root).as_posix(), **compared.result}
 
 
+def _job(name: str, arguments: dict, loaded: Config) -> dict:
+    try:
+        if name != "speech_job_submit":
+            action = {
+                "speech_job_status": jobs.status,
+                "speech_job_result": jobs.result,
+                "speech_job_cancel": jobs.cancel,
+            }[name]
+            return action(arguments["job_id"], loaded)
+        fields = {
+            key: arguments[key] for key in ("request_id", "task", "intent") if key in arguments
+        }
+        if "layers" in arguments:
+            fields["layers"] = tuple(arguments["layers"])
+        binding = jobs.Binding(
+            submitter=SUBMITTER,
+            **{key: arguments.get(key) for key in ("connection", "profile", "session_id")},
+        )
+        return jobs.submit(jobs.SubmitRequest(arguments["path"], **fields), binding, loaded)
+    except jobs.JobError as error:
+        raise Refused(error.code, error.message) from error
+    except ingest.IngestError as error:
+        raise Refused(
+            error.code, paths.without_paths(error.message, arguments["path"], loaded)
+        ) from error
+    except tuple(kind for kind, _ in jobs.REFUSALS) as error:
+        code = next(code for kind, code in jobs.REFUSALS if isinstance(error, kind))
+        reason = error.reason if isinstance(error, paths.PathDenied) else None
+        raise Refused(code, str(error), reason) from error
+
+
 def _error(code: str, message: str, tool: str) -> dict:
     error = {"code": code, "message": " ".join(message.split())}
-    if tool == "speech_analyze" and code == PATH_DENIED:
+    if tool in ("speech_analyze", "speech_job_submit") and code == PATH_DENIED:
         error["hint"] = PATH_HINT
     return {"error": error}
 
@@ -298,13 +440,16 @@ async def _serve(loaded: Config) -> None:
 
 
 def build_server(loaded: Config) -> Server:
-    """The MCP server of the three tools, without a transport; calls run one at a time."""
+    """The MCP server of `TOOLS`, without a transport; calls other than the job tools run one at
+    a time."""
     lock = anyio.Lock()
 
     async def list_tools(ctx: object, params: object) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list(TOOLS))
 
     async def call_tool(ctx: object, params: types.CallToolRequestParams) -> types.CallToolResult:
+        if params.name in JOB_TOOLS:
+            return result(*await _call_in_thread(params.name, params.arguments, loaded))
         async with lock:
             return result(*await _call_in_thread(params.name, params.arguments, loaded))
 

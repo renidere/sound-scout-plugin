@@ -31,4 +31,8 @@ mcp_servers:
         - speech_capabilities
         - speech_analyze
         - speech_compare
+        - speech_job_submit
+        - speech_job_status
+        - speech_job_result
+        - speech_job_cancel
     enabled: true

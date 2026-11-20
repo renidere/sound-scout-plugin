@@ -95,7 +95,7 @@ def test_doc_lint_reports_a_missing_section_and_term() -> None:
     ]
 
 
-def test_example_entry_allows_exactly_the_three_tools() -> None:
+def test_example_entry_allows_exactly_the_server_tools() -> None:
     text = EXAMPLE.read_text(encoding="utf-8")
     include = text.split("include:", 1)[1]
     listed = re.findall(r"^\s+- (\S+)$", include, re.MULTILINE)

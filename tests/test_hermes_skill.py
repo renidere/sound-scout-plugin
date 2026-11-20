@@ -113,7 +113,8 @@ def test_skill_has_every_section_and_term_and_no_station_path_or_secret() -> Non
 
 def test_skill_names_every_tool_with_its_arguments() -> None:
     text = SKILL.read_text(encoding="utf-8")
-    for tool in mcp_server.TOOLS:
+    # The skill takes up the job tools with its own rules in issue #100.
+    for tool in (tool for tool in mcp_server.TOOLS if tool.name not in mcp_server.JOB_TOOLS):
         assert f"`{tool.name}`" in text
         for argument in tool.input_schema["properties"]:
             assert f"`{argument}`" in text, (tool.name, argument)

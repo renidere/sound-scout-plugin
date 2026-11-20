@@ -211,8 +211,8 @@ hermes mcp add speech-review \
   - `--offline` — `uv` не ходит в сеть, даже если окружение разошлось с lock-файлом (R09);
   - `sound-scout serve` — MCP stdio сервер.
 
-`hermes mcp add` сразу подключается к серверу, показывает три инструмента и спрашивает
-`Enable all 3 tools? [Y/n/select]`. Ответ `Y` сохраняет запись без `tools.include`; allowlist
+`hermes mcp add` сразу подключается к серверу, показывает все инструменты сервера и спрашивает
+`Enable all <N> tools? [Y/n/select]`. Ответ `Y` сохраняет запись без `tools.include`; allowlist
 задаётся следующим шагом.
 
 ## Настройка записи
@@ -220,13 +220,15 @@ hermes mcp add speech-review \
 Значения, которых нет у `hermes mcp add`, задаются явно — на умолчания не полагаемся (R12):
 
 ```sh
-hermes config set mcp_servers.speech-review.tools.include '[speech_capabilities, speech_analyze, speech_compare]'
+hermes config set mcp_servers.speech-review.tools.include '[speech_capabilities, speech_analyze, speech_compare, speech_job_submit, speech_job_status, speech_job_result, speech_job_cancel]'
 hermes config set mcp_servers.speech-review.sampling.enabled false
 hermes config set mcp_servers.speech-review.supports_parallel_tool_calls false
 hermes config set mcp_servers.speech-review.timeout 300
 ```
 
-- `tools.include` — явный allowlist из трёх инструментов R12. `hermes config set` разбирает
+- `tools.include` — явный allowlist из трёх инструментов R12 и четырёх инструментов очереди
+  заданий (`docs/mcp.md`, решение 0013 § 3.1). Запись, настроенная до появления инструментов
+  заданий, их не показывает, пока владелец не повторит эту команду и не применит запись. `hermes config set` разбирает
   `[…]` как YAML-список. `hermes mcp configure` для этого не используйте: при выборе всех
   инструментов он удаляет `tools` из записи.
 - `sampling.enabled false` — Hermes включает sampling по умолчанию; Sound Scout его не запрашивает и
@@ -262,7 +264,7 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
 Ожидаемая запись — `docs/examples/hermes-mcp-entry.example.yaml`: `command`, `args`,
 `env.SOUND_SCOUT_CONFIG`, `env.PATH` из системных каталогов, `connect_timeout: 60.0` (`--connect-timeout` сохраняется числом с
 плавающей точкой), `timeout: 300`, `supports_parallel_tool_calls: false`, `sampling.enabled: false`,
-`tools.include` из трёх инструментов, `enabled: true`. Пути в угловых скобках у владельца —
+`tools.include` из семи инструментов `docs/mcp.md`, `enabled: true`. Пути в угловых скобках у владельца —
 настоящие абсолютные пути хоста.
 
 ## Readback
@@ -287,7 +289,9 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
    `hermes chat` — новая сессия или `/reload-mcp`. Затем — в **новой** сессии того runtime, где
    будут вызовы (gateway мессенджера или `hermes chat`). В `hermes chat` команда `/tools list` показывает ровно
    `mcp__speech_review__speech_capabilities`, `mcp__speech_review__speech_analyze`,
-   `mcp__speech_review__speech_compare`; в gateway `/tools` недоступна (CLI-only по справочнику
+   `mcp__speech_review__speech_compare`, `mcp__speech_review__speech_job_submit`,
+   `mcp__speech_review__speech_job_status`, `mcp__speech_review__speech_job_result`,
+   `mcp__speech_review__speech_job_cancel`; в gateway `/tools` недоступна (CLI-only по справочнику
    slash-команд), там discovery подтверждает строка `MCP: registered … tool(s) from … server(s)` в
    `agent.log`, где `speech-review` не назван среди несостоявшихся (`failed`), и реальный вызов
    из пункта 3. `hermes mcp test speech-review` только проверяет, что сервер
@@ -319,11 +323,11 @@ R12). Интеграция считается подключённой, толь
 - [ ] запись создана через `hermes mcp add` и `hermes config set`, без ручного редактирования
       `mcp_servers`;
 - [ ] readback exact entry совпадает с `docs/examples/hermes-mcp-entry.example.yaml`: allowlist из
-      трёх инструментов, `sampling.enabled: false`, `supports_parallel_tool_calls: false`, явные
+      семи инструментов, `sampling.enabled: false`, `supports_parallel_tool_calls: false`, явные
       `connect_timeout` и `timeout`, `timeout` ≥ worker deadline + `max_subprocess_seconds` + запас,
       `env.PATH` без каталогов `~/.hermes/tools`;
 - [ ] `terminal.backend` — `local`;
-- [ ] discovery в новой сессии нужного runtime показывает ровно три инструмента
+- [ ] discovery в новой сессии нужного runtime показывает ровно семь инструментов
       `mcp__speech_review__…`;
 - [ ] реальный вызов `speech_capabilities` и `speech_analyze` моделью Hermes из новой сессии вернул
       ответ, и в data root есть соответствующий `<run_dir>/result.json`;

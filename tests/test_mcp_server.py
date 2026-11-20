@@ -1,5 +1,6 @@
 """`sound-scout serve`: the MCP stdio adapter over `app`, `doctor` and `report` (R12, R08, T09a)."""
 
+import dataclasses
 import json
 import logging
 import os
@@ -15,12 +16,19 @@ import anyio
 import pytest
 from mcp import Client
 
-from sound_scout import app, config, mcp_server, report
+from sound_scout import app, config, jobs, mcp_server, report
 from tests.conftest import WavFactory
 from tests.test_cli import ABSENT_ASR_MODEL, needs_ffmpeg, offline_env, write_config
 
 REPO = Path(__file__).resolve().parent.parent
-TOOL_NAMES = ["speech_capabilities", "speech_analyze", "speech_compare"]
+JOB_TOOL_NAMES = [
+    "speech_job_submit",
+    "speech_job_status",
+    "speech_job_result",
+    "speech_job_cancel",
+]
+TOOL_NAMES = ["speech_capabilities", "speech_analyze", "speech_compare", *JOB_TOOL_NAMES]
+CALL_SECONDS = 2.0
 BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{120,}")
 RESPONSE_SECONDS = 120
 OPERATOR_ARGUMENTS = [
@@ -41,6 +49,10 @@ VALID_ARGUMENTS = {
     "speech_capabilities": {},
     "speech_analyze": {"path": "recordings/tone.wav", "request_id": "r-1"},
     "speech_compare": {"run_a": "a" * 32, "run_b": "b" * 32, "criterion": "completeness_of_phrase"},
+    "speech_job_submit": {"path": "recordings/tone.wav", "request_id": "r-1"},
+    "speech_job_status": {"job_id": "a" * 32},
+    "speech_job_result": {"job_id": "a" * 32},
+    "speech_job_cancel": {"job_id": "a" * 32},
 }
 
 
@@ -149,7 +161,7 @@ def without_run_identity(result: dict) -> dict:
 # --- tools: names, schemas, annotations ------------------------------------------------------
 
 
-def test_the_tools_are_the_three_of_r12_with_closed_schemas() -> None:
+def test_the_tools_have_closed_schemas() -> None:
     assert [tool.name for tool in mcp_server.TOOLS] == TOOL_NAMES
     for tool in mcp_server.TOOLS:
         assert tool.description
@@ -168,8 +180,13 @@ def test_annotations_follow_the_side_effects() -> None:
     assert hints["speech_capabilities"].read_only_hint is True
     assert hints["speech_analyze"].read_only_hint is False
     assert hints["speech_compare"].read_only_hint is False
+    assert hints["speech_job_submit"].read_only_hint is False
+    assert hints["speech_job_status"].read_only_hint is True
+    assert hints["speech_job_result"].read_only_hint is True
+    assert hints["speech_job_cancel"].read_only_hint is False
     assert all(hint.open_world_hint is False for hint in hints.values())
-    assert all(hint.destructive_hint is False for hint in hints.values())
+    destructive = [name for name, hint in hints.items() if hint.destructive_hint is not False]
+    assert destructive == ["speech_job_cancel"]
 
 
 def test_docs_list_every_tool_exactly_as_the_code_declares_it() -> None:
@@ -731,3 +748,446 @@ def test_cli_and_mcp_give_the_same_result_and_the_same_compact_answer(
     assert len(text.encode("utf-8")) <= report.COMPACT_MAX_BYTES
     assert not BASE64_RUN.search(text)
     assert str(tmp_path) not in text
+
+
+# --- the job tools (decision 0013 § 3.1, § 3.8) -----------------------------------------------
+
+
+def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
+    schemas = {tool.name: tool.input_schema for tool in mcp_server.TOOLS}
+    assert list(mcp_server.JOB_TOOLS) == JOB_TOOL_NAMES
+    submit = schemas["speech_job_submit"]
+    assert list(submit["properties"]) == [
+        "path",
+        "request_id",
+        "layers",
+        "task",
+        "intent",
+        "connection",
+        "profile",
+        "session_id",
+    ]
+    assert submit["required"] == ["path", "request_id"]
+    assert submit["properties"]["layers"]["items"]["enum"] == list(jobs.LAYERS)
+    for name in JOB_TOOL_NAMES[1:]:
+        assert schemas[name]["properties"].keys() == {"job_id"}
+        assert schemas[name]["required"] == ["job_id"]
+    for name in JOB_TOOL_NAMES:
+        assert schemas[name]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "where"),
+    [
+        ("speech_job_submit", {"request_id": "r-1"}, "'path' is a required property"),
+        ("speech_job_submit", {"path": "a.wav"}, "'request_id' is a required property"),
+        ("speech_job_submit", {"path": "a.wav", "request_id": "r-1", "layers": []}, "layers: "),
+        (
+            "speech_job_submit",
+            {"path": "a.wav", "request_id": "r-1", "session_id": ""},
+            "session_id: ",
+        ),
+        (
+            "speech_job_submit",
+            {"path": "a.wav", "request_id": "r-1", "submitter": "x"},
+            "Additional",
+        ),
+        ("speech_job_status", {}, "'job_id' is a required property"),
+        ("speech_job_result", {"job_id": 7}, "job_id: must be of type string"),
+        ("speech_job_cancel", {"job_id": ""}, "job_id: "),
+    ],
+)
+def test_malformed_job_arguments_are_refused_before_anything_runs(
+    tool: str, arguments: dict, where: str, loaded: config.Config
+) -> None:
+    answer, is_error = mcp_server.call(tool, arguments, loaded)
+
+    assert is_error is True
+    assert answer["error"]["code"] == "invalid_arguments"
+    assert where in answer["error"]["message"]
+    assert list(loaded.data_root.iterdir()) == []
+
+
+async def timed_call(client: Client, tool: str, arguments: dict) -> tuple[object, float]:
+    started = time.monotonic()
+    answered = await client.call_tool(tool, arguments)
+    return answered, time.monotonic() - started
+
+
+def test_job_tools_through_an_mcp_client_are_the_jobs_functions_and_answer_within_2_s(
+    loaded: config.Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/tone.wav", seconds=2.0)
+    outside = make_wav("elsewhere.wav")
+    submit = {"path": str(wav), "request_id": "r-1", "layers": ["content"], "session_id": "s-1"}
+    calls = [
+        ("speech_job_submit", submit),
+        ("speech_job_submit", submit),
+        ("speech_job_submit", {**submit, "task": "another task"}),
+        ("speech_job_submit", {"path": str(outside), "request_id": "r-2"}),
+        ("speech_job_submit", {"path": r"C:\Users\someone\voice.wav", "request_id": "r-3"}),
+        ("speech_job_status", None),
+        ("speech_job_result", None),
+        ("speech_job_cancel", None),
+        ("speech_job_cancel", None),
+        ("speech_job_status", None),
+        ("speech_job_status", {"job_id": "f" * 32}),
+        ("speech_job_result", {"job_id": "../runs"}),
+        ("speech_job_cancel", {"job_id": "f" * 32}),
+    ]
+
+    async def scenario() -> list[tuple[object, float]]:
+        answers = []
+        async with Client(mcp_server.build_server(loaded)) as client:
+            for tool, arguments in calls:
+                if arguments is None:
+                    arguments = {"job_id": json.loads(answers[0][0].content[0].text)["job_id"]}
+                answers.append(await timed_call(client, tool, arguments))
+        return answers
+
+    answers = anyio.run(scenario)
+
+    assert all(seconds < CALL_SECONDS for _, seconds in answers), answers
+    results = [
+        (answered.is_error is True, json.loads(text_of_result(answered))) for answered, _ in answers
+    ]
+    (_, submitted), (_, repeated), *rest = results
+    job_id = submitted["job_id"]
+    assert submitted == {"job_id": job_id, "request_id": "r-1", "state": "queued", "reused": False}
+    assert repeated == {**submitted, "reused": True}
+    job = json.loads((loaded.data_root / "jobs" / job_id / "job.json").read_text("utf-8"))
+    assert job["binding"] == {
+        "submitter": "mcp",
+        "connection": None,
+        "profile": None,
+        "session_id": "s-1",
+    }
+    assert job["request"]["layers"] == ["content"]
+    mismatch, outside_root, windows, queued, no_result, cancelled, ended, status = rest[:8]
+    assert mismatch[0] and mismatch[1]["error"]["code"] == "request_mismatch"
+    assert outside_root[0] and outside_root[1]["error"]["code"] == "path_denied"
+    assert windows[0] and windows[1]["error"]["code"] == "path_denied"
+    assert "Windows path, a URL" in windows[1]["error"]["hint"]
+    assert queued[0] is False
+    assert queued[1] | {"updated_at": None} == {
+        **status[1],
+        "state": "queued",
+        "state_reason": None,
+        "updated_at": None,
+    }
+    assert no_result[0] and no_result[1]["error"]["code"] == "no_result"
+    assert cancelled == (False, {**status[1], "cancel": "cancelled"})
+    assert ended == (False, {**status[1], "cancel": "already_ended"})
+    assert status == (False, jobs.status(job_id, loaded))
+    assert status[1]["state"] == "cancelled"
+    assert [answer["error"]["code"] for _, answer in rest[8:]] == ["job_not_found"] * 3
+    assert all(is_error for is_error, _ in rest[8:])
+    assert sorted(path.name for path in (loaded.data_root / "jobs").iterdir()) == sorted(
+        [job_id, "by-request", "jobs.lock"]
+    )
+
+
+def text_of_result(answered: object) -> str:
+    [block] = answered.content
+    return block.text
+
+
+def test_a_full_queue_is_a_job_submit_refusal(loaded: config.Config, make_wav: WavFactory) -> None:
+    limited = dataclasses.replace(loaded, jobs=dataclasses.replace(loaded.jobs, max_queued_jobs=1))
+    first = make_wav("recordings/first.wav")
+    second = make_wav("recordings/second.wav", frequency=330.0)
+
+    queued, refused = (
+        mcp_server.call("speech_job_submit", {"path": str(wav), "request_id": rid}, limited)
+        for wav, rid in ((first, "r-1"), (second, "r-2"))
+    )
+
+    assert queued[1] is False and queued[0]["state"] == "queued"
+    assert refused[1] is True and refused[0]["error"]["code"] == "queue_full"
+
+
+def test_job_tools_answer_while_a_synchronous_analysis_holds_the_lock(
+    loaded: config.Config, monkeypatch: pytest.MonkeyPatch, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/tone.wav")
+    analyzing, release = threading.Event(), threading.Event()
+
+    def blocking(request: object, loaded: object, cancel: app.CancelToken) -> object:
+        analyzing.set()
+        assert release.wait(30), "the job tools never answered"
+        raise app.Busy("released")
+
+    monkeypatch.setattr(mcp_server.app, "analyze", blocking)
+
+    async def scenario() -> tuple[list, object]:
+        timed, analysis = [], []
+
+        async def analyze(client: Client) -> None:
+            analysis.append(
+                await client.call_tool("speech_analyze", {"path": str(wav), "request_id": "sync"})
+            )
+
+        async with (
+            Client(mcp_server.build_server(loaded)) as client,
+            anyio.create_task_group() as group,
+        ):
+            group.start_soon(analyze, client)
+            await anyio.to_thread.run_sync(analyzing.wait)
+            submitted = await timed_call(
+                client, "speech_job_submit", {"path": str(wav), "request_id": "job"}
+            )
+            timed.append(submitted)
+            job = {"job_id": json.loads(text_of_result(submitted[0]))["job_id"]}
+            for tool in ("speech_job_status", "speech_job_result", "speech_job_cancel"):
+                timed.append(await timed_call(client, tool, job))
+            release.set()
+        return timed, analysis[0]
+
+    timed, analysis = anyio.run(scenario)
+
+    assert all(seconds < CALL_SECONDS for _, seconds in timed), timed
+    assert [answered.is_error is True for answered, _ in timed] == [False, False, True, False]
+    assert json.loads(text_of_result(timed[3][0]))["cancel"] == "cancelled"
+    assert analysis.is_error is True
+    assert json.loads(text_of_result(analysis))["error"]["code"] == "busy"
+
+
+@needs_ffmpeg
+def test_job_tools_over_stdio_give_the_jobs_cli_answers_and_the_runner_s_result(
+    stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
+) -> None:
+    """Submit and follow a job through `sound-scout serve`; the CLI runner analyzes it."""
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+
+    def jobs_cli(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "sound_scout", "jobs", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=stdio_env,
+        )
+
+    def timed(session: StdioSession, tool: str, arguments: dict) -> dict:
+        started = time.monotonic()
+        answered = session.call_tool(tool, arguments)
+        assert time.monotonic() - started < CALL_SECONDS, tool
+        return answered
+
+    session = StdioSession(stdio_env)
+    session.initialize()
+    submitted = timed(session, "speech_job_submit", {"path": str(wav), "request_id": "m"})
+    job_id = answer_of(submitted)["job_id"]
+    queued = timed(session, "speech_job_status", {"job_id": job_id})
+    ran = jobs_cli("run", "--exit-when-idle")
+    status = timed(session, "speech_job_status", {"job_id": job_id})
+    ended = timed(session, "speech_job_result", {"job_id": job_id})
+    cancel = timed(session, "speech_job_cancel", {"job_id": job_id})
+    code, stderr = session.close()
+
+    assert code == 0, stderr
+    assert ran.returncode == 0, ran.stderr
+    assert answer_of(queued)["state"] == "queued"
+    by_cli_status = json.loads(jobs_cli("status", job_id, "--json").stdout)
+    by_cli_result = json.loads(jobs_cli("result", job_id, "--json").stdout)
+    assert answer_of(status) == by_cli_status
+    assert by_cli_status["state"] == "finished"
+    assert answer_of(ended) == by_cli_result
+    assert by_cli_result["job_state"] == "finished" and by_cli_result["status"] == "partial"
+    assert answer_of(cancel) == {**by_cli_status, "cancel": "already_ended"}
+    assert not any(answered.get("isError") for answered in (submitted, status, ended, cancel))
+    assert len(text_of(ended).encode("utf-8")) <= report.COMPACT_MAX_BYTES
+    assert str(tmp_path) not in "".join(session.lines) + stderr
+    assert "sound_scout.mcp: speech_job_result: partial in " in stderr
+
+
+# --- acceptance criteria of #99 ---------------------------------------------------------------
+
+
+def spy_on_job_functions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, object, object]]:
+    """Wrap `jobs.submit|status|result|cancel`: each call records (name, first argument, outcome)
+    and goes through to the real function."""
+    seen: list[tuple[str, object, object]] = []
+    for name in ("submit", "status", "result", "cancel"):
+        real = getattr(jobs, name)
+
+        def spy(*args: object, _name: str = name, _real=real) -> dict:
+            try:
+                answer = _real(*args)
+            except jobs.JobError as error:
+                seen.append((_name, args[0], error.code))
+                raise
+            seen.append((_name, args[0], answer))
+            return answer
+
+        monkeypatch.setattr(jobs, name, spy)
+    return seen
+
+
+def test_criterion_2_the_mcp_job_tools_and_the_jobs_cli_call_the_same_jobs_functions(
+    loaded: config.Config,
+    monkeypatch: pytest.MonkeyPatch,
+    make_wav: WavFactory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from sound_scout import cli
+
+    seen = spy_on_job_functions(monkeypatch)
+    wav = make_wav("recordings/tone.wav")
+
+    def by_cli(*argv: str) -> tuple[int, str, str]:
+        code = cli.main(["jobs", *argv])
+        printed = capsys.readouterr()
+        return code, printed.out, printed.err
+
+    code, out, _ = by_cli("submit", str(wav), "--request-id", "r-cli", "--json")
+    assert code == 0
+    cli_job = json.loads(out)["job_id"]
+    cli_answers = {"submit": json.loads(out)}
+    for action in ("status", "result", "cancel"):
+        code, out, err = by_cli(action, cli_job, "--json")
+        cli_answers[action] = json.loads(out) if code == 0 else err
+    cli_seen, seen[:] = list(seen), []
+
+    async def scenario() -> dict:
+        answers = {}
+        async with Client(mcp_server.build_server(loaded)) as client:
+            submitted = await client.call_tool(
+                "speech_job_submit", {"path": str(wav), "request_id": "r-mcp"}
+            )
+            answers["submit"] = json.loads(text_of_result(submitted))
+            job = {"job_id": answers["submit"]["job_id"]}
+            for action in ("status", "result", "cancel"):
+                answered = await client.call_tool(f"speech_job_{action}", job)
+                answers[action] = json.loads(text_of_result(answered))
+            answered = await client.call_tool("speech_job_status", {"job_id": cli_job})
+            answers["status of the cli job"] = json.loads(text_of_result(answered))
+        return answers
+
+    mcp_answers = anyio.run(scenario)
+    mcp_seen = list(seen)
+    mcp_job = mcp_answers["submit"]["job_id"]
+
+    assert [name for name, _, _ in cli_seen] == ["submit", "status", "result", "cancel"]
+    assert [name for name, _, _ in mcp_seen] == ["submit", "status", "result", "cancel", "status"]
+    assert cli_seen[0][1] == jobs.SubmitRequest(str(wav), request_id="r-cli")
+    assert mcp_seen[0][1] == jobs.SubmitRequest(str(wav), request_id="r-mcp")
+    assert [argument for _, argument, _ in cli_seen[1:]] == [cli_job] * 3
+    assert [argument for _, argument, _ in mcp_seen[1:4]] == [mcp_job] * 3
+    for action, _, outcome in cli_seen:
+        if action == "result":
+            assert outcome == "no_result" and "no_result" in cli_answers[action]
+        else:
+            assert cli_answers[action] == outcome, action
+    for action, _, outcome in mcp_seen[:4]:
+        if action == "result":
+            assert outcome == "no_result" and mcp_answers[action]["error"]["code"] == "no_result"
+        else:
+            assert mcp_answers[action] == outcome, action
+    assert mcp_answers["status of the cli job"] == mcp_seen[4][2]
+    assert mcp_answers["status of the cli job"] == jobs.status(cli_job, loaded)
+    assert mcp_answers["status of the cli job"]["state"] == "cancelled"
+
+
+def test_criterion_3_each_job_tool_answers_within_2_s_with_the_runner_absent_and_busy(
+    loaded: config.Config, monkeypatch: pytest.MonkeyPatch, make_wav: WavFactory
+) -> None:
+    from tests.test_jobs_runner import substitute
+
+    first, second = make_wav("recordings/first.wav"), make_wav("recordings/second.wav")
+    analyzing = threading.Event()
+    blocking = substitute([], until_cancelled=True)
+
+    def busy(request: app.AnalyzeRequest, config: config.Config, **options: object):
+        analyzing.set()
+        return blocking(request, config, **options)
+
+    monkeypatch.setattr(app, "analyze", busy)
+    timings: list[tuple[str, str, float]] = []
+    states: dict[str, object] = {}
+
+    async def timed(client: Client, phase: str, tool: str, arguments: dict) -> dict:
+        answered, seconds = await timed_call(client, tool, arguments)
+        timings.append((phase, tool, seconds))
+        return json.loads(text_of_result(answered))
+
+    async def scenario() -> threading.Thread:
+        async with Client(mcp_server.build_server(loaded)) as client:
+            absent = {"path": str(first), "request_id": "absent"}
+            job_a = (await timed(client, "absent", "speech_job_submit", absent))["job_id"]
+            for tool in ("speech_job_status", "speech_job_result"):
+                await timed(client, "absent", tool, {"job_id": job_a})
+            runner = threading.Thread(
+                target=jobs.run_runner,
+                args=(loaded,),
+                kwargs={"exit_when_idle": True, "poll_seconds": 0.02},
+            )
+            runner.start()
+            await anyio.to_thread.run_sync(analyzing.wait, 30)
+            busy_submit = {"path": str(second), "request_id": "busy"}
+            job_b = (await timed(client, "busy", "speech_job_submit", busy_submit))["job_id"]
+            states["a running"] = await timed(
+                client, "busy", "speech_job_status", {"job_id": job_a}
+            )
+            states["a result"] = await timed(client, "busy", "speech_job_result", {"job_id": job_a})
+            states["b status"] = await timed(client, "busy", "speech_job_status", {"job_id": job_b})
+            states["b result"] = await timed(client, "busy", "speech_job_result", {"job_id": job_b})
+            states["b cancel"] = await timed(client, "busy", "speech_job_cancel", {"job_id": job_b})
+            states["a cancel"] = await timed(client, "busy", "speech_job_cancel", {"job_id": job_a})
+            await anyio.to_thread.run_sync(runner.join, 30)
+            states["a ended"] = await timed(client, "ended", "speech_job_status", {"job_id": job_a})
+            return runner
+
+    runner = anyio.run(scenario)
+
+    assert not runner.is_alive()
+    assert all(seconds < CALL_SECONDS for _, _, seconds in timings), timings
+    for phase, tools in (
+        ("absent", {"speech_job_submit", "speech_job_status", "speech_job_result"}),
+        ("busy", set(JOB_TOOL_NAMES)),
+    ):
+        assert {tool for seen, tool, _ in timings if seen == phase} == tools
+    assert states["a running"]["state"] == "running"
+    assert states["a result"]["error"]["code"] == "no_result"
+    assert states["b status"]["state"] == "queued"
+    assert states["b result"]["error"]["code"] == "no_result"
+    assert states["b cancel"]["cancel"] == "cancelled"
+    assert states["a cancel"]["cancel"] == "requested"
+    assert states["a ended"]["state"] == "cancelled"
+
+
+def test_criterion_4_speech_analyze_stays_a_synchronous_tool_whose_cancel_stops_the_analysis(
+    loaded: config.Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokens: list[app.CancelToken] = []
+    analyzing, stopped = threading.Event(), threading.Event()
+
+    def blocking(request: object, loaded: object, cancel: app.CancelToken) -> object:
+        tokens.append(cancel)
+        analyzing.set()
+        deadline = time.monotonic() + 30
+        while not cancel.cancelled:
+            assert time.monotonic() < deadline, "the cancel never reached app.analyze"
+            time.sleep(0.01)
+        stopped.set()
+        raise app.Busy("stopped")
+
+    monkeypatch.setattr(mcp_server.app, "analyze", blocking)
+
+    async def scenario() -> list[str]:
+        async with Client(mcp_server.build_server(loaded)) as client:
+            listed = await client.list_tools()
+            with anyio.CancelScope() as scope:
+                async with anyio.create_task_group() as group:
+                    group.start_soon(
+                        client.call_tool, "speech_analyze", {"path": "a.wav", "request_id": "r-1"}
+                    )
+                    await anyio.to_thread.run_sync(analyzing.wait, 30)
+                    scope.cancel()
+            return [tool.name for tool in listed.tools]
+
+    names = anyio.run(scenario)
+
+    assert "speech_analyze" in names
+    assert stopped.wait(10)
+    assert len(tokens) == 1 and tokens[0].cancelled
