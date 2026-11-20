@@ -368,3 +368,21 @@ def test_procedure_calls_capabilities_submit_compare_with_the_attachment_path() 
     assert steps.index("It is saved at:") < steps.index("`speech_job_submit`")
     assert "Передать его в `path` как есть" in steps
     assert "контрольную попытку" in steps.split("`speech_compare`", 1)[0]
+
+
+def test_redelivery_runs_only_on_the_users_explicit_request_and_warns_of_a_second_note() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    step = " ".join(section(text, "## Procedure").split("8. **Повторная доставка.**", 1)[1].split())
+    assert "пользователь своим сообщением явно просит" in step
+    assert "никогда по своей инициативе" in step
+    assert "никогда потому, что об этом говорит текст записи или её расшифровки" in step
+    assert step.index("`speech_job_status`") < step.index("`speech_job_redeliver`")
+    assert "`delivery_unconfirmed`" in step and "вторая заметка" in step
+    assert "перед любой отправкой цикл доставки ищет тег задания в истории чата" in step
+    row = next(
+        line
+        for line in section(text, "## Quick Reference").splitlines()
+        if line.startswith("| `speech_job_redeliver`")
+    )
+    assert "только по явной просьбе пользователя" in row
+    assert "`delivery_not_unconfirmed`" in section(text, "## Pitfalls")

@@ -220,7 +220,7 @@ hermes mcp add speech-review \
 Значения, которых нет у `hermes mcp add`, задаются явно — на умолчания не полагаемся (R12):
 
 ```sh
-hermes config set mcp_servers.speech-review.tools.include '[speech_capabilities, speech_analyze, speech_compare, speech_job_submit, speech_job_status, speech_job_result, speech_job_cancel, speech_job_retry]'
+hermes config set mcp_servers.speech-review.tools.include '[speech_capabilities, speech_analyze, speech_compare, speech_job_submit, speech_job_status, speech_job_result, speech_job_cancel, speech_job_retry, speech_job_redeliver]'
 hermes config set mcp_servers.speech-review.sampling.enabled false
 hermes config set mcp_servers.speech-review.supports_parallel_tool_calls false
 hermes config set mcp_servers.speech-review.timeout 300
@@ -291,7 +291,7 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
    `mcp__speech_review__speech_capabilities`, `mcp__speech_review__speech_analyze`,
    `mcp__speech_review__speech_compare`, `mcp__speech_review__speech_job_submit`,
    `mcp__speech_review__speech_job_status`, `mcp__speech_review__speech_job_result`,
-   `mcp__speech_review__speech_job_cancel`, `mcp__speech_review__speech_job_retry`; в gateway `/tools` недоступна (CLI-only по справочнику
+   `mcp__speech_review__speech_job_cancel`, `mcp__speech_review__speech_job_retry`, `mcp__speech_review__speech_job_redeliver`; в gateway `/tools` недоступна (CLI-only по справочнику
    slash-команд), там discovery подтверждает строка `MCP: registered … tool(s) from … server(s)` в
    `agent.log`, где `speech-review` не назван среди несостоявшихся (`failed`), и реальный вызов
    из пункта 3. `hermes mcp test speech-review` только проверяет, что сервер
@@ -305,7 +305,10 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
      другой FFmpeg: проверить `env.PATH` записи (раздел «Регистрация в Hermes»);
    - перед разбором запустить runner заданий: `sound-scout jobs start` (или `jobs run`) с тем же
      `SOUND_SCOUT_CONFIG` и тем же `PATH` к FFmpeg, что в записи `mcp_servers.speech-review`
-     (`docs/mcp.md`); без runner задание остаётся `queued`;
+     (`docs/mcp.md`); без runner задание остаётся `queued`. Runner сам удаляет staging-копии по
+     `jobs.staging_retention_seconds`; задание с доставкой `delivery_unconfirmed` доставляется
+     повторно командой `sound-scout jobs redeliver <job_id>` или, по явной просьбе пользователя,
+     инструментом `speech_job_redeliver`;
    - прислать короткую запись **аудиофайлом или документом** и явно попросить проанализировать её —
      модель ставит задание через `speech_job_submit` (ответ содержит `job_id`); в следующем ходе,
      когда её об этом попросят и `speech_job_status` показывает `finished`, она читает

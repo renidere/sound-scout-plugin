@@ -5,7 +5,8 @@
 клипами, JSON- и Markdown-отчётом и одним контрольным заданием. Python CLI (`doctor`, `analyze`,
 `compare`, `jobs`, `serve`) и локальный MCP stdio (`speech_capabilities`, `speech_analyze`,
 `speech_compare` и инструменты очереди заданий `speech_job_submit`, `speech_job_status`,
-`speech_job_result`, `speech_job_cancel`, `speech_job_retry`) поверх одного application layer.
+`speech_job_result`, `speech_job_cancel`, `speech_job_retry`, `speech_job_redeliver`) поверх одного
+application layer.
 
 Статус: требования зафиксированы (`docs/spec/`), реализация ведётся через задачи на доске
 https://github.com/users/renidere/projects/1 автономным агентом (`docs/workflow.md`). Audio backend
@@ -94,8 +95,8 @@ uv run sound-scout doctor
 `asr: failed: <причина>`, даёт код 1 и не трогает прежний receipt. `doctor` в обоих случаях только
 читает receipt. Подкоманда `serve` запускает MCP stdio сервер с инструментами
 `speech_capabilities`, `speech_analyze`, `speech_compare`, `speech_job_submit`,
-`speech_job_status`, `speech_job_result`, `speech_job_cancel`, `speech_job_retry` (описание и схемы —
-`docs/mcp.md`).
+`speech_job_status`, `speech_job_result`, `speech_job_cancel`, `speech_job_retry`,
+`speech_job_redeliver` (описание и схемы — `docs/mcp.md`).
 Локальная конфигурация —
 `sound-scout.toml` (копия `sound-scout.example.toml`, в git не входит): `doctor`, `smoke`, `analyze` и
 `compare` читают её через `sound_scout.config.load()` из текущего каталога или по пути в `SOUND_SCOUT_CONFIG`;

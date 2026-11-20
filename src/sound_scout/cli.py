@@ -30,6 +30,10 @@ as the transient unit `jobs.RUNNER_UNIT` with this configuration file. `jobs del
 --profile=<p> --loop=<id>` and `jobs deliver-end --outcome=<o> [--error=<text>] <job_id>` are the
 calls of the plugin's delivery loop (`sound_scout.delivery`): the next note to send with its
 `sending` marker written first, and how its send ended; the same output and exit codes.
+`jobs redeliver <job_id>` is the operator's request to deliver the note of a
+`delivery_unconfirmed` job once more (`delivery.request_redelivery`); any other delivery state is
+the refusal `delivery_not_unconfirmed`. The MCP tool `speech_job_redeliver` calls the same
+function.
 `doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
 diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
 same functions until the client closes stdin, then exits 0.
@@ -74,7 +78,7 @@ SUBCOMMANDS = {
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
     "jobs": "queue an analysis and follow it: submit, status, result, cancel, retry; run the "
     "queue: run, start, recover; print the budgets and the staging root: limits; deliver the "
-    "final note: deliver-next, deliver-end",
+    "final note: deliver-next, deliver-end, redeliver",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -253,6 +257,16 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         "--error", help="what the send function said, for unconfirmed and failed"
     )
     deliver_end.add_argument("job_id", help="the job_id that deliver-next printed")
+    redeliver_help = (
+        "deliver the final note of a delivery_unconfirmed job to its chat once more; the plugin's "
+        "loop first looks for the job's tag in the chat history and sends nothing when it finds "
+        "the tag or cannot read the history; Hermes does not deduplicate notes, so a note that "
+        "arrived beyond the history it read shows up twice"
+    )
+    redeliver = actions.add_parser(
+        "redeliver", help=redeliver_help, description=redeliver_help, parents=[common, as_json]
+    )
+    redeliver.add_argument("job_id", help="the job_id of a delivery_unconfirmed job")
 
 
 def _layer_list(text: str) -> tuple[str, ...]:
@@ -438,6 +452,8 @@ def run_jobs(args: argparse.Namespace) -> int:
             answer = delivery.next_delivery(args.profile, args.loop, loaded)
         elif args.jobs_command == "deliver-end":
             answer = delivery.end_delivery(args.job_id, args.outcome, args.error, loaded)
+        elif args.jobs_command == "redeliver":
+            answer = delivery.request_redelivery(args.job_id, loaded)
         else:
             call = {
                 "status": jobs.status,

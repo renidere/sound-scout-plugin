@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -374,3 +375,200 @@ def test_deliver_next_and_end_through_the_console_entry(
     bad = run_cli(config_file, "deliver-next", "--profile=default", "--loop=")
     assert bad.returncode == 1
     assert bad.stderr.startswith("sound-scout jobs: invalid_request: ")
+
+
+# --- redelivery on the operator's request (#122) ---------------------------------------------
+
+
+def unconfirmed_job(cfg: Config, wav: Path, **kwargs: object) -> str:
+    job_id = ended_job(cfg, wav, **kwargs)
+    delivery.next_delivery("default", "loop-1", cfg)
+    delivery.end_delivery(job_id, "unconfirmed", "timed out", cfg)
+    return job_id
+
+
+def test_redeliver_takes_a_delivery_unconfirmed_job_and_records_the_request(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    before = job_file(setup, job_id)
+
+    status = delivery.request_redelivery(job_id, setup)
+
+    after = job_file(setup, job_id)
+    [request] = after["redeliveries"]
+    assert request["previous"] == before["delivery"] and request["requested_at"]
+    assert after["delivery"] == {
+        "state": "redelivery_requested",
+        "tag": f"sound-scout-job:{job_id}",
+        "requested_at": request["requested_at"],
+    }
+    assert after["updated_at"] == before["updated_at"] and after["state"] == "finished"
+    assert status["delivery"] == after["delivery"]
+
+
+@pytest.mark.parametrize(
+    "current",
+    [None, "absent", "sending", "delivered", "delivery_failed", "redelivery_requested"],
+)
+def test_redeliver_refuses_every_other_delivery_state_and_leaves_job_json_as_it_is(
+    setup: Config, make_wav: WavFactory, current: str | None
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"))
+    path = setup.data_root / "jobs" / job_id / "job.json"
+    job = job_file(setup, job_id)
+    if current == "absent":
+        del job["delivery"]
+    elif current is not None:
+        job["delivery"] = {"state": current, "tag": delivery.tag(job_id), "requested_at": "t"}
+    path.write_text(json.dumps(job), encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises(JobError) as refused:
+        delivery.request_redelivery(job_id, setup)
+
+    assert refused.value.code == "delivery_not_unconfirmed"
+    assert "only delivery_unconfirmed" in refused.value.message
+    assert path.read_bytes() == before
+
+
+def test_redeliver_of_an_unknown_job_is_job_not_found(setup: Config) -> None:
+    with pytest.raises(JobError) as refused:
+        delivery.request_redelivery("f" * 32, setup)
+    assert refused.value.code == "job_not_found"
+
+
+def test_next_answers_redeliver_with_the_marker_written_first(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"), session_id="chat-9")
+    requested = delivery.request_redelivery(job_id, setup)["delivery"]["requested_at"]
+
+    answer = delivery.next_delivery("default", "loop-2", setup)
+
+    assert answer == {
+        "action": "redeliver",
+        "job_id": job_id,
+        "session_id": "chat-9",
+        "tag": f"sound-scout-job:{job_id}",
+        "text": delivery.note_text(job_file(setup, job_id), setup),
+    }
+    marker = job_file(setup, job_id)["delivery"]
+    assert marker["state"] == "sending" and marker["loop_id"] == "loop-2"
+    assert marker["redelivery"] is True and marker["requested_at"] == requested
+    assert delivery.next_delivery("default", "loop-2", setup) == {"action": "none"}
+    check = delivery.next_delivery("default", "loop-3", setup)
+    assert check["action"] == "check" and check["job_id"] == job_id
+
+
+@pytest.mark.parametrize("outcome", ["delivered", "delivered_by_history", "unconfirmed", "failed"])
+def test_every_outcome_of_a_redelivery_carries_redelivery(
+    setup: Config, make_wav: WavFactory, outcome: str
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    delivery.request_redelivery(job_id, setup)
+    delivery.next_delivery("default", "loop-1", setup)
+
+    delivery.end_delivery(job_id, outcome, "timed out", setup)
+
+    recorded = job_file(setup, job_id)["delivery"]
+    assert recorded["redelivery"] is True and recorded["ended_at"]
+    assert recorded["state"] == delivery.OUTCOMES[outcome][0]
+
+
+def test_a_released_redelivery_waits_as_redelivery_requested_not_as_a_plain_send(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    requested = delivery.request_redelivery(job_id, setup)["delivery"]
+    delivery.next_delivery("default", "loop-1", setup)
+
+    delivery.end_delivery(job_id, "released", "no gateway in this process owns it", setup)
+
+    assert job_file(setup, job_id)["delivery"] == requested
+    assert delivery.next_delivery("default", "loop-1", setup)["action"] == "redeliver"
+
+
+def test_two_redelivery_requests_are_recorded_each_with_its_time(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    for _ in range(2):
+        delivery.request_redelivery(job_id, setup)
+        delivery.next_delivery("default", "loop-1", setup)
+        delivery.end_delivery(job_id, "unconfirmed", "history unread", setup)
+
+    first, second = job_file(setup, job_id)["redeliveries"]
+    assert first["requested_at"] < second["requested_at"]
+    assert first["previous"]["state"] == second["previous"]["state"] == "delivery_unconfirmed"
+    assert "redelivery" not in first["previous"] and second["previous"]["redelivery"] is True
+
+
+def test_jobs_redeliver_through_the_console_entry(
+    setup: Config, config_file: Path, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = unconfirmed_job(setup, wav)
+    other = unconfirmed_job(setup, wav)
+
+    as_text = run_cli(config_file, "redeliver", job_id)
+    assert as_text.returncode == 0, as_text.stderr
+    assert "redelivery_requested" in as_text.stdout
+    as_json = run_cli(config_file, "redeliver", "--json", other)
+    assert as_json.returncode == 0, as_json.stderr
+    assert json.loads(as_json.stdout)["delivery"]["state"] == "redelivery_requested"
+
+    path = setup.data_root / "jobs" / job_id / "job.json"
+    before = path.read_bytes()
+    again = run_cli(config_file, "redeliver", job_id)
+    assert again.returncode == 1 and again.stdout == ""
+    assert again.stderr.startswith("sound-scout jobs: delivery_not_unconfirmed: ")
+    assert path.read_bytes() == before
+    unknown = run_cli(config_file, "redeliver", "f" * 32)
+    assert unknown.returncode == 1
+    assert unknown.stderr.startswith("sound-scout jobs: job_not_found: ")
+
+
+# --- acceptance criteria of #122 through the real console entry ------------------------------
+
+
+@pytest.mark.parametrize(
+    "current",
+    [None, "absent", "sending", "delivered", "delivery_failed", "redelivery_requested"],
+)
+def test_criterion_2_jobs_redeliver_refuses_every_other_delivery_state_and_keeps_job_json(
+    setup: Config, config_file: Path, make_wav: WavFactory, current: str | None
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"))
+    path = setup.data_root / "jobs" / job_id / "job.json"
+    job = job_file(setup, job_id)
+    if current == "absent":
+        del job["delivery"]
+    elif current is not None:
+        job["delivery"] = {"state": current, "tag": delivery.tag(job_id), "requested_at": "t"}
+    path.write_text(json.dumps(job), encoding="utf-8")
+    before = path.read_bytes()
+
+    refused = run_cli(config_file, "redeliver", job_id)
+
+    assert refused.returncode == 1 and refused.stdout == ""
+    assert refused.stderr.startswith("sound-scout jobs: delivery_not_unconfirmed: ")
+    assert "only delivery_unconfirmed" in refused.stderr
+    assert path.read_bytes() == before
+
+
+def test_criterion_2_each_accepted_jobs_redeliver_is_recorded_in_job_json_with_its_time(
+    setup: Config, config_file: Path, make_wav: WavFactory
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    for _ in range(2):
+        accepted = run_cli(config_file, "redeliver", "--json", job_id)
+        assert accepted.returncode == 0, accepted.stderr
+        assert json.loads(accepted.stdout)["delivery"]["state"] == "redelivery_requested"
+        delivery.next_delivery("default", "loop-1", setup)
+        delivery.end_delivery(job_id, "unconfirmed", "timed out", setup)
+
+    first, second = job_file(setup, job_id)["redeliveries"]
+    for request in (first, second):
+        assert datetime.fromisoformat(request["requested_at"]).tzinfo is not None
+    assert first["requested_at"] < second["requested_at"]

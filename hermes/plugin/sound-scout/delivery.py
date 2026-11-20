@@ -15,7 +15,26 @@ address is always the `session_id` that `deliver-next` names. A timeout or an ex
 tag in the chat history: found is `delivered_by_history`, not found is `unconfirmed`. Any other
 error of the chat (unknown or deleted chat, admission refused, no route) is `failed`. "No gateway
 in this process owns its session" returns before sending and is `released`: the job waits for
-the owner. The Hermes names follow the Decision in #102, read from Hermes v0.23.1 (`3b42157858`):
+the owner.
+
+`redeliver` (the operator's `sound-scout jobs redeliver`, Decision in #122) first looks for the
+job tag in the whole history of the chat: found is `delivered_by_history` without a send; not
+found is one `send`, settled as above; a history that cannot be read, or one longer than
+`HISTORY_SCAN` messages without the tag, is `unconfirmed` without a send, because the tag's
+absence is not proven. The history is read with `include_ancestors=True`: after a compression the
+first note may sit in a parent segment of the lineage; and with `include_compacted=True`: the
+note may sit in a row compaction archived (`active = 0, compacted = 1`). Hermes v0.23.1
+`get_messages` takes `latest` together with `include_ancestors` and `include_compacted` (only
+`after_id` is refused with either) and returns the newest `limit` messages of the merged lineage
+in chronological order; read-only check of `hermes_state_messages.py:1385`.
+
+The tag counts only as a line of its own outside a tool result: the note ends with it, while the
+job status the agent reads shows it inside JSON. Hermes writes the note as a `user` row
+(`hermes_state_detached_results._append_detached_result`), so user and assistant rows are read; a
+user or the agent quoting the note is taken as delivered, which misses a redelivery rather than
+sending a second note.
+
+The Hermes names follow the Decision in #102, read from Hermes v0.23.1 (`3b42157858`):
 `hermes_constants.get_hermes_home`, `hermes_constants.profile_name_for_home`,
 `gateway.session_cron.owner_for_home` (it returns `(authority, loop)` or None),
 `gateway.session_cron.deliver_to_local_chat`, `_physical_target(authority, chat_id)` and
@@ -33,13 +52,14 @@ THREAD_NAME = "sound-scout-delivery"
 POLL_SECONDS = 10
 CLI_TIMEOUT_SECONDS = 30
 CLI_MAX_OUTPUT_BYTES = 64 * 1024
-HISTORY_SCAN = 200
+HISTORY_SCAN = 2000
 BIN_ENV = "SOUND_SCOUT_BIN"
 CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 PASSED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 NO_OWNER = "no gateway in this process owns its session"
 TIMED_OUT = "delivery not confirmed: TimeoutError"
 ORPHAN_ERROR = "marker left by a stopped delivery loop; tag not found in chat history"
+REDELIVERY_UNREAD = "redelivery not sent: chat history could not be read in full"
 # Refusals of deliver-end after which the outcome can never be recorded: drop it.
 FINAL_REFUSALS = ("delivery_not_sending", "job_not_found")
 
@@ -98,7 +118,7 @@ def tick(*, owner, profile, loop_id: str, cli, send, history_has, state: dict) -
     answer = cli(["deliver-next", f"--profile={profile()}", f"--loop={loop_id}"])
     if answer is None or "error" in answer:
         return "cli_failed"
-    if answer["action"] not in ("check", "send"):
+    if answer["action"] not in ("check", "send", "redeliver"):
         return "idle"
     job_id = answer["job_id"]
     # The marker is written: whatever happens now, the outcome reaches deliver-end or pending.
@@ -123,6 +143,12 @@ def _settle(answer: dict, send, history_has) -> tuple[str, str | None]:
         if _history_has(history_has, chat_id, tag):
             return "delivered_by_history", None
         return "unconfirmed", ORPHAN_ERROR
+    if answer["action"] == "redeliver":
+        seen = _history_state(history_has, chat_id, tag)
+        if seen is True:
+            return "delivered_by_history", None
+        if seen is None:
+            return "unconfirmed", REDELIVERY_UNREAD
     return _send_once(send, history_has, chat_id, answer["text"], tag)
 
 
@@ -146,11 +172,16 @@ def _send_once(send, history_has, chat_id: str, text: str, tag: str) -> tuple[st
 
 
 def _history_has(history_has, chat_id: str, tag: str) -> bool:
+    return _history_state(history_has, chat_id, tag) is True
+
+
+def _history_state(history_has, chat_id: str, tag: str) -> bool | None:
+    """Whether the tag is in the chat history; None when the history could not be read."""
     try:
         return bool(history_has(chat_id, tag))
     except Exception as exc:
         _log.warning("sound-scout delivery: history check failed: %s", type(exc).__name__)
-        return False
+        return None
 
 
 def _record(cli, job_id: str, outcome: str, error: str | None) -> bool:
@@ -191,11 +222,16 @@ def hermes_send(chat_id: str, text: str) -> str | None:
 
 
 def hermes_history_has(chat_id: str, tag: str) -> bool:
+    """Whether the tag is in the newest `HISTORY_SCAN` messages of the chat's whole lineage.
+
+    Raises when it cannot answer: `RuntimeError` without the owner process, `LookupError` when
+    the scan read `HISTORY_SCAN` messages without the tag (older ones were not read).
+    """
     from gateway.session_cron import owner_for_home
 
     owner = owner_for_home(_home())
     if owner is None:
-        return False
+        raise RuntimeError("no gateway in this process owns the session authority")
     authority = owner[0]
     try:
         from gateway.session_viewer_close import _physical_target
@@ -203,14 +239,30 @@ def hermes_history_has(chat_id: str, tag: str) -> bool:
         target = chat_id
     else:
         target = _physical_target(authority, chat_id)
-    messages = authority.db.get_messages(target, latest=True, limit=HISTORY_SCAN)
-    return any(tag in str(_content(message) or "") for message in messages)
-
-
-def _content(message):
-    return (
-        message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    messages = authority.db.get_messages(
+        target, latest=True, limit=HISTORY_SCAN, include_ancestors=True, include_compacted=True
     )
+    if any(_is_note(message, tag) for message in messages):
+        return True
+    if len(messages) >= HISTORY_SCAN:
+        raise LookupError("history longer than the scan")
+    return False
+
+
+def _is_note(message, tag: str) -> bool:
+    """Whether the message carries the note's tag line. A tool result (the job status shows the
+    tag inside JSON) is never a note; content that is not text is matched by substring, so a
+    note is never missed."""
+    if _field(message, "role") == "tool":
+        return False
+    content = _field(message, "content")
+    if not isinstance(content, str):
+        return tag in str(content or "")
+    return any(line.strip() == tag for line in content.splitlines())
+
+
+def _field(message, name: str):
+    return message.get(name) if isinstance(message, dict) else getattr(message, name, None)
 
 
 def start(

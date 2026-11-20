@@ -70,10 +70,15 @@
 # пользователя gateway, тот же путь вписывает в `allowed_roots`; каталог лежит вне `~/.hermes` и
 # вне `data_root`. Загрузчик отказывает, если путь не совпадает ни с одним из `allowed_roots` или
 # лежит под `.hermes`.
+# `staging_retention_seconds` — сколько секунд runner хранит staging-копию закончившегося задания
+# и загрузку `<uuid>.upload` без задания (после `cli_timeout` или `cli_failed`). Копия задания
+# `finished` с доставленным итогом удаляется сразу. Без копии повтор задания (`jobs retry`)
+# невозможен. По умолчанию 7 суток.
 # [jobs]
 # max_queued_jobs = 10
 # max_staging_bytes = 1073741824
 # staging_root = "/path/to/sound-scout-staging"
+# staging_retention_seconds = 604800
 
 # Сеть по умолчанию запрещена: без загрузок моделей, без внешнего inference, без телеметрии (R09).
 # При `allow = false` процесс ставит audit hook на сокеты (`guard.install_network_guard`, снять его

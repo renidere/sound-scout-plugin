@@ -67,7 +67,9 @@ runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gat
 `KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
 
 `delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
-kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it.
+kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. About once a minute
+the runner deletes the staging copies that are due (`sound_scout.staging.sweep`) and marks their
+jobs `staging_removed_at`.
 """
 
 import contextlib
@@ -451,10 +453,18 @@ def run_runner(
     With `exit_when_idle` it returns once no job is `queued`. Raises `JobError`
     (`runner_running`) when another runner holds `runner.lock`.
     """
-    from sound_scout import app
+    from sound_scout import app, staging
 
+    swept_at = None
     with _runner_lock(config.data_root):
         while True:
+            if swept_at is None or time.monotonic() - swept_at >= staging.SWEEP_SECONDS:
+                swept_at = time.monotonic()
+                try:
+                    for item in staging.sweep(config):
+                        _log(f"staging {item['name']} removed: {item['reason']}")
+                except (OSError, ValueError) as error:
+                    _log(f"staging sweep failed: {type(error).__name__}")
             claimed = _claim_next(config)
             if claimed is None:
                 if exit_when_idle:

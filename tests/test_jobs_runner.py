@@ -16,6 +16,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1049,3 +1050,91 @@ def test_the_runner_never_retries_an_ended_job_on_its_own(
     assert calls == []
     job = job_file(cfg, job_id)
     assert job["state"] == state and job["attempts"] == [] and "retries" not in job
+
+
+# --- the staging sweep of the runner (#122) --------------------------------------------------
+
+
+def staging_cfg(cfg: Config) -> Config:
+    root = cfg.data_root.parent / "staging"
+    root.mkdir()
+    return Config(
+        allowed_roots=(*cfg.allowed_roots, root),
+        data_root=cfg.data_root,
+        asr=cfg.asr,
+        jobs=config.Jobs(staging_root=root),
+    )
+
+
+def test_the_runner_removes_a_delivered_staging_copy_without_a_command(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    cfg = staging_cfg(cfg)
+    path = cfg.jobs.staging_root / f"{'a' * 32}.upload"
+    make_wav("recordings/a.wav").rename(path)
+    job_id = queue(cfg, path)
+    delivered = {"state": "delivered", "tag": "t", "confirmed_by": "send"}
+    set_job(cfg, job_id, state="finished", delivery=delivered)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert not path.exists()
+    assert job_file(cfg, job_id)["staging_removed_at"]
+
+
+def test_a_failing_sweep_does_not_stop_the_runner(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, capfd
+) -> None:
+    from sound_scout import staging
+
+    def failing_sweep(config: Config) -> list[dict]:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(staging, "sweep", failing_sweep)
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{job_id}-a1"]
+    assert job_file(cfg, job_id)["state"] == "finished"
+    assert "staging sweep failed: OSError" in capfd.readouterr().err
+
+
+def test_criterion_3_jobs_run_cleans_staging_by_the_retention_from_sound_scout_toml(
+    tmp_path: Path, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("recordings", "staging", "data"):
+        (tmp_path / name).mkdir()
+    roots = [str(tmp_path / "recordings"), str(tmp_path / "staging")]
+    config_path = tmp_path / "sound-scout.toml"
+    config_path.write_text(
+        f"allowed_roots = {json.dumps(roots)}\n"
+        f"data_root = {json.dumps(str(tmp_path / 'data'))}\n"
+        f"[asr]\nmodel = {json.dumps(ABSENT_ASR_MODEL)}\n"
+        f"[jobs]\nstaging_root = {json.dumps(roots[1])}\nstaging_retention_seconds = 600\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(config_path))
+    cfg = config.load()
+    assert cfg.jobs.staging_retention_seconds == 600
+
+    def staged(name: str) -> tuple[Path, str]:
+        path = tmp_path / "staging" / f"{name * 32}.upload"
+        make_wav(f"recordings/{name}.wav").rename(path)
+        return path, queue(cfg, path)
+
+    old = (datetime.now(UTC) - timedelta(seconds=601)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+    expired, expired_id = staged("a")
+    set_job(cfg, expired_id, state="failed", updated_at=old)
+    young, young_id = staged("b")
+    set_job(cfg, young_id, state="failed", updated_at=recent)
+
+    ran = run_jobs_cli(config_path, "run", "--exit-when-idle")
+
+    assert ran.returncode == 0, ran.stderr
+    assert f"staging {expired.name} removed: retention" in ran.stderr
+    assert not expired.exists() and job_file(cfg, expired_id)["staging_removed_at"]
+    assert young.exists() and "staging_removed_at" not in job_file(cfg, young_id)

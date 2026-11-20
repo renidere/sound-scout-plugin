@@ -9,7 +9,9 @@ import ast
 import importlib.util
 import json
 import logging
+import os
 import shutil
+import subprocess
 import sys
 import threading
 import types
@@ -20,7 +22,7 @@ import pytest
 from sound_scout import config, jobs
 from sound_scout.config import Config
 from tests.conftest import WavFactory
-from tests.test_delivery import analyzed_job, ended_job, job_file
+from tests.test_delivery import analyzed_job, ended_job, job_file, unconfirmed_job
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE = REPO / "hermes" / "plugin" / "sound-scout" / "delivery.py"
@@ -500,8 +502,9 @@ def test_the_hermes_edge_calls_the_gateway_functions(loop, monkeypatch) -> None:
     sent = []
 
     class Db:
-        def get_messages(self, target, *, latest, limit):
+        def get_messages(self, target, *, latest, limit, include_ancestors, include_compacted):
             assert latest is True and limit == loop.HISTORY_SCAN
+            assert include_ancestors is True and include_compacted is True
             return [{"content": "hello"}, {"content": f"note\nsound-scout-job:{target}"}]
 
     authority = types.SimpleNamespace(db=Db())
@@ -531,7 +534,223 @@ def test_the_hermes_edge_calls_the_gateway_functions(loop, monkeypatch) -> None:
 
     owners.clear()
     assert loop.hermes_owner() is False
-    assert loop.hermes_history_has("c", "sound-scout-job:phys-c") is False
+    with pytest.raises(RuntimeError):
+        loop.hermes_history_has("c", "sound-scout-job:phys-c")
+
+
+def hermes_with_history(monkeypatch, segments: dict[str, list[dict]], calls: list[dict]):
+    """A fake gateway whose lineage read returns the parent segments only with
+    `include_ancestors` and the rows compaction archived (`compacted: 1`) only with
+    `include_compacted`, newest `limit` messages, as Hermes v0.23.1 `get_messages` does."""
+
+    class Db:
+        def get_messages(
+            self, target, *, latest, limit, include_ancestors=False, include_compacted=False
+        ):
+            calls.append(
+                {
+                    "target": target,
+                    "latest": latest,
+                    "limit": limit,
+                    "include_ancestors": include_ancestors,
+                    "include_compacted": include_compacted,
+                }
+            )
+            rows = [row for name in segments for row in segments[name]]
+            if not include_ancestors:
+                rows = segments[target]
+            if not include_compacted:
+                rows = [row for row in rows if not row.get("compacted")]
+            return rows[-limit:] if latest else rows[:limit]
+
+    authority = types.SimpleNamespace(db=Db())
+    monkeypatch.setitem(sys.modules, "gateway", stub("gateway"))
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.session_cron",
+        stub("gateway.session_cron", owner_for_home=lambda home: (authority, None)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.session_viewer_close",
+        stub("gateway.session_viewer_close", _physical_target=lambda auth, chat: "tip"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_constants", stub("hermes_constants", get_hermes_home=lambda: "HOME")
+    )
+
+
+def test_the_history_check_reads_the_whole_lineage_and_finds_the_tag_in_a_parent(
+    loop, monkeypatch
+) -> None:
+    calls = []
+    segments = {
+        "root": [{"content": "note\nsound-scout-job:j1"}],
+        "tip": [{"content": "after the compression"}],
+    }
+    hermes_with_history(monkeypatch, segments, calls)
+
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j2") is False
+    assert calls[0] == {
+        "target": "tip",
+        "latest": True,
+        "limit": loop.HISTORY_SCAN,
+        "include_ancestors": True,
+        "include_compacted": True,
+    }
+
+
+def test_the_history_check_finds_the_tag_in_a_row_compaction_archived(loop, monkeypatch) -> None:
+    segments = {
+        "tip": [
+            {"role": "user", "content": "note\nsound-scout-job:j1", "compacted": 1},
+            {"role": "assistant", "content": "summary of the earlier talk"},
+        ]
+    }
+    hermes_with_history(monkeypatch, segments, [])
+
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j2") is False
+
+
+def test_the_tag_inside_the_job_status_tool_result_is_not_a_delivered_note(
+    loop, monkeypatch
+) -> None:
+    status = json.dumps(
+        {"delivery": {"state": "delivery_unconfirmed", "tag": "sound-scout-job:j1"}}
+    )
+    segments = {
+        "tip": [
+            {"role": "tool", "content": status},
+            {"role": "tool", "content": "sound-scout-job:j1"},
+            {"role": "assistant", "content": "Задание j1 (`sound-scout-job:j1`) не доставлено."},
+        ]
+    }
+    hermes_with_history(monkeypatch, segments, [])
+
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1") is False
+
+
+def test_the_tag_line_of_a_note_in_a_user_or_assistant_row_is_a_delivered_note(
+    loop, monkeypatch
+) -> None:
+    # Hermes v0.23.1 writes a cron note into the chat as a `user` row; the agent may quote it.
+    segments = {
+        "tip": [
+            {
+                "role": "user",
+                "content": "Sound Scout: анализ\nОтчёт: r/report.md\nsound-scout-job:j1",
+            },
+            {"role": "assistant", "content": "> Отчёт готов\n>\n  sound-scout-job:j2  \nok"},
+            {"role": "user", "content": [{"type": "text", "text": "x\nsound-scout-job:j3"}]},
+        ]
+    }
+    hermes_with_history(monkeypatch, segments, [])
+
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j2") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j3") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j4") is False
+
+
+def test_a_history_as_long_as_the_scan_without_the_tag_cannot_answer(loop, monkeypatch) -> None:
+    rows = [{"content": f"message {n}"} for n in range(loop.HISTORY_SCAN + 5)]
+    hermes_with_history(monkeypatch, {"tip": rows}, [])
+
+    with pytest.raises(LookupError):
+        loop.hermes_history_has("chat-1", "sound-scout-job:j1")
+
+
+# --- redelivery on the operator's request (#122) ---------------------------------------------
+
+
+def requested(cfg: Config, wav: Path, **kwargs) -> str:
+    from sound_scout import delivery
+
+    job_id = unconfirmed_job(cfg, wav, **kwargs)
+    delivery.request_redelivery(job_id, cfg)
+    return job_id
+
+
+def test_a_redelivery_with_the_tag_in_history_sends_nothing(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = requested(setup, make_wav("recordings/a.wav"), session_id="chat-1")
+    chats = Chats(setup, history=True)
+
+    assert ticks(loop, chats) == ["delivered_by_history", "idle", "idle"]
+
+    assert chats.sent == []
+    assert chats.checked == [("chat-1", f"sound-scout-job:{job_id}")]
+    recorded = delivery_of(setup, job_id)
+    assert recorded["state"] == "delivered" and recorded["confirmed_by"] == "history"
+    assert recorded["redelivery"] is True
+
+
+def test_a_redelivery_without_the_tag_sends_exactly_one_note_to_the_bound_chat(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = requested(setup, make_wav("recordings/a.wav"), session_id="chat-7")
+    chats = Chats(setup, history=False)
+
+    assert ticks(loop, chats, 4) == ["delivered", "idle", "idle", "idle"]
+
+    assert [chat for chat, _ in chats.sent] == ["chat-7"]
+    assert chats.sent[0][1].splitlines()[-1] == f"sound-scout-job:{job_id}"
+    assert chats.checked == [("chat-7", f"sound-scout-job:{job_id}")]
+    [marker] = chats.markers
+    assert marker["state"] == "sending" and marker["redelivery"] is True
+    recorded = delivery_of(setup, job_id)
+    assert recorded["state"] == "delivered" and recorded["confirmed_by"] == "send"
+
+
+def test_an_unreadable_history_sends_nothing_and_a_new_request_is_taken(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    from sound_scout import delivery
+
+    job_id = requested(setup, make_wav("recordings/a.wav"))
+    chats = Chats(setup, history=LookupError("history longer than the scan"))
+
+    assert ticks(loop, chats, 2) == ["unconfirmed", "idle"]
+
+    assert chats.sent == []
+    recorded = delivery_of(setup, job_id)
+    assert recorded["state"] == "delivery_unconfirmed"
+    assert recorded["error"] == loop.REDELIVERY_UNREAD
+    assert delivery.request_redelivery(job_id, setup)["delivery"]["state"] == (
+        "redelivery_requested"
+    )
+    assert len(job_file(setup, job_id)["redeliveries"]) == 2
+
+
+def test_a_timed_out_redelivery_without_the_tag_is_unconfirmed_after_one_send(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = requested(setup, make_wav("recordings/a.wav"))
+    chats = Chats(setup, TIMEOUT, history=False)
+
+    assert ticks(loop, chats, 3) == ["unconfirmed", "idle", "idle"]
+
+    assert len(chats.sent) == 1 and len(chats.checked) == 2
+    recorded = delivery_of(setup, job_id)
+    assert recorded["state"] == "delivery_unconfirmed" and recorded["redelivery"] is True
+
+
+def test_no_owner_in_a_redelivery_send_waits_and_checks_the_history_again(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = requested(setup, make_wav("recordings/a.wav"), session_id="chat-1")
+    chats = Chats(setup, "local chat {}: no gateway in this process owns its session")
+
+    assert ticks(loop, chats, 1) == ["released"]
+    assert delivery_of(setup, job_id)["state"] == "redelivery_requested"
+
+    assert ticks(loop, chats, 2) == ["delivered", "idle"]
+    assert [chat for chat, _ in chats.sent] == ["chat-1", "chat-1"]
+    assert len(chats.checked) == 2
+    assert delivery_of(setup, job_id)["state"] == "delivered"
 
 
 def test_the_hermes_edge_without_gateway_has_no_owner(loop, monkeypatch) -> None:
@@ -550,3 +769,58 @@ def test_the_loop_imports_only_the_stdlib_and_parses_as_python_311() -> None:
             top_level.add(node.module.split(".")[0])
     assert top_level <= set(sys.stdlib_module_names)
     assert "sound_scout" not in source
+
+
+# --- acceptance criterion 1 of #122 through the real `sound-scout jobs redeliver` ------------
+
+
+def jobs_redeliver(job_id: str) -> subprocess.CompletedProcess[str]:
+    """The operator's real console command, with the configuration of `setup`."""
+    return subprocess.run(
+        [os.environ["SOUND_SCOUT_BIN"], "jobs", "redeliver", job_id],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(os.environ),
+    )
+
+
+def test_criterion_1_jobs_redeliver_makes_the_loop_send_one_more_note_to_the_same_chat(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), session_id="chat-7")
+    chats = Chats(setup, TIMEOUT, history=False)
+    assert ticks(loop, chats, 2) == ["unconfirmed", "idle"]
+    assert delivery_of(setup, job_id)["state"] == "delivery_unconfirmed"
+    assert len(chats.sent) == 1
+
+    accepted = jobs_redeliver(job_id)
+    assert accepted.returncode == 0, accepted.stderr
+
+    assert ticks(loop, chats, 5) == ["delivered", "idle", "idle", "idle", "idle"]
+    assert [chat for chat, _ in chats.sent] == ["chat-7", "chat-7"]
+    assert chats.sent[1][1].splitlines()[-1] == f"sound-scout-job:{job_id}"
+    assert delivery_of(setup, job_id)["state"] == "delivered"
+    assert len(job_file(setup, job_id)["redeliveries"]) == 1
+
+    refused = jobs_redeliver(job_id)
+    assert refused.returncode == 1
+    assert refused.stderr.startswith("sound-scout jobs: delivery_not_unconfirmed: ")
+    assert ticks(loop, chats, 3) == ["idle", "idle", "idle"]
+    assert len(chats.sent) == 2
+
+
+def test_criterion_1_jobs_redeliver_takes_no_job_but_a_delivery_unconfirmed_one(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), session_id="chat-7")
+    before = job_file(setup, job_id)
+
+    refused = jobs_redeliver(job_id)
+
+    assert refused.returncode == 1
+    assert refused.stderr.startswith("sound-scout jobs: delivery_not_unconfirmed: ")
+    assert job_file(setup, job_id) == before
+    chats = Chats(setup)
+    assert ticks(loop, chats) == ["delivered", "idle", "idle"]
+    assert [chat for chat, _ in chats.sent] == ["chat-7"]

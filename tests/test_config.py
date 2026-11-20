@@ -109,6 +109,9 @@ def test_jobs_admission_limits_are_read_and_default(write_config, minimal_toml: 
     assert load().jobs == Jobs() == Jobs(max_queued_jobs=10, max_staging_bytes=1024 * config.MIB)
     write_config(minimal_toml + "[jobs]\nmax_queued_jobs = 3\nmax_staging_bytes = 4096\n")
     assert load().jobs == Jobs(max_queued_jobs=3, max_staging_bytes=4096)
+    assert Jobs().staging_retention_seconds == 604800
+    write_config(minimal_toml + "[jobs]\nstaging_retention_seconds = 60\n")
+    assert load().jobs.staging_retention_seconds == 60
 
 
 @pytest.mark.parametrize(
@@ -117,6 +120,9 @@ def test_jobs_admission_limits_are_read_and_default(write_config, minimal_toml: 
         ("[jobs]\nmax_queued_jobs = 0\n", "jobs.max_queued_jobs: expected a positive integer"),
         ('[jobs]\nmax_staging_bytes = "1G"\n', "jobs.max_staging_bytes: expected a positive"),
         ("[jobs]\nrunners = 2\n", "unknown field: jobs.runners"),
+        ("[jobs]\nstaging_retention_seconds = 0\n", "jobs.staging_retention_seconds: expected"),
+        ("[jobs]\nstaging_retention_seconds = -1\n", "jobs.staging_retention_seconds: expected"),
+        ('[jobs]\nstaging_retention_seconds = "7d"\n', "jobs.staging_retention_seconds: expected"),
         ("jobs = 3\n", "jobs: expected a table"),
     ],
 )

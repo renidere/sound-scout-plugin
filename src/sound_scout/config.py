@@ -94,11 +94,14 @@ class Jobs:
 
     `staging_root` is where the Hermes plugin writes uploaded recordings (decision 0013 § 3.5):
     one of `allowed_roots`, never under `.hermes`; `None` when the plugin takes no uploads.
+    `staging_retention_seconds` is how long the runner keeps the staging copy of an ended job
+    and an upload without a job (`sound_scout.staging.sweep`).
     """
 
     max_queued_jobs: int = 10
     max_staging_bytes: int = 1024 * MIB
     staging_root: Path | None = None
+    staging_retention_seconds: int = 7 * 24 * 3600
 
 
 @dataclass(frozen=True)
