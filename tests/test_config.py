@@ -128,6 +128,73 @@ def test_invalid_jobs_table_is_rejected_by_field(
         load()
 
 
+def test_staging_root_is_unset_by_default_and_read_when_it_is_an_allowed_root(
+    write_config, roots: tuple[Path, Path], tmp_path: Path
+) -> None:
+    recordings, data = roots
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    head = f"data_root = {toml_string(data)}\n"
+    write_config(f"allowed_roots = [{toml_string(recordings)}]\n" + head)
+    assert load().jobs.staging_root is None
+    both = f"allowed_roots = [{toml_string(recordings)}, {toml_string(staging)}]\n"
+    write_config(both + head + f"[jobs]\nstaging_root = {toml_string(staging)}\n")
+    assert load().jobs.staging_root == staging.resolve()
+
+
+@pytest.mark.parametrize("where", ["outside", "inside_a_root", "missing", "relative"])
+def test_staging_root_must_be_one_of_the_allowed_roots(
+    write_config, roots: tuple[Path, Path], tmp_path: Path, where: str
+) -> None:
+    recordings, data = roots
+    staging = {
+        "outside": tmp_path / "staging",
+        "inside_a_root": recordings / "staging",
+        "missing": tmp_path / "absent",
+    }.get(where)
+    if where in ("outside", "inside_a_root"):
+        staging.mkdir()
+    value = '"staging"' if where == "relative" else toml_string(staging)
+    write_config(
+        f"allowed_roots = [{toml_string(recordings)}]\ndata_root = {toml_string(data)}\n"
+        f"[jobs]\nstaging_root = {value}\n"
+    )
+    message = {
+        "outside": "jobs.staging_root: must be one of allowed_roots",
+        "inside_a_root": "jobs.staging_root: must be one of allowed_roots",
+        "missing": "jobs.staging_root: not an existing directory",
+        "relative": "jobs.staging_root: expected an absolute path",
+    }[where]
+    with pytest.raises(ConfigError, match=message):
+        load()
+
+
+@pytest.mark.parametrize(
+    "parts", [(".hermes", "cache", "audio"), (".Hermes", "audio_cache"), ("media", ".HERMES")]
+)
+def test_staging_root_under_hermes_is_refused_even_as_an_allowed_media_dir(
+    write_config, roots: tuple[Path, Path], tmp_path: Path, parts: tuple[str, ...]
+) -> None:
+    _, data = roots
+    staging = tmp_path.joinpath(*parts)
+    staging.mkdir(parents=True)
+    write_config(
+        f"allowed_roots = [{toml_string(staging)}]\ndata_root = {toml_string(data)}\n"
+        f"[jobs]\nstaging_root = {toml_string(staging)}\n"
+    )
+    with pytest.raises(ConfigError, match=r"jobs\.staging_root|allowed_roots\[0\]"):
+        load()
+    if parts[-1] in ("audio", "audio_cache"):
+        write_config(f"allowed_roots = [{toml_string(staging)}]\ndata_root = {toml_string(data)}\n")
+        assert load().allowed_roots == (staging.resolve(),)
+        write_config(
+            f"allowed_roots = [{toml_string(staging)}]\ndata_root = {toml_string(data)}\n"
+            f"[jobs]\nstaging_root = {toml_string(staging)}\n"
+        )
+        with pytest.raises(ConfigError, match=r"jobs\.staging_root: must not be under \.hermes"):
+            load()
+
+
 def test_asr_model_alone_leaves_revision_unset(write_config, minimal_toml: str) -> None:
     write_config(minimal_toml + '[asr]\nmodel = "owner/model.v2-ru"\n')
     assert load().asr == Asr(model="owner/model.v2-ru", revision=None)
@@ -486,8 +553,10 @@ def example_config_text(allowed_root: Path, data_root: Path) -> str:
         if match := COMMENTED_FIELD_LINE.fullmatch(line):
             field_lines.append(match.group(1))
     text = "\n".join(field_lines) + "\n"
-    return text.replace('"/path/to/recordings"', toml_string(allowed_root)).replace(
-        '"/path/to/sound-scout-data"', toml_string(data_root)
+    return (
+        text.replace('"/path/to/recordings"', toml_string(allowed_root))
+        .replace('"/path/to/sound-scout-data"', toml_string(data_root))
+        .replace('"/path/to/sound-scout-staging"', toml_string(allowed_root))
     )
 
 

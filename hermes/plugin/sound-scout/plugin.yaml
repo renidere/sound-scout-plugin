@@ -1,4 +1,9 @@
 name: sound-scout
-version: 0.0.1
-description: Sound Scout spike B probe - backend health, chat note delivery and runner unit start
+version: 0.1.0
+description: Sound Scout - send a voice recording for speech analysis and follow the job
 author: renidere
+requires_env:
+  - name: SOUND_SCOUT_BIN
+    description: Absolute path to the sound-scout executable, for example <venv>/bin/sound-scout
+  - name: SOUND_SCOUT_CONFIG
+    description: Absolute path to sound-scout.toml with jobs.staging_root set

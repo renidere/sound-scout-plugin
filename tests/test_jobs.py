@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -378,6 +379,96 @@ def test_the_stage_names_of_jobs_are_those_of_the_application_layer() -> None:
     assert jobs.LAYERS == app.LAYERS
     assert jobs.LAYER_STAGES == app.LAYER_STAGES
     assert jobs.WORKER_STAGES == app.WORKER_STAGES
+    assert jobs.STAGE_RECORD == app.STAGE_RECORD
+    assert jobs.CHECKPOINT == app.CHECKPOINT
+
+
+def test_limits_answer_the_budgets_the_queue_limits_and_the_staging_root(setup: Config) -> None:
+    staging = setup.allowed_roots[0]
+    cfg = dataclasses.replace(
+        setup,
+        budgets=Budgets(max_duration_seconds=60, max_input_bytes=4096),
+        jobs=Jobs(max_queued_jobs=2, max_staging_bytes=8192, staging_root=staging),
+    )
+
+    assert jobs.limits(cfg) == {
+        "max_duration_seconds": 60,
+        "max_input_bytes": 4096,
+        "max_queued_jobs": 2,
+        "max_staging_bytes": 8192,
+        "staging_root": str(staging),
+    }
+    assert jobs.limits(setup)["staging_root"] is None
+
+
+def write_stage_record(cfg: Config, run_id: str, stage: str, record: object) -> None:
+    work = cfg.data_root / runs.RUNS_DIR_NAME / run_id / ingest.WORK_DIR_NAME
+    work.mkdir(parents=True, exist_ok=True)
+    text = record if isinstance(record, str) else json.dumps(record)
+    (work / jobs.STAGE_RECORD.format(name=stage)).write_text(text, encoding="utf-8")
+
+
+def stage_record(stage: str, status: str, **more: object) -> dict:
+    return {"stage": stage, "entry": {"status": status, "reason": "/private/path"}, **more}
+
+
+def test_finished_stages_are_empty_before_the_first_attempt(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+
+    assert jobs.status(job_id, setup)["finished_stages"] == []
+
+
+def test_finished_stages_of_a_running_attempt_come_from_its_run_through_the_index(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    run_id, request_id = runs.new_run_id(), f"{job_id}-a1"
+    index = setup.data_root / runs.RUNS_DIR_NAME / runs.INDEX_DIR_NAME
+    index.mkdir(parents=True)
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    (index / digest).write_text(run_id, encoding="utf-8")
+    write_stage_record(setup, run_id, "asr", stage_record("asr", "failed"))
+    write_stage_record(setup, run_id, "prepare", stage_record("prepare", "completed"))
+    write_stage_record(setup, run_id, "acoustics", "{torn")
+    write_stage_record(
+        setup, run_id, "audio_review", stage_record("audio_review", "completed", checkpoint=True)
+    )
+    attempt = {"number": 1, "request_id": request_id, "run_id": None}
+    set_job(setup, job_id, state="running", attempts=[attempt])
+
+    found = jobs.status(job_id, setup)
+
+    assert found["finished_stages"] == [
+        {"stage": "prepare", "status": "completed"},
+        {"stage": "asr", "status": "failed"},
+    ]
+    assert "/private/path" not in json.dumps(found)
+
+
+def test_finished_stages_follow_the_latest_attempt_and_its_plan(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = jobs.submit(SubmitRequest(str(wav), layers=("content",)), Binding(), setup)["job_id"]
+    old, new = runs.new_run_id(), runs.new_run_id()
+    write_stage_record(setup, old, "prepare", stage_record("prepare", "completed"))
+    write_stage_record(setup, new, "acoustics", stage_record("acoustics", "completed"))
+    write_stage_record(setup, new, "prepare", stage_record("prepare", "failed"))
+    attempts = [
+        {"number": 1, "request_id": f"{job_id}-a1", "run_id": old},
+        {"number": 2, "request_id": f"{job_id}-a2", "run_id": new},
+    ]
+    set_job(setup, job_id, state="finished", attempts=attempts)
+
+    assert jobs.status(job_id, setup)["finished_stages"] == [
+        {"stage": "prepare", "status": "failed"}
+    ]
 
 
 # --- the real console entry point ------------------------------------------------------------
@@ -446,6 +537,9 @@ def test_jobs_through_the_console_entry(config_file: Path, make_wav: WavFactory)
 
     status = run_cli(config_file, "status", job_id)
     assert status.returncode == 0, status.stderr
+    assert (
+        json.loads(run_cli(config_file, "status", job_id, "--json").stdout)["finished_stages"] == []
+    )
     assert f"job_id: {job_id}" in status.stdout.splitlines()
     assert "state: queued" in status.stdout.splitlines()
 
@@ -464,6 +558,43 @@ def test_jobs_through_the_console_entry(config_file: Path, make_wav: WavFactory)
     assert unknown.returncode == 1
     assert unknown.stderr.startswith("sound-scout jobs: job_not_found: ")
     assert str(config_file.parent) not in unknown.stderr + full.stderr
+
+
+def test_jobs_limits_through_the_console(config_file: Path) -> None:
+    staging = config_file.parent / "recordings"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8")
+        + f"staging_root = {json.dumps(str(staging))}\n[budgets]\nmax_input_bytes = 2048\n",
+        encoding="utf-8",
+    )
+
+    as_json = run_cli(config_file, "limits", "--json")
+    as_text = run_cli(config_file, "limits")
+
+    assert as_json.returncode == 0, as_json.stderr
+    assert json.loads(as_json.stdout) == {
+        "max_duration_seconds": Budgets().max_duration_seconds,
+        "max_input_bytes": 2048,
+        "max_queued_jobs": 1,
+        "max_staging_bytes": Jobs().max_staging_bytes,
+        "staging_root": str(staging),
+    }
+    assert as_text.returncode == 0, as_text.stderr
+    assert "max_input_bytes: 2048" in as_text.stdout.splitlines()
+    assert f"staging_root: {staging}" in as_text.stdout.splitlines()
+
+
+def test_jobs_limits_with_a_broken_configuration_is_config_error(config_file: Path) -> None:
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + 'staging_root = "/nowhere/staging"\n',
+        encoding="utf-8",
+    )
+
+    refused = run_cli(config_file, "limits", "--json")
+
+    assert refused.returncode == 1
+    assert refused.stdout == ""
+    assert refused.stderr.startswith("sound-scout jobs: config_error: ")
 
 
 def test_jobs_submit_through_the_console_writes_job_json_and_answers_within_a_second(

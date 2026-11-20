@@ -90,10 +90,15 @@ def decoded_samples_limit(budgets: Budgets, sample_rate: int, channels: int) -> 
 class Jobs:
     """Admission of the job queue (`sound_scout.jobs`, decision 0013 § 6): a submit that would
     put more than `max_queued_jobs` jobs in `queued`, or more than `max_staging_bytes` of input
-    in the jobs not yet ended (`queued`, `running`), is refused with its reason."""
+    in the jobs not yet ended (`queued`, `running`), is refused with its reason.
+
+    `staging_root` is where the Hermes plugin writes uploaded recordings (decision 0013 § 3.5):
+    one of `allowed_roots`, never under `.hermes`; `None` when the plugin takes no uploads.
+    """
 
     max_queued_jobs: int = 10
     max_staging_bytes: int = 1024 * MIB
+    staging_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +183,8 @@ def _parse(data: dict[str, object]) -> Config:
                 f"data_root and allowed_roots[{index}] must not contain each other: "
                 f"{data_root} and {root}"
             )
+    jobs = _jobs(data.get("jobs", {}))
+    _check_staging_root(jobs.staging_root, allowed_roots)
     return Config(
         allowed_roots=allowed_roots,
         data_root=data_root,
@@ -185,8 +192,22 @@ def _parse(data: dict[str, object]) -> Config:
         network=_network(data.get("network", {})),
         backend=_backend(data.get("backend", "none")),
         asr=_asr(data.get("asr", {})),
-        jobs=_jobs(data.get("jobs", {})),
+        jobs=jobs,
     )
+
+
+def _check_staging_root(staging_root: Path | None, allowed_roots: tuple[Path, ...]) -> None:
+    """The plugin's uploads must be readable input (one of the roots, not merely inside one) and
+    stay out of the Hermes home, even its media directories (decision 0013 § 3.5)."""
+    if staging_root is None:
+        return
+    if staging_root not in allowed_roots:
+        raise ConfigError(
+            f"jobs.staging_root: must be one of allowed_roots: {staging_root} is not "
+            f"{[str(root) for root in allowed_roots]}"
+        )
+    if any(part.lower() == HERMES_DIR for part in staging_root.parts):
+        raise ConfigError(f"jobs.staging_root: must not be under {HERMES_DIR}: {staging_root}")
 
 
 def is_denied_name(name: str) -> bool:
@@ -246,7 +267,14 @@ def _budgets(value: object) -> Budgets:
 def _jobs(value: object) -> Jobs:
     table = _table(value, "jobs")
     _reject_unknown(table, {field.name for field in fields(Jobs)}, prefix="jobs")
-    return Jobs(**{name: _positive_int(item, f"jobs.{name}") for name, item in table.items()})
+    values: dict[str, object] = {
+        name: _positive_int(item, f"jobs.{name}")
+        for name, item in table.items()
+        if name != "staging_root"
+    }
+    if "staging_root" in table:
+        values["staging_root"] = _directory(table["staging_root"], "jobs.staging_root")
+    return Jobs(**values)
 
 
 def _network(value: object) -> Network:

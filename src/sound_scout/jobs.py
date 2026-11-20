@@ -1,6 +1,7 @@
 """The file job store of the analysis queue (decision 0013 § 3.6): submit, status, result, cancel.
 
 CLI (`sound-scout jobs`) and MCP call these functions and nothing else: all job logic is here.
+`limits` answers the budgets and `jobs.staging_root` to the Hermes plugin, a client of the CLI.
 
 Layout: `<data_root>/jobs/<job_id>/` (0700) holds `job.json` (0600) with the request, the
 resolved plan, the binding and the job state; `cancel.json` is the cancel marker of a running
@@ -98,6 +99,10 @@ INTERRUPTED = "interrupted"
 LAYERS = ("content", "measurements", "sound")
 LAYER_STAGES = {"content": "asr", "measurements": "acoustics", "sound": "audio_review"}
 WORKER_STAGES = ("prepare", "acoustics", "asr", "audio_review")
+# `app.STAGE_RECORD` and `app.CHECKPOINT`, repeated for the same reason: `status` reads the stage
+# records of the run to name the finished stages.
+STAGE_RECORD = "stage-{name}.json"
+CHECKPOINT = "checkpoint"
 SUBMITTER_CLI = "cli"
 
 INVALID_REQUEST = "invalid_request"
@@ -216,9 +221,23 @@ def resolved_plan(layers: tuple[str, ...], config: Config) -> dict:
 
 
 def status(job_id: str, config: Config) -> dict:
-    """The job's state without its private input path: state, times, attempts, cancel marker."""
+    """The job's state without its private input path: state, times, attempts, cancel marker and
+    `finished_stages`, the stages of the latest attempt's run that wrote their final record."""
     job_dir = _job_dir(job_id, config)
-    return _view(job_dir, _load(job_dir))
+    return _view(job_dir, _load(job_dir), config)
+
+
+def limits(config: Config) -> dict:
+    """The operator's budgets and queue limits a client checks before it uploads, and the
+    staging root the Hermes plugin writes uploads to (`None`: the plugin takes none)."""
+    staging_root = config.jobs.staging_root
+    return {
+        "max_duration_seconds": config.budgets.max_duration_seconds,
+        "max_input_bytes": config.budgets.max_input_bytes,
+        "max_queued_jobs": config.jobs.max_queued_jobs,
+        "max_staging_bytes": config.jobs.max_staging_bytes,
+        "staging_root": None if staging_root is None else str(staging_root),
+    }
 
 
 def result(job_id: str, config: Config) -> dict:
@@ -275,7 +294,7 @@ def cancel(job_id: str, config: Config) -> dict:
             outcome = "requested"
         else:
             outcome = "already_ended"
-        return _view(job_dir, job) | {"cancel": outcome}
+        return _view(job_dir, job, config) | {"cancel": outcome}
 
 
 def run_runner(
@@ -696,7 +715,7 @@ def _job_dir(job_id: object, config: Config) -> Path:
     return job_dir
 
 
-def _view(job_dir: Path, job: dict) -> dict:
+def _view(job_dir: Path, job: dict, config: Config) -> dict:
     run_ids = [attempt.get("run_id") for attempt in job["attempts"]]
     return {
         "job_id": job["job_id"],
@@ -709,7 +728,33 @@ def _view(job_dir: Path, job: dict) -> dict:
         "attempts": len(job["attempts"]),
         "run_id": run_ids[-1] if run_ids else None,
         "cancel_requested": (job_dir / CANCEL_MARKER_NAME).exists(),
+        "finished_stages": _finished_stages(job, config),
     }
+
+
+def _finished_stages(job: dict, config: Config) -> list[dict]:
+    """`{stage, status}` of each planned stage whose final record the latest attempt's run holds,
+    in plan order; a checkpoint record or an unreadable one does not count. No `reason`: it may
+    carry a path or text of the recording."""
+    if not job["attempts"]:
+        return []
+    attempt = job["attempts"][-1]
+    run_id = attempt.get("run_id") or _run_id_of(attempt["request_id"], config)
+    if not isinstance(run_id, str) or not runs.RUN_ID_PATTERN.fullmatch(run_id):
+        return []
+    work_dir = config.data_root / runs.RUNS_DIR_NAME / run_id / ingest.WORK_DIR_NAME
+    finished = []
+    for stage in job["plan"]["stages"]:
+        try:
+            record = json.loads((work_dir / STAGE_RECORD.format(name=stage)).read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get(CHECKPOINT):
+            continue
+        entry = record.get("entry")
+        if isinstance(entry, dict) and isinstance(entry.get("status"), str):
+            finished.append({"stage": stage, "status": entry["status"]})
+    return finished
 
 
 def _answer(job: dict, *, reused: bool) -> dict:

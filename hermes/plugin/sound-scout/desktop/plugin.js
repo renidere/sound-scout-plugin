@@ -1,15 +1,11 @@
-// Spike B Desktop half of the Sound Scout package (#96, decision 0015): palette commands that call
-// the backend through ctx.rest and the sound-scout-report transcript directive.
+// Desktop half of the Sound Scout package (#101, decision 0013 § 3.2): the health command of the
+// palette, which calls the backend through ctx.rest, and the sound-scout-report transcript
+// directive (its card is #108).
 import { host, PALETTE_AREA, TRANSCRIPT_DIRECTIVE_AREA } from '@hermes/plugin-sdk'
 import { jsx } from 'react/jsx-runtime'
 
 const DIRECTIVE = 'sound-scout-report'
 const SPIKE_JOB = /^spike-[0-9a-f]{32}$/
-const DELIVERY_DELAY_S = 30
-
-function show(title, message, ok) {
-  host.notify({ kind: ok ? 'info' : 'warning', title, message })
-}
 
 function ReportCard({ job }) {
   return jsx('div', {
@@ -18,76 +14,42 @@ function ReportCard({ job }) {
   })
 }
 
+function describeHealth(answer) {
+  const budgets = answer.budgets
+    ? `до ${answer.budgets.max_duration_seconds} с, до ${answer.budgets.max_input_bytes} байт`
+    : 'бюджеты недоступны'
+  const intake = answer.intake.ready
+    ? 'приём записей готов'
+    : `приём записей: ${answer.intake.error}: ${answer.intake.detail}`
+  return `pid=${answer.pid} session_owner=${answer.session_owner}; ${budgets}; ${intake}`
+}
+
 export default {
   id: 'sound-scout',
-  name: 'Sound Scout (spike B)',
+  name: 'Sound Scout',
   register(ctx) {
-    let lastToken = null
-
-    async function call(title, request, describe) {
+    const health = async () => {
+      const title = 'Sound Scout: health'
       try {
-        const answer = await request()
-        const failure = answer.error
-          ? `${answer.error}: ${answer.detail}`
-          : `returncode=${answer.returncode} ${answer.stderr || ''}`
-        show(title, answer.ok ? describe(answer) : failure, answer.ok)
-        return answer
+        const answer = await ctx.rest('/health')
+        const ready = answer.ok && answer.intake.ready
+        host.notify({ kind: ready ? 'info' : 'warning', title, message: describeHealth(answer) })
       } catch (error) {
         host.notify({ kind: 'error', title, message: String(error) })
-        return null
       }
     }
-
-    const health = () =>
-      call('Sound Scout spike: health', () => ctx.rest('/health'), a =>
-        `ok=${a.ok} pid=${a.pid} session_owner=${a.session_owner}`)
-
-    const deliver = async () => {
-      const chatId = host.state.focusedStoredSessionId.get()
-      if (!chatId) {
-        show('Sound Scout spike: deliver', 'Нет открытого чата: заметку некуда доставить', false)
-        return
-      }
-      const answer = await call(
-        'Sound Scout spike: deliver',
-        () => ctx.rest('/spike/deliver', { method: 'POST', body: { chat_id: chatId, delay_s: DELIVERY_DELAY_S } }),
-        a => `token=${a.token}, доставка через ${a.delay_s} с`
-      )
-      if (answer && answer.ok) lastToken = answer.token
-    }
-
-    const checkDelivery = () => {
-      if (!lastToken) {
-        show('Sound Scout spike: delivery', 'В этом окне ещё не было доставки', false)
-        return
-      }
-      const token = lastToken
-      return call('Sound Scout spike: delivery', () => ctx.rest(`/spike/deliver/${token}`), a =>
-        `token=${token} state=${a.state}${a.error ? ` error=${a.error}` : ''}`)
-    }
-
-    const startRunner = () =>
-      call('Sound Scout spike: start runner', () => ctx.rest('/spike/runner', { method: 'POST' }), a =>
-        `unit=${a.unit} returncode=${a.returncode}`)
-
-    const runnerStatus = () =>
-      call('Sound Scout spike: runner status', () => ctx.rest('/spike/runner'), a => {
-        const p = a.properties
-        return `ActiveState=${p.ActiveState} MainPID=${p.MainPID} ControlGroup=${p.ControlGroup}`
-      })
-
-    const command = (id, label, run) => ({
-      id,
-      area: PALETTE_AREA,
-      data: { id: `sound-scout.${id}`, label, keywords: ['sound', 'scout', 'spike'], run: () => void run() }
-    })
 
     ctx.registerMany([
-      command('health', 'Sound Scout spike: health', health),
-      command('deliver', 'Sound Scout spike: deliver note to this chat in 30 s', deliver),
-      command('check-delivery', 'Sound Scout spike: check last delivery', checkDelivery),
-      command('start-runner', 'Sound Scout spike: start runner unit', startRunner),
-      command('runner-status', 'Sound Scout spike: runner unit status', runnerStatus),
+      {
+        id: 'health',
+        area: PALETTE_AREA,
+        data: {
+          id: 'sound-scout.health',
+          label: 'Sound Scout: health',
+          keywords: ['sound', 'scout', 'health'],
+          run: () => void health()
+        }
+      },
       {
         id: 'report-directive',
         area: TRANSCRIPT_DIRECTIVE_AREA,

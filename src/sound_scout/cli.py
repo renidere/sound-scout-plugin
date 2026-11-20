@@ -17,7 +17,9 @@ root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 
 `jobs submit|status|result|cancel|recover` calls `sound_scout.jobs` and prints its answer as
 `key: value` lines (`--json`: the answer; `recover`: one line per recovered job); `result` puts
 `job_id`, `job_state` and `attempt` before the summary of the compact answer, as `analyze` prints
-it. The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
+it; `status` lists `finished_stages`. `jobs limits` prints `jobs.limits`: the budgets, the queue
+limits and `jobs.staging_root`, which the Hermes plugin reads instead of the configuration file.
+The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
 is the runner in the foreground (`jobs.run_runner`; `--exit-when-idle` returns once no job is
 queued), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
 as the transient unit `jobs.RUNNER_UNIT` with this configuration file.
@@ -64,7 +66,7 @@ SUBCOMMANDS = {
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
     "jobs": "queue an analysis and follow it: submit, status, result, cancel; run the queue: "
-    "run, start, recover",
+    "run, start, recover; print the budgets and the staging root: limits",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -209,6 +211,10 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
     )
     actions.add_parser(
         "recover", help=recover_help, description=recover_help, parents=[common, as_json]
+    )
+    limits_help = "print the budgets, the queue limits and the staging root of the configuration"
+    actions.add_parser(
+        "limits", help=limits_help, description=limits_help, parents=[common, as_json]
     )
 
 
@@ -373,6 +379,8 @@ def run_jobs(args: argparse.Namespace) -> int:
             answer = jobs.start_runner_unit(config.config_path())
         elif args.jobs_command == "recover":
             answer = jobs.recover(loaded)
+        elif args.jobs_command == "limits":
+            answer = jobs.limits(loaded)
         elif args.jobs_command == "submit":
             fields = {"request_id": args.request_id, "task": args.task, "intent": args.intent}
             if args.layers is not None:

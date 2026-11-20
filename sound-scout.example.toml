@@ -65,9 +65,15 @@
 # `max_queued_jobs` — сколько заданий может ждать в состоянии `queued`; `max_staging_bytes` —
 # сумма размеров входов у незавершённых заданий (`queued` и `running`) вместе с новым. Сверх
 # любого предела `submit` отказывает с причиной `queue_full` или `staging_full`.
+# `staging_root` — каталог, куда плагин Hermes кладёт загруженные записи (`POST /jobs`, решение
+# 0013 § 3.5); без него плагин записи не принимает. Каталог создаёт оператор с правами 0700 от
+# пользователя gateway, тот же путь вписывает в `allowed_roots`; каталог лежит вне `~/.hermes` и
+# вне `data_root`. Загрузчик отказывает, если путь не совпадает ни с одним из `allowed_roots` или
+# лежит под `.hermes`.
 # [jobs]
 # max_queued_jobs = 10
 # max_staging_bytes = 1073741824
+# staging_root = "/path/to/sound-scout-staging"
 
 # Сеть по умолчанию запрещена: без загрузок моделей, без внешнего inference, без телеметрии (R09).
 # При `allow = false` процесс ставит audit hook на сокеты (`guard.install_network_guard`, снять его
