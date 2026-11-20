@@ -98,15 +98,31 @@ def test_readme_describes_installation_and_checks() -> None:
 
 
 GATE0_DECISION = "`docs/decisions/0007-gate0-result.md`"
-OWNER_CHOICE_ISSUE = "#68"
 CLOSED_CHOICE_ISSUE = "[#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта)"
 NEXT_EXPERIMENT_ISSUE = "[#119](https://github.com/renidere/sound-scout-plugin/issues/119)"
 CONNECT_BACKEND_ISSUE = "[#90](https://github.com/renidere/sound-scout-plugin/issues/90"
 ISSUE_40 = "[#40](https://github.com/renidere/sound-scout-plugin/issues/40)"
+MOSS_DIAGNOSTIC = (
+    "MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не формальный Gate 0: "
+    "READY не получен ([#90](https://github.com/renidere/sound-scout-plugin/issues/90"
+    "#issuecomment-7024154195))"
+)
+STALE_OWNER_CHOICE = re.compile(
+    r"замену выбирает владелец[^.]*#68|#68[^.]*замену выбирает владелец"
+)
 
 
 def flat(text: str) -> str:
     return " ".join(text.split())
+
+
+def stale_owner_choice(text: str) -> list[str]:
+    return STALE_OWNER_CHOICE.findall(flat(text))
+
+
+def open_issue_68_mentions(text: str) -> int:
+    text = flat(text)
+    return text.count("#68") - text.count(CLOSED_CHOICE_ISSUE)
 
 
 def test_readme_status_says_gemma_failed_gate0_and_no_backend_is_chosen() -> None:
@@ -144,10 +160,16 @@ def test_claude_md_stack_line_says_no_backend_is_chosen_after_gate0() -> None:
         "Gemma 4 E4B-it",
         "не прошла Gate 0 — вердикт NOT READY",
         GATE0_DECISION,
-        "замену выбирает владелец",
-        OWNER_CHOICE_ISSUE,
+        CLOSED_CHOICE_ISSUE,
+        MOSS_DIAGNOSTIC,
+        "Следующий ограниченный эксперимент предлагает агент, утверждает владелец "
+        f"({NEXT_EXPERIMENT_ISSUE})",
+        f"подключение backend с READY — {CONNECT_BACKEND_ISSUE})",
     ):
         assert fragment in stack, fragment
+    assert stale_owner_choice(stack) == []
+    assert open_issue_68_mentions(stack) == 0
+    assert "следующий шаг — за владельцем" not in stack
 
 
 def test_dependencies_backend_intro_records_gate0_verdict_and_keeps_weights() -> None:
@@ -159,10 +181,28 @@ def test_dependencies_backend_intro_records_gate0_verdict_and_keeps_weights() ->
         "вердиктом **NOT READY**",
         "`docs/decisions/0007-gate0-result.md` §5",
         "backend не упакован, `backend` остаётся `none`",
-        OWNER_CHOICE_ISSUE,
+        f"замену владелец выбирал в {CLOSED_CHOICE_ISSUE}",
+        f"следующий ограниченный эксперимент — {NEXT_EXPERIMENT_ISSUE}",
     ):
         assert fragment in intro, fragment
+    assert stale_owner_choice(intro) == []
+    assert open_issue_68_mentions(intro) == 0
     assert "### 3.1. Веса" in section and "SHA-256" in section
+
+
+def test_stale_owner_choice_check_reports_the_old_text_of_issue_68() -> None:
+    """#124: the old CLAUDE.md and docs/dependencies.md wording fails the checks above."""
+    old = (
+        "вердикт NOT READY (`docs/decisions/0007-gate0-result.md`), замену выбирает владелец\n"
+        "  ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат"
+    )
+    assert stale_owner_choice(old) != []
+    assert stale_owner_choice("#68 открыта, замену выбирает владелец.") != []
+    assert open_issue_68_mentions(old) == 1
+    assert open_issue_68_mentions("Borealis проверен по решению владельца на #68.") == 1
+    new = f"замену владелец выбирал в {CLOSED_CHOICE_ISSUE}. Следующий — {NEXT_EXPERIMENT_ISSUE}."
+    assert stale_owner_choice(new) == []
+    assert open_issue_68_mentions(new) == 0
 
 
 CANDIDATE_CHOSEN = re.compile(

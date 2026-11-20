@@ -11,14 +11,19 @@
   `faster-whisper` для ASR; `praat-parselmouth` для F0. Backend слухового анализа сейчас не
   выбран (`backend = none`): Gemma 4 E4B-it (GGUF через llama.cpp, только локально; кандидат по
   решению владельца, `docs/spec/REQUIREMENTS.md` раздел 9) не прошла Gate 0 — вердикт NOT READY
-  (`docs/decisions/0007-gate0-result.md`), замену выбирает владелец
-  ([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат
-  Borealis-5b-it, проверенный по решению владельца на #68 тем же протоколом, тоже получил NOT
+  (`docs/decisions/0007-gate0-result.md`); замену владелец выбирал в
+  [#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта). Запасной кандидат
+  Borealis-5b-it, проверенный по решению владельца тем же протоколом, тоже получил NOT
   READY (`docs/decisions/0010-gate0-borealis.md`). Кандидат вне бюджета памяти
   GigaChat3.1-Audio-10B-A1.8B (разрешение владельца на #85, потолок 26 GB) по тому же протоколу и
   правилу тоже получил NOT READY (`docs/decisions/0011-gate0-gigachat-audio.md`): не выполнено
   предусловие P3 (20 аудиотокенов на секунду при 6,25 позиции в секунду у его энкодера), о слухе
-  модели это не говорит; следующий шаг — за владельцем ([#90](https://github.com/renidere/sound-scout-plugin/issues/90)).
+  модели это не говорит. MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
+  формальный Gate 0: READY не получен
+  ([#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195)).
+  Следующий ограниченный эксперимент предлагает агент, утверждает владелец
+  ([#119](https://github.com/renidere/sound-scout-plugin/issues/119)); подключение backend с
+  READY — [#90](https://github.com/renidere/sound-scout-plugin/issues/90).
   Без БД, брокеров и provider framework.
 - **Направление (с 20 ноября 2026):** единый плагин — рекордер Hermes Desktop на штатном Desktop
   Plugin SDK, backend-часть в существующем gateway, файловая очередь заданий с одним runner; CLI и

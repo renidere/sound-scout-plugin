@@ -76,14 +76,15 @@ apt runner'а, Node.js — предустановленный в образе ru
 
 Gate 0 для неё закончился вердиктом **NOT READY** (`docs/decisions/0007-gate0-result.md` §5):
 backend не упакован, `backend` остаётся `none`, `doctor` для `audio_review` —
-`permission_required`; замену выбирает владелец
-([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Записи о весах и runtime ниже
-остаются: веса лежат на станции разработки, по ним работает `sound_scout.eval.gate0`.
+`permission_required`; замену владелец выбирал в
+[#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта), следующий ограниченный
+эксперимент — [#119](https://github.com/renidere/sound-scout-plugin/issues/119). Записи о весах и
+runtime ниже остаются: веса лежат на станции разработки, по ним работает `sound_scout.eval.gate0`.
 
-Запасной кандидат **Borealis-5b-it** (`docs/spec/REQUIREMENTS.md` раздел 9; решение владельца на
-[#68](https://github.com/renidere/sound-scout-plugin/issues/68)) проверен тем же протоколом и тоже
-получил **NOT READY** (`docs/decisions/0010-gate0-borealis.md` §5): ничего не упаковано, `backend`
-остаётся `none`. Его веса удалены со станции разработки 2026-11-19 (техническая заметка
+Запасной кандидат **Borealis-5b-it** (`docs/spec/REQUIREMENTS.md` раздел 9; решение владельца в
+[#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта)) проверен тем же протоколом и тоже получил **NOT READY**
+(`docs/decisions/0010-gate0-borealis.md` §5): ничего не упаковано, `backend` остаётся `none`.
+Его веса удалены со станции разработки 2026-11-19 (техническая заметка
 [#85](https://github.com/renidere/sound-scout-plugin/issues/85), чтобы освободить место); их
 SHA-256 и runtime остаются записанными ниже (3.1, 3.2).
 
