@@ -130,13 +130,19 @@ journalctl --user -u hermes-autonomous.service --since "15 min ago" | grep "Moun
 
 ### 4. Критерий 3: `GET /health` через `ctx.rest` с Windows
 
-1. Палитра → `Sound Scout spike: health`. Ожидается уведомление `ok=true pid=<N> session_owner=true`.
+1. Палитра → `Sound Scout spike: health`. В текущей топологии `ctx.rest` идёт на `:9119`
+   (`hermes serve`), и ожидается уведомление `ok=true pid=<N> session_owner=false`; см. 0017.
+   `session_owner=true` ожидается только после смены топологии, которую выбирает владелец (0017).
 2. На Linux: `systemctl --user show -p MainPID hermes-autonomous.service` — `MainPID` должен
-   совпасть с `pid`. `session_owner=true` подтверждает, что этот процесс владеет чатами Desktop
-   (#94, пункт 5).
+   совпасть с `pid`. `session_owner=false` значит, что этот процесс не владеет чатами Desktop
+   (#94, пункт 5; владелец — `hermes-gateway.service`, см. 0017).
 3. Ошибку `ctx.rest` записать дословно.
 
 ### 5. Критерий 4: доставка заметки ровно один раз
+
+В текущей топологии доставка через `ctx.rest` идёт в `hermes serve` и возвращает `local chat <id>:
+no gateway in this process owns its session` (`check last delivery` → `state=failed`); см. 0017.
+Шаги ниже описывают ожидание после смены топологии.
 
 1. **Открытый чат X.** Открыть чат X, палитра → `Sound Scout spike: deliver note to this chat in 30 s`,
    не уходить из чата. Через ~30 с в X должна появиться ровно одна заметка с токеном из
