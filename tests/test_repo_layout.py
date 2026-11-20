@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from sound_scout import mcp_server
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MEDIA_SUFFIXES = {
     ".wav",
@@ -97,6 +99,10 @@ def test_readme_describes_installation_and_checks() -> None:
 
 GATE0_DECISION = "`docs/decisions/0007-gate0-result.md`"
 OWNER_CHOICE_ISSUE = "#68"
+CLOSED_CHOICE_ISSUE = "[#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта)"
+NEXT_EXPERIMENT_ISSUE = "[#119](https://github.com/renidere/sound-scout-plugin/issues/119)"
+CONNECT_BACKEND_ISSUE = "[#90](https://github.com/renidere/sound-scout-plugin/issues/90"
+ISSUE_40 = "[#40](https://github.com/renidere/sound-scout-plugin/issues/40)"
 
 
 def flat(text: str) -> str:
@@ -114,9 +120,12 @@ def test_readme_status_says_gemma_failed_gate0_and_no_backend_is_chosen() -> Non
         "`docs/decisions/0001-audio-backend.md`",
         "Gate 0 не прошла — вердикт NOT READY",
         GATE0_DECISION,
-        OWNER_CHOICE_ISSUE,
+        CLOSED_CHOICE_ISSUE,
+        NEXT_EXPERIMENT_ISSUE,
+        CONNECT_BACKEND_ISSUE,
         "Русская квалификация (Gate 1) не пройдена",
-        "подключение к Hermes не выполнено",
+        "подключён к Hermes 2026-11-19",
+        f"{ISSUE_40}, закрыта",
         "инструмент не считается готовым",
     ):
         assert fragment in status, fragment
@@ -157,7 +166,7 @@ def test_dependencies_backend_intro_records_gate0_verdict_and_keeps_weights() ->
 
 
 CANDIDATE_CHOSEN = re.compile(
-    r"выбран[аоы]?[^.]*(?:Borealis|GigaChat|Qwen)|(?:Borealis|GigaChat|Qwen)[^.]*выбран"
+    r"выбран[аоы]?[^.]*(?:Borealis|GigaChat|Qwen|MOSS)|(?:Borealis|GigaChat|Qwen|MOSS)[^.]*выбран"
 )
 
 
@@ -312,3 +321,140 @@ def test_backend_status_records_that_gigachat_failed_gate0_on_p3() -> None:
         assert "P3" in text and "о слухе модели" in text, text
     verdict = (REPO_ROOT / "docs" / "decisions" / "0011-gate0-gigachat-audio.md").read_text("utf-8")
     assert "**Вердикт: NOT READY**" in verdict
+
+
+ISSUE = "https://github.com/renidere/sound-scout-plugin/issues/{}"
+STALE_HERMES_CLAIM = re.compile(
+    r"подключени\w* к Hermes не (?:выполнен|сделан)|Hermes (?:ещё |пока )?не подключ"
+)
+
+
+def stale_hermes_claims(text: str) -> list[str]:
+    return STALE_HERMES_CLAIM.findall(flat(text))
+
+
+def read(name: str) -> str:
+    return (REPO_ROOT / name).read_text(encoding="utf-8")
+
+
+def test_docs_name_the_hermes_connection_of_issue_40_as_done() -> None:
+    """#111 criterion 1: no document still says that Hermes is not connected."""
+    for name in ("README.md", "docs/hermes-install.md", "docs/ACCEPTANCE.md"):
+        assert stale_hermes_claims(read(name)) == [], name
+    status = flat(read("README.md").split("Статус:", 1)[1].split("\n\n", 1)[0])
+    assert "native вызовы из новой сессии `hermes -z` и из Hermes Desktop вернули `partial`" in (
+        status
+    )
+    assert "Подключение на другом хосте — шаг владельца (`docs/hermes-install.md`)" in status
+
+
+def test_stale_hermes_claim_check_reports_the_old_readme_line() -> None:
+    old = "Русская квалификация не пройдена, подключение к Hermes не выполнено — пока это так"
+    assert stale_hermes_claims(old) == ["подключение к Hermes не выполнен"]
+    assert stale_hermes_claims("Hermes пока не подключён.") == ["Hermes пока не подключ"]
+    assert stale_hermes_claims("Сервер подключён к Hermes 2026-11-19.") == []
+
+
+def test_readme_shows_the_unified_plugin_direction_and_what_main_has() -> None:
+    """#111 criterion 1: the direction of decision 0013 and the parts that are on main."""
+    readme = read("README.md")
+    direction = flat(readme.split("Направление (с 20 ноября 2026):", 1)[1].split("\n\n", 1)[0])
+    for fragment in (
+        "`docs/decisions/0013-voice-note-integration.md`",
+        f"сначала Linux-часть ([#114]({ISSUE.format(114)}))",
+        f"затем Windows-клиент (эпик [#115]({ISSUE.format(115)}))",
+        "`sound-scout jobs`",
+        "`docs/decisions/0018-job-modes-and-retry.md`",
+        "`hermes/plugin/sound-scout/`",
+        "`GET /health`, `POST /jobs`, `GET /jobs/<job_id>`",
+        "`/api/plugins/sound-scout/`",
+        "одной заметки с итогом задания в привязанный чат",
+        "`hermes/skills/speech-review/`",
+        f"([#104]({ISSUE.format(104)}))",
+        f"([#103]({ISSUE.format(103)}))",
+    ):
+        assert fragment in direction, fragment
+    for path in (
+        "src/sound_scout/jobs.py",
+        "docs/mcp.md",
+        "hermes/plugin/sound-scout/delivery.py",
+        "hermes/skills/speech-review/SKILL.md",
+    ):
+        assert (REPO_ROOT / path).is_file(), path
+    assert "Решения по направлению — 0013, 0015–0018" in direction
+    for number in (13, 15, 16, 17, 18):
+        assert len(list((REPO_ROOT / "docs" / "decisions").glob(f"00{number}-*.md"))) == 1
+    routes = read("hermes/plugin/sound-scout/dashboard/plugin_api.py")
+    for route in (
+        '@router.get("/health")',
+        '@router.post("/jobs")',
+        '@router.get("/jobs/{job_id}")',
+    ):
+        assert route in routes, route
+    intro = flat(readme.split("Статус:", 1)[0])
+    names = [tool.name for tool in mcp_server.TOOLS]
+    assert re.findall(r"`(speech_\w+)`", intro) == names
+
+
+def test_readme_and_acceptance_record_four_backend_candidates_without_ready() -> None:
+    moss = "MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не формальный Gate 0"
+    for name in ("README.md", "docs/ACCEPTANCE.md"):
+        text = flat(read(name))
+        for candidate in (
+            "Gemma 4 E4B-it",
+            "Borealis-5b-it",
+            "GigaChat3.1-Audio-10B-A1.8B",
+            moss,
+            "READY не получен",
+            "issues/90#issuecomment-7024154195",
+            f"[#119]({ISSUE.format(119)})",
+        ):
+            assert candidate in text, (name, candidate)
+
+
+TOOL_COUNTS = {3: "трёх", 6: "шести", 9: "девяти"}
+
+
+def test_hermes_install_keeps_connection_an_owner_step_and_counts_the_tools() -> None:
+    """#111 criterion 2 and the allowlist size of the nine MCP tools."""
+    doc = flat(read("docs/hermes-install.md"))
+    for fragment in (
+        "**Подключение к действующему Hermes — шаг владельца по отдельному разрешению**",
+        "Агенты эти команды не выполняют",
+        "На станции разработки сервер подключён 2026-11-19 по версии этой инструкции для трёх "
+        "инструментов R12 (issue #40, закрыта)",
+        "Инструменты заданий попадут в эту запись, только когда владелец повторит команду "
+        "`tools.include`",
+        "подключение на другом хосте — снова шаг владельца по отдельному разрешению",
+    ):
+        assert fragment in doc, fragment
+    names = [tool.name for tool in mcp_server.TOOLS]
+    jobs = [name for name in names if name.startswith("speech_job_")]
+    total, sync = TOOL_COUNTS[len(names)], TOOL_COUNTS[len(names) - len(jobs)]
+    assert f"allowlist из {sync} инструментов R12 и {TOOL_COUNTS[len(jobs)]} инструментов" in doc
+    assert doc.count(f"из {total} инструментов") == 2
+    assert "ровно девять инструментов" in doc
+    assert not re.search(r"\b(?:семи|семь|пяти|пять) инструмент", doc)
+
+
+def test_acceptance_limits_t09b_to_the_sync_call_and_lists_a01_a14_as_not_passed() -> None:
+    """#111 criterion 3: T09b is the synchronous MCP call; A01–A14 are new and not run."""
+    text = read("docs/ACCEPTANCE.md")
+    section = flat(text.split("## Приёмка единого плагина (A01–A14)", 1)[1].split("\n## ", 1)[0])
+    for fragment in (
+        "**T09b покрывает только синхронный native вызов MCP.**",
+        "**A01–A14 — новые пункты приёмки**, не часть T01–T10",
+        "ни один сценарий не выполнялся, значит ни один не пройден",
+        f"[#112]({ISSUE.format(112)})",
+        f"[#114]({ISSUE.format(114)})",
+        f"[#115]({ISSUE.format(115)})",
+        "моки не доказывают пользовательский путь",
+    ):
+        assert fragment in section, fragment
+    named = re.findall(r"`(tests/test_\w+\.py)`", section)
+    assert {"tests/test_mcp_server.py", "tests/test_staging.py"} <= set(named)
+    for test in named:
+        assert (REPO_ROOT / test).is_file(), test
+    t09b = next(line for line in text.splitlines() if line.startswith("| Hermes (T09b) |"))
+    assert "T09b покрывает только синхронный native вызов MCP" in t09b
+    assert "A01–A14 пройдены" not in flat(text)

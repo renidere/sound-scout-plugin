@@ -309,7 +309,9 @@ def test_desktop_rows_keep_the_missing_audio_backend_limit(text: str) -> None:
     assert matrix_row(text, "R12")[1] == "проверено"
     t09 = matrix_row(text, "T09")
     assert t09[1] == "partial"
-    assert "issues/68" in t09[4].partition("blocked:")[2]
+    blocked = t09[4].partition("blocked:")[2]
+    assert "issues/119" in blocked and "issues/90" in blocked
+    assert "issues/68" not in blocked and "issues/25" not in blocked
 
 
 def test_r08_cites_the_desktop_call_and_names_nothing_unchecked(text: str) -> None:

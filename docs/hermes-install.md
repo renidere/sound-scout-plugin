@@ -7,6 +7,10 @@ stdio сервер `sound-scout serve` в Hermes под именем `speech-rev
 **Подключение к действующему Hermes — шаг владельца по отдельному разрешению** (issue #40).
 Агенты эти команды не выполняют: всё, что ниже меняет конфигурацию Hermes или подключается к нему
 (`hermes mcp add`, `hermes config set`, `hermes mcp test`, новая сессия), запускает владелец.
+На станции разработки сервер подключён 2026-11-19 по версии этой инструкции для трёх
+инструментов R12 (issue #40, закрыта). Инструменты заданий попадут в эту запись, только когда
+владелец повторит команду `tools.include` из раздела «Настройка записи». Повторная регистрация,
+изменение записи или подключение на другом хосте — снова шаг владельца по отдельному разрешению.
 
 ## Источники
 
@@ -226,7 +230,7 @@ hermes config set mcp_servers.speech-review.supports_parallel_tool_calls false
 hermes config set mcp_servers.speech-review.timeout 300
 ```
 
-- `tools.include` — явный allowlist из трёх инструментов R12 и пяти инструментов очереди
+- `tools.include` — явный allowlist из трёх инструментов R12 и шести инструментов очереди
   заданий (`docs/mcp.md`, решение 0013 § 3.1). Запись, настроенная до появления инструментов
   заданий, их не показывает, пока владелец не повторит эту команду и не применит запись. `hermes config set` разбирает
   `[…]` как YAML-список. `hermes mcp configure` для этого не используйте: при выборе всех
@@ -264,7 +268,7 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
 Ожидаемая запись — `docs/examples/hermes-mcp-entry.example.yaml`: `command`, `args`,
 `env.SOUND_SCOUT_CONFIG`, `env.PATH` из системных каталогов, `connect_timeout: 60.0` (`--connect-timeout` сохраняется числом с
 плавающей точкой), `timeout: 300`, `supports_parallel_tool_calls: false`, `sampling.enabled: false`,
-`tools.include` из семи инструментов `docs/mcp.md`, `enabled: true`. Пути в угловых скобках у владельца —
+`tools.include` из девяти инструментов `docs/mcp.md`, `enabled: true`. Пути в угловых скобках у владельца —
 настоящие абсолютные пути хоста.
 
 ## Readback
@@ -332,11 +336,11 @@ R12). Интеграция считается подключённой, толь
 - [ ] запись создана через `hermes mcp add` и `hermes config set`, без ручного редактирования
       `mcp_servers`;
 - [ ] readback exact entry совпадает с `docs/examples/hermes-mcp-entry.example.yaml`: allowlist из
-      семи инструментов, `sampling.enabled: false`, `supports_parallel_tool_calls: false`, явные
+      девяти инструментов, `sampling.enabled: false`, `supports_parallel_tool_calls: false`, явные
       `connect_timeout` и `timeout`, `timeout` ≥ worker deadline + `max_subprocess_seconds` + запас,
       `env.PATH` без каталогов `~/.hermes/tools`;
 - [ ] `terminal.backend` — `local`;
-- [ ] discovery в новой сессии нужного runtime показывает ровно семь инструментов
+- [ ] discovery в новой сессии нужного runtime показывает ровно девять инструментов
       `mcp__speech_review__…`;
 - [ ] реальные вызовы `speech_capabilities`, `speech_job_submit` и `speech_job_result` моделью
       Hermes из новой сессии вернули ответ, и в data root есть соответствующий

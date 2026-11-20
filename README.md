@@ -12,16 +12,40 @@ application layer.
 https://github.com/users/renidere/projects/1 автономным агентом (`docs/workflow.md`). Audio backend
 сейчас не выбран (`backend = none`): Gemma 4 E4B-it в GGUF через llama.cpp, только локально,
 выбранная владельцем 2026-11-18 для Gate 0 (`docs/decisions/0001-audio-backend.md`), Gate 0 не
-прошла — вердикт NOT READY (`docs/decisions/0007-gate0-result.md`); замену выбирает владелец
-([#68](https://github.com/renidere/sound-scout-plugin/issues/68)). Запасной кандидат Borealis-5b-it,
+прошла — вердикт NOT READY (`docs/decisions/0007-gate0-result.md`); замену владелец выбирал в
+[#68](https://github.com/renidere/sound-scout-plugin/issues/68) (закрыта). Запасной кандидат Borealis-5b-it,
 проверенный по решению владельца тем же протоколом, тоже получил NOT READY
 (`docs/decisions/0010-gate0-borealis.md`). Кандидат вне бюджета памяти GigaChat3.1-Audio-10B-A1.8B,
 проверенный по разрешению владельца тем же протоколом и правилом под потолком 26 GB, тоже получил
 NOT READY (`docs/decisions/0011-gate0-gigachat-audio.md`): не выполнено предусловие P3 правила
 (20 аудиотокенов на секунду при 6,25 позиции в секунду у его энкодера), о слухе модели это не
-говорит; следующий шаг — за владельцем. Русская квалификация (Gate 1)
-не пройдена, подключение к Hermes не выполнено — пока это так, инструмент не считается готовым
-(Gate 0–3 в `docs/spec/REQUIREMENTS.md`).
+говорит. Четвёртый кандидат MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
+формальный Gate 0: READY не получен
+([#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195)).
+Следующий ограниченный эксперимент предлагает агент, утверждает владелец
+([#119](https://github.com/renidere/sound-scout-plugin/issues/119)). На станции разработки MCP
+сервер `speech-review` подключён к Hermes 2026-11-19
+([#40](https://github.com/renidere/sound-scout-plugin/issues/40), закрыта): native вызовы из
+новой сессии `hermes -z` и из Hermes Desktop вернули `partial`, потому что слоя звучания нет.
+Подключение на другом хосте — шаг владельца (`docs/hermes-install.md`). Русская квалификация
+(Gate 1) не пройдена — пока это так, инструмент не считается готовым (Gate 0–3 в
+`docs/spec/REQUIREMENTS.md`).
+
+Направление (с 20 ноября 2026): единый плагин — рекордер Hermes Desktop на штатном Desktop Plugin
+SDK, backend-часть в существующем gateway Hermes, файловая очередь заданий с одним runner; CLI и
+MCP — равноправные входы в ту же очередь (`docs/decisions/0013-voice-note-integration.md`, раздел
+10 `docs/spec/REQUIREMENTS.md`). Порядок: сначала Linux-часть
+([#114](https://github.com/renidere/sound-scout-plugin/issues/114)), затем Windows-клиент (эпик
+[#115](https://github.com/renidere/sound-scout-plugin/issues/115)). На `main` уже есть очередь
+`sound-scout jobs` (`src/sound_scout/jobs.py`; режимы плана и повтор —
+`docs/decisions/0018-job-modes-and-retry.md`), MCP-инструменты заданий (`docs/mcp.md`), пакет
+плагина `hermes/plugin/sound-scout/` (маршруты `GET /health`, `POST /jobs`, `GET /jobs/<job_id>`
+под `/api/plugins/sound-scout/`; цикл доставки одной заметки с итогом задания в привязанный чат —
+`delivery.py`) и skill `hermes/skills/speech-review/`. Пакет на хосте Hermes ещё не развёрнут
+([#104](https://github.com/renidere/sound-scout-plugin/issues/104)), рекордера Desktop нет
+([#103](https://github.com/renidere/sound-scout-plugin/issues/103)). Решения по направлению —
+0013, 0015–0018: Spike B (0015), Spike A (0016), владелец session authority (0017), режимы
+плана и повтор (0018).
 
 ## Документы
 
