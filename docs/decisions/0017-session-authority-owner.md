@@ -1,9 +1,13 @@
 # 0017 — Какой процесс Hermes владеет session authority Desktop
 
-- **Статус:** факт установлен; выбор топологии ждёт владельца.
-- **Дата:** 2026-11-20.
-- **Решение:** [Decision в #116](https://github.com/renidere/sound-scout-plugin/issues/116#issuecomment-7025500309).
-- **Задача:** [#116](https://github.com/renidere/sound-scout-plugin/issues/116); эпик
+- **Статус:** факт установлен. Топология выбрана: вариант (б), уточнённый в план по этапам
+  (2026-11-20). Этап A выполнен 2026-11-20. Клиентская проверка в Windows и этап B ждут владельца.
+  Подробности — раздел «Этап A (2026-11-20)».
+- **Дата:** 2026-11-20; этап A и сверка — 2026-11-20.
+- **Решение:** [Decision в #116](https://github.com/renidere/sound-scout-plugin/issues/116#issuecomment-7025500309);
+  остаток после этапа A — [Decision в #120](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7052302513).
+- **Задача:** [#116](https://github.com/renidere/sound-scout-plugin/issues/116); выбор топологии и
+  перезапуск — [#120](https://github.com/renidere/sound-scout-plugin/issues/120); эпик
   [#92](https://github.com/renidere/sound-scout-plugin/issues/92).
 - **Основание:** `docs/decisions/0013-voice-note-integration.md` § 3.7 (доставка в чат) и § 9 п. 5
   (процесс-владелец чатов Desktop); `docs/decisions/0015-spike-b-backend-package.md` (маршрут
@@ -16,7 +20,9 @@
   `apps/desktop`, `website/docs`, `tests/tools`, `tests/tui_gateway`. Ссылки `файл:строка` ниже даны
   на эту ревизию.
 - **Как получено:** только чтение. Первое наблюдение — 2026-11-19 23:42–23:46 UTC, повторная сверка —
-  2026-11-19 23:49–23:50 UTC. Ничего не перезапускалось и не менялось.
+  2026-11-19 23:49–23:50 UTC. Ничего не перезапускалось и не менялось. Этап A (изменение и
+  перезапуск gateway 2026-11-20) выполнил оркестратор по разрешению владельца в #120; сверка после
+  него — только чтение, 2026-11-20 22:30 UTC.
 
 ## Вопрос
 
@@ -45,6 +51,10 @@ Session authority профиля `default` (`~/.hermes`, `~/.hermes/state.db`) �
 
 Посылка 0013 § 9 п. 5 («процесс-владелец чатов Desktop — `hermes-autonomous.service`») неверна.
 
+С 2026-11-20 (этап A) authority держит тот же unit, процесс другой: `hermes-gateway.service`, PID
+2297970. Gateway теперь слушает `0.0.0.0:9120` (Webapp со входом). `hermes serve` на `:9119` пока
+работает, и Windows Desktop пока подключается к нему.
+
 ## Процессы Hermes на общем `~/.hermes`
 
 Наблюдение — 2026-11-19 23:42–23:50 UTC.
@@ -62,6 +72,12 @@ Session authority профиля `default` (`~/.hermes`, `~/.hermes/state.db`) �
 | `~/.hermes/gateway_state.json` | — | `pid=1234703`, `kind=hermes-gateway`, `served_profiles=["default"]`, `code_sha=3b421578…`, `active_agents=0`, `active_work=null` | — |
 | журнал | `~/.hermes/logs/gui.log`: `Mounted plugin API routes: /api/plugins/sound-scout/` в 22:40:13 и 22:41:19 UTC | `~/.hermes/logs/agent.log`: в 08:34:39 UTC смонтированы plugin API `subscription-usage`, `hermes-achievements`, `kanban` (прогрев дашборда после старта gateway; процесс определён по времени, в `agent.log` нет PID); строки для `sound-scout` нет | — |
 
+Таблица — состояние на 2026-11-19. После этапа A (2026-11-20) изменилось: gateway — PID 2297970 с
+12:58:49 UTC, listener `0.0.0.0:9120` (Webapp со входом); TCP `127.0.0.1:43189` больше не слушает,
+control socket gateway — `~/.hermes/gateway.sock` (сверка 2026-11-20 22:30 UTC). Desktop SSH
+backend теперь другой: PID 434482, `127.0.0.1:37575`, с 2026-11-20 06:56 UTC. Подробности — раздел
+«Этап A (2026-11-20)».
+
 Третий процесс — `serve --isolated`, который Desktop запускает через SSH. Он есть в
 `~/.hermes/spawn-ledger.json` (`port=42421`, `spawner_pid=None`, то есть отсоединён от SSH) и в
 таблице `gateway_heartbeats` (последний heartbeat 2026-11-19 23:02:42 UTC). С 23:42 UTC его нет в
@@ -72,7 +88,8 @@ Session authority профиля `default` (`~/.hermes`, `~/.hermes/state.db`) �
 - `systemctl --user show -p MainPID,ExecStart,ControlGroup,ActiveEnterTimestamp hermes-autonomous.service hermes-gateway.service`;
 - `tr '\0' ' ' < /proc/<pid>/cmdline`, `cat /proc/<pid>/cgroup`, `HERMES_HOME` из `/proc/<pid>/environ`;
 - `lslocks -o PID,TYPE,MODE,PATH | grep -E 'gateway.lock|gateway-locks'`;
-- `ss -ltnp | grep -E '9119|43189'`, соединения — `ss -tnp state established | grep -E ':9119|:43189'`;
+- `ss -ltnp | grep -E '9119|9120'`, соединения — `ss -tnp state established | grep -E ':9119|:9120'`
+  (до этапа A gateway слушал `:43189`);
 - `~/.hermes/gateway_state.json` (`pid`, `kind`, `served_profiles`, `code_sha`, `active_agents`,
   `active_work`), `~/.local/state/hermes/gateway-locks/host-*.json` (`role`, `pid`, `profiles`,
   `host`, `port`).
@@ -173,6 +190,12 @@ flock `gateway.lock` у PID 1234703, `host-gateway.json`, `gateway_state.json` �
 выполнялся. Живое чтение возможно аутентифицированным `GET /api/plugins/sound-scout/health` на
 `127.0.0.1:43189` по native ticket'у control socket, если владелец это разрешит.
 
+**После этапа A (2026-11-20):** gateway перезапущен (PID 2297970) и монтирует маршруты
+`sound-scout` при старте (`agent.log`, 12:58:53 UTC): Webapp прогревается сразу. Оркестратор
+сообщил живое чтение health с входом на `:9120`: `pid=2297970`, `session_owner: true`. Пробел для
+PID 1234703 не закрыт, а потерял смысл: этого процесса больше нет, и прочитать в нём `owner_for_home`
+уже нельзя. Новый gateway, по отчёту, owner видит. Повторно health не читался. См. раздел «Этап A (2026-11-20)».
+
 ## Выводы по критериям #116
 
 1. **Процесс и профиль.** Факт: владелец — `hermes gateway run`, `hermes-gateway.service`, PID 1234703,
@@ -192,6 +215,11 @@ flock `gateway.lock` у PID 1234703, `host-gateway.json`, `gateway_state.json` �
    перезапуска, который владелец разрешит отдельно, и откат — в разделе «Перезапуск и откат».
 
 ## Варианты топологии для владельца
+
+**История.** Текст ниже — варианты на 2026-11-20 до выбора. Владелец выбрал (б). Исследование
+исходников уточнило его в план по этапам: gateway остаётся в `hermes-gateway.service` и получает
+Webapp-listener, как в (а); `hermes-autonomous.service` отключается позже, на этапе B. Действующий
+план — раздел «Этап A (2026-11-20)».
 
 Ни один не выбран. Оба требуют перезапуска gateway и меняют либо адрес подключения
 Windows-клиента, либо unit'ы. Решает владелец.
@@ -217,6 +245,10 @@ routes: /api/plugins/sound-scout/` в `agent.log`, не в `gateway.log`).
 
 ## Перезапуск и откат
 
+Порядок записан до этапа A. С этапа A проверка нагрузки смотрит на `:9120` вместо `:43189`, и в
+неё входит Desktop SSH backend (п. 4 проверки в разделе «Этап A (2026-11-20)»). Drop-in у
+`hermes-gateway.service` теперь есть: его тоже копируют.
+
 Перезапуск gateway с активными чатами без проверки нагрузки запрещён. Порядок:
 
 1. **Проверка нагрузки.** В `~/.hermes/gateway_state.json` `active_agents=0` и `active_work=null`; на
@@ -238,6 +270,185 @@ routes: /api/plugins/sound-scout/` в `agent.log`, не в `gateway.log`).
 Побочный эффект: systemd завершает дочерние процессы gateway (MCP), идущие ходы прерываются
 (комментарий 7024288870 к #96).
 
+## Этап A (2026-11-20)
+
+### Выбор владельца
+
+Владелец выбрал (б). Исследование исходников Hermes v0.23.1 (`3b42157858`) уточнило его в план по
+этапам: этап A → проверка → Windows-клиент → этап B
+([комментарий 7039818435](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7039818435)).
+Причины:
+
+- Desktop «Remote gateway» работает с listener'ом gateway. Условие: Webapp на `0.0.0.0` с
+  провайдером входа (`gateway/run_runtime.py:586-608`, `gateway/run_api.py:472-493`).
+- `serve` не передаёт чаты в authority gateway (`hermes_cli/web_routers/chat_ws.py:651-706`,
+  `tui_gateway/ws.py:400`). Доставка в чат, созданный через `serve`, невозможна.
+- Gateway остаётся в `hermes-gateway.service`: `hermes update` и restart знают только unit'ы
+  `hermes-gateway*`. Unit-файл Hermes пересоздаёт, поэтому дополнения — через drop-in.
+- Риск: Webapp даёт вошедшему пользователю терминал и файлы хоста
+  (`hermes_cli/web_server_surface.py:61-76`). Соединение по LAN — plain HTTP.
+
+Итоговая топология: один gateway `hermes-gateway.service` владеет authority и слушает LAN на
+`:9120`. `hermes-autonomous.service` (`serve` на `:9119`) работает рядом до этапа B.
+
+Владелец задал рамки следующего шага: остаток установить, этап A не повторять, новых перезапусков
+нет ([комментарий 7051997437](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7051997437)).
+Остаток записан в [Decision в #120](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7052302513).
+
+### Сообщалось выполненным
+
+Источник — отчёт оркестратора
+([комментарий 7040152960](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7040152960)),
+2026-11-20 ~16:00 MSK. Это отчёт исполнителя, а не сверка текущего состояния. Здесь только факты
+этого отчёта; точное время старта и монтирование маршрутов — в «Проверено сейчас».
+
+- Нагрузка до перезапуска: `active_agents=0`, `active_work=null`; на `:43189` соединений нет.
+  Проверку 3 (`gui.log`) отчёт не записал.
+- Копии: `~/.hermes/backups/stage-a-20261120T125829Z/` — `config.yaml`, оба unit-файла, `pids.txt`
+  (gateway 1234703, autonomous 726109). Drop-in до этапа A не было.
+- Drop-in `~/.config/systemd/user/hermes-gateway.service.d/30-lan-auth.conf`: `EnvironmentFile` —
+  файлы dashboard-auth. Содержимое файлов здесь не записано.
+- `~/.hermes/config.yaml`: `webapp: {enabled: true, host: 0.0.0.0, port: 9120}`.
+- `systemctl --user daemon-reload`, затем мягкий `hermes gateway restart`, около 16:00 MSK.
+  `MainPID` 1234703 → 2297970 (gateway из `pids.txt` → PID после перезапуска).
+- Чтение после перезапуска:
+  - `0.0.0.0:9120` слушает процесс gateway;
+  - `/api/status`: `auth_required: true`, провайдеры `basic` и `session-token`;
+  - `GET /api/plugins/sound-scout/health` с LAN без входа — 401;
+  - тот же GET с входом — `pid=2297970` (= `MainPID` `hermes-gateway.service`),
+    `session_owner: true`.
+- `serve` на `:9119` (PID 726109) не перезапускался, его health — 200. Платформ мессенджеров в
+  gateway нет (`configured: 0`).
+- `hermes webapp --status`: бандл Webapp не собран. Native Desktop он не нужен.
+- В gateway работает копия Spike B (`dcb530e`).
+
+### Проверено сейчас
+
+Только чтение, 2026-11-20 22:30 UTC
+([Decision в #120](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7052302513)).
+Health и запросы с входом не выполнялись.
+
+- `hermes-gateway.service`: active, enabled, `MainPID=2297970`, с 2026-11-20 12:58:49 UTC
+  (`ActiveEnterTimestamp`), `hermes gateway run`. Drop-in `30-lan-auth.conf` на месте; env-файлы не читались.
+- `hermes-autonomous.service`: active, enabled, `MainPID=726109`, с 2026-11-19 22:41:17 UTC,
+  `hermes serve --isolated --host 0.0.0.0 --port 9119`, без drop-in.
+- `~/.hermes/gateway_state.json`: `pid=2297970`, `running`, `active_agents=0`, `active_work=null`,
+  платформ мессенджеров нет, `code_version=0.23.1`.
+- `~/.hermes/config.yaml`: `webapp` — `enabled: true`, `host: 0.0.0.0`, `port: 9120`.
+- Listener'ы: `0.0.0.0:9120` — PID 2297970; `0.0.0.0:9119` — PID 726109. TCP `127.0.0.1:43189`
+  больше не слушает. Control socket gateway — `~/.hermes/gateway.sock`.
+- Установленные соединения: на `:9120` — 0. На `:9119` — 5, все с одного LAN-хоста владельца, на
+  оба адреса станции.
+- Третий backend — Desktop SSH backend: PID 434482,
+  `serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file …`, `127.0.0.1:37575`, с
+  2026-11-20 06:56 UTC. SSH-сессия — с того же LAN-хоста. Это ещё один писатель в `state.db`.
+- `~/.hermes/state.db` (`mode=ro`): после этапа A один новый чат `source=desktop` (21:54 UTC). Строк в
+  `session_admissions` у него нет: чат прошёл через `serve`, мимо authority gateway.
+- `dashboard-auth.log`: после этапа A входа на gateway с Windows-хоста не видно. Порт лог не пишет;
+  картина та же, что до этапа A.
+- `agent.log`: gateway смонтировал `/api/plugins/sound-scout/` при старте (12:58:53 UTC).
+- Копия плагина `~/.hermes/plugins/sound-scout`: `version: 0.0.1`, все 5 файлов = `dcb530e`
+  (Spike B, #96). `delivery.py` нет, маршруты `/spike/deliver` и `/spike/runner` есть.
+  Production-копия — [#104](https://github.com/renidere/sound-scout-plugin/issues/104).
+- Hermes Agent v0.23.1 (2026.9.24), stable, ревизия `3b4215785882`.
+- Каталог копий `~/.hermes/backups/stage-a-20261120T125829Z/`: `config.yaml`, оба unit-файла,
+  `pids.txt`.
+- Windows-хост: управлять им со станции нельзя. Записи в `~/.ssh/config` и `known_hosts` нет;
+  порты 22, 5985, 3389 закрыты или фильтруются; средств удалённого управления нет.
+- Пропущено: GET `/api/status` (handler читает health gateway и может записать install id), любые
+  запросы под `/api/plugins/`, любые запросы с входом.
+
+### Ещё не проверено
+
+- `session_owner` сейчас. Последнее чтение — отчёт об этапе A.
+- Версия штатного Windows Desktop: записи нет ни на станции, ни в репозитории.
+- Что Windows Desktop подключается к `:9120` как Remote gateway и проходит вход.
+- Что чат, созданный через `:9120`, получает admissions в authority gateway.
+- Доставка заметки задания (#102, #114). Нужна production-копия плагина (#104).
+- Перенос старых чатов (`hermes sessions adopt`) и риск двух писателей у чатов, созданных через
+  `serve` на `:9119` или через SSH backend.
+- Проверка 3 (`gui.log`) перед этапом A: отчёт её не записал.
+- Результаты Windows-зонда 0016: все строки — «ожидает прогона владельцем».
+
+Один health с `session_owner: true` не доказывает сквозную работу Windows-клиента, доставку заметки
+и перенос старых чатов.
+
+### Откат этапа A
+
+1. Проверить нагрузку (раздел «Проверка перед любым перезапуском» ниже). При невыполненном условии —
+   ждать.
+2. Вернуть копии из `~/.hermes/backups/stage-a-20261120T125829Z/`: `config.yaml` и unit-файлы.
+3. Удалить drop-in `~/.config/systemd/user/hermes-gateway.service.d/30-lan-auth.conf`.
+4. `systemctl --user daemon-reload`.
+5. Перезапустить `hermes-gateway.service`.
+6. Проверить `systemctl --user show -p MainPID,ActiveState hermes-gateway.service`: новый `MainPID`,
+   `active`. Проверить, что `0.0.0.0:9120` не слушает, а `:9119` у `hermes-autonomous.service` —
+   слушает. Health на `:9119` снова даёт `session_owner=false`.
+
+`hermes-autonomous.service` этап A не менял, его откат этапа A не трогает. Откат — тоже перезапуск:
+нужно отдельное разрешение владельца.
+
+### Проверка перед любым перезапуском
+
+Действует с этапа A. Все условия должны выполняться:
+
+1. `~/.hermes/gateway_state.json`: `active_agents=0`, `active_work=null`.
+2. `ss -tnp state established`: нет соединений на `:9119` и на `:9120`.
+3. `gui.log`: с момента старта каждого работающего backend у каждого `tui prompt accepted` есть
+   парный `tui turn finished` с теми же `ui_session` и `agent_session_id`.
+4. Desktop SSH backend (`serve … --ssh-session-token-file`) не ведёт активный чат.
+
+### Остаток: клиентская проверка
+
+Шаг владельца (агент не может управлять Windows-хостом):
+
+1. В штатном Windows Desktop добавить Remote gateway `http://<адрес хоста в LAN>:9120` — проводной
+   или Wi-Fi адрес станции. Клиент сейчас ходит на оба адреса `:9119`.
+2. Войти провайдером `basic` с теми же учётными данными, что для `:9119`: оба unit'а читают одни
+   env-файлы dashboard-auth. Доступен и `session-token`. Пароли и токены в задачи не писать.
+3. Создать один контрольный чат и отправить одно сообщение.
+4. Сообщить версию Windows Desktop с экрана About. Иначе агент берёт её из следов входа.
+
+Затем агент сверяет, только чтение:
+
+- `ss -tnp state established`: соединение Windows-хоста на `:9120` у gateway `MainPID` (2297970,
+  если gateway не перезапускался);
+- `dashboard-auth.log`: вход с Windows-хоста после шага владельца;
+- `~/.hermes/state.db`: новый чат `source=desktop` со строками в `session_admissions`;
+- для этого чата не появился новый `serve` или SSH backend;
+- версия Windows Desktop и провайдер входа.
+
+Один контрольный чат доказывает только подключение, вход и попадание нового чата в authority
+gateway. Он не доказывает доставку заметки (нужны #104 и #114), перенос старых чатов и отсутствие
+двух писателей у чатов, созданных через `serve` `:9119` или через SSH backend. Health с входом на
+`:9120` агент читает только по отдельному разрешению владельца.
+
+### Остаток: этап B
+
+Каждое действие и окно владелец одобряет отдельно. Разрешение на этап A этап B не покрывает.
+
+- Сервисы: остановить и отключить `hermes-autonomous.service`. Windows-клиент работает только через
+  gateway.
+- Убрать SSH-подключение Desktop: его backend — третий писатель.
+- По желанию: перенести Webapp 9120 → 9119. Это правка `~/.hermes/config.yaml` и перезапуск
+  gateway, только после остановки `serve`.
+- Старые чаты: `hermes sessions adopt` только для чатов, названных владельцем, и только когда их не
+  держит другой процесс.
+- Плагин: production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104) вместо
+  Spike B. Она уберёт маршруты `/spike/*` и добавит цикл доставки. Нужен перезапуск gateway.
+- Предусловия: четыре условия проверки выше; нет соединений на `:9119` и `:9120`; SSH backend не
+  работает. На 2026-11-20 22:30 UTC не выполнено: на `:9119` 5 соединений.
+- Перед этапом B — новые копии `config.yaml`, unit-файлов и drop-in; записать `MainPID` и
+  `ActiveState` обоих unit'ов.
+- Риски: два писателя одной истории; Webapp даёт вошедшему терминал и файлы хоста; plain HTTP по
+  LAN; у Windows-клиента меняется адрес.
+- Откат этапа B: вернуть копии `config.yaml`, unit-файлов и drop-in, снятые перед этапом B.
+  Удалить только drop-in, созданные на этапе B; `30-lan-auth.conf` этапа A остаётся (его удаляет
+  только откат этапа A). Затем `daemon-reload`, перезапустить `hermes-gateway.service`, включить и
+  запустить `hermes-autonomous.service`. Сверить `MainPID`, `ActiveState` и listener'ы.
+- После этапа B: health даёт `pid` = gateway `MainPID` и `session_owner=true`; этап B
+  записывается в это решение. Живая доставка остаётся в #114.
+
 ## Последствия для #102
 
 - Критерий 1 #102 («цикл доставки только в процессе — владельце authority») означает
@@ -255,12 +466,23 @@ routes: /api/plugins/sound-scout/` в `agent.log`, не в `gateway.log`).
   (шаг 5 0015) с вызовом из gateway.
 - Ожидание шага 4 в 0015 (`session_owner=true` через `ctx.rest`) в текущей топологии не выполнится:
   `ctx.rest` Desktop идёт на `:9119`, то есть в serve.
+- **После этапа A (2026-11-20):** топология выбрана, gateway слушает `:9120`. Windows-клиент пока
+  подключён к `:9119`, поэтому оба пункта выше остаются в силе. Они снимаются, когда клиент
+  работает через `:9120` и в gateway стоит production-копия (#104). Живая доставка — #114.
 
 ## Что не установлено
+
+Список на 2026-11-20 до этапа A. Пометки «с этапа A» — изменения после него.
 
 - `owner_for_home` внутри PID 1234703 вживую: маршрут health там не смонтирован, а первый запрос к
   `:43189` смонтировал бы его — это изменение живого процесса. Факт владения опирается на трассу по
   исходникам, flock `gateway.lock` и `state.db`; живое чтение ждёт разрешения владельца.
+  **С этапа A:** PID 1234703 больше нет. Для нового gateway (PID 2297970) оркестратор сообщил health
+  с входом на `:9120`: `session_owner: true`. Сейчас health не перечитывался.
 - Связь `instance_id` в `runtime_epoch` с PID: дескриптор runtime не записан в файл.
-- cgroup SSH-backend'а Desktop (PID 4084248): процесс завершился до наблюдения.
-- Работает ли штатный Windows-клиент с Webapp listener'ом gateway (вариант (а)).
+- cgroup SSH-backend'а Desktop (PID 4084248): процесс завершился до наблюдения. **С этапа A:**
+  работает другой SSH backend, PID 434482; его cgroup тоже не записан.
+- Работает ли штатный Windows-клиент с Webapp listener'ом gateway (вариант (а)). **С этапа A:**
+  по-прежнему не установлено, теперь это клиентская проверка этапа A; на `:9120` соединений нет.
+- **С этапа A:** версия штатного Windows Desktop; доставка заметки в чат (#104, #114); перенос
+  старых чатов и риск двух писателей. Полный список — «Этап A (2026-11-20)», «Ещё не проверено».
