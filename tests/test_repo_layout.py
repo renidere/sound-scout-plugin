@@ -498,3 +498,19 @@ def test_acceptance_limits_t09b_to_the_sync_call_and_lists_a01_a14_as_not_passed
     t09b = next(line for line in text.splitlines() if line.startswith("| Hermes (T09b) |"))
     assert "T09b покрывает только синхронный native вызов MCP" in t09b
     assert "A01–A14 пройдены" not in flat(text)
+
+
+def test_spec_readme_marks_its_17_november_status_as_history_and_links_current_docs() -> None:
+    spec_readme = REPO_ROOT / "docs/spec/README.md"
+    text = spec_readme.read_text(encoding="utf-8")
+    assert "Историческая пометка" in text
+    assert "Исторический статус на 17 ноября 2026 года" in text
+    assert "Исторический перечень на 17 ноября 2026 года" in text
+    # The original wording stays as history under the marks.
+    assert "Репозиторий не создан, audio backend не выбран" in text
+    assert "1. Явное поручение на реализацию" in text
+    for link in re.findall(r"\]\(([^)#]+)\)", text):
+        assert (spec_readme.parent / link).resolve().is_file(), link
+    assert "../decisions/0013-voice-note-integration.md" in text
+    assert "../../README.md" in text
+    assert "../ACCEPTANCE.md" in text
