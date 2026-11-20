@@ -341,3 +341,24 @@ def test_criterion1_the_desktop_call_claims_no_speech_compare_and_no_hearing(tex
     for item in ("R12", "T09"):
         assert "`audio_review` — `unavailable` (`backend = none`)" in matrix_row(text, item)[4]
     assert "validated_ru` — true" not in text
+
+
+NEXT_BACKEND_RULE = "`docs/decisions/0019-next-audio-experiment.md` §4.8"
+
+
+def test_no_sentence_names_issue_119_as_the_source_of_a_ready_backend(text: str) -> None:
+    sentences = re.split(r"(?<=[.;])\s+", text)
+    for sentence in (s for s in sentences if "issues/119" in s):
+        for claim in ("READY", "Gate 0", "прошедш", "следующий эксперимент"):
+            assert claim not in sentence, (claim, sentence)
+
+
+def test_audio_blocked_rows_name_the_missing_ready_candidate_90_and_the_0019_rule(
+    text: str,
+) -> None:
+    for item in ("R03", "R06", "T04"):
+        blocked = matrix_row(text, item)[4].partition("blocked:")[2]
+        assert "нет кандидата с вердиктом ready" in blocked.lower(), item
+        assert "issues/90)" in blocked, item
+        assert NEXT_BACKEND_RULE in blocked, item
+        assert "issues/119" not in blocked, item
