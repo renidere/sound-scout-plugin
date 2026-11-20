@@ -7,7 +7,8 @@ deletes a staging copy when every job that names it has ended and either
 
 - the job is `finished` and its note is `delivered`: it is never retried, the copy goes at once;
 - `jobs.staging_retention_seconds` have passed since the job's `updated_at`: a `failed` or
-  `cancelled` job keeps its copy until then, even after its note, because a retry needs it.
+  `cancelled` job keeps its copy until then, even after its note, because `jobs retry` needs
+  it; once the copy is gone `jobs.retry` refuses the job with `not_retryable`.
 
 An upload no job names (the plugin keeps it after `cli_timeout` or `cli_failed`) goes once its
 mtime is older than the retention period. A `queued` or `running` job keeps its copy forever.
@@ -30,7 +31,7 @@ from sound_scout.config import Config
 
 UPLOAD_NAME = re.compile(r"[0-9a-f]{32}\.upload")
 SWEEP_SECONDS = 60
-STAGING_REMOVED_AT = "staging_removed_at"
+STAGING_REMOVED_AT = jobs.STAGING_REMOVED_AT
 
 
 def sweep(config: Config, *, now: datetime | None = None) -> list[dict]:

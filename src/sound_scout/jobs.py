@@ -134,6 +134,8 @@ RUNNER_RUNNING = "runner_running"
 RUNNER_START_FAILED = "runner_start_failed"
 NOT_RETRYABLE = "not_retryable"
 PLAN_REFUSED = "plan_refused"
+# Set by `staging.sweep` on a job whose staging copy it removed.
+STAGING_REMOVED_AT = "staging_removed_at"
 
 MODES = ("quick", "targeted", "full", "auto")
 DEFAULT_MODE = "auto"
@@ -410,7 +412,8 @@ def retry(job_id: str, config: Config) -> dict:
     `request_id`, request, plan, binding and delivery; `retries` keeps how it ended before.
 
     The answer is the job's status with `retry: queued` and `next_attempt`. `not_retryable` for
-    a job in another state, `queue_full` or `staging_full` like a submit."""
+    a job in another state or one whose staging copy `staging.sweep` removed (it has no input
+    any more), `queue_full` or `staging_full` like a submit."""
     with _store(config.data_root) as (jobs_dir, _):
         job_dir = _job_dir(job_id, config)
         job = _load(job_dir)
@@ -421,6 +424,12 @@ def retry(job_id: str, config: Config) -> dict:
             raise JobError(
                 NOT_RETRYABLE,
                 f"job {job_id} is {job['state']}; only a failed or cancelled job is retried{hint}",
+            )
+        if job.get(STAGING_REMOVED_AT):
+            raise JobError(
+                NOT_RETRYABLE,
+                f"job {job_id} has no input: its staging copy was removed at "
+                f"{job[STAGING_REMOVED_AT]} after the retention period; submit the recording again",
             )
         _admit(jobs_dir, job["request"]["input"]["size_bytes"], config)
         (job_dir / CANCEL_MARKER_NAME).unlink(missing_ok=True)

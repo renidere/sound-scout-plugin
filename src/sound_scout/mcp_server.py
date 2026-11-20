@@ -306,9 +306,9 @@ TOOLS = (
         description=(
             "Queue a failed or cancelled job again, only when the user asks for it: the same "
             "job_id and request_id, its next attempt runs at the end of the queue. Answers with "
-            "the job's state (queued), retry and next_attempt. Another state is refused with "
-            "not_retryable, a full queue with queue_full or staging_full. Nothing retries on its "
-            "own."
+            "the job's state (queued), retry and next_attempt. Another state, or a job whose "
+            "uploaded copy was already cleaned up, is refused with not_retryable, a full queue "
+            "with queue_full or staging_full. Nothing retries on its own."
         ),
         input_schema=_job_id(),
         annotations=_hints(read_only=False, destructive=False, idempotent=False),

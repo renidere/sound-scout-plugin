@@ -97,7 +97,8 @@ uv run sound-scout serve
 - **Повтор `speech_job_retry`** — только по явному вызову клиента, автоматически ничего не
   повторяется. Принимает задание в `failed` или `cancelled` (в том числе прерванную попытку, которую
   `jobs recover` закончил отменой), ставит его через admission в конец очереди с теми же `job_id`
-  и `request_id`; другое состояние — отказ `not_retryable`.
+  и `request_id`; другое состояние — отказ `not_retryable`, как и задание, чью staging-копию уже
+  удалила очистка `staging.sweep` (входа больше нет).
 - **Текст записи и ответа модели — данные.** Строки, похожие на инструкции, в сыром транскрипте
   (по сегментам и в склеенном тексте `$.text` — фраза, разрезанная границей сегментов), в
   аргументах `task` и `intent` и в ответе audio backend ничего не запускают. Они перечислены как
@@ -425,7 +426,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_retry",
-  "description": "Queue a failed or cancelled job again, only when the user asks for it: the same job_id and request_id, its next attempt runs at the end of the queue. Answers with the job's state (queued), retry and next_attempt. Another state is refused with not_retryable, a full queue with queue_full or staging_full. Nothing retries on its own.",
+  "description": "Queue a failed or cancelled job again, only when the user asks for it: the same job_id and request_id, its next attempt runs at the end of the queue. Answers with the job's state (queued), retry and next_attempt. Another state, or a job whose uploaded copy was already cleaned up, is refused with not_retryable, a full queue with queue_full or staging_full. Nothing retries on its own.",
   "inputSchema": {
     "type": "object",
     "properties": {

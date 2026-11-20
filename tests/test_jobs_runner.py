@@ -1138,3 +1138,32 @@ def test_criterion_3_jobs_run_cleans_staging_by_the_retention_from_sound_scout_t
     assert f"staging {expired.name} removed: retention" in ran.stderr
     assert not expired.exists() and job_file(cfg, expired_id)["staging_removed_at"]
     assert young.exists() and "staging_removed_at" not in job_file(cfg, young_id)
+
+
+def test_retry_of_a_job_whose_staging_copy_was_removed_is_refused_with_a_clear_error(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    from sound_scout import staging
+
+    cfg = staging_cfg(cfg)
+    path = cfg.jobs.staging_root / f"{'c' * 32}.upload"
+    make_wav("recordings/c.wav").rename(path)
+    job_id = queue(cfg, path)
+    old = (
+        datetime.now(UTC) - timedelta(seconds=cfg.jobs.staging_retention_seconds + 1)
+    ).isoformat()
+    set_job(
+        cfg, job_id, state="failed", state_reason="internal_error: RuntimeError", updated_at=old
+    )
+    assert [item["reason"] for item in staging.sweep(cfg)] == ["retention"]
+    job_json = cfg.data_root / "jobs" / job_id / "job.json"
+    before = job_json.read_bytes()
+
+    with pytest.raises(JobError) as refused:
+        jobs.retry(job_id, cfg)
+
+    assert refused.value.code == "not_retryable"
+    assert "staging copy was removed" in refused.value.message
+    assert "submit the recording again" in refused.value.message
+    assert job_json.read_bytes() == before
+    assert not path.exists()
