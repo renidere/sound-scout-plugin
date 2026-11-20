@@ -572,3 +572,119 @@ def test_criterion_2_each_accepted_jobs_redeliver_is_recorded_in_job_json_with_i
     for request in (first, second):
         assert datetime.fromisoformat(request["requested_at"]).tzinfo is not None
     assert first["requested_at"] < second["requested_at"]
+
+
+# --- the comparison block of a control job's note (#110) -------------------------------------
+
+
+def control_job(cfg: Config, make_wav: WavFactory) -> str:
+    """A control job the real runner analyzed and compared; `backend = none`."""
+    initial_wav = make_wav("recordings/initial.wav", seconds=1.5)
+    initial = app.analyze(app.AnalyzeRequest(str(initial_wav), request_id="initial"), cfg)
+    wav = make_wav("recordings/control.wav", seconds=1.5, frequency=330.0)
+    request = SubmitRequest(
+        str(wav), previous_run_id=initial.run.run_id, criterion="completeness_of_phrase"
+    )
+    job_id = jobs.submit(request, Binding(session_id="chat-1"), cfg)["job_id"]
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=0.02)
+    return job_id
+
+
+@needs_ffmpeg
+def test_note_of_a_control_job_without_a_backend_says_inconclusive_and_why(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = control_job(setup, make_wav)
+    summary = job_file(setup, job_id)["attempts"][-1]["compare"]
+    document = json.loads((setup.data_root / summary["path"]).read_text(encoding="utf-8"))
+
+    text = delivery.next_delivery("default", "loop-1", setup)["text"]
+
+    lines = text.splitlines()
+    assert lines[-1] == f"sound-scout-job:{job_id}"
+    assert lines[-2] == f"Сравнение: {summary['path']}"
+    verdict = next(line for line in lines if line.startswith("Сравнение с исходной попыткой"))
+    assert verdict == (
+        "Сравнение с исходной попыткой по критерию `completeness_of_phrase`: `inconclusive` — "
+        "сравнение недостоверно."
+    )
+    reasons = next(line for line in lines if line.startswith("Причины: "))
+    for side in ("A", "B"):
+        assert (
+            f"попытка {side}: audio review `unavailable` — audio backend не выбран "
+            "(`backend = none`)"
+        ) in reasons
+    missing = [item for item in document["reasons"] if item["code"] == "audio_review_missing"]
+    assert len(missing) == 2
+    for item in missing:  # its message quotes the stage reason; the note never does
+        assert item["message"] not in text
+    assert not any(phrase in text.lower() for phrase in ALL_DONE)
+    assert str(setup.data_root) not in text
+
+
+@pytest.mark.parametrize(
+    ("summary", "line"),
+    [
+        (
+            {"state": "completed", "verdict": "improved", "reasons": []},
+            " по критерию `emphasis_on:слово`: `improved` — улучшение по этому критерию; один "
+            "контроль не доказывает устойчивый навык.",
+        ),
+        (
+            {"state": "completed", "verdict": "not_improved", "reasons": []},
+            " по критерию `emphasis_on:слово`: `not_improved` — улучшения по этому критерию нет.",
+        ),
+        (
+            {"state": "refused", "code": "run_not_found", "message": "run x is not here"},
+            " не выполнено: код `run_not_found`.",
+        ),
+        (
+            {"state": "failed", "error": "internal_error: ValueError"},
+            " не выполнено: внутренняя ошибка.",
+        ),
+        (
+            {"state": "not_run", "reason": "cancelled"},
+            " не выполнено: контрольный анализ не закончен (`cancelled`).",
+        ),
+        (None, " не выполнено: контрольный анализ не закончен (`failed`)."),
+    ],
+    ids=["improved", "not_improved", "refused", "failed", "not_run", "no_summary"],
+)
+def test_note_labels_each_comparison_summary_written_into_job_json(
+    setup: Config, make_wav: WavFactory, summary: dict | None, line: str
+) -> None:
+    """The text contract of each label on a summary written by hand, not a capability (R01)."""
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="failed", reason="x: y")
+    control = {"previous_run_id": "a" * 32, "criterion": "emphasis_on:слово"}
+    compare_id = "c" * 32
+    if summary is not None and summary["state"] == "completed":
+        summary |= {"criterion": "emphasis_on:слово", "path": f"compare/{compare_id}.json"}
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": None}
+    if summary is not None:
+        attempt["compare"] = summary
+    request = job_file(setup, job_id)["request"] | {"control": control}
+    set_job(setup, job_id, request=request, attempts=[attempt])
+
+    lines = delivery.next_delivery("default", "loop-1", setup)["text"].splitlines()
+
+    assert lines[-1] == f"sound-scout-job:{job_id}"
+    assert f"Сравнение с исходной попыткой{line}" in lines
+    assert not any(item.startswith("Причины") for item in lines)
+    assert "run x is not here" not in "\n".join(lines)
+    if summary is not None and summary["state"] == "completed":
+        assert lines[-2] == f"Сравнение: compare/{compare_id}.json"
+
+
+def test_every_reason_code_of_compare_v1_has_a_label() -> None:
+    from sound_scout import comparison
+
+    codes = comparison.SCHEMA["$defs"]["reason"]["properties"]["code"]["enum"]
+    assert sorted(delivery.COMPARE_REASON_LABELS) == sorted(codes)
+
+
+def test_note_of_an_ordinary_job_has_no_comparison(setup: Config, make_wav: WavFactory) -> None:
+    ended_job(setup, make_wav("recordings/a.wav"), state="failed", reason="x: y")
+
+    text = delivery.next_delivery("default", "loop-1", setup)["text"]
+
+    assert "Сравнение" not in text

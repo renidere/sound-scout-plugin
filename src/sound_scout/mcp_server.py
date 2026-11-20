@@ -4,7 +4,8 @@ The tools are the same functions the CLI calls: `speech_capabilities` is `doctor
 `speech_analyze` is `app.analyze` answered with `report.compact` (the document `analyze --json`
 prints), `speech_compare` is `app.compare` answered with the comparison and its file (the document
 `compare --json` prints). The job tools (decision 0013 § 3.1) are the queue of `sound-scout jobs`:
-`speech_job_submit` is `jobs.submit` with the submitter `mcp` and its plan `mode`;
+`speech_job_submit` is `jobs.submit` with the submitter `mcp`, its plan `mode` and, for a control
+attempt, `previous_run_id` with `criterion` (`jobs.submit` checks the pair, not the schema);
 `speech_job_status`, `speech_job_result`, `speech_job_cancel` and `speech_job_retry` are
 `jobs.status`, `jobs.result`, `jobs.cancel` and `jobs.retry`; `speech_job_redeliver` is
 `delivery.request_redelivery`, the function of `jobs redeliver`. Only the job submit takes `mode`:
@@ -109,6 +110,14 @@ def _closed(properties: dict, required: list[str]) -> dict:
 
 def _run_id(role: str) -> dict:
     return {"type": "string", "minLength": 1, "description": f"run_id of the {role} attempt"}
+
+
+CRITERION = {
+    "type": "string",
+    "minLength": 1,
+    "description": "emphasis_on:<word>, pause_before:<word>, intelligibility_of:<word> or "
+    "completeness_of_phrase",
+}
 
 
 def _identifier(description: str) -> dict:
@@ -222,12 +231,7 @@ TOOLS = (
             {
                 "run_a": _run_id("initial"),
                 "run_b": _run_id("control"),
-                "criterion": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "emphasis_on:<word>, pause_before:<word>, "
-                    "intelligibility_of:<word> or completeness_of_phrase",
-                },
+                "criterion": CRITERION,
             },
             ["run_a", "run_b", "criterion"],
         ),
@@ -247,7 +251,10 @@ TOOLS = (
             "queued. Follow it with speech_job_status and read it with speech_job_result. "
             "The same request_id with the same request returns the same job; with another file "
             "or other arguments it is refused. A full queue is refused with queue_full or "
-            "staging_full."
+            "staging_full. A control attempt names previous_run_id (the run_id of the initial "
+            "attempt, from its speech_job_result) and criterion, both together: after the "
+            "control analysis the server compares the two attempts and puts the verdict into "
+            "the job's result (compare)."
         ),
         input_schema=_closed(
             {
@@ -261,6 +268,8 @@ TOOLS = (
                     "operator's audio backend, auto is targeted with layers and full without; "
                     "layers go only with targeted or auto",
                 },
+                "previous_run_id": _run_id("initial"),
+                "criterion": CRITERION,
                 "connection": _identifier("the connection the job came through, stored as is"),
                 "profile": _identifier("the agent profile of the chat, stored as is"),
                 "session_id": _identifier("the stored session ID of the chat, stored as is"),
@@ -276,7 +285,8 @@ TOOLS = (
             "reason, its stages, the stage running now (current_stage, only while running), the "
             "finished stages, the number of attempts and the run_id of the latest one. "
             "finished means the runner stopped working on it, not that the result is complete: "
-            "read speech_job_result. Reads only."
+            "read speech_job_result. A control attempt shows control (previous_run_id, "
+            "criterion) and compare, the summary of its comparison. Reads only."
         ),
         input_schema=_job_id(),
         annotations=_hints(read_only=True, destructive=False, idempotent=True),
@@ -285,8 +295,9 @@ TOOLS = (
         name="speech_job_result",
         description=(
             "Read the result of a job: the compact summary of its latest attempt's run, as "
-            "speech_analyze answers it, with job_id, job_state and attempt. A job without a run "
-            "result yet is refused with no_result. Reads only."
+            "speech_analyze answers it, with job_id, job_state and attempt; a control attempt "
+            "adds compare: the verdict, its reason codes and the file compare/<compare_id>.json. "
+            "A job without a run result yet is refused with no_result. Reads only."
         ),
         input_schema=_job_id(),
         annotations=_hints(read_only=True, destructive=False, idempotent=True),
@@ -443,7 +454,7 @@ def _job(name: str, arguments: dict, loaded: Config) -> dict:
             return action(arguments["job_id"], loaded)
         fields = {
             key: arguments[key]
-            for key in ("request_id", "task", "intent", "mode")
+            for key in ("request_id", "task", "intent", "mode", "previous_run_id", "criterion")
             if key in arguments
         }
         if "layers" in arguments:

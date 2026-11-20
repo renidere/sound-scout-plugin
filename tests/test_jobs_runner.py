@@ -10,6 +10,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -26,7 +27,7 @@ from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
 from tests.conftest import WavFactory
 from tests.test_app import SlowFakeBackend, codes, pid_of, wait_for
-from tests.test_jobs import ABSENT_ASR_MODEL, job_file, needs_ffmpeg, set_job
+from tests.test_jobs import ABSENT_ASR_MODEL, baseline_run, job_file, needs_ffmpeg, set_job
 from tests.test_proc import process_gone
 
 POLL = 0.02
@@ -1167,3 +1168,182 @@ def test_retry_of_a_job_whose_staging_copy_was_removed_is_refused_with_a_clear_e
     assert "submit the recording again" in refused.value.message
     assert job_json.read_bytes() == before
     assert not path.exists()
+
+
+# --- a control attempt: compared with its initial run before the job ends (#110) -------------
+# Without an audio backend the real verdict is always `inconclusive`: these tests prove the order
+# and the records of the runner, never that the tool hears an improvement (R01, R03).
+
+
+def control_job(cfg: Config, make_wav: WavFactory, **fields: object) -> tuple[str, str]:
+    initial = baseline_run(cfg, make_wav("recordings/initial.wav", seconds=1.5))
+    wav = make_wav("recordings/control.wav", seconds=1.5, frequency=330.0)
+    link = {"previous_run_id": initial, "criterion": "completeness_of_phrase"}
+    return queue(cfg, wav, request_id="r-control", **link | fields), initial
+
+
+@needs_ffmpeg
+def test_a_control_job_without_a_backend_ends_finished_with_an_inconclusive_comparison(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    job_id, initial = control_job(cfg, make_wav)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished"
+    [attempt] = job["attempts"]
+    summary = attempt["compare"]
+    assert summary["state"] == "completed" and summary["verdict"] == "inconclusive"
+    assert summary["criterion"] == "completeness_of_phrase"
+    assert {"code": "audio_review_missing", "attempt": "a"} in summary["reasons"]
+    assert {"code": "audio_review_missing", "attempt": "b"} in summary["reasons"]
+    assert summary["backend"] == {"a": "none", "b": "none"}
+    assert summary["audio_review"] == {"a": "unavailable", "b": "unavailable"}
+    assert summary["path"] == f"compare/{summary['compare_id']}.json"
+    document = json.loads((cfg.data_root / summary["path"]).read_text(encoding="utf-8"))
+    assert document["verdict"] == summary["verdict"]
+    assert [item["code"] for item in document["reasons"]] == [
+        item["code"] for item in summary["reasons"]
+    ]
+    assert document["attempts"]["a"]["run_id"] == initial
+    assert document["attempts"]["b"]["run_id"] == attempt["run_id"]
+    assert all(set(item) == {"code", "attempt"} for item in summary["reasons"])
+    assert jobs.status(job_id, cfg)["compare"] == summary
+    answer = jobs.result(job_id, cfg)
+    assert answer["attempt"] == 1 and answer["compare"] == summary
+    assert len(json.dumps(answer, ensure_ascii=False).encode("utf-8")) <= 4096
+
+
+@needs_ffmpeg
+def test_the_comparison_runs_before_the_job_is_finished_and_lands_in_the_same_write(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id, initial = control_job(cfg, make_wav)
+    real_compare = app.compare
+    seen: list[dict] = []
+
+    def watched(run_a: str, run_b: str, criterion: str, config: Config):
+        seen.append(job_file(cfg, job_id))
+        assert (run_a, criterion) == (initial, "completeness_of_phrase")
+        return real_compare(run_a, run_b, criterion, config)
+
+    monkeypatch.setattr(app, "compare", watched)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    [during] = seen
+    assert during["state"] == "running" and "compare" not in during["attempts"][-1]
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished" and job["attempts"][-1]["compare"]["state"] == "completed"
+
+
+@needs_ffmpeg
+def test_an_initial_run_removed_after_submit_is_a_refused_comparison_of_a_finished_job(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    job_id, initial = control_job(cfg, make_wav)
+    shutil.rmtree(cfg.data_root / "runs" / initial)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished"
+    summary = job["attempts"][-1]["compare"]
+    assert summary["state"] == "refused" and summary["code"] == "run_not_found"
+    assert not (cfg.data_root / "compare").exists()
+
+
+@needs_ffmpeg
+def test_an_unexpected_comparison_error_is_failed_by_its_type_and_the_job_stays_finished(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id, _ = control_job(cfg, make_wav)
+
+    def broken(*args: object) -> None:
+        raise ValueError("a message that may carry a path")
+
+    monkeypatch.setattr(app, "compare", broken)
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished"
+    assert job["attempts"][-1]["compare"] == {
+        "state": "failed",
+        "error": "internal_error: ValueError",
+    }
+
+
+def no_compare(calls: list[object]) -> Callable[..., None]:
+    def compare(*args: object) -> None:
+        calls.append(args)
+        raise AssertionError("app.compare was called")
+
+    return compare
+
+
+@needs_ffmpeg
+def test_a_cancelled_control_attempt_is_not_compared(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id, _ = control_job(cfg, make_wav)
+    calls: list[str] = []
+    compared: list[object] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls, until_cancelled=True))
+    monkeypatch.setattr(app, "compare", no_compare(compared))
+    runner = runner_thread(cfg)
+    wait_until(lambda: calls == [f"{job_id}-a1"])
+
+    jobs.cancel(job_id, cfg)
+    runner.join(timeout=10)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "cancelled" and compared == []
+    assert job["attempts"][-1]["compare"] == {"state": "not_run", "reason": "cancelled"}
+
+
+def test_an_ordinary_job_is_never_compared(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"), request_id="r-1")
+    compared: list[object] = []
+    monkeypatch.setattr(app, "analyze", substitute([]))
+    monkeypatch.setattr(app, "compare", no_compare(compared))
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished" and compared == []
+    assert "compare" not in job["attempts"][-1]
+    assert jobs.status(job_id, cfg)["compare"] is None
+    assert jobs.status(job_id, cfg)["control"] is None
+
+
+@needs_ffmpeg
+def test_each_attempt_of_a_retried_control_job_has_its_own_comparison(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id, _ = control_job(cfg, make_wav)
+    real_analyze = app.analyze
+    calls: list[str] = []
+
+    def crash_then_real(request: app.AnalyzeRequest, config: Config, **kwargs: object):
+        calls.append(request.request_id)
+        if len(calls) == 1:
+            raise RuntimeError("unexpected failure")
+        return real_analyze(request, config, **kwargs)
+
+    monkeypatch.setattr(app, "analyze", crash_then_real)
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    assert job_file(cfg, job_id)["state"] == "failed"
+
+    jobs.retry(job_id, cfg)
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    first, second = job_file(cfg, job_id)["attempts"]
+    assert first["compare"] == {"state": "not_run", "reason": "failed"}
+    assert second["compare"]["state"] == "completed"
+    assert second["compare"]["verdict"] == "inconclusive"
+    answer = jobs.result(job_id, cfg)
+    assert answer["attempt"] == 2 and answer["compare"] == second["compare"]

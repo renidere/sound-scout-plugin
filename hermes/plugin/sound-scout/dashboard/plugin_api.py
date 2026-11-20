@@ -48,6 +48,8 @@ JOB_OPTIONS = {
     "connection": "--connection",
     "layers": "--layers",
     "mode": "--mode",
+    "previous_run_id": "--previous-run-id",
+    "criterion": "--criterion",
 }
 QUERY_KEYS = ("request_id", *JOB_OPTIONS)
 UNFINISHED = ("queued", "running")

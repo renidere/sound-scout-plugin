@@ -69,7 +69,7 @@ uv run sound-scout serve
   (решение 0013 § 3.1, § 3.8): вызывают те же функции `sound_scout.jobs` и `sound_scout.delivery` и
   отвечают тем же документом, что `--json` этих подкоманд, с теми же
   кодами отказа (`job_not_found`, `no_result`, `queue_full`, `staging_full`, `invalid_request`,
-  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, коды приёма входа). Lock сервера они не берут, поэтому отвечают
+  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, коды приёма входа, коды `compare` у контрольной попытки). Lock сервера они не берут, поэтому отвечают
   и во время синхронного `speech_analyze`; хранилище заданий держит свой lock миллисекунды.
   `speech_job_submit` проверяет путь, размер и SHA-256 входа и сразу отвечает `job_id` в состоянии
   `queued`; проверка входа через ffprobe и сам анализ — дело runner. Сервер runner не запускает:
@@ -94,6 +94,21 @@ uv run sound-scout serve
   `targeted`, если `layers` названы, иначе `full`. `layers` вместе с `quick` или `full` и
   `targeted` без `layers` — отказ `invalid_request`. Режим сужает только набор стадий: корни,
   сеть, бюджеты и backend задаёт оператор (решение 0018).
+- **Контрольная попытка** (Decision в #110): `speech_job_submit` с `previous_run_id` (`run_id`
+  исходной попытки из её `speech_job_result`) и `criterion` (та же грамматика, что у
+  `speech_compare`) — только вместе, как `jobs submit --previous-run-id --criterion` и query
+  `previous_run_id`/`criterion` маршрута плагина `POST /jobs`. Пару проверяет `jobs.submit` теми же
+  функциями, что `compare`: отказы `criterion_invalid`, `run_not_found`, `run_incomplete`,
+  `result_invalid`; одно поле без другого, план без слоя `sound` (`quick`) или критерий со словом
+  без слоя `content` — `invalid_request`. Связь хранится в задании (`control` в
+  `speech_job_status`) и входит в его identity. После контрольного анализа runner вызывает
+  `app.compare` и пишет сводку `compare` в попытку до того, как задание станет `finished`:
+  `completed` (`compare_id`, `path` — `compare/<compare_id>.json`, `criterion`, `verdict`, коды
+  `reasons`, `audio_review` и `backend` попыток), `refused` (код `compare`, например исходный run
+  удалён), `failed` (`internal_error`) или `not_run` (анализ не закончен). `speech_job_status`
+  показывает `compare` последней попытки, `speech_job_result` — той, что отвечает. Без audio
+  backend вердикт всегда `inconclusive` с причиной `audio_review_missing`, и итоговая заметка
+  пишет «audio backend не выбран (`backend = none`)». Состояние задания от сравнения не меняется.
 - **Повтор `speech_job_retry`** — только по явному вызову клиента, автоматически ничего не
   повторяется. Принимает задание в `failed` или `cancelled` (в том числе прерванную попытку, которую
   `jobs recover` закончил отменой), ставит его через admission в конец очереди с теми же `job_id`
@@ -255,7 +270,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_submit",
-  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full.",
+  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full. A control attempt names previous_run_id (the run_id of the initial attempt, from its speech_job_result) and criterion, both together: after the control analysis the server compares the two attempts and puts the verdict into the job's result (compare).",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -300,6 +315,16 @@ uv run sound-scout serve
         ],
         "description": "the plan mode (default auto): quick is content and measurements, targeted the layers named, full all three layers with the operator's audio backend, auto is targeted with layers and full without; layers go only with targeted or auto"
       },
+      "previous_run_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "run_id of the initial attempt"
+      },
+      "criterion": {
+        "type": "string",
+        "minLength": 1,
+        "description": "emphasis_on:<word>, pause_before:<word>, intelligibility_of:<word> or completeness_of_phrase"
+      },
       "connection": {
         "type": "string",
         "minLength": 1,
@@ -339,7 +364,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_status",
-  "description": "Read the state of a job: queued, running, finished, cancelled or failed, with its reason, its stages, the stage running now (current_stage, only while running), the finished stages, the number of attempts and the run_id of the latest one. finished means the runner stopped working on it, not that the result is complete: read speech_job_result. Reads only.",
+  "description": "Read the state of a job: queued, running, finished, cancelled or failed, with its reason, its stages, the stage running now (current_stage, only while running), the finished stages, the number of attempts and the run_id of the latest one. finished means the runner stopped working on it, not that the result is complete: read speech_job_result. A control attempt shows control (previous_run_id, criterion) and compare, the summary of its comparison. Reads only.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -368,7 +393,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_result",
-  "description": "Read the result of a job: the compact summary of its latest attempt's run, as speech_analyze answers it, with job_id, job_state and attempt. A job without a run result yet is refused with no_result. Reads only.",
+  "description": "Read the result of a job: the compact summary of its latest attempt's run, as speech_analyze answers it, with job_id, job_state and attempt; a control attempt adds compare: the verdict, its reason codes and the file compare/<compare_id>.json. A job without a run result yet is refused with no_result. Reads only.",
   "inputSchema": {
     "type": "object",
     "properties": {

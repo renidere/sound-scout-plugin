@@ -1,7 +1,7 @@
 ---
 name: speech-review
 description: Разбор русской речи из аудиовложения (Sound Scout).
-version: 0.3.0
+version: 0.4.0
 author: Sound Scout
 metadata:
   hermes:
@@ -44,9 +44,9 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
 | инструмент | аргументы | ответ |
 |---|---|---|
 | `speech_capabilities` | нет | состояние `components` (`decoder`, `asr`, `acoustics`, `audio_review`: `ready`, `unvalidated`, `unavailable`, `permission_required`), флаги `validated_ru`, `diction_validated_ru`, `prosody_validated_ru` |
-| `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `connection`, `profile`, `session_id` агент не передаёт | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
-| `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested` |
-| `speech_job_result` | `job_id` | compact-ответ последней попытки с результатом: `job_id`, `job_state`, `attempt`, `run_dir`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links` |
+| `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `previous_run_id` и `criterion` — только вместе и только для контрольной попытки (`run_id` исходной попытки — из её `speech_job_result`; критерий — тот, что выбран до записи контроля; `task` и `intent` — те же, что у исходной, иначе причина `task_differs`/`intent_differs`); `connection`, `profile`, `session_id` агент не передаёт | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
+| `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested`; у контрольной попытки — `control` (`previous_run_id`, `criterion`) и `compare` последней попытки |
+| `speech_job_result` | `job_id` | compact-ответ последней попытки с результатом: `job_id`, `job_state`, `attempt`, `run_dir`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links`; у контрольной попытки — `compare`: `state`, `verdict`, коды `reasons`, `path` |
 | `speech_job_cancel` | `job_id` | состояние задания и `cancel`: `cancelled`, `requested` или `already_ended` |
 | `speech_job_retry` | `job_id` | только по прямой просьбе пользователя: задание из `failed` или `cancelled` снова `queued` с теми же `job_id` и `request_id`, `retry`, `next_attempt`; иначе отказ `not_retryable` |
 | `speech_job_redeliver` | `job_id` | только по явной просьбе пользователя: состояние задания, `delivery` = `redelivery_requested`; задание не в `delivery_unconfirmed` — отказ `delivery_not_unconfirmed` |
@@ -250,7 +250,13 @@ runner за `analyze.lock`.
   `delivery_unconfirmed` (уже доставлено, отправляется, повтор уже запрошен или итога ещё нет);
   `job.json` не изменился. Не повторять вызов, назвать состояние доставки.
 - `run_not_found`, `same_run`, `criterion_invalid` у `speech_compare` — неверные `run_id` или
-  критерий; `run_id` брать только из ответов `speech_job_result`.
+  критерий; `run_id` брать только из ответов `speech_job_result`. Те же коды и `run_incomplete`,
+  `result_invalid` у `speech_job_submit` с `previous_run_id` и `criterion` — задание не создано;
+  `invalid_request` — передано одно поле из двух, `mode` `quick` (нет слоя звучания) или критерий
+  со словом без слоя `content`.
+- `inconclusive` в `compare` контрольного задания или у `speech_compare` — «сравнение
+  недостоверно», а не «не улучшилось»; назвать причины. Без audio backend (`backend = none`)
+  вердикт всегда `inconclusive`.
 - `invalid_arguments` — лишний аргумент: `data_root`, `allowed_roots`, модель и бюджеты задаёт
   оператор, не агент.
 - Если инструментов `speech-review` нет в сессии, сказать, что анализ звучания не подключён, и

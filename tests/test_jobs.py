@@ -77,6 +77,7 @@ def test_submit_writes_job_json_and_answers_within_a_second(
         "layers": sorted(app.LAYERS),
         "task": "фраза",
         "intent": None,
+        "control": None,
     }
     assert job["plan"] == {
         "capability_version": 1,
@@ -1010,3 +1011,142 @@ def test_jobs_submit_mode_and_retry_through_the_console(
     answer = json.loads(again.stdout)
     assert answer["retry"] == "queued" and answer["retries"] == 2
     assert answer["job_id"] == job_id and answer["next_attempt"] == f"{job_id}-a1"
+
+
+# --- a control attempt: the link to the initial run and its criterion (#110) -----------------
+
+
+def baseline_run(cfg: Config, wav: Path, request_id: str = "initial") -> str:
+    """A real initial attempt: `app.analyze` with `backend = none` and an absent ASR model."""
+    return app.analyze(app.AnalyzeRequest(str(wav), request_id=request_id), cfg).run.run_id
+
+
+def asr_absent(cfg: Config) -> Config:
+    return dataclasses.replace(cfg, asr=config.Asr(model=ABSENT_ASR_MODEL))
+
+
+def no_job_written(cfg: Config) -> bool:
+    jobs_dir = cfg.data_root / "jobs"
+    return not jobs_dir.exists() or not jobs._job_dirs(jobs_dir)
+
+
+@needs_ffmpeg
+def test_a_control_job_stores_its_link_with_the_normalized_criterion(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    cfg = asr_absent(setup)
+    initial = baseline_run(cfg, make_wav("recordings/initial.wav", seconds=1.5))
+    wav = make_wav("recordings/control.wav", seconds=1.5, frequency=330.0)
+    request = SubmitRequest(
+        str(wav), request_id="r-c", previous_run_id=initial, criterion=" emphasis_on: Слово "
+    )
+
+    answer = jobs.submit(request, Binding(), cfg)
+
+    control = {"previous_run_id": initial, "criterion": "emphasis_on:Слово"}
+    job = job_file(cfg, answer["job_id"])
+    assert job["request"]["control"] == control
+    assert job["plan"] == jobs.resolved_plan("auto", None, cfg)[1]
+    view = jobs.status(answer["job_id"], cfg)
+    assert view["control"] == control and view["compare"] is None
+    assert jobs.submit(request, Binding(), cfg) == answer | {"reused": True}
+    other = dataclasses.replace(request, criterion="completeness_of_phrase")
+    with pytest.raises(runs.RequestMismatch):
+        jobs.submit(other, Binding(), cfg)
+    plain = jobs.submit(SubmitRequest(str(wav), request_id="r-plain"), Binding(), cfg)
+    assert job_file(cfg, plain["job_id"])["request"]["control"] is None
+    assert jobs.status(plain["job_id"], cfg)["control"] is None
+
+
+@needs_ffmpeg
+def test_a_control_job_compare_would_refuse_is_refused_at_submit_and_writes_nothing(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    cfg = asr_absent(setup)
+    initial = baseline_run(cfg, make_wav("recordings/initial.wav", seconds=1.5))
+    wav = str(make_wav("recordings/control.wav", seconds=1.5, frequency=330.0))
+    incomplete = runs.open_run("left-incomplete", {}, cfg.data_root).run_id
+    linked = cfg.data_root / "runs" / ("e" * 32)
+    linked.symlink_to(cfg.data_root / "runs" / initial)
+
+    def refusal(**fields: object) -> str:
+        with pytest.raises(JobError) as refused:
+            jobs.submit(SubmitRequest(wav, **fields), Binding(), cfg)
+        assert no_job_written(cfg)
+        return refused.value.code
+
+    for criterion in (
+        "louder",
+        "emphasis_on:два слова",
+        "completeness_of_phrase:x",
+        "emphasis_on:…",
+    ):
+        assert refusal(previous_run_id=initial, criterion=criterion) == "criterion_invalid"
+    assert refusal(previous_run_id=initial) == "invalid_request"
+    assert refusal(criterion="completeness_of_phrase") == "invalid_request"
+    for run_id in ("not-a-run", "f" * 32, linked.name):
+        assert refusal(previous_run_id=run_id, criterion="completeness_of_phrase") == (
+            "run_not_found"
+        )
+    assert refusal(previous_run_id=incomplete, criterion="completeness_of_phrase") == (
+        "run_incomplete"
+    )
+    assert refusal(mode="quick", previous_run_id=initial, criterion="completeness_of_phrase") == (
+        "invalid_request"
+    )
+    sound_only = {"mode": "targeted", "layers": ("sound",), "previous_run_id": initial}
+    assert refusal(**sound_only, criterion="emphasis_on:слово") == "invalid_request"
+
+    accepted = jobs.submit(
+        SubmitRequest(wav, **sound_only, criterion="completeness_of_phrase"), Binding(), cfg
+    )
+    assert job_file(cfg, accepted["job_id"])["request"]["control"]["criterion"] == (
+        "completeness_of_phrase"
+    )
+    (cfg.data_root / "runs" / initial / "result.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(JobError) as refused:
+        jobs.submit(
+            SubmitRequest(wav, previous_run_id=initial, criterion="completeness_of_phrase"),
+            Binding(),
+            cfg,
+        )
+    assert refused.value.code == "result_invalid"
+    assert [path.name for path in jobs._job_dirs(cfg.data_root / "jobs")] == [accepted["job_id"]]
+
+
+@needs_ffmpeg
+def test_jobs_submit_of_a_control_attempt_through_the_console(
+    config_file: Path, make_wav: WavFactory
+) -> None:
+    data = config_file.parent / "data"
+    cfg = Config(
+        allowed_roots=(config_file.parent / "recordings",),
+        data_root=data,
+        asr=config.Asr(model=ABSENT_ASR_MODEL),
+    )
+    initial = baseline_run(cfg, make_wav("recordings/initial.wav", seconds=1.5))
+    wav = str(make_wav("recordings/control.wav", seconds=1.5, frequency=330.0))
+    link = ("--previous-run-id", initial, "--criterion", "completeness_of_phrase")
+
+    bad = run_cli(config_file, "submit", wav, "--previous-run-id", initial, "--criterion", "bad")
+    assert bad.returncode == 1 and bad.stdout == ""
+    assert bad.stderr.startswith("sound-scout jobs: criterion_invalid: ")
+    assert no_job_written(cfg)
+
+    text = run_cli(config_file, "submit", wav, *link, "--request-id", "r-text")
+    assert text.returncode == 0, text.stderr
+    assert "state: queued" in text.stdout.splitlines()
+    run_cli(config_file, "cancel", text.stdout.split("job_id: ", 1)[1].split()[0])
+    submitted = run_cli(config_file, "submit", wav, *link, "--request-id", "r-json", "--json")
+    assert submitted.returncode == 0, submitted.stderr
+    job_id = json.loads(submitted.stdout)["job_id"]
+    status = json.loads(run_cli(config_file, "status", job_id, "--json").stdout)
+    assert status["control"] == {"previous_run_id": initial, "criterion": "completeness_of_phrase"}
+
+    ran = run_cli(config_file, "run", "--exit-when-idle")
+    assert ran.returncode == 0, ran.stderr
+    shown = run_cli(config_file, "result", job_id)
+    assert shown.returncode == 0, shown.stderr
+    compare_line = next(line for line in shown.stdout.splitlines() if line.startswith("compare: "))
+    summary = json.loads(compare_line.removeprefix("compare: "))
+    assert summary["state"] == "completed" and summary["verdict"] == "inconclusive"

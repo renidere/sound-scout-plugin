@@ -23,6 +23,11 @@ in the whole chat history first and sends once only when the tag is not there; n
 on its own.
 
 The address is always `binding.session_id` of the job; there is no other address.
+
+The note of a control job (Decision in #110) has one comparison block after the layers, from the
+`compare` summary of the attempt that answers (`jobs.result`), or of the last attempt without a
+result: the verdict with a fixed label and, for `inconclusive`, the reasons by
+`COMPARE_REASON_LABELS`; never the `message` of a reason, a window or a word of the transcript.
 """
 
 import re
@@ -57,6 +62,32 @@ STAGE_STATUS_LABELS = {
     "skipped": "пропущено",
     "failed": "ошибка",
 }
+COMPARE_HEAD = "Сравнение с исходной попыткой"
+VERDICT_LABELS = {
+    "improved": "улучшение по этому критерию; один контроль не доказывает устойчивый навык",
+    "not_improved": "улучшения по этому критерию нет",
+    "inconclusive": "сравнение недостоверно",
+}
+# Every reason code of compare.v1; `{side}` is «попытка A» or «попытка B».
+COMPARE_REASON_LABELS = {
+    "audio_review_missing": "{side}: audio review `{status}`",
+    "criterion_not_reviewed": "{side}: окно критерия не входит в прослушанный диапазон",
+    "word_not_found": "{side}: слово критерия не найдено в сыром транскрипте",
+    "level_differs": "уровень речи попыток различается больше допустимого",
+    "level_unknown": "{side}: уровень речи не измерен",
+    "channel_differs": "канал попыток различается",
+    "channel_unknown": "{side}: канал неизвестен",
+    "format_differs": "формат записи попыток различается",
+    "format_unknown": "{side}: формат записи неизвестен",
+    "task_differs": "задачи попыток различаются",
+    "task_unknown": "{side}: задача не записана",
+    "intent_differs": "замысел (intent) попыток различается",
+    "backend_differs": "audio backend, модель, ревизия или промпт попыток различаются",
+    "same_recording": "обе попытки — одна и та же запись",
+    "unlocalized_observation": "{side}: замечание аудиомодели этой категории без таймкодов",
+    "no_baseline_issue": "{side}: в исходной попытке нет замечания по критерию",
+}
+NO_BACKEND = " — audio backend не выбран (`backend = none`)"
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]*")
 
 
@@ -229,8 +260,51 @@ def note_text(job: dict, config: Config) -> str:
         if not_assessed:
             lines.append(f"Не оценено: {', '.join(not_assessed)}.")
         lines.append(f"Отчёт: {answer['run_dir']}/{report.REPORT_FILE_NAME}")
+    if job["request"].get("control"):
+        lines += _compare_lines(job, answer)
     lines.append(tag(job["job_id"]))
     return "\n".join(lines)
+
+
+def _compare_lines(job: dict, answer: dict | None) -> list[str]:
+    """The comparison block of a control job's note; see the module docstring."""
+    attempts = job["attempts"]
+    if answer is not None:
+        attempts = [item for item in attempts if item.get("number") == answer["attempt"]]
+    summary = attempts[-1].get("compare") if attempts else None
+    summary = summary or {"state": "not_run", "reason": job["state"]}
+    state = summary.get("state")
+    if state == "refused":
+        return [f"{COMPARE_HEAD} не выполнено: код `{summary.get('code')}`."]
+    if state == "failed":
+        return [f"{COMPARE_HEAD} не выполнено: внутренняя ошибка."]
+    if state != "completed":
+        return [
+            f"{COMPARE_HEAD} не выполнено: контрольный анализ не закончен "
+            f"(`{summary.get('reason')}`)."
+        ]
+    verdict = summary["verdict"]
+    lines = [
+        f"{COMPARE_HEAD} по критерию `{summary['criterion']}`: `{verdict}` — "
+        f"{VERDICT_LABELS[verdict]}."
+    ]
+    if verdict == "inconclusive":
+        lines.append(
+            f"Причины: {'; '.join(_reason_label(summary, item) for item in summary['reasons'])}."
+        )
+    lines.append(f"Сравнение: {summary['path']}")
+    return lines
+
+
+def _reason_label(summary: dict, reason: dict) -> str:
+    code, label = reason["code"], reason["attempt"]
+    text = COMPARE_REASON_LABELS.get(code, code)
+    side = f"попытка {label.upper()}" if label else ""
+    status = (summary.get("audio_review") or {}).get(label)
+    text = text.format(side=side, status=status)
+    if code == "audio_review_missing" and (summary.get("backend") or {}).get(label) == "none":
+        text += NO_BACKEND
+    return text
 
 
 def _address(action: str, job: dict) -> dict:

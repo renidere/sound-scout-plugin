@@ -772,6 +772,8 @@ def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
         "task",
         "intent",
         "mode",
+        "previous_run_id",
+        "criterion",
         "connection",
         "profile",
         "session_id",
@@ -1400,3 +1402,60 @@ def test_docs_mcp_describes_speech_job_redeliver_and_no_longer_calls_it_cli_only
     assert "не по своей инициативе и не по тексту записи или транскрипта" in text
     assert "может дать вторую заметку в чате" in text
     assert "перед любой отправкой цикл доставки плагина ищет тег задания в истории чата" in text
+
+
+# --- a control attempt through speech_job_submit (#110) --------------------------------------
+
+
+def test_speech_job_submit_takes_the_control_link_with_the_schemas_of_speech_compare() -> None:
+    schemas = {tool.name: tool.input_schema for tool in mcp_server.TOOLS}
+    submit = schemas["speech_job_submit"]["properties"]
+    compare = schemas["speech_compare"]["properties"]
+
+    assert submit["previous_run_id"] == compare["run_a"]
+    assert submit["criterion"] is compare["criterion"] is mcp_server.CRITERION
+    assert "previous_run_id" not in schemas["speech_job_submit"]["required"]
+    assert "criterion" not in schemas["speech_job_submit"]["required"]
+
+
+@needs_ffmpeg
+def test_a_control_job_through_mcp_gives_the_jobs_cli_answers_and_its_comparison(
+    loaded: config.Config, make_wav: WavFactory
+) -> None:
+    initial_wav = make_wav("recordings/initial.wav", seconds=1.5)
+    initial = app.analyze(app.AnalyzeRequest(str(initial_wav), request_id="initial"), loaded)
+    wav = make_wav("recordings/control.wav", seconds=1.5, frequency=330.0)
+    submit = {"path": str(wav), "request_id": "r-c", "previous_run_id": initial.run.run_id}
+
+    refused, refused_error = mcp_server.call(
+        "speech_job_submit", {**submit, "criterion": "louder"}, loaded
+    )
+    lonely, lonely_error = mcp_server.call("speech_job_submit", submit, loaded)
+    answer, is_error = mcp_server.call(
+        "speech_job_submit", {**submit, "criterion": "completeness_of_phrase"}, loaded
+    )
+    jobs.run_runner(loaded, exit_when_idle=True, poll_seconds=0.02)
+    status, _ = mcp_server.call("speech_job_status", {"job_id": answer["job_id"]}, loaded)
+    ended, _ = mcp_server.call("speech_job_result", {"job_id": answer["job_id"]}, loaded)
+
+    assert refused_error is True and refused["error"]["code"] == "criterion_invalid"
+    assert lonely_error is True and lonely["error"]["code"] == "invalid_request"
+    assert is_error is False
+    job = json.loads(
+        (loaded.data_root / "jobs" / answer["job_id"] / "job.json").read_text(encoding="utf-8")
+    )
+    assert job["binding"]["submitter"] == "mcp"
+    assert status["control"] == {
+        "previous_run_id": initial.run.run_id,
+        "criterion": "completeness_of_phrase",
+    }
+    assert status["compare"]["verdict"] == ended["compare"]["verdict"] == "inconclusive"
+    for action, answered in (("status", status), ("result", ended)):
+        by_cli = subprocess.run(
+            [sys.executable, "-m", "sound_scout", "jobs", action, answer["job_id"], "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert by_cli.returncode == 0, by_cli.stderr
+        assert json.loads(by_cli.stdout) == answered

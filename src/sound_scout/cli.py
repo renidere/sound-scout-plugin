@@ -19,8 +19,11 @@ root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 
 `job_id`, `job_state` and `attempt` before the summary of the compact answer, as `analyze` prints
 it; `status` names `current_stage` and lists `finished_stages`. `jobs submit --mode` is the
 plan mode of `jobs.MODES` (default `auto`), checked by `jobs.resolved_plan`, so an unknown one is
-`invalid_request`; `--layers` goes with `targeted` or `auto`. `jobs retry` queues a failed or
-cancelled job again as its next attempt (`jobs.retry`). `jobs limits` prints
+`invalid_request`; `--layers` goes with `targeted` or `auto`. `jobs submit --previous-run-id
+<run_id> --criterion <criterion>` (always together) queues a control attempt: `jobs.submit`
+checks the criterion and the initial run as `compare` does, the runner compares the two attempts
+after the analysis and `status`/`result` show `control` and `compare`. `jobs retry` queues a
+failed or cancelled job again as its next attempt (`jobs.retry`). `jobs limits` prints
 `jobs.limits`: the budgets, the queue limits and `jobs.staging_root`, which the Hermes plugin
 reads instead of the configuration file.
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
@@ -172,15 +175,15 @@ def _add_analyze_arguments(parser: argparse.ArgumentParser, *, with_json: bool =
         )
 
 
+CRITERION_HELP = (
+    "emphasis_on:<word>, pause_before:<word>, intelligibility_of:<word> or completeness_of_phrase"
+)
+
+
 def _add_compare_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("run_a", help="run_id of the initial attempt")
     parser.add_argument("run_b", help="run_id of the control attempt")
-    parser.add_argument(
-        "--criterion",
-        required=True,
-        help="emphasis_on:<word>, pause_before:<word>, intelligibility_of:<word> or "
-        "completeness_of_phrase",
-    )
+    parser.add_argument("--criterion", required=True, help=CRITERION_HELP)
     parser.add_argument(
         "--json", action="store_true", help="print the comparison as JSON instead of a summary"
     )
@@ -201,6 +204,12 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         help="the plan mode: quick (content and measurements), targeted (the --layers), full "
         "(all three layers) or auto (targeted with --layers, otherwise full); default: auto",
     )
+    submit.add_argument(
+        "--previous-run-id",
+        help="run_id of the initial attempt to compare this control attempt with; goes with "
+        "--criterion",
+    )
+    submit.add_argument("--criterion", help=CRITERION_HELP)
     submit.add_argument("--connection", help="the connection the job came through, stored as is")
     submit.add_argument("--profile", help="the agent profile of the chat, stored as is")
     submit.add_argument("--session-id", help="the stored session ID of the chat, stored as is")
@@ -441,6 +450,9 @@ def run_jobs(args: argparse.Namespace) -> int:
             }
             if args.layers is not None:
                 fields["layers"] = args.layers
+            for name in ("previous_run_id", "criterion"):
+                if getattr(args, name) is not None:
+                    fields[name] = getattr(args, name)
             binding = jobs.Binding(
                 submitter=args.submitter,
                 connection=args.connection,
@@ -480,6 +492,8 @@ def run_jobs(args: argparse.Namespace) -> int:
     elif args.jobs_command == "result":
         print(f"job_id: {answer['job_id']}\njob_state: {answer['job_state']}")
         print(f"attempt: {_plain(answer['attempt'])}")
+        if "compare" in answer:
+            print(f"compare: {_plain(answer['compare'])}")
         print(format_analysis(answer, answer["run_dir"], reused=False))
     else:
         print("\n".join(f"{key}: {_plain(value)}" for key, value in answer.items()))

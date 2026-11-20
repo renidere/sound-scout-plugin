@@ -70,6 +70,20 @@ runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gat
 kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. About once a minute
 the runner deletes the staging copies that are due (`sound_scout.staging.sweep`) and marks their
 jobs `staging_removed_at`.
+
+A control attempt (Decision in #110) is a job submitted with `previous_run_id` and `criterion`,
+always together. `submit` checks them with the functions of `compare`: the criterion by
+`comparison.parse_criterion`, the initial run by `comparison.load_attempt` (complete, its
+`result.json` valid), and refuses with the same codes (`criterion_invalid`, `run_not_found`,
+`run_incomplete`, `result_invalid`). A criterion the plan cannot answer is `invalid_request`: the
+verdict needs the `sound` layer, a criterion with a word the `content` layer too. The link is
+stored as `request.control` and counts in the job identity; the plan does not change. After
+`app.analyze` the runner calls `app.compare(previous_run_id, <run of the attempt>, criterion)`
+and records its summary as `compare` of the attempt in the same write that ends the attempt, so
+a `finished` control job always carries the verdict of its last attempt (or why there is none:
+`refused`, `failed`, `not_run`). The full document stays `<data_root>/compare/<compare_id>.json`;
+the comparison never changes the job state. Each attempt, after a retry or a recover too, is
+compared again with the same initial run and criterion.
 """
 
 import contextlib
@@ -87,7 +101,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sound_scout import __version__, ingest, paths, proc, report, runs, schema
+from sound_scout import __version__, comparison, ingest, paths, proc, report, runs, schema
 from sound_scout.config import CONFIG_PATH_ENV, Budgets, Config
 
 JOBS_DIR_NAME = "jobs"
@@ -172,6 +186,8 @@ class SubmitRequest:
     task: str | None = None
     intent: str | None = None
     mode: str = DEFAULT_MODE
+    previous_run_id: str | None = None
+    criterion: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +210,7 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
         value = getattr(request, name)
         if value is not None and not isinstance(value, str):
             raise JobError(INVALID_REQUEST, f"{name} must be a string, got {type(value).__name__}")
+    control = _checked_control(request, layers, config)
     _check_identifier("submitter", binding.submitter)
     for name in ("connection", "profile", "session_id"):
         if getattr(binding, name) is not None:
@@ -204,6 +221,7 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
         "layers": sorted(layers),
         "task": request.task,
         "intent": request.intent,
+        "control": control,
     }
     bound = dataclasses.asdict(binding)
     digest = _identity_hash(sha256, analysis, plan, bound)
@@ -245,6 +263,34 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
             shutil.rmtree(job_dir)
             return _answer(_indexed_job(jobs_dir, index_path, request_id, digest), reused=True)
         return _answer(job, reused=False)
+
+
+def _checked_control(
+    request: SubmitRequest, layers: tuple[str, ...], config: Config
+) -> dict | None:
+    """The link of a control attempt to its initial run, checked as `compare` checks it; `None`
+    for an ordinary job. See the module docstring."""
+    if request.previous_run_id is None and request.criterion is None:
+        return None
+    if request.previous_run_id is None or request.criterion is None:
+        raise JobError(INVALID_REQUEST, "previous_run_id and criterion go together")
+    try:
+        criterion = comparison.parse_criterion(request.criterion)
+        if "sound" not in layers:
+            raise JobError(
+                INVALID_REQUEST,
+                "a control attempt needs the sound layer: the verdict comes only from audio review",
+            )
+        if criterion.word is not None and "content" not in layers:
+            raise JobError(
+                INVALID_REQUEST,
+                f"a control attempt by {criterion.kind} needs the content layer: the word is "
+                "looked up in the transcript",
+            )
+        comparison.load_attempt(request.previous_run_id, config)
+    except comparison.CompareError as error:
+        raise JobError(error.code, error.message) from None
+    return {"previous_run_id": request.previous_run_id, "criterion": criterion.raw}
 
 
 def resolved_plan(mode: object, layers: object, config: Config) -> tuple[tuple[str, ...], dict]:
@@ -378,6 +424,8 @@ def result(job_id: str, config: Config) -> dict:
             continue
         run_rel = run_dir.relative_to(config.data_root).as_posix()
         head = {"job_id": job_id, "job_state": job["state"], "attempt": attempt.get("number")}
+        if job["request"].get("control"):
+            head["compare"] = attempt.get("compare")
         return report.compact(document, run_dir=run_rel, head=head)
     raise JobError(NO_RESULT, f"job {job_id} is {job['state']} and has no run result yet")
 
@@ -609,7 +657,7 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
     done = threading.Event()
     watcher = threading.Thread(target=_watch_cancel, args=(job_dir, token, done), daemon=True)
     watcher.start()
-    run_id, state, reason, changed = None, FINISHED, None, False
+    run_id, state, reason, changed, compared = None, FINISHED, None, False, None
     try:
         layers, effective = applied_plan(job["plan"], config)
         analysis = app.analyze(
@@ -630,6 +678,7 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
             state, reason = FAILED, f"{ingest.INPUT_CHANGED}: {_private(message, request, config)}"
         elif token.cancelled and not analysis.run.complete:
             state, reason = CANCELLED, "cancelled while running; the run keeps what was done"
+        compared = _compared(app, job, run_id, state, config)
     except app.Busy:
         state = QUEUED
     except JobError as error:
@@ -645,7 +694,44 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
     finally:
         done.set()
         watcher.join()
-    return _end_attempt(job_dir, attempt, state, reason, run_id, config, input_changed=changed)
+    if compared is None and state == FAILED and request.get("control"):
+        compared = {"state": "not_run", "reason": FAILED}
+    return _end_attempt(
+        job_dir, attempt, state, reason, run_id, config, input_changed=changed, compare=compared
+    )
+
+
+def _compared(app, job: dict, run_id: str, state: str, config: Config) -> dict | None:
+    """The summary of the control attempt's comparison with its initial run, `None` for an
+    ordinary job; see the module docstring. The `message` of the reasons stays in the full
+    document: it may quote a stage reason."""
+    control = job["request"].get("control")
+    if not control:
+        return None
+    if state != FINISHED:
+        return {"state": "not_run", "reason": state}
+    try:
+        compared = app.compare(control["previous_run_id"], run_id, control["criterion"], config)
+    except comparison.CompareError as error:
+        return {"state": "refused", "code": error.code, "message": error.message}
+    except Exception as error:
+        return {"state": "failed", "error": f"internal_error: {type(error).__name__}"}
+    document = compared.result
+    backend = document["conditions_diff"]["backend"]
+    return {
+        "state": "completed",
+        "compare_id": document["compare_id"],
+        "path": compared.path.relative_to(config.data_root).as_posix(),
+        "criterion": document["criterion"]["raw"],
+        "verdict": document["verdict"],
+        "reasons": [
+            {"code": item["code"], "attempt": item["attempt"]} for item in document["reasons"]
+        ],
+        "audio_review": {
+            label: document["attempts"][label]["audio_review"]["status"] for label in ("a", "b")
+        },
+        "backend": {label: (backend[label] or {}).get("backend") for label in ("a", "b")},
+    }
 
 
 def _recorded_sha256s(analysis) -> set[object]:
@@ -672,8 +758,10 @@ def _end_attempt(
     config: Config,
     *,
     input_changed: bool = False,
+    compare: dict | None = None,
 ) -> str:
-    """Record how the attempt ended and answer the job's new state.
+    """Record how the attempt ended, with the summary of its comparison when it has one, and
+    answer the job's new state.
 
     Under `jobs.lock`, so a `cancel` cannot land between the cancel-marker check of a `Busy`
     attempt and its requeue.
@@ -695,6 +783,8 @@ def _end_attempt(
                 outcome=state,
                 input_changed=input_changed,
             )
+            if compare is not None:
+                current["compare"] = compare
         job.update(state=state, state_reason=reason, updated_at=_now())
         _save(job_dir, job)
         return state
@@ -907,6 +997,8 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "current_stage": _current_stage(job, work_dir, finished),
         "finished_stages": finished,
         "delivery": job.get("delivery"),
+        "control": job["request"].get("control"),
+        "compare": job["attempts"][-1].get("compare") if job["attempts"] else None,
     }
 
 

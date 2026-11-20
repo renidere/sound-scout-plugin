@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import types
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -1050,3 +1051,51 @@ def test_criterion_6_decision_has_a_results_table_pending_the_owner() -> None:
     assert {"1", "2", "3", "4а", "4б", "4в", "5а", "5б", "5в", "6"} <= set(by_criterion)
     for criterion in ("3", "4а", "4б", "4в", "5а", "5б", "5в", "6"):
         assert by_criterion[criterion] == "ожидает прогона владельцем"
+
+
+def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them(
+    api, station: Station, audio: bytes, monkeypatch
+) -> None:
+    calls = observe_cli(api, monkeypatch)
+    run_id = "a" * 32
+    link = f"previous_run_id={run_id}&criterion={urllib.parse.quote('emphasis_on:слово')}"
+
+    refused = post(api, multipart(audio), query=f"request_id=r-c&{link}").answer
+    repeated = post(
+        api, multipart(audio), query=f"request_id=r-r&{link}&criterion=completeness_of_phrase"
+    ).answer
+
+    [submit] = [call for call in calls if call[0] == "submit"]
+    assert f"--previous-run-id={run_id}" in submit
+    assert "--criterion=emphasis_on:слово" in submit
+    assert_refused(refused, "run_not_found")
+    assert_refused(repeated, "invalid_request")
+    assert station.staged() == []
+
+
+@needs_ffmpeg
+def test_criterion_1_post_jobs_takes_the_control_link_and_refuses_an_unsupported_criterion(
+    api, station: Station, make_wav: WavFactory
+) -> None:
+    wav = make_wav("voice.wav", seconds=1.5).read_bytes()
+    station.write(max_input_bytes=len(wav) + 1)
+    initial = post(api, multipart(wav), query="request_id=r-initial").answer
+    [staged] = station.staged()
+    baseline = app.analyze(app.AnalyzeRequest(str(staged), request_id="initial"), config.load())
+    run_id = baseline.run.run_id
+    link = f"previous_run_id={run_id}&criterion={urllib.parse.quote('emphasis_on: Слово')}"
+
+    accepted = post(api, multipart(wav), query=f"request_id=r-control&{link}").answer
+    unsupported = post(
+        api, multipart(wav), query=f"request_id=r-bad&previous_run_id={run_id}&criterion=louder"
+    ).answer
+    lonely = post(api, multipart(wav), query=f"request_id=r-lonely&previous_run_id={run_id}")
+
+    assert accepted["ok"] is True, accepted
+    control = {"previous_run_id": run_id, "criterion": "emphasis_on:Слово"}
+    assert job_json(station, accepted["job_id"])["request"]["control"] == control
+    assert get_job(api, accepted["job_id"])["job"]["control"] == control
+    assert job_json(station, initial["job_id"])["request"]["control"] is None
+    assert_refused(unsupported, "criterion_invalid")
+    assert_refused(lonely.answer, "invalid_request")
+    assert len(station.staged()) == 2
