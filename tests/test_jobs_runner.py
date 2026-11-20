@@ -265,6 +265,53 @@ def test_a_cancel_marker_stops_a_running_real_analyze_through_the_cancel_token(
     assert manifest["complete"] is False
 
 
+@needs_ffmpeg
+def test_jobs_status_merges_state_current_stage_and_finished_stages_of_a_real_running_job(
+    cfg: Config, make_wav: WavFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_dir = tmp_path / "pids"
+    pid_dir.mkdir()
+    config_path = tmp_path / "sound-scout.toml"
+    config_path.write_text(
+        f"allowed_roots = [{json.dumps(str(cfg.allowed_roots[0]))}]\n"
+        f"data_root = {json.dumps(str(cfg.data_root))}\n"
+        f"[asr]\nmodel = {json.dumps(ABSENT_ASR_MODEL)}\n",
+        encoding="utf-8",
+    )
+    job_id = queue(cfg, make_wav("recordings/a.wav"), layers=("measurements", "sound"))
+    real_analyze = app.analyze
+
+    def with_hung_backend(request: app.AnalyzeRequest, config: Config, **kwargs: object):
+        backend = SlowFakeBackend(pid_dir=str(pid_dir))
+        return real_analyze(request, config, backend=backend, cancel=kwargs["cancel"])
+
+    monkeypatch.setattr(app, "analyze", with_hung_backend)
+    runner = runner_thread(cfg)
+    try:
+        wait_for(pid_dir / "child", seconds=60)
+        shown = run_jobs_cli(config_path, "status", job_id, "--json")
+        plain = run_jobs_cli(config_path, "status", job_id).stdout.splitlines()
+        jobs.cancel(job_id, cfg)
+        runner.join(timeout=30)
+    finally:
+        (cfg.data_root / "jobs" / job_id / "cancel.json").touch()
+        runner.join(timeout=60)
+
+    assert shown.returncode == 0, shown.stderr
+    running = json.loads(shown.stdout)
+    assert running["state"] == "running"
+    assert running["current_stage"]["stage"] == "audio_review"
+    assert running["finished_stages"] == [
+        {"stage": "prepare", "status": "completed"},
+        {"stage": "acoustics", "status": "completed"},
+    ]
+    assert "state: running" in plain
+    assert any(line.startswith("current_stage: ") and '"audio_review"' in line for line in plain)
+    ended = jobs.status(job_id, cfg)
+    assert ended["state"] == "cancelled" and ended["current_stage"] is None
+    assert ended["finished_stages"] == running["finished_stages"]
+
+
 def replace_with_other_audio(wav: Path, make_wav: WavFactory) -> None:
     """Put other synthesized audio at `wav`'s path, as an editor saving over it would."""
     other = make_wav("other.wav", seconds=1.5, frequency=440.0)

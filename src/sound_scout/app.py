@@ -9,17 +9,18 @@ rather than charging the request again.
 
 The stages run in a child process (`multiprocessing`, `spawn`), the worker: prepare (ingest,
 channels, the 16 kHz copy for ASR), acoustics, asr, audio_review (`review.cover`: a clip and one
-backend call per window, then findings). After each stage the worker writes
-`work/stage-<name>.json` atomically: the contract entry, errors, its steps with their times and its
-part of the result. The caller watches `budgets.worker_deadline_seconds` and the `CancelToken`; on
-either it sends SIGTERM and, after
-`TERMINATE_GRACE_SECONDS`, SIGKILL. SIGTERM raises `WorkerStopped` in the worker, which no stage
-boundary catches, so `proc.run` kills the group of a running decoder on the way out. The handler
-also notes the stop first, and every step and record write checks that note: a stop swallowed on
-its way out (a lazy C-extension import reports it as `ImportError`) still ends the worker before
-it can record the interrupted stage as anything. The worker and every decoder are also bound to
-their parent with `proc.die_with_parent`, so neither outlives a killed parent. Stdout of the
-worker is pointed at stderr: stdout belongs to the MCP protocol.
+backend call per window, then findings). At the start of each stage the worker replaces
+`work/stage-current.json` with the stage's name and start time; it names the last stage started and
+stays after the worker ends. After each stage the worker writes `work/stage-<name>.json`
+atomically: the contract entry, errors, its steps with their times and its part of the result. The
+caller watches `budgets.worker_deadline_seconds` and the `CancelToken`; on either it sends SIGTERM
+and, after `TERMINATE_GRACE_SECONDS`, SIGKILL. SIGTERM raises `WorkerStopped` in the worker, which
+no stage boundary catches, so `proc.run` kills the group of a running decoder on the way out. The
+handler also notes the stop first, and every step and record write checks that note: a stop
+swallowed on its way out (a lazy C-extension import reports it as `ImportError`) still ends the
+worker before it can record the interrupted stage as anything. The worker and every decoder are
+also bound to their parent with `proc.die_with_parent`, so neither outlives a killed parent. Stdout
+of the worker is pointed at stderr: stdout belongs to the MCP protocol.
 
 The worker runs under the network guard. A network attempt it denies is `network_denied` in
 `errors[]` and fails the stage it happened in, also when the stage caught the exception and
@@ -96,6 +97,7 @@ TERMINATE_GRACE_SECONDS = 0.5
 LOCK_FILE_NAME = "analyze.lock"
 LOCK_FILE_MODE = 0o600
 STAGE_RECORD = "stage-{name}.json"
+CURRENT_STAGE = "stage-current.json"
 CHECKPOINT = "checkpoint"
 CLIP_PAD_MS = review.WINDOW_PAD_MS
 DEADLINE_EXCEEDED = "deadline_exceeded"
@@ -503,6 +505,7 @@ def _run_stages(
 ) -> None:
     requested = {LAYER_STAGES[layer] for layer in request.layers}
     denied = len(guard.denied_events())
+    _mark_current(run, config, "prepare")
     prepared, record = _prepare_stage(request.path, run, config, audio_sha256, "asr" in requested)
     record = _with_denials(record, guard.denied_events()[denied:])
     if record["entry"]["status"] != "completed":
@@ -513,6 +516,7 @@ def _run_stages(
     for name in WORKER_STAGES[1:]:
         if name not in requested:
             continue
+        _mark_current(run, config, name)
         denied = len(guard.denied_events())
         if prepared is None:
             record = _Stage(name).done("skipped", no_signal)
@@ -709,8 +713,17 @@ def _review_stage(
         return stage.failed(error)
 
 
+def _mark_current(run: runs.Run, config: Config, stage: str) -> None:
+    """`work/stage-current.json`: the stage that starts now, for the job status."""
+    _write_work_file(run, config, CURRENT_STAGE, {"stage": stage, "started_at": _now()})
+
+
 def _write_record(run: runs.Run, config: Config, record: dict) -> None:
     """`work/stage-<name>.json`, replaced atomically so a killed worker leaves no torn record."""
+    _write_work_file(run, config, STAGE_RECORD.format(name=record["stage"]), record)
+
+
+def _write_work_file(run: runs.Run, config: Config, name: str, document: dict) -> None:
     _raise_if_stopped()
     work_dir = paths.resolve_output(run.path, ingest.WORK_DIR_NAME, config)
     try:
@@ -719,9 +732,8 @@ def _write_record(run: runs.Run, config: Config, record: dict) -> None:
         pass
     else:
         os.chmod(work_dir, ingest.DIR_MODE)
-    name = STAGE_RECORD.format(name=record["stage"])
     staging = f".{name}.{uuid.uuid4().hex}"
-    text = json.dumps(record, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
+    text = json.dumps(document, ensure_ascii=False, allow_nan=False, indent=2) + "\n"
     with paths.open_output(work_dir, staging, config) as out:
         out.write(text.encode("utf-8"))
     os.replace(work_dir / staging, work_dir / name)

@@ -102,9 +102,10 @@ INTERRUPTED = "interrupted"
 LAYERS = ("content", "measurements", "sound")
 LAYER_STAGES = {"content": "asr", "measurements": "acoustics", "sound": "audio_review"}
 WORKER_STAGES = ("prepare", "acoustics", "asr", "audio_review")
-# `app.STAGE_RECORD` and `app.CHECKPOINT`, repeated for the same reason: `status` reads the stage
-# records of the run to name the finished stages.
+# `app.STAGE_RECORD`, `app.CURRENT_STAGE` and `app.CHECKPOINT`, repeated for the same reason:
+# `status` reads the stage records and the marker of the run: the finished and current stages.
 STAGE_RECORD = "stage-{name}.json"
+CURRENT_STAGE = "stage-current.json"
 CHECKPOINT = "checkpoint"
 SUBMITTER_CLI = "cli"
 
@@ -226,8 +227,13 @@ def resolved_plan(layers: tuple[str, ...], config: Config) -> dict:
 
 
 def status(job_id: str, config: Config) -> dict:
-    """The job's state without its private input path: state, times, attempts, cancel marker and
-    `finished_stages`, the stages of the latest attempt's run that wrote their final record."""
+    """The job's state without its private input path: state, times, attempts, cancel marker,
+    `current_stage` and `finished_stages` of the latest attempt's run.
+
+    `current_stage` is `{stage, started_at}` of the run's `work/stage-current.json` only while
+    the job is `running` and that stage has no final record yet; otherwise `None` (between two
+    stages, before the first one, or once the job ended: the marker stays in the run and names
+    the last stage started, not one that runs)."""
     job_dir = _job_dir(job_id, config)
     return _view(job_dir, _load(job_dir), config)
 
@@ -722,6 +728,8 @@ def _job_dir(job_id: object, config: Config) -> Path:
 
 def _view(job_dir: Path, job: dict, config: Config) -> dict:
     run_ids = [attempt.get("run_id") for attempt in job["attempts"]]
+    work_dir = _work_dir(job, config)
+    finished = _finished_stages(job, work_dir)
     return {
         "job_id": job["job_id"],
         "request_id": job["request_id"],
@@ -733,22 +741,44 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "attempts": len(job["attempts"]),
         "run_id": run_ids[-1] if run_ids else None,
         "cancel_requested": (job_dir / CANCEL_MARKER_NAME).exists(),
-        "finished_stages": _finished_stages(job, config),
+        "current_stage": _current_stage(job, work_dir, finished),
+        "finished_stages": finished,
         "delivery": job.get("delivery"),
     }
 
 
-def _finished_stages(job: dict, config: Config) -> list[dict]:
-    """`{stage, status}` of each planned stage whose final record the latest attempt's run holds,
-    in plan order; a checkpoint record or an unreadable one does not count. No `reason`: it may
-    carry a path or text of the recording."""
+def _work_dir(job: dict, config: Config) -> Path | None:
+    """`work/` of the latest attempt's run, `None` before the first attempt or its run."""
     if not job["attempts"]:
-        return []
+        return None
     attempt = job["attempts"][-1]
     run_id = attempt.get("run_id") or _run_id_of(attempt["request_id"], config)
     if not isinstance(run_id, str) or not runs.RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    return config.data_root / runs.RUNS_DIR_NAME / run_id / ingest.WORK_DIR_NAME
+
+
+def _current_stage(job: dict, work_dir: Path | None, finished: list[dict]) -> dict | None:
+    if job["state"] != RUNNING or work_dir is None:
+        return None
+    try:
+        marker = json.loads((work_dir / CURRENT_STAGE).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict) or not isinstance(marker.get("started_at"), str):
+        return None
+    stage = marker.get("stage")
+    if stage not in job["plan"]["stages"] or any(item["stage"] == stage for item in finished):
+        return None
+    return {"stage": stage, "started_at": marker["started_at"]}
+
+
+def _finished_stages(job: dict, work_dir: Path | None) -> list[dict]:
+    """`{stage, status}` of each planned stage whose final record the latest attempt's run holds,
+    in plan order; a checkpoint record or an unreadable one does not count. No `reason`: it may
+    carry a path or text of the recording."""
+    if work_dir is None:
         return []
-    work_dir = config.data_root / runs.RUNS_DIR_NAME / run_id / ingest.WORK_DIR_NAME
     finished = []
     for stage in job["plan"]["stages"]:
         try:

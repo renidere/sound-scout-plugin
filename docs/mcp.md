@@ -305,7 +305,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_status",
-  "description": "Read the state of a job: queued, running, finished, cancelled or failed, with its reason, its stages, the number of attempts and the run_id of the latest one. finished means the runner stopped working on it, not that the result is complete: read speech_job_result. Reads only.",
+  "description": "Read the state of a job: queued, running, finished, cancelled or failed, with its reason, its stages, the stage running now (current_stage, only while running), the finished stages, the number of attempts and the run_id of the latest one. finished means the runner stopped working on it, not that the result is complete: read speech_job_result. Reads only.",
   "inputSchema": {
     "type": "object",
     "properties": {

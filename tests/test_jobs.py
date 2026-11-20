@@ -380,6 +380,7 @@ def test_the_stage_names_of_jobs_are_those_of_the_application_layer() -> None:
     assert jobs.LAYER_STAGES == app.LAYER_STAGES
     assert jobs.WORKER_STAGES == app.WORKER_STAGES
     assert jobs.STAGE_RECORD == app.STAGE_RECORD
+    assert jobs.CURRENT_STAGE == app.CURRENT_STAGE
     assert jobs.CHECKPOINT == app.CHECKPOINT
 
 
@@ -471,6 +472,100 @@ def test_finished_stages_follow_the_latest_attempt_and_its_plan(
     ]
 
 
+def write_current_stage(cfg: Config, run_id: str, marker: object) -> None:
+    work = cfg.data_root / runs.RUNS_DIR_NAME / run_id / ingest.WORK_DIR_NAME
+    work.mkdir(parents=True, exist_ok=True)
+    text = marker if isinstance(marker, str) else json.dumps(marker)
+    (work / jobs.CURRENT_STAGE).write_text(text, encoding="utf-8")
+
+
+def running_job(cfg: Config, wav: Path) -> tuple[str, str]:
+    """A submitted job the runner moved to `running` with attempt 1 and its run id."""
+    job_id = jobs.submit(SubmitRequest(str(wav)), Binding(), cfg)["job_id"]
+    run_id = runs.new_run_id()
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}
+    set_job(cfg, job_id, state="running", attempts=[attempt])
+    return job_id, run_id
+
+
+def test_status_follows_each_stage_transition_of_a_running_job(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id, run_id = running_job(setup, make_wav("recordings/a.wav"))
+    assert jobs.status(job_id, setup)["current_stage"] is None
+
+    finished: list[dict] = []
+    for i, stage in enumerate(jobs.WORKER_STAGES):
+        started_at = f"2026-11-20T10:00:0{i}+00:00"
+        write_current_stage(setup, run_id, {"stage": stage, "started_at": started_at})
+        found = jobs.status(job_id, setup)
+        assert found["state"] == "running"
+        assert found["current_stage"] == {"stage": stage, "started_at": started_at}
+        assert found["finished_stages"] == finished
+
+        if stage == "audio_review":
+            write_stage_record(setup, run_id, stage, stage_record(stage, "failed", checkpoint=True))
+            assert jobs.status(job_id, setup)["current_stage"] == found["current_stage"]
+        write_stage_record(setup, run_id, stage, stage_record(stage, "completed"))
+        finished.append({"stage": stage, "status": "completed"})
+        found = jobs.status(job_id, setup)
+        assert found["current_stage"] is None, "between stages nothing runs"
+        assert found["finished_stages"] == finished
+
+
+@pytest.mark.parametrize("state", ["queued", "finished", "cancelled", "failed"])
+def test_a_job_that_is_not_running_has_no_current_stage(
+    setup: Config, make_wav: WavFactory, state: str
+) -> None:
+    job_id, run_id = running_job(setup, make_wav("recordings/a.wav"))
+    write_stage_record(setup, run_id, "prepare", stage_record("prepare", "completed"))
+    write_current_stage(setup, run_id, {"stage": "acoustics", "started_at": "2026-11-20T10:00Z"})
+    set_job(setup, job_id, state=state)
+
+    found = jobs.status(job_id, setup)
+
+    assert found["state"] == state
+    assert found["current_stage"] is None
+    assert found["finished_stages"] == [{"stage": "prepare", "status": "completed"}]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "{torn",
+        ["acoustics"],
+        {"stage": "acoustics"},
+        {"stage": "report", "started_at": "2026-11-20T10:00Z"},
+        {"stage": "asr", "started_at": "2026-11-20T10:00Z"},
+    ],
+    ids=["torn", "not_an_object", "no_start_time", "not_a_worker_stage", "not_in_the_plan"],
+)
+def test_an_unusable_marker_names_no_current_stage(
+    setup: Config, make_wav: WavFactory, marker: object
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = jobs.submit(SubmitRequest(str(wav), layers=("measurements",)), Binding(), setup)[
+        "job_id"
+    ]
+    run_id = runs.new_run_id()
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}
+    set_job(setup, job_id, state="running", attempts=[attempt])
+    write_current_stage(setup, run_id, marker)
+
+    assert jobs.status(job_id, setup)["current_stage"] is None
+
+
+def test_a_running_attempt_without_its_marker_yet_has_no_current_stage(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id, _ = running_job(setup, make_wav("recordings/a.wav"))
+
+    found = jobs.status(job_id, setup)
+
+    assert found["state"] == "running"
+    assert found["current_stage"] is None and found["finished_stages"] == []
+
+
 # --- the real console entry point ------------------------------------------------------------
 
 
@@ -542,6 +637,21 @@ def test_jobs_through_the_console_entry(config_file: Path, make_wav: WavFactory)
     )
     assert f"job_id: {job_id}" in status.stdout.splitlines()
     assert "state: queued" in status.stdout.splitlines()
+
+    data = config_file.parent / "data"
+    running = Config(allowed_roots=(config_file.parent / "recordings",), data_root=data)
+    run_id = runs.new_run_id()
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}
+    set_job(running, job_id, state="running", attempts=[attempt])
+    write_stage_record(running, run_id, "prepare", stage_record("prepare", "completed"))
+    write_current_stage(running, run_id, {"stage": "asr", "started_at": "2026-11-20T10:00Z"})
+    merged = json.loads(run_cli(config_file, "status", job_id, "--json").stdout)
+    assert merged["state"] == "running"
+    assert merged["current_stage"] == {"stage": "asr", "started_at": "2026-11-20T10:00Z"}
+    assert merged["finished_stages"] == [{"stage": "prepare", "status": "completed"}]
+    plain = run_cli(config_file, "status", job_id).stdout.splitlines()
+    assert 'current_stage: {"stage": "asr", "started_at": "2026-11-20T10:00Z"}' in plain
+    set_job(running, job_id, state="queued", attempts=[])
 
     no_result = run_cli(config_file, "result", job_id)
     assert no_result.returncode == 1

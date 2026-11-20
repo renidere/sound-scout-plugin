@@ -18,7 +18,9 @@ import sys
 import threading
 import time
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -219,6 +221,101 @@ def test_a_failed_prepare_skips_the_requested_stages_and_fails_the_result(
     for name in ("asr", "acoustics", "audio_review"):
         assert result["stages"][name]["status"] == "skipped"
         assert "prepare failed" in result["stages"][name]["reason"]
+
+
+def current_stage(run: runs.Run) -> dict:
+    return json.loads((run.path / "work" / app.CURRENT_STAGE).read_text(encoding="utf-8"))
+
+
+def recorded_stages(run: runs.Run) -> list[str]:
+    work = run.path / "work"
+    return [name for name in app.WORKER_STAGES if (work / f"stage-{name}.json").exists()]
+
+
+def watch_transitions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, list[str]]]:
+    """Run the worker in this process and note, at each stage start and each record write, the
+    stage `work/stage-current.json` names and the stages already recorded."""
+    seen: list[tuple[str, str, list[str]]] = []
+    watched: list[runs.Run] = []
+
+    def execute_in_process(
+        request: AnalyzeRequest, config: Config, run: runs.Run, *rest: object
+    ) -> None:
+        watched.append(run)
+        app._run_stages(request, config, run, rest[0], rest[1])
+
+    def noting(label: Callable[[tuple], str], original: Callable) -> Callable:
+        def wrapper(*args: object) -> object:
+            run = watched[-1]
+            seen.append((label(args), current_stage(run)["stage"], recorded_stages(run)))
+            return original(*args)
+
+        return wrapper
+
+    for function, stage in (
+        ("_prepare_stage", "prepare"),
+        ("_acoustics_stage", "acoustics"),
+        ("_asr_stage", "asr"),
+        ("_review_stage", "audio_review"),
+    ):
+        start = noting(lambda _, stage=stage: f"start {stage}", getattr(app, function))
+        monkeypatch.setattr(app, function, start)
+    record = noting(lambda args: f"record {args[2]['stage']}", app._write_record)
+    monkeypatch.setattr(app, "_write_record", record)
+    monkeypatch.setattr(app, "_execute", execute_in_process)
+    return seen
+
+
+@pytest.mark.parametrize("layers", [ALL_LAYERS, ("measurements",)])
+def test_each_stage_names_itself_current_at_its_start_and_keeps_it_to_its_record(
+    config: Config, wav: Path, monkeypatch: pytest.MonkeyPatch, layers: tuple[str, ...]
+) -> None:
+    seen = watch_transitions(monkeypatch)
+
+    run = analyze(AnalyzeRequest(str(wav), layers=layers), config).run
+
+    stages = [
+        name
+        for name in app.WORKER_STAGES
+        if name == "prepare" or name in {app.LAYER_STAGES[layer] for layer in layers}
+    ]
+    expected = []
+    for i, stage in enumerate(stages):
+        expected += [
+            (f"start {stage}", stage, stages[:i]),
+            (f"record {stage}", stage, stages[:i]),
+        ]
+    assert seen == expected
+    marker = current_stage(run)
+    assert marker["stage"] == stages[-1], "the marker stays on the last stage started"
+    assert datetime.fromisoformat(marker["started_at"]).tzinfo is not None
+
+
+def test_a_stage_skipped_after_a_failed_prepare_is_marked_current_before_its_record(
+    config: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    silent = make_wav("recordings/silent.wav", seconds=0.5, frequency=0.0)
+    seen = watch_transitions(monkeypatch)
+
+    result = analyze(AnalyzeRequest(str(silent), layers=ALL_LAYERS), config).result
+
+    assert result["stages"]["prepare"]["status"] == "failed"
+    assert seen == [
+        ("start prepare", "prepare", []),
+        ("record prepare", "prepare", []),
+        ("record acoustics", "acoustics", ["prepare"]),
+        ("record asr", "asr", ["prepare", "acoustics"]),
+        ("record audio_review", "audio_review", ["prepare", "acoustics", "asr"]),
+    ]
+
+
+def test_the_worker_process_leaves_the_marker_of_its_last_stage(config: Config, wav: Path) -> None:
+    run = analyze(AnalyzeRequest(str(wav), layers=("measurements",)), config).run
+
+    assert current_stage(run)["stage"] == "acoustics"
+    assert stage_record(run, "acoustics")["entry"]["status"] == "completed"
+    mode = (run.path / "work" / app.CURRENT_STAGE).stat().st_mode & 0o777
+    assert mode == runs.FILE_MODE
 
 
 def stereo_wav(path: Path, right_phase: float, right_sign: float = 1.0) -> Path:

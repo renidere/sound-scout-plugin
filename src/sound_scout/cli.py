@@ -17,8 +17,9 @@ root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 
 `jobs submit|status|result|cancel|recover` calls `sound_scout.jobs` and prints its answer as
 `key: value` lines (`--json`: the answer; `recover`: one line per recovered job); `result` puts
 `job_id`, `job_state` and `attempt` before the summary of the compact answer, as `analyze` prints
-it; `status` lists `finished_stages`. `jobs limits` prints `jobs.limits`: the budgets, the queue
-limits and `jobs.staging_root`, which the Hermes plugin reads instead of the configuration file.
+it; `status` names `current_stage` and lists `finished_stages`. `jobs limits` prints
+`jobs.limits`: the budgets, the queue limits and `jobs.staging_root`, which the Hermes plugin
+reads instead of the configuration file.
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
 is the runner in the foreground (`jobs.run_runner`; `--exit-when-idle` returns once no job is
 queued), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
