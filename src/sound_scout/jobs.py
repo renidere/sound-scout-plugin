@@ -51,6 +51,9 @@ zombie, or a pid with another start time) gets its attempt marked `interrupted` 
 Nothing retries on its own. `runner_unit_argv` is the `systemd-run --user` command that starts the
 runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has
 `KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
+
+`delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
+kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it.
 """
 
 import contextlib
@@ -142,7 +145,8 @@ class SubmitRequest:
 
 @dataclass(frozen=True)
 class Binding:
-    """Where the job came from and where its answer goes; stored as given, nothing acts on it."""
+    """Where the job came from and where its answer goes; `profile` and `session_id` address the
+    final note of `sound_scout.delivery`."""
 
     submitter: str = SUBMITTER_CLI
     connection: str | None = None
@@ -193,6 +197,7 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
             "state": QUEUED,
             "state_reason": None,
             "attempts": [],
+            "delivery": None,
         }
         try:
             _save(job_dir, job)
@@ -729,6 +734,7 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "run_id": run_ids[-1] if run_ids else None,
         "cancel_requested": (job_dir / CANCEL_MARKER_NAME).exists(),
         "finished_stages": _finished_stages(job, config),
+        "delivery": job.get("delivery"),
     }
 
 

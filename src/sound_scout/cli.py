@@ -22,7 +22,10 @@ limits and `jobs.staging_root`, which the Hermes plugin reads instead of the con
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
 is the runner in the foreground (`jobs.run_runner`; `--exit-when-idle` returns once no job is
 queued), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
-as the transient unit `jobs.RUNNER_UNIT` with this configuration file.
+as the transient unit `jobs.RUNNER_UNIT` with this configuration file. `jobs deliver-next
+--profile=<p> --loop=<id>` and `jobs deliver-end --outcome=<o> [--error=<text>] <job_id>` are the
+calls of the plugin's delivery loop (`sound_scout.delivery`): the next note to send with its
+`sending` marker written first, and how its send ended; the same output and exit codes.
 `doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
 diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
 same functions until the client closes stdin, then exits 0.
@@ -66,7 +69,8 @@ SUBCOMMANDS = {
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
     "jobs": "queue an analysis and follow it: submit, status, result, cancel; run the queue: "
-    "run, start, recover; print the budgets and the staging root: limits",
+    "run, start, recover; print the budgets and the staging root: limits; deliver the final "
+    "note: deliver-next, deliver-end",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -216,6 +220,28 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
     actions.add_parser(
         "limits", help=limits_help, description=limits_help, parents=[common, as_json]
     )
+    next_help = (
+        "mark the next ended job of a profile sending and print its note and chat, or a stale "
+        "marker to check in the chat history"
+    )
+    deliver_next = actions.add_parser(
+        "deliver-next", help=next_help, description=next_help, parents=[common, as_json]
+    )
+    deliver_next.add_argument("--profile", required=True, help="the Hermes profile of the loop")
+    deliver_next.add_argument("--loop", required=True, help="the ID of the delivery loop")
+    end_help = "record how the send of a job's note ended"
+    deliver_end = actions.add_parser(
+        "deliver-end", help=end_help, description=end_help, parents=[common, as_json]
+    )
+    deliver_end.add_argument(
+        "--outcome",
+        required=True,
+        help="delivered, delivered_by_history, unconfirmed, failed or released",
+    )
+    deliver_end.add_argument(
+        "--error", help="what the send function said, for unconfirmed and failed"
+    )
+    deliver_end.add_argument("job_id", help="the job_id that deliver-next printed")
 
 
 def _layer_list(text: str) -> tuple[str, ...]:
@@ -369,7 +395,7 @@ def run_compare(args: argparse.Namespace) -> int:
 
 def run_jobs(args: argparse.Namespace) -> int:
     loaded = _load_config(args)
-    from sound_scout import ingest, jobs, paths
+    from sound_scout import delivery, ingest, jobs, paths
 
     try:
         if args.jobs_command == "run":
@@ -392,6 +418,10 @@ def run_jobs(args: argparse.Namespace) -> int:
                 session_id=args.session_id,
             )
             answer = jobs.submit(jobs.SubmitRequest(args.file, **fields), binding, loaded)
+        elif args.jobs_command == "deliver-next":
+            answer = delivery.next_delivery(args.profile, args.loop, loaded)
+        elif args.jobs_command == "deliver-end":
+            answer = delivery.end_delivery(args.job_id, args.outcome, args.error, loaded)
         else:
             call = {"status": jobs.status, "result": jobs.result, "cancel": jobs.cancel}
             answer = call[args.jobs_command](args.job_id, loaded)

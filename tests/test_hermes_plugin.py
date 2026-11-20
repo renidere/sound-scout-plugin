@@ -956,11 +956,14 @@ def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
     assert required == ["SOUND_SCOUT_BIN", "SOUND_SCOUT_CONFIG"]
 
 
-def test_agent_half_registers_nothing() -> None:
+def test_agent_half_registers_nothing(monkeypatch) -> None:
     spec = importlib.util.spec_from_file_location(
-        "sound_scout_plugin_agent", PACKAGE / "__init__.py"
+        "sound_scout_plugin_agent",
+        PACKAGE / "__init__.py",
+        submodule_search_locations=[str(PACKAGE)],
     )
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     assert module.register(object()) is None
 
