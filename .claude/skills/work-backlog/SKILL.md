@@ -88,9 +88,14 @@ Run it from Start to its end, its step 7 included, without asking anything, and 
 ```
 
 Its notification wakes you when it returns: log `- <HH:MM> agent <k> returned`. If its task has no
-final line after its `dispatched` line, the agent stopped mid-task: log
-`- <YYYY-MM-DD HH:MM> | <issue url> | failed | - | agent <k> ended without a result: <its last words, one line>`.
-Leave the issue as it is: its claim goes stale, and a later run recovers it as `abandoned`.
+final line after its `dispatched` line, the agent stopped mid-task — usually an early report while
+one of its step agents still ran, sometimes a usage limit. **Resume it at once** with SendMessage
+(its transcript, claim and tree are intact): tell it to continue where it stopped, run its step
+agents in the foreground, and stay until the task's final step. Its slot stays taken meanwhile. Log
+`- <HH:MM> agent <k> resumed: <one line>`. Only when the resume fails (the agent is gone, or a usage
+limit stops it again) log
+`- <YYYY-MM-DD HH:MM> | <issue url> | failed | - | agent <k> ended without a result: <its last words, one line>`
+and leave the issue as it is: its claim goes stale, and a later run recovers it as `abandoned`.
 
 The task agents live in this session: closing it ends them mid-task, and the next run recovers
 their tasks as hung ones.

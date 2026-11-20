@@ -110,10 +110,15 @@ prints: found from the current directory, a folder inside it, or a task tree und
    - the **slot**: `agent <k> of <N>` from the args — a queue run works N tasks side by side —
      or `1 of 1` without. The agents use it to take their share of this machine.
 
-   In a queue run this skill runs in a task agent: a background subagent nobody watches. An agent
-   you launch reports back on its own: ending your turn while it runs is how you wait for it, and
-   its result wakes you. Long commands run in the foreground, in blocks, as the briefs' shared
-   block says.
+   In a queue run this skill runs in a task agent: a background subagent nobody watches. **Launch
+   every step agent (Decision, Executor, Verifier, Lander, Filer, Repair) in the foreground** — the
+   Agent tool without `run_in_background` — so the call returns only with its result. Do not end
+   your turn while a step agent runs: in a task agent an ended turn is taken as your final report,
+   the step's result never reaches you, and the task is left half-done with its claim and tree held
+   (this happened on #100, #101, #102, #110, #117, #119 and #122, 2026-11-20). Long commands run in
+   the foreground, in blocks, as the briefs' shared block says. If you are resumed after such an
+   early report, read the log and the tree, do not redo finished steps, and carry the task to its
+   end.
 3. If the log already has a `started` line for this issue and no final line, an earlier attempt
    was interrupted — or is still running in another session; from here the two look the same.
    Don't release its claim and don't touch its changes: go on to the **Gate**, whose claim
