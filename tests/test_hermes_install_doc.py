@@ -155,7 +155,11 @@ def test_criterion2_readback_reads_the_entry_checks_discovery_and_calls_from_a_n
     for tool in mcp_server.TOOLS:
         assert f"mcp__speech_review__{tool.name}" in readback
     assert "Реальный вызов из новой сессии" in readback
-    assert "speech_analyze" in readback and "run_id" in readback
+    real_call = readback.split("Реальный вызов из новой сессии", 1)[1]
+    assert "speech_job_submit" in real_call and "speech_job_result" in real_call
+    assert "sound-scout jobs start" in real_call
+    assert "run_id" in real_call
+    assert "через `speech_analyze`" not in " ".join(real_call.split())
 
 
 def test_criterion3_connected_section_separates_sdk_call_from_native_exposure() -> None:

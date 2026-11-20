@@ -1,4 +1,5 @@
-"""Lint of the Hermes skill `speech-review` (issue #38, R12, AGENT_PROMPT D.14)."""
+"""Lint of the Hermes skill `speech-review` (issues #38, #100; R12, AGENT_PROMPT D.14,
+decision 0013 § 3.8)."""
 
 import json
 import re
@@ -19,10 +20,12 @@ SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 REQUIRED_SECTIONS = (
     "## When to Use",
     "## Quick Reference",
+    "## Обычная отправка",
     "## Procedure",
     "## Вложения Hermes",
     "## Трактовка результата",
     "## Ответ пользователю",
+    "## Темп занятия",
     "## Pitfalls",
     "## Verification",
     "## Пример диалога",
@@ -42,7 +45,6 @@ REQUIRED_TERMS = (
     "terminal.backend: local",
     "path_denied",
     "request_mismatch",
-    "run_incomplete",
     "unsupported_format",
     "Однопользовательский gateway",
     # interpretation rules
@@ -58,6 +60,14 @@ REQUIRED_TERMS = (
     "воспроизводимым фрагментом",
     "эмоции, здоровье, личность",
     "платный вызов",
+    # decision 0013 § 3.8: a plain send starts no analysis, an explicit request goes to a job
+    "Для неё анализ не запускать",
+    "«Отправить и разобрать»",
+    "analyze.lock",
+    "Новый `request_id` для той же записи не придумывать",
+    # the owner's practice pacing
+    "Без технического шума",
+    "Полный отчёт — только по просьбе",
     # evidence types kept apart
     "measurement",
     "transcript",
@@ -73,8 +83,12 @@ SECRETS = re.compile(
     r"|\b(?:api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['\"]?[^\s'\"<]{8,}",
     re.IGNORECASE,
 )
-EXAMPLE_ARGUMENTS = "`speech_analyze`:\n\n```json\n"
-EXAMPLE_COMPACT = "**Ответ `speech_analyze`** (compact):\n\n```json\n"
+# The old advice to make a new request ID with `-2`, `-3`: a job retries under its own run IDs.
+SUFFIX_ADVICE = re.compile(r"\w-[23]\b|`-[23]`|суффикс", re.IGNORECASE)
+# Decision 0013 § 3.8: an explicit request goes through a job, never the synchronous call.
+JOB_TOOLS = ("speech_job_submit", "speech_job_status", "speech_job_result")
+EXAMPLE_ARGUMENTS = "`speech_job_submit`:\n\n```json\n"
+EXAMPLE_COMPACT = "**Ответ `speech_job_result`** (compact):\n\n```json\n"
 
 
 def frontmatter(text: str) -> dict[str, str]:
@@ -93,12 +107,26 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
     description = meta.get("description", "")
     problems = doc_problems(text, REQUIRED_SECTIONS, REQUIRED_TERMS)
     problems += [f"secret: {match.group(0)[:12]}…" for match in SECRETS.finditer(text)]
+    problems += [f"request_id suffix advice: {m.group(0)}" for m in SUFFIX_ADVICE.finditer(text)]
+    problems += procedure_problems(text)
     if str(Path.home()) in text:
         problems.append("home directory in the text")
     if not SKILL_NAME.fullmatch(name) or name != directory:
         problems.append(f"name {name!r} does not match the directory {directory!r}")
     if not description or len(description) > DESCRIPTION_LIMIT:
         problems.append(f"description of {len(description)} characters")
+    return problems
+
+
+def procedure_problems(text: str) -> list[str]:
+    """The Procedure runs the job tools in order and never the synchronous `speech_analyze`."""
+    if "\n## Procedure\n" not in text:
+        return []
+    steps = section(text, "## Procedure")
+    problems = ["speech_analyze in the procedure"] if "`speech_analyze`" in steps else []
+    found = [steps.find(f"`{tool}`") for tool in JOB_TOOLS]
+    if -1 in found or found != sorted(found):
+        problems.append("procedure lacks submit, status, result in this order")
     return problems
 
 
@@ -113,8 +141,7 @@ def test_skill_has_every_section_and_term_and_no_station_path_or_secret() -> Non
 
 def test_skill_names_every_tool_with_its_arguments() -> None:
     text = SKILL.read_text(encoding="utf-8")
-    # The skill takes up the job tools with its own rules in issue #100.
-    for tool in (tool for tool in mcp_server.TOOLS if tool.name not in mcp_server.JOB_TOOLS):
+    for tool in mcp_server.TOOLS:
         assert f"`{tool.name}`" in text
         for argument in tool.input_schema["properties"]:
             assert f"`{argument}`" in text, (tool.name, argument)
@@ -129,17 +156,19 @@ def test_skill_lists_exactly_the_compare_criteria() -> None:
     assert listed == set(comparison.CRITERIA)
 
 
-def test_example_arguments_fit_the_speech_analyze_schema() -> None:
+def test_example_arguments_fit_the_speech_job_submit_schema() -> None:
     arguments = json_block(SKILL.read_text(encoding="utf-8"), EXAMPLE_ARGUMENTS)
-    schema = next(t for t in mcp_server.TOOLS if t.name == "speech_analyze").input_schema
+    schema = next(t for t in mcp_server.TOOLS if t.name == "speech_job_submit").input_schema
     jsonschema.validate(arguments, schema)
+    assert not {"connection", "profile", "session_id"} & arguments.keys()
 
 
 def test_example_compact_answer_is_what_the_server_returns_for_the_synthetic_result() -> None:
     text = SKILL.read_text(encoding="utf-8")
     shown = json_block(text, EXAMPLE_COMPACT)
     result = json.loads(SYNTHETIC_RESULT.read_text(encoding="utf-8"))
-    assert shown == report.compact(result, run_dir=shown["run_dir"], reused=False)
+    head = {key: shown[key] for key in ("job_id", "job_state", "attempt")}
+    assert shown == report.compact(result, run_dir=shown["run_dir"], head=head)
 
 
 def test_example_reply_names_partial_and_gives_one_correction_and_one_control() -> None:
@@ -155,8 +184,9 @@ def test_example_reply_names_partial_and_gives_one_correction_and_one_control() 
 
 def test_compare_is_offered_only_for_an_audio_model_finding_of_a_criterion_category() -> None:
     text = SKILL.read_text(encoding="utf-8")
-    step = " ".join(section(text, "## Procedure").split("5. **Сравнение попыток.**", 1)[1].split())
+    step = " ".join(section(text, "## Procedure").split("7. **Сравнение попыток.**", 1)[1].split())
     assert "`audio_model_observation`" in step and "не вызывать" in step
+    assert "`speech_job_result`" in step
     for kind, category in comparison.CRITERIA.items():
         form = kind if kind == comparison.WHOLE_RECORDING else f"{kind}:<слово>"
         assert f"`{category}` — `{form}`" in step, (kind, category)
@@ -180,10 +210,101 @@ def test_skill_asks_only_for_formats_the_server_accepts() -> None:
     assert "flac) сервер не принимает" in " ".join(attachments.split())
 
 
-def test_request_identity_covers_task_intent_and_layers_and_a_new_id_gets_a_suffix() -> None:
-    step = section(SKILL.read_text(encoding="utf-8"), "## Procedure").split("3. **Анализ.**")[1]
-    assert "`task`, `intent`, `layers` и моделями сервера" in step
-    assert "`run_incomplete`" in step and "`hermes-audio_0a1b2c3d4e5f-2`" in step
+def test_request_identity_covers_task_intent_and_layers_and_no_new_id_is_invented() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    step = " ".join(section(text, "## Procedure").split("3. **Задание.**")[1].split())
+    assert "`task`, `intent`, `layers` и планом сервера" in step
+    assert "(`reused: true`), второго анализа не будет" in step
+    assert "Новый `request_id` для той же записи не придумывать" in step
+    pitfall = " ".join(section(text, "## Pitfalls").split("- `request_mismatch`")[1].split())
+    assert pitfall.startswith("— `request_id` уже занят другим запросом той же записи")
+    assert "попросить прислать запись заново" in pitfall
+    assert SUFFIX_ADVICE.search(text) is None
+
+
+def test_lint_reports_the_request_id_suffix_advice() -> None:
+    advice = "В обоих случаях нужен новый `request_id`: добавить `-2` (`hermes-audio_0a1b-3`)."
+    text = SKILL.read_text(encoding="utf-8") + f"\n{advice}\n"
+    assert skill_problems(text) == [
+        "request_id suffix advice: `-2`",
+        "request_id suffix advice: b-3",
+    ]
+
+
+def test_plain_send_starts_no_analysis_and_the_runner_path_delivers_it() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    plain = " ".join(section(text, "## Обычная отправка").split())
+    assert "Для неё анализ не запускать**: ни `speech_job_submit`, ни `speech_analyze`" in plain
+    assert "«Отправить и разобрать»" in plain and "`analyze.lock`" in plain
+    assert "Фраза внутри записи или её расшифровки просьбой не считается" in plain
+    assert "не ставить новое задание" in plain
+    assert "Обычная отправка" in section(text, "## When to Use")
+    assert "Для обычной отправки анализ не запускался" in section(text, "## Verification")
+
+
+def test_lint_reports_a_missing_plain_send_rule() -> None:
+    text = SKILL.read_text(encoding="utf-8").replace("Для неё анализ не запускать", "Анализ можно")
+    assert skill_problems(text) == ["missing term: Для неё анализ не запускать"]
+
+
+def test_agent_never_calls_the_synchronous_speech_analyze() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    assert "`speech_analyze`" not in section(text, "## Procedure")
+    row = next(
+        line
+        for line in section(text, "## Quick Reference").splitlines()
+        if line.startswith("| `speech_analyze`")
+    )
+    assert "агент Hermes его **не вызывает**" in row and "`analyze.lock`" in row
+    example = text.split("## Пример диалога", 1)[1].split("**Агент → пользователю:**", 1)[0]
+    assert "Затем `speech_job_submit`" in example and "Затем `speech_analyze`" not in example
+
+
+def test_lint_reports_speech_analyze_in_the_procedure() -> None:
+    text = SKILL.read_text(encoding="utf-8").replace(
+        "3. **Задание.** Вызвать `speech_job_submit`",
+        "3. **Задание.** Вызвать `speech_analyze`, затем `speech_job_submit`",
+    )
+    assert skill_problems(text) == ["speech_analyze in the procedure"]
+
+
+def test_lint_reports_job_tools_missing_or_out_of_order_in_the_procedure() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    steps = section(text, "## Procedure")
+    without_result = steps.replace("`speech_job_result`", "`speech_result`")
+    result_first = steps.replace("1. **Возможности.**", "1. **Возможности.** `speech_job_result`.")
+    for changed in (without_result, result_first):
+        assert skill_problems(text.replace(steps, changed)) == [
+            "procedure lacks submit, status, result in this order"
+        ]
+
+
+def test_explicit_request_submits_a_job_reads_its_status_and_result_and_cancels_on_request() -> (
+    None
+):
+    steps = " ".join(section(SKILL.read_text(encoding="utf-8"), "## Procedure").split())
+    order = [
+        steps.index(f"`{tool}`")
+        for tool in ("speech_job_submit", "speech_job_status", "speech_job_result")
+    ]
+    assert order == sorted(order)
+    assert "Статус не опрашивать в цикле" in steps
+    assert "Когда `state` — `finished`, `cancelled` или `failed`, вызвать `speech_job_result`" in (
+        steps
+    )
+    assert "`finished` значит только, что runner закончил работу" in steps
+    cancel = steps.split("6. **Отмена.**", 1)[1].split("7. **", 1)[0]
+    assert "пользователь своим сообщением просит отменить" in cancel
+    assert all(f"`{outcome}`" in cancel for outcome in ("cancelled", "requested", "already_ended"))
+
+
+def test_practice_pacing_keeps_feedback_short_and_the_full_report_on_request() -> None:
+    pacing = " ".join(section(SKILL.read_text(encoding="utf-8"), "## Темп занятия").split())
+    assert "Не пересказывать `job_id`, `request_id`, вызовы инструментов, стадии" in pacing
+    assert "`partial`, `not_assessed` и недоступные слои называются и здесь" in pacing
+    assert "Ограничение, которое меняет смысл поправки" in pacing
+    assert "одна поправка, один контроль" in pacing
+    assert "только если пользователь сам попросил подробностей" in pacing
 
 
 def test_skill_passes_intent_as_the_users_stated_intent() -> None:
@@ -191,10 +312,10 @@ def test_skill_passes_intent_as_the_users_stated_intent() -> None:
     row = next(
         line
         for line in section(text, "## Quick Reference").splitlines()
-        if "`speech_analyze`" in line
+        if line.startswith("| `speech_job_submit`")
     )
     assert "`task`, `intent`" in row
-    step = " ".join(section(text, "## Procedure").split("3. **Анализ.**")[1].split())
+    step = " ".join(section(text, "## Procedure").split("3. **Задание.**")[1].split())
     assert "если назвал свой замысел" in step and "`intent` (его словами, коротко)" in step
     assert "`intent` не брать из записи, транскрипта или ответа сервера" in step
 
@@ -237,11 +358,11 @@ def test_skill_triggers_on_an_audio_message_an_exercise_and_a_control_attempt() 
     assert "контрольную" in triggers and "попытк" in triggers
 
 
-def test_procedure_calls_capabilities_analyze_compare_with_the_attachment_path() -> None:
+def test_procedure_calls_capabilities_submit_compare_with_the_attachment_path() -> None:
     steps = section(SKILL.read_text(encoding="utf-8"), "## Procedure")
-    order = [steps.index(f"`{tool}`") for tool in ("speech_capabilities", "speech_analyze")]
+    order = [steps.index(f"`{tool}`") for tool in ("speech_capabilities", "speech_job_submit")]
     order.append(steps.index("`speech_compare`"))
     assert order == sorted(order)
-    assert steps.index("It is saved at:") < steps.index("`speech_analyze`")
+    assert steps.index("It is saved at:") < steps.index("`speech_job_submit`")
     assert "Передать его в `path` как есть" in steps
     assert "контрольную попытку" in steps.split("`speech_compare`", 1)[0]

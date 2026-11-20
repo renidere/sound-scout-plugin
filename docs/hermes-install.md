@@ -303,9 +303,15 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
      `decoder` под Hermes тоже `ready`, с той же версией `ffmpeg`/`ffprobe`, что в `doctor`.
      `decoder: unvalidated` под Hermes при `ready` в терминале значит, что сервер нашёл
      другой FFmpeg: проверить `env.PATH` записи (раздел «Регистрация в Hermes»);
-   - прислать короткую запись **аудиофайлом или документом** и попросить проанализировать её через
-     `speech_analyze` — ответ содержит `run_id`, `status` и `run_dir` (путь run-каталога
-     относительно data root), а в data root появился `<run_dir>/result.json`;
+   - перед разбором запустить runner заданий: `sound-scout jobs start` (или `jobs run`) с тем же
+     `SOUND_SCOUT_CONFIG` и тем же `PATH` к FFmpeg, что в записи `mcp_servers.speech-review`
+     (`docs/mcp.md`); без runner задание остаётся `queued`;
+   - прислать короткую запись **аудиофайлом или документом** и явно попросить проанализировать её —
+     модель ставит задание через `speech_job_submit` (ответ содержит `job_id`); в следующем ходе,
+     когда её об этом попросят и `speech_job_status` показывает `finished`, она читает
+     `speech_job_result`: ответ содержит `run_id`, `status` и `run_dir` (путь run-каталога
+     относительно data root), а в data root появился `<run_dir>/result.json`. Синхронный
+     `speech_analyze` агент Hermes не вызывает (скил `speech-review`);
    - для двух таких run — `speech_compare` с критерием, ответ содержит `path` к
      `compare/<compare_id>.json`.
 
@@ -329,8 +335,9 @@ R12). Интеграция считается подключённой, толь
 - [ ] `terminal.backend` — `local`;
 - [ ] discovery в новой сессии нужного runtime показывает ровно семь инструментов
       `mcp__speech_review__…`;
-- [ ] реальный вызов `speech_capabilities` и `speech_analyze` моделью Hermes из новой сессии вернул
-      ответ, и в data root есть соответствующий `<run_dir>/result.json`;
+- [ ] реальные вызовы `speech_capabilities`, `speech_job_submit` и `speech_job_result` моделью
+      Hermes из новой сессии вернули ответ, и в data root есть соответствующий
+      `<run_dir>/result.json`;
 - [ ] результат записан с датой, версией Hermes и `run_id`, без содержимого записи.
 
 Пока хотя бы один пункт не выполнен, интеграция не законченная: T09a может быть успешным, T09b —
