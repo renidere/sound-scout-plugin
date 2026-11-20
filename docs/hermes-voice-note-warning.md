@@ -1,6 +1,12 @@
-# Предупреждение о прежнем направлении `hermes-voice-note` (черновик)
+# Предупреждение о прежнем направлении `hermes-voice-note`
 
-**Статус: черновик. Публикация ждёт одобрения владельца ([#117](https://github.com/renidere/sound-scout-plugin/issues/117), третий критерий). В `renidere/hermes-voice-note` ничего не опубликовано.**
+**Статус: опубликовано 2026-11-21 по
+[разрешению владельца](https://github.com/renidere/sound-scout-plugin/issues/117#issuecomment-7051905266).**
+README — коммит
+[`2398d84`](https://github.com/renidere/hermes-voice-note/commit/2398d8482c0c84385ee2c51d95044a0b21c1ef2e);
+описания выпусков [v0.4.1](https://github.com/renidere/hermes-voice-note/releases/tag/v0.4.1) и
+[v0.4.2](https://github.com/renidere/hermes-voice-note/releases/tag/v0.4.2). Исходный текст стоит под
+блоком без изменений. Снять предупреждение — раздел «Откат».
 
 - **Задача:** [#117](https://github.com/renidere/sound-scout-plugin/issues/117); эпик
   [#92](https://github.com/renidere/sound-scout-plugin/issues/92).

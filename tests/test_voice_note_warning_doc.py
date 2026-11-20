@@ -35,12 +35,15 @@ def block(request) -> str:
     return vnw.block(draft(), request.param)
 
 
-def test_draft_exists_and_states_it_waits_for_the_owner() -> None:
-    head = draft().split("\n## ", 1)[0]
-    assert "черновик" in head.lower()
-    assert "одобрения владельца" in head
-    assert "#117" in head and "третий критерий" in head
-    assert "ничего не опубликовано" in head
+def test_header_records_the_publication_and_points_to_the_rollback() -> None:
+    head = " ".join(draft().split("\n## ", 1)[0].split())
+    assert "опубликовано 2026-11-21" in head
+    assert "issues/117#issuecomment-7051905266" in head
+    assert re.search(r"hermes-voice-note/commit/[0-9a-f]{40}\)", head)
+    for tag in ("v0.4.1", "v0.4.2"):
+        assert f"hermes-voice-note/releases/tag/{tag})" in head, tag
+    assert "раздел «Откат»" in head and "\n## Откат\n" in draft()
+    assert "черновик" not in head.lower() and "ничего не опубликовано" not in head
 
 
 def test_each_block_has_one_start_and_one_end_marker_around_it(block: str) -> None:
