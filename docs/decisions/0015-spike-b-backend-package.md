@@ -148,19 +148,32 @@ grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/agent
 
 ### 4. Критерий 3: `GET /health` через `ctx.rest` с Windows
 
-1. Палитра → `Sound Scout spike: health`. В текущей топологии `ctx.rest` идёт на `:9119`
-   (`hermes serve`), и ожидается уведомление `ok=true pid=<N> session_owner=false`; см. 0017.
-   `session_owner=true` ожидается только после смены топологии, которую выбирает владелец (0017).
+1. Палитра → `Sound Scout spike: health`. Ожидание зависит от адреса, на который `ctx.rest` ведёт
+   клиент ([0017, «Этап A (2026-11-20)»](0017-session-authority-owner.md#этап-a-2026-11-20)):
+   - `:9119` (`hermes serve`) — уведомление `ok=true pid=<N> session_owner=false`;
+   - `:9120` (gateway `hermes-gateway.service`) — уведомление `ok=true pid=<N> session_owner=true`.
+
+   С 2026-11-20 топология выбрана, этап A выполнен: gateway слушает `:9120`. Windows-клиент пока
+   подключён к `:9119`.
 2. На Linux: `systemctl --user show -p MainPID hermes-autonomous.service` — `MainPID` должен
-   совпасть с `pid`. `session_owner=false` значит, что этот процесс не владеет чатами Desktop
+   совпасть с `pid` для `:9119`; для `:9120` — `MainPID` у `hermes-gateway.service`.
+   `session_owner=false` значит, что этот процесс не владеет чатами Desktop
    (#94, пункт 5; владелец — `hermes-gateway.service`, см. 0017).
 3. Ошибку `ctx.rest` записать дословно.
 
 ### 5. Критерий 4: доставка заметки ровно один раз
 
-В текущей топологии доставка через `ctx.rest` идёт в `hermes serve` и возвращает `local chat <id>:
+Доставка через `ctx.rest` на `:9119` идёт в `hermes serve` и возвращает `local chat <id>:
 no gateway in this process owns its session` (`check last delivery` → `state=failed`); см. 0017.
-Шаги ниже описывают ожидание после смены топологии.
+После этапа A (2026-11-20) это верно: Windows-клиент пока подключён к `:9119`. Ошибка уходит, когда
+`ctx.rest` клиента доходит до gateway на `:9120` (0017, «Остаток: клиентская проверка»). Условие
+этапа B 0017 («Остаток: этап B») делает этот путь единственным: остановить и отключить
+`hermes-autonomous.service`, и Windows-клиент работает только через gateway; остальные предусловия
+этапа B — там же. Шаги 5.1–5.4 вызывают маршруты Spike B `/spike/*`, поэтому их выполняют до
+этапа B: на этапе B production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104)
+заменяет Spike B в gateway и убирает `/spike/*`. После этапа B доставку через #104 проверяет
+[#114](https://github.com/renidere/sound-scout-plugin/issues/114).
+Шаги ниже описывают ожидание, когда клиент работает через gateway.
 
 1. **Открытый чат X.** Открыть чат X, палитра → `Sound Scout spike: deliver note to this chat in 30 s`,
    не уходить из чата. Через ~30 с в X должна появиться ровно одна заметка с токеном из
