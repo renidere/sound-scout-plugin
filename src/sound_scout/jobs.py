@@ -8,8 +8,19 @@ resolved plan, the binding and the job state; `cancel.json` is the cancel marker
 job, which the runner turns into its `CancelToken`. `<data_root>/jobs/by-request/<sha256(
 request_id)>` names the job of a request, published by a hard link like `runs.open_run`: the
 same request returns the same job, the same `request_id` with another identity raises
-`runs.RequestMismatch`. The job identity is the SHA-256 of the input, the request (layers,
+`runs.RequestMismatch`. The job identity is the SHA-256 of the input, the request (mode, layers,
 task, intent), the plan and the binding; the run identity of `runs` stays as it is.
+
+The request's `mode` (`MODES`, default `auto`) is resolved at submit by `resolved_plan` into the
+layers and the plan stored in `job.json` with `capability_version` (`CAPABILITY_VERSION`, the
+version of the table mode -> layers -> stages and of the plan fields): `quick` is content and
+measurements, `full` all three layers, `targeted` the layers the caller named, `auto` is
+`targeted` when layers are named and `full` otherwise. The plan holds the stages, the operator's
+budgets and backend at submit, nothing else: no root, network, data root or model. The runner
+does not resolve the plan again: `applied_plan` checks the stored plan against the configuration
+of the moment and refuses (`plan_refused`) a plan with another key, another backend, another
+capability version or stages of no layer set; budgets are the smaller of the plan and the
+configuration, so a plan only narrows. `full` runs only the configured backend.
 
 `submit` checks synchronously only what is cheap and decides admission: the request fields, the
 path policy (`paths.resolve_input`, `paths.open_input`), the size against
@@ -31,7 +42,7 @@ milliseconds): a submit and its admission count, and a state change such as `que
 
 `run_runner` is the one runner: it holds `<data_root>/jobs/runner.lock` (`flock`, no waiting: a
 second runner is `runner_running`) for its whole life, not `analyze.lock`, which `app.analyze`
-takes itself. It takes the oldest `queued` job (by `submitted_at`), moves it to `running` with a
+takes itself. It takes the oldest `queued` job (by `queued_at`), moves it to `running` with a
 new attempt `{"number": n, "request_id": "<job_id>-a<n>", "lease": ...}` and calls `app.analyze`
 unchanged with that `request_id`, so a run left incomplete never blocks the next attempt. The
 lease names the runner process: `boot_id`, `pid`, its start time in clock ticks since boot
@@ -45,10 +56,13 @@ recorded another input SHA-256 than the one submitted (`source` of its result, `
 ends the job `failed` with `input_changed`: it analysed other audio than the job names, so its
 attempt is marked `input_changed` and `result` never answers with it (R02).
 
-`recover` is the only retry: a `running` job whose lease owner is gone (another boot, no such pid, a
-zombie, or a pid with another start time) gets its attempt marked `interrupted` and goes back to
+`recover` takes a `running` job whose lease owner is gone (another boot, no such pid, a zombie,
+or a pid with another start time): its attempt is marked `interrupted` and the job goes back to
 `queued`, where the runner takes it as attempt n+1; with a cancel marker it ends `cancelled`.
-Nothing retries on its own. `runner_unit_argv` is the `systemd-run --user` command that starts the
+`retry` puts a `failed` or `cancelled` job (an interrupted attempt that `recover` ended
+`cancelled` too) back to `queued` at the end of the queue, with the same `job_id` and
+`request_id`; the runner takes it as attempt n+1. Only a client calls `retry` or `recover`:
+nothing retries on its own. `runner_unit_argv` is the `systemd-run --user` command that starts the
 runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has
 `KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
 
@@ -72,7 +86,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from sound_scout import __version__, ingest, paths, proc, report, runs, schema
-from sound_scout.config import CONFIG_PATH_ENV, Config
+from sound_scout.config import CONFIG_PATH_ENV, Budgets, Config
 
 JOBS_DIR_NAME = "jobs"
 INDEX_DIR_NAME = "by-request"
@@ -116,6 +130,17 @@ JOB_NOT_FOUND = "job_not_found"
 NO_RESULT = "no_result"
 RUNNER_RUNNING = "runner_running"
 RUNNER_START_FAILED = "runner_start_failed"
+NOT_RETRYABLE = "not_retryable"
+PLAN_REFUSED = "plan_refused"
+
+MODES = ("quick", "targeted", "full", "auto")
+DEFAULT_MODE = "auto"
+CAPABILITY_VERSION = 1
+MODE_LAYERS = {"quick": ("content", "measurements"), "full": LAYERS}
+PLAN_KEYS = frozenset(
+    {"capability_version", "mode", "resolved_mode", "resolution", "stages", "budgets", "backend"}
+)
+RETRYABLE = (FAILED, CANCELLED)
 
 
 class JobError(Exception):
@@ -139,9 +164,10 @@ REFUSALS = (
 class SubmitRequest:
     path: str
     request_id: str | None = None
-    layers: tuple[str, ...] = LAYERS
+    layers: tuple[str, ...] | None = None
     task: str | None = None
     intent: str | None = None
+    mode: str = DEFAULT_MODE
 
 
 @dataclass(frozen=True)
@@ -159,7 +185,7 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
     """Queue one analysis and answer `{job_id, request_id, state, reused}`; see the docstring."""
     request_id = runs.new_run_id() if request.request_id is None else request.request_id
     _check_identifier("request_id", request_id)
-    layers = _checked_layers(request.layers)
+    layers, plan = resolved_plan(request.mode, request.layers, config)
     for name in ("task", "intent"):
         value = getattr(request, name)
         if value is not None and not isinstance(value, str):
@@ -169,8 +195,12 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
         if getattr(binding, name) is not None:
             _check_identifier(name, getattr(binding, name))
     resolved, size, sha256 = _hashed_input(request.path, config)
-    plan = resolved_plan(layers, config)
-    analysis = {"layers": sorted(layers), "task": request.task, "intent": request.intent}
+    analysis = {
+        "mode": request.mode,
+        "layers": sorted(layers),
+        "task": request.task,
+        "intent": request.intent,
+    }
     bound = dataclasses.asdict(binding)
     digest = _identity_hash(sha256, analysis, plan, bound)
     with _store(config.data_root) as (jobs_dir, index_dir):
@@ -188,6 +218,7 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
             "identity_hash": digest,
             "package_version": __version__,
             "submitted_at": now,
+            "queued_at": now,
             "updated_at": now,
             "request": {
                 "input": {"path": str(resolved), "size_bytes": size, "sha256": sha256},
@@ -212,18 +243,81 @@ def submit(request: SubmitRequest, binding: Binding, config: Config) -> dict:
         return _answer(job, reused=False)
 
 
-def resolved_plan(layers: tuple[str, ...], config: Config) -> dict:
-    """The fixed plan of today's `app.analyze`: its stages and the operator's budgets.
-
-    A plain dict, so modes can later narrow it; a plan never widens roots, network, limits or
-    the backend of the operator configuration.
-    """
-    wanted = {"prepare", *(LAYER_STAGES[layer] for layer in layers)}
-    return {
-        "stages": [stage for stage in WORKER_STAGES if stage in wanted],
+def resolved_plan(mode: object, layers: object, config: Config) -> tuple[tuple[str, ...], dict]:
+    """The layers and the plan of a request's mode; see the module docstring. `invalid_request`
+    for an unknown mode, layers with `quick` or `full`, or `targeted` without layers."""
+    if not isinstance(mode, str) or mode not in MODES:
+        raise JobError(INVALID_REQUEST, f"mode must be one of {list(MODES)}, got {mode!r}")
+    if mode in MODE_LAYERS and layers is not None:
+        raise JobError(INVALID_REQUEST, f"layers only with targeted or auto, not with {mode}")
+    if mode == "targeted" and layers is None:
+        raise JobError(INVALID_REQUEST, "mode targeted needs the layers to analyze")
+    resolved, resolution = mode, None
+    if mode == "auto":
+        resolved = "full" if layers is None else "targeted"
+        resolution = "auto: no layers named" if layers is None else "auto: layers named"
+    chosen = MODE_LAYERS[resolved] if resolved in MODE_LAYERS else _checked_layers(layers)
+    plan = {
+        "capability_version": CAPABILITY_VERSION,
+        "mode": mode,
+        "resolved_mode": resolved,
+        "resolution": resolution,
+        "stages": _stages(chosen),
         "budgets": dataclasses.asdict(config.budgets),
         "backend": config.backend,
     }
+    return tuple(layer for layer in LAYERS if layer in chosen), plan
+
+
+def applied_plan(plan: object, config: Config) -> tuple[tuple[str, ...], Config]:
+    """The layers of a stored plan and the configuration its attempt runs with: `config` with
+    each budget the smaller of the plan's and the configuration's. Roots, network, data root,
+    ASR and backend always come from `config`. `plan_refused` for a plan that would widen it or
+    that this version does not know; see the module docstring."""
+    if not isinstance(plan, dict):
+        raise JobError(PLAN_REFUSED, f"the plan is not an object: {type(plan).__name__}")
+    version = plan.get("capability_version")
+    if type(version) is not int or version != CAPABILITY_VERSION:
+        raise JobError(
+            PLAN_REFUSED,
+            f"plan of capability version {version!r}, this version runs {CAPABILITY_VERSION}; "
+            "submit the recording again",
+        )
+    extra, missing = sorted(set(plan) - PLAN_KEYS), sorted(PLAN_KEYS - set(plan))
+    if extra or missing:
+        raise JobError(PLAN_REFUSED, f"plan keys: unknown {extra}, missing {missing}")
+    if plan["mode"] not in MODES or plan["resolved_mode"] not in ("targeted", *MODE_LAYERS):
+        raise JobError(
+            PLAN_REFUSED, f"plan mode {plan['mode']!r} resolved as {plan['resolved_mode']!r}"
+        )
+    stages = plan["stages"]
+    layers = tuple(
+        layer for layer in LAYERS if isinstance(stages, list) and LAYER_STAGES[layer] in stages
+    )
+    expected = MODE_LAYERS.get(plan["resolved_mode"], layers)
+    if not layers or stages != _stages(layers) or layers != expected:
+        raise JobError(
+            PLAN_REFUSED,
+            f"plan stages {stages!r} are not the stages of its {plan['resolved_mode']} layers",
+        )
+    if plan["backend"] != config.backend:
+        raise JobError(
+            PLAN_REFUSED,
+            f"plan backend {plan['backend']!r} is not the configured backend {config.backend!r}",
+        )
+    budgets, fields = plan["budgets"], [field.name for field in dataclasses.fields(Budgets)]
+    if not isinstance(budgets, dict) or sorted(budgets) != sorted(fields):
+        raise JobError(PLAN_REFUSED, f"plan budgets must have exactly the fields {fields}")
+    for name, value in budgets.items():
+        if type(value) is not int or value < 1:
+            raise JobError(PLAN_REFUSED, f"plan budget {name} must be an integer >= 1")
+    narrowed = {name: min(budgets[name], getattr(config.budgets, name)) for name in fields}
+    return layers, dataclasses.replace(config, budgets=Budgets(**narrowed))
+
+
+def _stages(layers: tuple[str, ...]) -> list[str]:
+    wanted = {"prepare", *(LAYER_STAGES[layer] for layer in layers)}
+    return [stage for stage in WORKER_STAGES if stage in wanted]
 
 
 def status(job_id: str, config: Config) -> dict:
@@ -306,6 +400,47 @@ def cancel(job_id: str, config: Config) -> dict:
         else:
             outcome = "already_ended"
         return _view(job_dir, job, config) | {"cancel": outcome}
+
+
+def retry(job_id: str, config: Config) -> dict:
+    """Queue a `failed` or `cancelled` job again, at the end of the queue, through admission;
+    the runner takes it as its next attempt `<job_id>-a<n+1>`. The job keeps its `job_id`,
+    `request_id`, request, plan, binding and delivery; `retries` keeps how it ended before.
+
+    The answer is the job's status with `retry: queued` and `next_attempt`. `not_retryable` for
+    a job in another state, `queue_full` or `staging_full` like a submit."""
+    with _store(config.data_root) as (jobs_dir, _):
+        job_dir = _job_dir(job_id, config)
+        job = _load(job_dir)
+        if job["state"] not in RETRYABLE:
+            hint = (
+                "; if its runner is gone, run jobs recover first" if job["state"] == RUNNING else ""
+            )
+            raise JobError(
+                NOT_RETRYABLE,
+                f"job {job_id} is {job['state']}; only a failed or cancelled job is retried{hint}",
+            )
+        _admit(jobs_dir, job["request"]["input"]["size_bytes"], config)
+        (job_dir / CANCEL_MARKER_NAME).unlink(missing_ok=True)
+        number = len(job["attempts"]) + 1
+        next_attempt = f"{job_id}-a{number}"
+        now = _now()
+        job.setdefault("retries", []).append(
+            {
+                "requested_at": now,
+                "after_state": job["state"],
+                "after_reason": job["state_reason"],
+                "next_attempt": next_attempt,
+            }
+        )
+        job.update(
+            state=QUEUED,
+            state_reason=f"retry requested: attempt {number} ({next_attempt})",
+            queued_at=now,
+            updated_at=now,
+        )
+        _save(job_dir, job)
+        return _view(job_dir, job, config) | {"retry": QUEUED, "next_attempt": next_attempt}
 
 
 def run_runner(
@@ -426,7 +561,10 @@ def _claim_next(config: Config) -> tuple[dict, dict] | None:
         queued = [job for job in map(_load, _job_dirs(jobs_dir)) if job["state"] == QUEUED]
         if not queued:
             return None
-        job = min(queued, key=lambda item: (item["submitted_at"], item["job_id"]))
+        job = min(
+            queued,
+            key=lambda item: (item.get("queued_at") or item["submitted_at"], item["job_id"]),
+        )
         number = len(job["attempts"]) + 1
         attempt = {
             "number": number,
@@ -454,15 +592,16 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
     watcher.start()
     run_id, state, reason, changed = None, FINISHED, None, False
     try:
+        layers, effective = applied_plan(job["plan"], config)
         analysis = app.analyze(
             app.AnalyzeRequest(
                 request["input"]["path"],
                 request_id=attempt["request_id"],
-                layers=tuple(request["layers"]),
+                layers=layers,
                 task=request["task"],
                 intent=request["intent"],
             ),
-            config,
+            effective,
             cancel=token,
         )
         run_id = analysis.run.run_id
@@ -474,6 +613,8 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
             state, reason = CANCELLED, "cancelled while running; the run keeps what was done"
     except app.Busy:
         state = QUEUED
+    except JobError as error:
+        state, reason = FAILED, f"{error.code}: {error.message}"
     except ingest.IngestError as error:
         state, reason = FAILED, f"{error.code}: {_private(error.message, request, config)}"
     except tuple(kind for kind, _ in app.REFUSALS) as error:
@@ -738,7 +879,10 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "submitted_at": job["submitted_at"],
         "updated_at": job["updated_at"],
         "stages": job["plan"]["stages"],
+        "mode": job["plan"].get("mode"),
+        "resolved_mode": job["plan"].get("resolved_mode"),
         "attempts": len(job["attempts"]),
+        "retries": len(job.get("retries", [])),
         "run_id": run_ids[-1] if run_ids else None,
         "cancel_requested": (job_dir / CANCEL_MARKER_NAME).exists(),
         "current_stage": _current_stage(job, work_dir, finished),

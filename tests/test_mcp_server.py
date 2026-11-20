@@ -26,6 +26,7 @@ JOB_TOOL_NAMES = [
     "speech_job_status",
     "speech_job_result",
     "speech_job_cancel",
+    "speech_job_retry",
 ]
 TOOL_NAMES = ["speech_capabilities", "speech_analyze", "speech_compare", *JOB_TOOL_NAMES]
 CALL_SECONDS = 2.0
@@ -53,6 +54,7 @@ VALID_ARGUMENTS = {
     "speech_job_status": {"job_id": "a" * 32},
     "speech_job_result": {"job_id": "a" * 32},
     "speech_job_cancel": {"job_id": "a" * 32},
+    "speech_job_retry": {"job_id": "a" * 32},
 }
 
 
@@ -184,6 +186,8 @@ def test_annotations_follow_the_side_effects() -> None:
     assert hints["speech_job_status"].read_only_hint is True
     assert hints["speech_job_result"].read_only_hint is True
     assert hints["speech_job_cancel"].read_only_hint is False
+    assert hints["speech_job_retry"].read_only_hint is False
+    assert hints["speech_job_retry"].idempotent_hint is False
     assert all(hint.open_world_hint is False for hint in hints.values())
     destructive = [name for name, hint in hints.items() if hint.destructive_hint is not False]
     assert destructive == ["speech_job_cancel"]
@@ -763,12 +767,15 @@ def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
         "layers",
         "task",
         "intent",
+        "mode",
         "connection",
         "profile",
         "session_id",
     ]
     assert submit["required"] == ["path", "request_id"]
     assert submit["properties"]["layers"]["items"]["enum"] == list(jobs.LAYERS)
+    assert submit["properties"]["mode"]["enum"] == list(jobs.MODES)
+    assert "mode" not in schemas["speech_analyze"]["properties"]
     for name in JOB_TOOL_NAMES[1:]:
         assert schemas[name]["properties"].keys() == {"job_id"}
         assert schemas[name]["required"] == ["job_id"]
@@ -795,6 +802,9 @@ def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
         ("speech_job_status", {}, "'job_id' is a required property"),
         ("speech_job_result", {"job_id": 7}, "job_id: must be of type string"),
         ("speech_job_cancel", {"job_id": ""}, "job_id: "),
+        ("speech_job_submit", {"path": "a.wav", "request_id": "r-1", "mode": "fast"}, "mode: "),
+        ("speech_job_retry", {}, "'job_id' is a required property"),
+        ("speech_job_retry", {"job_id": "a" * 32, "mode": "full"}, "Additional"),
     ],
 )
 def test_malformed_job_arguments_are_refused_before_anything_runs(
@@ -806,6 +816,30 @@ def test_malformed_job_arguments_are_refused_before_anything_runs(
     assert answer["error"]["code"] == "invalid_arguments"
     assert where in answer["error"]["message"]
     assert list(loaded.data_root.iterdir()) == []
+
+
+def test_the_job_mode_reaches_the_plan_and_a_mode_with_layers_is_invalid_request(
+    loaded: config.Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/tone.wav")
+    submit = {"path": str(wav), "request_id": "r-1"}
+
+    answer, is_error = mcp_server.call("speech_job_submit", {**submit, "mode": "quick"}, loaded)
+    refused, refused_error = mcp_server.call(
+        "speech_job_submit",
+        {**submit, "request_id": "r-2", "mode": "full", "layers": ["sound"]},
+        loaded,
+    )
+    retried, retry_error = mcp_server.call("speech_job_retry", {"job_id": answer["job_id"]}, loaded)
+
+    assert is_error is False
+    plan = json.loads(
+        (loaded.data_root / "jobs" / answer["job_id"] / "job.json").read_text(encoding="utf-8")
+    )["plan"]
+    assert plan["mode"] == plan["resolved_mode"] == "quick"
+    assert plan["stages"] == ["prepare", "acoustics", "asr"]
+    assert refused_error is True and refused["error"]["code"] == "invalid_request"
+    assert retry_error is True and retried["error"]["code"] == "not_retryable"
 
 
 async def timed_call(client: Client, tool: str, arguments: dict) -> tuple[object, float]:
@@ -1005,10 +1039,10 @@ def test_job_tools_over_stdio_give_the_jobs_cli_answers_and_the_runner_s_result(
 
 
 def spy_on_job_functions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, object, object]]:
-    """Wrap `jobs.submit|status|result|cancel`: each call records (name, first argument, outcome)
-    and goes through to the real function."""
+    """Wrap `jobs.submit|status|result|cancel|retry`: each call records (name, first argument,
+    outcome) and goes through to the real function."""
     seen: list[tuple[str, object, object]] = []
-    for name in ("submit", "status", "result", "cancel"):
+    for name in ("submit", "status", "result", "cancel", "retry"):
         real = getattr(jobs, name)
 
         def spy(*args: object, _name: str = name, _real=real) -> dict:
@@ -1044,7 +1078,7 @@ def test_criterion_2_the_mcp_job_tools_and_the_jobs_cli_call_the_same_jobs_funct
     assert code == 0
     cli_job = json.loads(out)["job_id"]
     cli_answers = {"submit": json.loads(out)}
-    for action in ("status", "result", "cancel"):
+    for action in ("status", "result", "cancel", "retry"):
         code, out, err = by_cli(action, cli_job, "--json")
         cli_answers[action] = json.loads(out) if code == 0 else err
     cli_seen, seen[:] = list(seen), []
@@ -1057,7 +1091,7 @@ def test_criterion_2_the_mcp_job_tools_and_the_jobs_cli_call_the_same_jobs_funct
             )
             answers["submit"] = json.loads(text_of_result(submitted))
             job = {"job_id": answers["submit"]["job_id"]}
-            for action in ("status", "result", "cancel"):
+            for action in ("status", "result", "cancel", "retry"):
                 answered = await client.call_tool(f"speech_job_{action}", job)
                 answers[action] = json.loads(text_of_result(answered))
             answered = await client.call_tool("speech_job_status", {"job_id": cli_job})
@@ -1068,25 +1102,30 @@ def test_criterion_2_the_mcp_job_tools_and_the_jobs_cli_call_the_same_jobs_funct
     mcp_seen = list(seen)
     mcp_job = mcp_answers["submit"]["job_id"]
 
-    assert [name for name, _, _ in cli_seen] == ["submit", "status", "result", "cancel"]
-    assert [name for name, _, _ in mcp_seen] == ["submit", "status", "result", "cancel", "status"]
+    actions = ["submit", "status", "result", "cancel", "retry"]
+    assert [name for name, _, _ in cli_seen] == actions
+    assert [name for name, _, _ in mcp_seen] == [*actions, "status"]
     assert cli_seen[0][1] == jobs.SubmitRequest(str(wav), request_id="r-cli")
     assert mcp_seen[0][1] == jobs.SubmitRequest(str(wav), request_id="r-mcp")
-    assert [argument for _, argument, _ in cli_seen[1:]] == [cli_job] * 3
-    assert [argument for _, argument, _ in mcp_seen[1:4]] == [mcp_job] * 3
+    assert [argument for _, argument, _ in cli_seen[1:]] == [cli_job] * 4
+    assert [argument for _, argument, _ in mcp_seen[1:5]] == [mcp_job] * 4
     for action, _, outcome in cli_seen:
         if action == "result":
             assert outcome == "no_result" and "no_result" in cli_answers[action]
         else:
             assert cli_answers[action] == outcome, action
-    for action, _, outcome in mcp_seen[:4]:
+    for action, _, outcome in mcp_seen[:5]:
         if action == "result":
             assert outcome == "no_result" and mcp_answers[action]["error"]["code"] == "no_result"
         else:
             assert mcp_answers[action] == outcome, action
-    assert mcp_answers["status of the cli job"] == mcp_seen[4][2]
+    assert mcp_answers["status of the cli job"] == mcp_seen[5][2]
     assert mcp_answers["status of the cli job"] == jobs.status(cli_job, loaded)
-    assert mcp_answers["status of the cli job"]["state"] == "cancelled"
+    assert mcp_answers["status of the cli job"]["state"] == "queued"
+    assert mcp_answers["status of the cli job"]["retries"] == 1
+    assert cli_answers["retry"]["next_attempt"] == f"{cli_job}-a1"
+    assert mcp_answers["retry"]["next_attempt"] == f"{mcp_job}-a1"
+    assert cli_answers["retry"].keys() == mcp_answers["retry"].keys()
 
 
 def test_criterion_3_each_job_tool_answers_within_2_s_with_the_runner_absent_and_busy(
@@ -1133,6 +1172,10 @@ def test_criterion_3_each_job_tool_answers_within_2_s_with_the_runner_absent_and
             states["b status"] = await timed(client, "busy", "speech_job_status", {"job_id": job_b})
             states["b result"] = await timed(client, "busy", "speech_job_result", {"job_id": job_b})
             states["b cancel"] = await timed(client, "busy", "speech_job_cancel", {"job_id": job_b})
+            states["b retry"] = await timed(client, "busy", "speech_job_retry", {"job_id": job_b})
+            states["b cancel again"] = await timed(
+                client, "busy", "speech_job_cancel", {"job_id": job_b}
+            )
             states["a cancel"] = await timed(client, "busy", "speech_job_cancel", {"job_id": job_a})
             await anyio.to_thread.run_sync(runner.join, 30)
             states["a ended"] = await timed(client, "ended", "speech_job_status", {"job_id": job_a})
@@ -1152,6 +1195,9 @@ def test_criterion_3_each_job_tool_answers_within_2_s_with_the_runner_absent_and
     assert states["b status"]["state"] == "queued"
     assert states["b result"]["error"]["code"] == "no_result"
     assert states["b cancel"]["cancel"] == "cancelled"
+    assert states["b retry"]["state"] == "queued" and states["b retry"]["retry"] == "queued"
+    assert states["b retry"]["next_attempt"] == f"{states['b status']['job_id']}-a1"
+    assert states["b cancel again"]["cancel"] == "cancelled"
     assert states["a cancel"]["cancel"] == "requested"
     assert states["a ended"]["state"] == "cancelled"
 

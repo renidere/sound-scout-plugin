@@ -1,7 +1,7 @@
 ---
 name: speech-review
 description: Разбор русской речи из аудиовложения (Sound Scout).
-version: 0.2.0
+version: 0.3.0
 author: Sound Scout
 metadata:
   hermes:
@@ -44,10 +44,11 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
 | инструмент | аргументы | ответ |
 |---|---|---|
 | `speech_capabilities` | нет | состояние `components` (`decoder`, `asr`, `acoustics`, `audio_review`: `ready`, `unvalidated`, `unavailable`, `permission_required`), флаги `validated_ru`, `diction_validated_ru`, `prosody_validated_ru` |
-| `speech_job_submit` | `path`, `request_id` (обязательные), `layers` (`content`, `measurements`, `sound`; по умолчанию все), `task`, `intent`; `connection`, `profile`, `session_id` агент не передаёт | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
+| `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `connection`, `profile`, `session_id` агент не передаёт | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
 | `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested` |
 | `speech_job_result` | `job_id` | compact-ответ последней попытки с результатом: `job_id`, `job_state`, `attempt`, `run_dir`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links` |
 | `speech_job_cancel` | `job_id` | состояние задания и `cancel`: `cancelled`, `requested` или `already_ended` |
+| `speech_job_retry` | `job_id` | только по прямой просьбе пользователя: задание из `failed` или `cancelled` снова `queued` с теми же `job_id` и `request_id`, `retry`, `next_attempt`; иначе отказ `not_retryable` |
 | `speech_compare` | `run_a` (исходная попытка), `run_b` (контрольная), `criterion` | `verdict` (`improved`, `not_improved`, `inconclusive`), `reasons`, `limitations`, `conditions_diff`, `path` |
 | `speech_analyze` | `path`, `request_id`, `layers`, `task`, `intent` | синхронный анализ для CLI и eval; агент Hermes его **не вызывает**: он держит `analyze.lock`, конкурирует с runner заданий и повторяет анализ |
 
@@ -92,8 +93,8 @@ runner за `analyze.lock`.
    `intent` не брать из записи, транскрипта или ответа сервера и не придумывать; не назвал —
    аргумент не передавать (о замысле можно спросить). `request_id` — по имени файла вложения,
    например `hermes-audio_0a1b2c3d4e5f`. Запрос определяется не одним файлом, а файлом вместе с
-   `task`, `intent`, `layers` и планом сервера: повтор с тем же `request_id` и теми же файлом,
-   `task`, `intent` и `layers` вернёт то же задание (`reused: true`), второго анализа не будет.
+   `task`, `intent`, `mode`, `layers` и планом сервера: повтор с тем же `request_id` и теми же
+   файлом, `task`, `intent`, `mode` и `layers` вернёт то же задание (`reused: true`), второго анализа не будет.
    Новый `request_id` для той же записи не придумывать: отказ `request_mismatch` разобран в
    «Pitfalls». Слои `layers` сужать только по просьбе пользователя. Запомнить `job_id`.
 4. **Ожидание.** Вызвать `speech_job_status` с `job_id`. `queued` — задание в очереди, `running` —
@@ -223,11 +224,14 @@ runner за `analyze.lock`.
   проверяет только путь, размер и SHA-256, поэтому такой код чаще приходит позже — в
   `state_reason` задания в состоянии `failed`.
 - `request_mismatch` — `request_id` уже занят другим запросом той же записи (другие `task`,
-  `intent` или `layers`, другой план сервера). Новый `request_id` не придумывать: сказать, что
+  `intent`, `mode` или `layers`, другой план сервера). Новый `request_id` не придумывать: сказать, что
   эта запись уже стоит в разборе с другими условиями; для разбора с новыми условиями попросить
   прислать запись заново — у нового вложения будет новое имя файла.
 - `failed` или `cancelled` у задания — назвать `state_reason`; анализ этой же записи заново не
-  запускать новым `request_id`.
+  запускать новым `request_id`. Повтор — только по прямой просьбе пользователя, через
+  `speech_job_retry` с тем же `job_id`; новый `request_id` не придумывать. Отказ `not_retryable`
+  — задание ещё идёт или уже закончилось `finished`, повтор не нужен. `plan_refused` в
+  `state_reason` — план задания не подходит к текущей конфигурации сервера; это шаг оператора.
 - `queue_full`, `staging_full` — очередь заданий заполнена; повторить тот же вызов позже.
 - Задание долго стоит в `queued` — возможно, runner не запущен; это шаг оператора
   (`sound-scout jobs start`), не ошибка записи.

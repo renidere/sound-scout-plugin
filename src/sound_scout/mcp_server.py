@@ -4,8 +4,10 @@ The tools are the same functions the CLI calls: `speech_capabilities` is `doctor
 `speech_analyze` is `app.analyze` answered with `report.compact` (the document `analyze --json`
 prints), `speech_compare` is `app.compare` answered with the comparison and its file (the document
 `compare --json` prints). The job tools (decision 0013 § 3.1) are the queue of `sound-scout jobs`:
-`speech_job_submit` is `jobs.submit` with the submitter `mcp`; `speech_job_status`,
-`speech_job_result` and `speech_job_cancel` are `jobs.status`, `jobs.result` and `jobs.cancel`.
+`speech_job_submit` is `jobs.submit` with the submitter `mcp` and its plan `mode`;
+`speech_job_status`, `speech_job_result`, `speech_job_cancel` and `speech_job_retry` are
+`jobs.status`, `jobs.result`, `jobs.cancel` and `jobs.retry`. Only the job submit takes `mode`:
+`speech_analyze` keeps `layers`, as `sound-scout analyze` does.
 Each answers with the document `jobs <action> --json` prints, and none runs the analysis: the
 runner of `sound-scout jobs run|start` does. The descriptions and argument schemas in `TOOLS` are
 the ones `docs/mcp.md` lists. Every schema closes its object (`additionalProperties: false`) and
@@ -20,7 +22,8 @@ the caller reads the reason; the codes are those the CLI prints. An unexpected e
 `internal_error` with the type only: its message may carry a path or a transcript. The
 annotations say what a tool does: `speech_capabilities` reads, `speech_analyze` and
 `speech_compare` write run and comparison files under the data root, so neither is read-only;
-`speech_job_status` and `speech_job_result` read, `speech_job_submit` writes the job and
+`speech_job_status` and `speech_job_result` read, `speech_job_submit` writes the job,
+`speech_job_retry` queues it again (not idempotent: each call is one more attempt) and
 `speech_job_cancel` stops one, so it is the one destructive tool.
 
 One call of `speech_capabilities`, `speech_analyze` or `speech_compare` at a time: they are
@@ -69,7 +72,8 @@ SERVER_NAME = "sound-scout"
 INSTRUCTIONS = (
     "Sound analysis of Russian speech in a local recording. Call speech_capabilities to see what "
     "is ready, speech_job_submit to queue one recording and speech_job_status / "
-    "speech_job_result / speech_job_cancel to follow the job (speech_analyze analyzes it while "
+    "speech_job_result / speech_job_cancel / speech_job_retry to follow the job (speech_analyze "
+    "analyzes it while "
     "the call waits), speech_compare for two analyzed attempts. Read "
     "every status: partial, not_assessed and unavailable are not success, and a finding is only "
     "as strong as its evidence_basis."
@@ -245,6 +249,15 @@ TOOLS = (
         input_schema=_closed(
             {
                 **_recording("job"),
+                "layers": _recording("job")["layers"]
+                | {"description": "layers to analyze, with mode targeted or auto"},
+                "mode": {
+                    "enum": list(jobs.MODES),
+                    "description": "the plan mode (default auto): quick is content and "
+                    "measurements, targeted the layers named, full all three layers with the "
+                    "operator's audio backend, auto is targeted with layers and full without; "
+                    "layers go only with targeted or auto",
+                },
                 "connection": _identifier("the connection the job came through, stored as is"),
                 "profile": _identifier("the agent profile of the chat, stored as is"),
                 "session_id": _identifier("the stored session ID of the chat, stored as is"),
@@ -285,10 +298,28 @@ TOOLS = (
         input_schema=_job_id(),
         annotations=_hints(read_only=False, destructive=True, idempotent=True),
     ),
+    types.Tool(
+        name="speech_job_retry",
+        description=(
+            "Queue a failed or cancelled job again, only when the user asks for it: the same "
+            "job_id and request_id, its next attempt runs at the end of the queue. Answers with "
+            "the job's state (queued), retry and next_attempt. Another state is refused with "
+            "not_retryable, a full queue with queue_full or staging_full. Nothing retries on its "
+            "own."
+        ),
+        input_schema=_job_id(),
+        annotations=_hints(read_only=False, destructive=False, idempotent=False),
+    ),
 )
 _TOOLS = {tool.name: tool for tool in TOOLS}
 # They never wait for the analysis, so they never wait for the lock a synchronous one holds.
-JOB_TOOLS = ("speech_job_submit", "speech_job_status", "speech_job_result", "speech_job_cancel")
+JOB_TOOLS = (
+    "speech_job_submit",
+    "speech_job_status",
+    "speech_job_result",
+    "speech_job_cancel",
+    "speech_job_retry",
+)
 
 
 class Refused(Exception):
@@ -386,10 +417,13 @@ def _job(name: str, arguments: dict, loaded: Config) -> dict:
                 "speech_job_status": jobs.status,
                 "speech_job_result": jobs.result,
                 "speech_job_cancel": jobs.cancel,
+                "speech_job_retry": jobs.retry,
             }[name]
             return action(arguments["job_id"], loaded)
         fields = {
-            key: arguments[key] for key in ("request_id", "task", "intent") if key in arguments
+            key: arguments[key]
+            for key in ("request_id", "task", "intent", "mode")
+            if key in arguments
         }
         if "layers" in arguments:
             fields["layers"] = tuple(arguments["layers"])

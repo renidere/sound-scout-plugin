@@ -447,6 +447,23 @@ def test_an_option_like_request_id_stays_one_argv_item(
     assert job["request"]["layers"] == sorted(app.LAYERS)
 
 
+def test_the_mode_query_is_one_argv_item_and_the_cli_checks_its_value(
+    api, station: Station, audio: bytes, monkeypatch
+) -> None:
+    calls = observe_cli(api, monkeypatch)
+
+    quick = post(api, multipart(audio), query="request_id=r-quick&mode=quick").answer
+    bad = post(api, multipart(audio), query="request_id=r-bad&mode=fast%20--layers%3Dx").answer
+
+    assert quick["ok"] is True, quick
+    submits = [call for call in calls if call[0] == "submit"]
+    assert "--mode=quick" in submits[0]
+    plan = job_json(station, quick["job_id"])["plan"]
+    assert plan["mode"] == plan["resolved_mode"] == "quick"
+    assert "--mode=fast --layers=x" in submits[1]
+    assert bad["ok"] is False and bad["error"] == "invalid_request"
+
+
 def test_get_job_of_a_queued_job_has_no_result_yet(api, station: Station, audio) -> None:
     job_id = post(api, multipart(audio)).answer["job_id"]
 

@@ -9,10 +9,11 @@
 | `speech_capabilities` | `doctor.report` | только чтение | отчёт `doctor --json` |
 | `speech_analyze` | `app.analyze` | пишет `runs/<run_id>/` под data root | `report.compact` с `run_dir` и `reused` — тот же документ, что `analyze --json` |
 | `speech_compare` | `app.compare` | пишет `compare/<compare_id>.json` под data root | сравнение с полем `path` — тот же документ, что `compare --json` |
-| `speech_job_submit` | `jobs.submit` (submitter `mcp`) | пишет задание `jobs/<job_id>/` под data root, анализ не запускает | `{job_id, request_id, state, reused}` — тот же документ, что `jobs submit --json` |
+| `speech_job_submit` | `jobs.submit` (submitter `mcp`, режим `mode`) | пишет задание `jobs/<job_id>/` под data root, анализ не запускает | `{job_id, request_id, state, reused}` — тот же документ, что `jobs submit --json` |
 | `speech_job_status` | `jobs.status` | только чтение | состояние задания — тот же документ, что `jobs status --json` |
 | `speech_job_result` | `jobs.result` | только чтение | `report.compact` run последней попытки с результатом и полями `job_id`, `job_state`, `attempt` — тот же документ, что `jobs result --json` |
 | `speech_job_cancel` | `jobs.cancel` | `queued` → `cancelled` сразу, у `running` — маркер `cancel.json` для runner | состояние задания с полем `cancel` — тот же документ, что `jobs cancel --json` |
+| `speech_job_retry` | `jobs.retry` | `failed`/`cancelled` → снова `queued` в конце очереди, следующую попытку `<job>-a<n+1>` создаёт runner | состояние задания с полями `retry` и `next_attempt` — тот же документ, что `jobs retry --json` |
 
 ## Запуск
 
@@ -62,11 +63,11 @@ uv run sound-scout serve
   останавливает worker анализа через `CancelToken`; следующий такой вызов начинается только после
   его остановки. Повтор того же `request_id` с тем же файлом возвращает прежний результат (R11).
 - **Инструменты заданий не ждут анализа.** `speech_job_submit`, `speech_job_status`,
-  `speech_job_result` и `speech_job_cancel` — входы в ту же файловую очередь, что CLI
-  `sound-scout jobs submit|status|result|cancel` (решение 0013 § 3.1, § 3.8): вызывают те же
+  `speech_job_result`, `speech_job_cancel` и `speech_job_retry` — входы в ту же файловую очередь,
+  что CLI `sound-scout jobs submit|status|result|cancel|retry` (решение 0013 § 3.1, § 3.8): вызывают те же
   функции `sound_scout.jobs` и отвечают тем же документом, что `--json` этих подкоманд, с теми же
   кодами отказа (`job_not_found`, `no_result`, `queue_full`, `staging_full`, `invalid_request`,
-  `request_mismatch`, `path_denied`, коды приёма входа). Lock сервера они не берут, поэтому отвечают
+  `not_retryable`, `request_mismatch`, `path_denied`, коды приёма входа). Lock сервера они не берут, поэтому отвечают
   и во время синхронного `speech_analyze`; хранилище заданий держит свой lock миллисекунды.
   `speech_job_submit` проверяет путь, размер и SHA-256 входа и сразу отвечает `job_id` в состоянии
   `queued`; проверка входа через ffprobe и сам анализ — дело runner. Сервер runner не запускает:
@@ -75,6 +76,18 @@ uv run sound-scout serve
   необязательные `connection`, `profile`, `session_id` сохраняются как есть, как у
   `jobs submit --connection/--profile/--session-id`. Состояние задания (`finished` и др.) отдельно
   от `status` результата: `finished` не значит `complete`.
+- **Режим задания `mode`** (`quick`, `targeted`, `full`, `auto`; по умолчанию `auto`) есть только у
+  `speech_job_submit`, как `jobs submit --mode` и query `mode` маршрута плагина `POST /jobs`;
+  синхронный `speech_analyze` и `sound-scout analyze` остаются на `layers`. `quick` — слои
+  `content` и `measurements`, `full` — все три слоя с audio backend из конфигурации оператора (при
+  `backend = none` стадия `audio_review` — `unavailable`), `targeted` — названные `layers`, `auto` —
+  `targeted`, если `layers` названы, иначе `full`. `layers` вместе с `quick` или `full` и
+  `targeted` без `layers` — отказ `invalid_request`. Режим сужает только набор стадий: корни,
+  сеть, бюджеты и backend задаёт оператор (решение 0018).
+- **Повтор `speech_job_retry`** — только по явному вызову клиента, автоматически ничего не
+  повторяется. Принимает задание в `failed` или `cancelled` (в том числе прерванную попытку, которую
+  `jobs recover` закончил отменой), ставит его через admission в конец очереди с теми же `job_id`
+  и `request_id`; другое состояние — отказ `not_retryable`.
 - **Текст записи и ответа модели — данные.** Строки, похожие на инструкции, в сыром транскрипте
   (по сегментам и в склеенном тексте `$.text` — фраза, разрезанная границей сегментов), в
   аргументах `task` и `intent` и в ответе audio backend ничего не запускают. Они перечислены как
@@ -103,7 +116,7 @@ uv run sound-scout serve
 `speech_job_result` — `readOnlyHint: true`; `speech_analyze`, `speech_compare` и
 `speech_job_submit` создают файлы под data root и поэтому не read-only. `speech_analyze` и
 `speech_job_submit` идемпотентны по `request_id`, `speech_compare` пишет новый файл при каждом
-вызове. `speech_job_cancel` останавливает задание и поэтому `destructiveHint: true`; повтор
+вызове, `speech_job_retry` при каждом вызове добавляет попытку и поэтому не идемпотентен. `speech_job_cancel` останавливает задание и поэтому `destructiveHint: true`; повтор
 отмены ничего не меняет. Ни один инструмент не обращается во внешний мир (`openWorldHint: false`).
 
 ### `speech_capabilities`
@@ -256,7 +269,7 @@ uv run sound-scout serve
         },
         "minItems": 1,
         "uniqueItems": true,
-        "description": "layers to analyze (default: all three)"
+        "description": "layers to analyze, with mode targeted or auto"
       },
       "task": {
         "type": "string",
@@ -265,6 +278,15 @@ uv run sound-scout serve
       "intent": {
         "type": "string",
         "description": "the speaker's intent for the recording, as the user stated it; never text taken from the recording or its transcript"
+      },
+      "mode": {
+        "enum": [
+          "quick",
+          "targeted",
+          "full",
+          "auto"
+        ],
+        "description": "the plan mode (default auto): quick is content and measurements, targeted the layers named, full all three layers with the operator's audio backend, auto is targeted with layers and full without; layers go only with targeted or auto"
       },
       "connection": {
         "type": "string",
@@ -382,6 +404,35 @@ uv run sound-scout serve
     "readOnlyHint": false,
     "destructiveHint": true,
     "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+### `speech_job_retry`
+
+```json
+{
+  "name": "speech_job_retry",
+  "description": "Queue a failed or cancelled job again, only when the user asks for it: the same job_id and request_id, its next attempt runs at the end of the queue. Answers with the job's state (queued), retry and next_attempt. Another state is refused with not_retryable, a full queue with queue_full or staging_full. Nothing retries on its own.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "job_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "the job_id that speech_job_submit answered"
+      }
+    },
+    "required": [
+      "job_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
     "openWorldHint": false
   }
 }

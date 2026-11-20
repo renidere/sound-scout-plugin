@@ -14,10 +14,13 @@ their absolute paths (ffprobe and ffmpeg quote them). Stdout carries only the an
 root. The exit code follows the result: 0 `complete`, 3 `partial`, 4 `blocked`, 1 `failed`.
 `compare` calls `app.compare` and prints the verdict, its reasons and the file
 `compare/<id>.json` (`--json`: the comparison with `path`), exit 0 whatever the verdict.
-`jobs submit|status|result|cancel|recover` calls `sound_scout.jobs` and prints its answer as
+`jobs submit|status|result|cancel|retry|recover` calls `sound_scout.jobs` and prints its answer as
 `key: value` lines (`--json`: the answer; `recover`: one line per recovered job); `result` puts
 `job_id`, `job_state` and `attempt` before the summary of the compact answer, as `analyze` prints
-it; `status` names `current_stage` and lists `finished_stages`. `jobs limits` prints
+it; `status` names `current_stage` and lists `finished_stages`. `jobs submit --mode` is the
+plan mode of `jobs.MODES` (default `auto`), checked by `jobs.resolved_plan`, so an unknown one is
+`invalid_request`; `--layers` goes with `targeted` or `auto`. `jobs retry` queues a failed or
+cancelled job again as its next attempt (`jobs.retry`). `jobs limits` prints
 `jobs.limits`: the budgets, the queue limits and `jobs.staging_root`, which the Hermes plugin
 reads instead of the configuration file.
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
@@ -69,9 +72,9 @@ SUBCOMMANDS = {
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
-    "jobs": "queue an analysis and follow it: submit, status, result, cancel; run the queue: "
-    "run, start, recover; print the budgets and the staging root: limits; deliver the final "
-    "note: deliver-next, deliver-end",
+    "jobs": "queue an analysis and follow it: submit, status, result, cancel, retry; run the "
+    "queue: run, start, recover; print the budgets and the staging root: limits; deliver the "
+    "final note: deliver-next, deliver-end",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -188,6 +191,12 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         "submit", help=submit_help, description=submit_help, parents=[common, as_json]
     )
     _add_analyze_arguments(submit, with_json=False)
+    submit.add_argument(
+        "--mode",
+        default="auto",
+        help="the plan mode: quick (content and measurements), targeted (the --layers), full "
+        "(all three layers) or auto (targeted with --layers, otherwise full); default: auto",
+    )
     submit.add_argument("--connection", help="the connection the job came through, stored as is")
     submit.add_argument("--profile", help="the agent profile of the chat, stored as is")
     submit.add_argument("--session-id", help="the stored session ID of the chat, stored as is")
@@ -198,6 +207,7 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         ("status", "print the state of a job"),
         ("result", "print the compact answer of the run of a job"),
         ("cancel", "cancel a job: a queued job at once, a running one by its cancel marker"),
+        ("retry", "queue a failed or cancelled job again as its next attempt"),
     ):
         command = actions.add_parser(
             action, help=help_text, description=help_text, parents=[common, as_json]
@@ -409,7 +419,12 @@ def run_jobs(args: argparse.Namespace) -> int:
         elif args.jobs_command == "limits":
             answer = jobs.limits(loaded)
         elif args.jobs_command == "submit":
-            fields = {"request_id": args.request_id, "task": args.task, "intent": args.intent}
+            fields = {
+                "request_id": args.request_id,
+                "task": args.task,
+                "intent": args.intent,
+                "mode": args.mode,
+            }
             if args.layers is not None:
                 fields["layers"] = args.layers
             binding = jobs.Binding(
@@ -424,7 +439,12 @@ def run_jobs(args: argparse.Namespace) -> int:
         elif args.jobs_command == "deliver-end":
             answer = delivery.end_delivery(args.job_id, args.outcome, args.error, loaded)
         else:
-            call = {"status": jobs.status, "result": jobs.result, "cancel": jobs.cancel}
+            call = {
+                "status": jobs.status,
+                "result": jobs.result,
+                "cancel": jobs.cancel,
+                "retry": jobs.retry,
+            }
             answer = call[args.jobs_command](args.job_id, loaded)
     except jobs.JobError as error:
         raise CliError(error.code, error.message) from error

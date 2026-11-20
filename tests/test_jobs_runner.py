@@ -1,10 +1,12 @@
-"""The jobs runner (#98): FIFO, `runner.lock`, requeue on `Busy`, cancel marker, lease, recover.
+"""The jobs runner (#98): FIFO, `runner.lock`, requeue on `Busy`, cancel marker, lease, recover;
+the plan the runner applies and the explicit retry (#107).
 
 The analysis substitutes below stand in for `app.analyze` where the test is about the queue, the
 locks and the cancel contract, not about what the tool hears; the tests marked `needs_ffmpeg`
 run the real `app.analyze` on synthesized audio.
 """
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -18,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import app, config, ingest, jobs, runs
+from sound_scout import app, config, ingest, jobs, report, runs
 from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
 from tests.conftest import WavFactory
@@ -778,3 +780,272 @@ def test_jobs_start_runs_systemd_run_and_reports_its_refusal(tmp_path: Path, fai
     else:
         assert started.returncode == 0, started.stderr
         assert json.loads(started.stdout) == {"unit": "sound-scout-jobs-runner", "started": True}
+
+
+# --- plan modes and retry (#107) -------------------------------------------------------------
+
+
+def recorder(seen: list[tuple[app.AnalyzeRequest, Config, object]]) -> Callable[..., app.Analysis]:
+    """`substitute`, keeping the request, the configuration and the backend it was called with."""
+    analyze = substitute([])
+
+    def record(request: app.AnalyzeRequest, config: Config, **options: object) -> app.Analysis:
+        seen.append((request, config, options.get("backend")))
+        return analyze(request, config, **options)
+
+    return record
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"allowed_roots": ["/"]},
+        {"network": {"allow": True}},
+        {"backend": "llama"},
+        {"capability_version": 2},
+        {"stages": ["prepare", "asr", "audio_review", "acoustics"]},
+        {"budgets": {"worker_deadline_seconds": 10_000}},
+    ],
+    ids=["roots", "network", "backend", "version", "stages", "budget-fields"],
+)
+def test_a_widened_plan_in_job_json_fails_the_job_plan_refused_before_analyze(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, change: dict
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    set_job(cfg, job_id, plan=job_file(cfg, job_id)["plan"] | change)
+    seen: list = []
+    monkeypatch.setattr(app, "analyze", recorder(seen))
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert seen == []
+    job = job_file(cfg, job_id)
+    assert job["state"] == "failed" and job["state_reason"].startswith("plan_refused: ")
+    assert [attempt["outcome"] for attempt in job["attempts"]] == ["failed"]
+
+
+def test_the_runner_applies_the_plan_with_budgets_narrowed_by_the_configuration_of_the_moment(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    full = queue(cfg, wav, request_id="r-full")
+    quick = queue(cfg, wav, request_id="r-quick", mode="quick")
+    budgets = job_file(cfg, full)["plan"]["budgets"] | {"max_duration_seconds": 10_000}
+    set_job(cfg, full, plan=job_file(cfg, full)["plan"] | {"budgets": budgets})
+    narrowed = dataclasses.replace(
+        cfg, budgets=dataclasses.replace(cfg.budgets, worker_deadline_seconds=30)
+    )
+    seen: list = []
+    monkeypatch.setattr(app, "analyze", recorder(seen))
+
+    jobs.run_runner(narrowed, exit_when_idle=True, poll_seconds=POLL)
+
+    [(full_request, full_config, full_backend), (quick_request, _, quick_backend)] = seen
+    assert full_request.layers == app.LAYERS
+    assert quick_request.layers == ("content", "measurements")
+    assert full_config.budgets.worker_deadline_seconds == 30
+    assert full_config.budgets.max_duration_seconds == cfg.budgets.max_duration_seconds
+    assert full_config.allowed_roots == cfg.allowed_roots and full_config.backend == "none"
+    assert full_backend is None and quick_backend is None
+    assert {job_file(cfg, job_id)["state"] for job_id in (full, quick)} == {"finished"}
+
+
+def test_an_input_outside_the_roots_narrowed_after_submit_fails_the_job_path_denied(
+    cfg: Config, make_wav: WavFactory, tmp_path: Path
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    (tmp_path / "other").mkdir()
+    narrowed = dataclasses.replace(cfg, allowed_roots=(tmp_path / "other",))
+
+    jobs.run_runner(narrowed, exit_when_idle=True, poll_seconds=POLL)
+
+    job = job_file(cfg, job_id)
+    assert job["state"] == "failed" and job["state_reason"].startswith("path_denied: ")
+
+
+@needs_ffmpeg
+def test_full_with_backend_none_marks_audio_review_unavailable_and_quick_skips_it(
+    cfg: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav", seconds=1.5)
+    full = queue(cfg, wav, request_id="r-full", mode="full")
+    quick = queue(cfg, wav, request_id="r-quick", mode="quick")
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    def audio_review(job_id: str) -> dict:
+        run_id = job_file(cfg, job_id)["attempts"][-1]["run_id"]
+        path = cfg.data_root / runs.RUNS_DIR_NAME / run_id / report.RESULT_FILE_NAME
+        return json.loads(path.read_text(encoding="utf-8"))["stages"]["audio_review"]
+
+    assert audio_review(full)["status"] == "unavailable"
+    assert audio_review(full)["reason"] == app.NO_BACKEND_REASON
+    assert audio_review(quick)["status"] == "skipped"
+    assert audio_review(quick)["reason"] == app.NOT_REQUESTED_REASON
+
+
+def test_retry_of_a_failed_job_queues_its_next_attempt_with_the_same_ids(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"), request_id="r-1")
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls, fail_first=True))
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    delivery = {"state": "delivered", "tag": f"sound-scout-job:{job_id}"}
+    set_job(cfg, job_id, delivery=delivery)
+    before = job_file(cfg, job_id)
+
+    answer = jobs.retry(job_id, cfg)
+
+    assert answer["state"] == "queued" and answer["retry"] == "queued"
+    assert answer["next_attempt"] == f"{job_id}-a2" and answer["retries"] == 1
+    assert answer["job_id"] == job_id and answer["request_id"] == "r-1"
+    job = job_file(cfg, job_id)
+    assert job["retries"] == [
+        {
+            "requested_at": job["queued_at"],
+            "after_state": "failed",
+            "after_reason": "internal_error: RuntimeError",
+            "next_attempt": f"{job_id}-a2",
+        }
+    ]
+    assert job["state_reason"] == f"retry requested: attempt 2 ({job_id}-a2)"
+    for kept in ("request_id", "request", "plan", "binding", "delivery", "submitted_at"):
+        assert job[kept] == before[kept], kept
+    assert job["queued_at"] > job["submitted_at"]
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{job_id}-a1", f"{job_id}-a2"]
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished" and job["delivery"] == delivery
+    assert [(a["number"], a["request_id"], a["outcome"]) for a in job["attempts"]] == [
+        (1, f"{job_id}-a1", "failed"),
+        (2, f"{job_id}-a2", "finished"),
+    ]
+    assert jobs.status(job_id, cfg)["attempts"] == 2
+
+
+def test_retry_of_a_job_cancelled_before_it_started_is_its_first_attempt(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    jobs.cancel(job_id, cfg)
+
+    assert jobs.retry(job_id, cfg)["next_attempt"] == f"{job_id}-a1"
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{job_id}-a1"]
+    assert job_file(cfg, job_id)["state"] == "finished"
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["cancelled", "interrupted"])
+def test_retry_of_a_cancelled_job_drops_its_cancel_marker_so_the_new_attempt_runs(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, interrupted: bool
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    lease = jobs._lease(1) | ({"boot_id": "another-boot"} if interrupted else {})
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": None, "lease": lease}
+    set_job(cfg, job_id, state="running", attempts=[attempt])
+    jobs.cancel(job_id, cfg)
+    if interrupted:
+        [recovered] = jobs.recover(cfg)
+        assert recovered["state"] == "cancelled"
+        assert job_file(cfg, job_id)["attempts"][0]["outcome"] == "interrupted"
+    else:
+        set_job(cfg, job_id, state="cancelled", attempts=[attempt | {"outcome": "cancelled"}])
+    assert jobs.status(job_id, cfg)["cancel_requested"] is True
+
+    answer = jobs.retry(job_id, cfg)
+
+    assert answer["next_attempt"] == f"{job_id}-a2" and answer["cancel_requested"] is False
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    assert calls == [f"{job_id}-a2"]
+    job = job_file(cfg, job_id)
+    assert job["state"] == "finished"
+    assert [a["outcome"] for a in job["attempts"]] == [
+        "interrupted" if interrupted else "cancelled",
+        "finished",
+    ]
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "finished"])
+def test_retry_of_a_job_that_is_queued_running_or_finished_is_not_retryable(
+    cfg: Config, make_wav: WavFactory, state: str
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    set_job(cfg, job_id, state=state)
+    path = cfg.data_root / "jobs" / job_id / "job.json"
+    before = path.read_bytes()
+
+    with pytest.raises(JobError) as refused:
+        jobs.retry(job_id, cfg)
+
+    assert refused.value.code == "not_retryable" and f"is {state}" in refused.value.message
+    assert ("jobs recover" in refused.value.message) is (state == "running")
+    assert path.read_bytes() == before
+
+
+def test_retry_of_an_unknown_job_is_job_not_found(cfg: Config) -> None:
+    with pytest.raises(JobError) as refused:
+        jobs.retry("f" * 32, cfg)
+
+    assert refused.value.code == "job_not_found"
+
+
+@pytest.mark.parametrize("limit", ["queue", "staging"])
+def test_retry_goes_through_admission_like_a_submit(
+    cfg: Config, make_wav: WavFactory, limit: str
+) -> None:
+    first, second = make_wav("recordings/a.wav"), make_wav("recordings/b.wav", frequency=330.0)
+    failed = queue(cfg, first, request_id="r-1")
+    queue(cfg, second, request_id="r-2")
+    set_job(cfg, failed, state="failed", state_reason="internal_error: RuntimeError")
+    path = cfg.data_root / "jobs" / failed / "job.json"
+    before = path.read_bytes()
+    size = first.stat().st_size + second.stat().st_size
+    tight = {"max_queued_jobs": 1} if limit == "queue" else {"max_staging_bytes": size - 1}
+
+    with pytest.raises(JobError) as refused:
+        jobs.retry(failed, dataclasses.replace(cfg, jobs=config.Jobs(**tight)))
+
+    assert refused.value.code == f"{limit}_full"
+    assert path.read_bytes() == before
+    assert jobs.retry(failed, cfg)["state"] == "queued"
+
+
+def test_a_retried_job_waits_behind_a_job_submitted_after_it(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    first = queue(cfg, wav, request_id="r-1")
+    later = queue(cfg, wav, request_id="r-2")
+    set_job(cfg, first, state="failed", state_reason="internal_error: RuntimeError")
+    jobs.retry(first, cfg)
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{later}-a1", f"{first}-a1"]
+
+
+@pytest.mark.parametrize("state", ["failed", "cancelled"])
+def test_the_runner_never_retries_an_ended_job_on_its_own(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    set_job(cfg, job_id, state=state)
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    assert jobs.recover(cfg) == []
+
+    assert calls == []
+    job = job_file(cfg, job_id)
+    assert job["state"] == state and job["attempts"] == [] and "retries" not in job

@@ -47,6 +47,7 @@ JOB_OPTIONS = {
     "profile": "--profile",
     "connection": "--connection",
     "layers": "--layers",
+    "mode": "--mode",
 }
 QUERY_KEYS = ("request_id", *JOB_OPTIONS)
 UNFINISHED = ("queued", "running")

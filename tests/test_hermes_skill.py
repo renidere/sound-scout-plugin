@@ -210,14 +210,16 @@ def test_skill_asks_only_for_formats_the_server_accepts() -> None:
     assert "flac) сервер не принимает" in " ".join(attachments.split())
 
 
-def test_request_identity_covers_task_intent_and_layers_and_no_new_id_is_invented() -> None:
+def test_request_identity_covers_task_intent_mode_and_layers_and_no_new_id_is_invented() -> None:
     text = SKILL.read_text(encoding="utf-8")
     step = " ".join(section(text, "## Procedure").split("3. **Задание.**")[1].split())
-    assert "`task`, `intent`, `layers` и планом сервера" in step
+    assert "`task`, `intent`, `mode`, `layers` и планом сервера" in step
+    assert "файлом, `task`, `intent`, `mode` и `layers` вернёт то же задание" in step
     assert "(`reused: true`), второго анализа не будет" in step
     assert "Новый `request_id` для той же записи не придумывать" in step
     pitfall = " ".join(section(text, "## Pitfalls").split("- `request_mismatch`")[1].split())
     assert pitfall.startswith("— `request_id` уже занят другим запросом той же записи")
+    assert "(другие `task`, `intent`, `mode` или `layers`, другой план сервера)" in pitfall
     assert "попросить прислать запись заново" in pitfall
     assert SUFFIX_ADVICE.search(text) is None
 

@@ -35,4 +35,5 @@ mcp_servers:
         - speech_job_status
         - speech_job_result
         - speech_job_cancel
+        - speech_job_retry
     enabled: true

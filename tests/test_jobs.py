@@ -73,15 +73,21 @@ def test_submit_writes_job_json_and_answers_within_a_second(
             "size_bytes": wav.stat().st_size,
             "sha256": ingest.input_sha256(wav, setup),
         },
+        "mode": "auto",
         "layers": sorted(app.LAYERS),
         "task": "фраза",
         "intent": None,
     }
     assert job["plan"] == {
+        "capability_version": 1,
+        "mode": "auto",
+        "resolved_mode": "full",
+        "resolution": "auto: no layers named",
         "stages": list(app.WORKER_STAGES),
         "budgets": dataclasses.asdict(Budgets()),
         "backend": "none",
     }
+    assert job["queued_at"] == job["submitted_at"]
     assert job["binding"] == {
         "submitter": "desktop",
         "connection": "local",
@@ -111,12 +117,203 @@ def test_submit_does_not_check_the_input_the_runner_does(
 
 
 def test_the_plan_names_only_the_stages_of_the_requested_layers(setup: Config) -> None:
-    assert jobs.resolved_plan(("content",), setup)["stages"] == ["prepare", "asr"]
-    assert jobs.resolved_plan(("sound", "measurements"), setup)["stages"] == [
-        "prepare",
-        "acoustics",
-        "audio_review",
-    ]
+    assert jobs.resolved_plan("targeted", ("content",), setup)[1]["stages"] == ["prepare", "asr"]
+    layers, plan = jobs.resolved_plan("auto", ("sound", "measurements"), setup)
+    assert layers == ("measurements", "sound")
+    assert plan["stages"] == ["prepare", "acoustics", "audio_review"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "named", "layers", "resolved", "resolution", "stages"),
+    [
+        (
+            "quick",
+            None,
+            ("content", "measurements"),
+            "quick",
+            None,
+            ["prepare", "acoustics", "asr"],
+        ),
+        ("full", None, app.LAYERS, "full", None, list(app.WORKER_STAGES)),
+        ("targeted", ("sound",), ("sound",), "targeted", None, ["prepare", "audio_review"]),
+        (
+            "auto",
+            ("content",),
+            ("content",),
+            "targeted",
+            "auto: layers named",
+            ["prepare", "asr"],
+        ),
+        ("auto", None, app.LAYERS, "full", "auto: no layers named", list(app.WORKER_STAGES)),
+    ],
+    ids=["quick", "full", "targeted", "auto-layers", "auto-none"],
+)
+def test_the_resolver_turns_each_mode_into_layers_and_a_versioned_plan(
+    setup: Config,
+    mode: str,
+    named: tuple | None,
+    layers: tuple,
+    resolved: str,
+    resolution: str | None,
+    stages: list,
+) -> None:
+    got, plan = jobs.resolved_plan(mode, named, setup)
+
+    assert got == layers
+    assert set(plan) == jobs.PLAN_KEYS
+    assert plan == {
+        "capability_version": jobs.CAPABILITY_VERSION,
+        "mode": mode,
+        "resolved_mode": resolved,
+        "resolution": resolution,
+        "stages": stages,
+        "budgets": dataclasses.asdict(setup.budgets),
+        "backend": setup.backend,
+    }
+    assert jobs.CAPABILITY_VERSION == 1
+    assert jobs.applied_plan(plan, setup) == (layers, setup)
+
+
+@pytest.mark.parametrize(
+    ("mode", "layers", "message"),
+    [
+        ("fast", None, "mode must be one of"),
+        (None, None, "mode must be one of"),
+        ("quick", ("content",), "layers only with targeted or auto"),
+        ("full", ("sound",), "layers only with targeted or auto"),
+        ("targeted", None, "mode targeted needs the layers"),
+        ("targeted", (), "layers must be a non-empty list"),
+        ("auto", ("voice",), "layers must be distinct items"),
+    ],
+)
+def test_a_bad_mode_request_is_invalid_request_and_writes_nothing(
+    setup: Config, make_wav: WavFactory, mode: object, layers: object, message: str
+) -> None:
+    wav = make_wav("recordings/voice.wav")
+
+    with pytest.raises(JobError) as refused:
+        jobs.submit(SubmitRequest(str(wav), mode=mode, layers=layers), Binding(), setup)
+
+    assert refused.value.code == "invalid_request" and message in refused.value.message
+    assert list(setup.data_root.iterdir()) == []
+
+
+def stored_plan(cfg: Config, **change: object) -> dict:
+    return jobs.resolved_plan("full", None, cfg)[1] | change
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"allowed_roots": ["/"]}, "unknown ['allowed_roots']"),
+        ({"roots": ["/"]}, "unknown ['roots']"),
+        ({"network": {"allow": True}}, "unknown ['network']"),
+        ({"data_root": "/tmp"}, "unknown ['data_root']"),
+        ({"model": "owner/name"}, "unknown ['model']"),
+        ({"backend": "llama"}, "plan backend 'llama' is not the configured backend 'none'"),
+        ({"capability_version": 0}, "plan of capability version 0"),
+        ({"capability_version": 2}, "plan of capability version 2"),
+        ({"capability_version": True}, "plan of capability version True"),
+        ({"stages": ["prepare", "asr", "acoustics"]}, "are not the stages"),
+        ({"stages": ["asr"]}, "are not the stages"),
+        ({"stages": ["prepare"]}, "are not the stages"),
+        ({"stages": ["prepare", "asr", "llm"]}, "are not the stages"),
+        ({"stages": "prepare,asr"}, "are not the stages"),
+        ({"stages": ["prepare", "asr"]}, "are not the stages of its full layers"),
+        ({"mode": "everything"}, "plan mode 'everything'"),
+        ({"resolved_mode": "auto"}, "resolved as 'auto'"),
+    ],
+    ids=lambda value: json.dumps(value) if isinstance(value, dict) else None,
+)
+def test_applied_plan_refuses_a_plan_that_would_widen_the_configuration(
+    setup: Config, change: dict, message: str
+) -> None:
+    with pytest.raises(JobError) as refused:
+        jobs.applied_plan(stored_plan(setup, **change), setup)
+
+    assert refused.value.code == "plan_refused" and message in refused.value.message
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"max_duration_seconds": 180},
+        {**dataclasses.asdict(Budgets()), "max_network_calls": 1},
+        {**dataclasses.asdict(Budgets()), "worker_deadline_seconds": True},
+        {**dataclasses.asdict(Budgets()), "worker_deadline_seconds": 0},
+        {**dataclasses.asdict(Budgets()), "worker_deadline_seconds": 1.5},
+        {**dataclasses.asdict(Budgets()), "worker_deadline_seconds": "180"},
+        [180],
+    ],
+    ids=["missing", "unknown", "bool", "zero", "float", "string", "list"],
+)
+def test_applied_plan_refuses_budgets_it_cannot_narrow_by(setup: Config, budgets: object) -> None:
+    with pytest.raises(JobError) as refused:
+        jobs.applied_plan(stored_plan(setup, budgets=budgets), setup)
+
+    assert refused.value.code == "plan_refused" and "plan budget" in refused.value.message
+
+
+def test_a_plan_of_the_old_format_without_its_version_is_refused(setup: Config) -> None:
+    old = {
+        "stages": list(app.WORKER_STAGES),
+        "budgets": dataclasses.asdict(Budgets()),
+        "backend": "none",
+    }
+
+    with pytest.raises(JobError) as refused:
+        jobs.applied_plan(old, setup)
+
+    assert refused.value.code == "plan_refused"
+    assert "capability version None" in refused.value.message
+    assert "submit the recording again" in refused.value.message
+    with pytest.raises(JobError, match="plan_refused"):
+        jobs.applied_plan("full", setup)
+
+
+def test_budgets_are_the_smaller_of_the_plan_and_the_configuration(setup: Config) -> None:
+    plan = stored_plan(
+        setup,
+        budgets=dataclasses.asdict(Budgets())
+        | {"worker_deadline_seconds": 10_000, "max_channels": 1},
+    )
+    narrowed = dataclasses.replace(
+        setup, budgets=dataclasses.replace(setup.budgets, max_duration_seconds=30)
+    )
+
+    layers, effective = jobs.applied_plan(plan, narrowed)
+
+    assert layers == app.LAYERS
+    assert effective.budgets == dataclasses.replace(
+        Budgets(), max_channels=1, max_duration_seconds=30
+    )
+    assert effective.budgets.worker_deadline_seconds == Budgets().worker_deadline_seconds
+    assert dataclasses.replace(effective, budgets=narrowed.budgets) == narrowed
+
+
+def test_the_jobs_module_never_builds_a_model_or_passes_a_backend() -> None:
+    import ast
+
+    tree = ast.parse(Path(jobs.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported |= {f"{node.module}.{alias.name}" for alias in node.names} | {node.module}
+    forbidden = (
+        "review",
+        "smoke",
+        "eval",
+        "llama",
+        "transformers",
+        "ctranslate2",
+        "faster_whisper",
+    )
+    assert not [name for name in imported if any(part in forbidden for part in name.split("."))]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            assert "backend" not in {keyword.arg for keyword in node.keywords}
 
 
 def test_the_same_request_returns_the_same_job_and_another_identity_is_a_mismatch(
@@ -771,3 +968,45 @@ def test_jobs_result_prints_the_job_state_next_to_the_result_summary(
         "status: partial",
     ]
     assert f"run_dir: runs/{analysis.run.run_id}" in lines
+
+
+def test_jobs_submit_mode_and_retry_through_the_console(
+    config_file: Path, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/voice.wav")
+    data = config_file.parent / "data"
+
+    bad = run_cli(config_file, "submit", str(wav), "--mode", "fast")
+    assert bad.returncode == 1 and bad.stdout == ""
+    assert bad.stderr.startswith("sound-scout jobs: invalid_request: mode must be one of")
+    layered = run_cli(config_file, "submit", str(wav), "--mode", "quick", "--layers", "sound")
+    assert layered.returncode == 1
+    assert layered.stderr.startswith("sound-scout jobs: invalid_request: layers only with")
+    assert not (data / "jobs").exists() or not jobs._job_dirs(data / "jobs")
+
+    submitted = run_cli(config_file, "submit", str(wav), "--mode", "quick", "--json")
+    assert submitted.returncode == 0, submitted.stderr
+    job_id = json.loads(submitted.stdout)["job_id"]
+    plan = json.loads((data / "jobs" / job_id / "job.json").read_text(encoding="utf-8"))["plan"]
+    assert plan["mode"] == plan["resolved_mode"] == "quick"
+    assert plan["stages"] == ["prepare", "acoustics", "asr"]
+    status = json.loads(run_cli(config_file, "status", job_id, "--json").stdout)
+    assert status["mode"] == "quick" and status["retries"] == 0
+
+    queued = run_cli(config_file, "retry", job_id)
+    assert queued.returncode == 1 and queued.stdout == ""
+    assert queued.stderr.startswith("sound-scout jobs: not_retryable: ")
+
+    assert run_cli(config_file, "cancel", job_id).returncode == 0
+    retried = run_cli(config_file, "retry", job_id)
+    assert retried.returncode == 0, retried.stderr
+    lines = retried.stdout.splitlines()
+    assert "state: queued" in lines and "retry: queued" in lines
+    assert f"next_attempt: {job_id}-a1" in lines and "retries: 1" in lines
+
+    assert run_cli(config_file, "cancel", job_id).returncode == 0
+    again = run_cli(config_file, "retry", job_id, "--json")
+    assert again.returncode == 0, again.stderr
+    answer = json.loads(again.stdout)
+    assert answer["retry"] == "queued" and answer["retries"] == 2
+    assert answer["job_id"] == job_id and answer["next_attempt"] == f"{job_id}-a1"
