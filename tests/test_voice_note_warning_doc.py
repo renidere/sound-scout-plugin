@@ -46,6 +46,75 @@ def test_header_records_the_publication_and_points_to_the_rollback() -> None:
     assert "черновик" not in head.lower() and "ничего не опубликовано" not in head
 
 
+ROW_PATHS = (
+    "`docs/hermes-voice-note-warning.md`",
+    "`scripts/voice_note_warning.py`",
+    "`tests/test_voice_note_warning_doc.py`",
+)
+DRAFT_ROW = (
+    "| Черновик обратимого предупреждения о прежнем направлении для README и выпусков "
+    "v0.4.1–v0.4.2 `renidere/hermes-voice-note` (0013 § 9 п. 4, #117): блоки с маркерами "
+    "`sound-scout-direction-warning`, команды публикации и отката; публикация — после одобрения "
+    "владельца | `docs/hermes-voice-note-warning.md`, `scripts/voice_note_warning.py` "
+    "(`insert`/`has`/`strip`; тесты — `tests/test_voice_note_warning_doc.py`) |"
+)
+
+
+def claude_md_row() -> str:
+    rows = [
+        line
+        for line in (REPO / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+        if line.startswith("|") and "`docs/hermes-voice-note-warning.md`" in line
+    ]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def stale_row_problems(row: str) -> list[str]:
+    """#127: what the CLAUDE.md layout row misses about the published warning."""
+    problems = []
+    if "черновик" in row.lower():
+        problems.append("calls the warning a draft")
+    if "после одобрения владельца" in row:
+        problems.append("says publication waits for owner approval")
+    if not ("опубликовано 2026-11-21" in row and "issues/117#issuecomment-7051905266)" in row):
+        problems.append("no publication date with the owner permission in #117")
+    problems += [f"no path {path}" for path in ROW_PATHS if path not in row]
+    if "раздел «Откат»" not in row:
+        problems.append("no rollback section")
+    if not all(
+        term in row for term in ("`insert`/`has`/`strip`", "`sound-scout-direction-warning`")
+    ):
+        problems.append("lost the script commands or the markers")
+    return problems
+
+
+def test_claude_md_row_records_the_publication_and_the_rollback() -> None:
+    assert stale_row_problems(claude_md_row()) == []
+
+
+def test_claude_md_row_links_the_exact_permission_and_a_real_rollback_section() -> None:
+    row = claude_md_row()
+    permission = "https://github.com/renidere/sound-scout-plugin/issues/117#issuecomment-7051905266"
+    link = r"опубликовано 2026-11-21 по \[[^\]]+\]\(" + re.escape(permission) + r"\)"
+    assert re.search(link, row)
+    named = re.findall(r"раздел «([^»]+)»", row)
+    assert named == ["Откат"]
+    assert f"\n## {named[0]}\n" in draft()
+    rollback = section(named[0])
+    assert "### README" in rollback and "### Выпуски" in rollback
+    assert 'voice_note_warning.py" strip' in rollback
+
+
+def test_the_draft_wording_of_the_claude_md_row_is_caught() -> None:
+    assert stale_row_problems(DRAFT_ROW) == [
+        "calls the warning a draft",
+        "says publication waits for owner approval",
+        "no publication date with the owner permission in #117",
+        "no rollback section",
+    ]
+
+
 def test_each_block_has_one_start_and_one_end_marker_around_it(block: str) -> None:
     assert block.count(vnw.START) == 1 and block.count(vnw.END) == 1
     assert block.startswith(vnw.START) and block.endswith(vnw.END)
