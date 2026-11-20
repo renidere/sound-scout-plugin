@@ -105,11 +105,22 @@ systemctl --user restart hermes-autonomous.service
 
 `hermes plugins enable` может сам попросить работающий gateway перечитать плагины; перезапуск всё
 равно нужен, чтобы прогон начался с чистого процесса. Маршруты монтируются при первом запросе к
-дашборду (например, команда «health» из шага 4). После него проверить журнал:
+дашборду (например, команда «health» из шага 4). После него найти строку монтирования в файлах логов
+Hermes: процесс `hermes serve` (`hermes-autonomous.service`) пишет её в `~/.hermes/logs/gui.log`,
+процесс `hermes gateway run` (`hermes-gateway.service`) — в `~/.hermes/logs/agent.log`. В журнал
+unit она не попадает: logger `hermes_cli.web_server` относится к компоненту `gui`, и Hermes пишет
+его только в файлы логов (`hermes_logging.py:322`, `:402–407`; см. 0017, «Живые данные»).
+`agent.log` — общий файл без фильтра компонента: в него пишет каждый процесс Hermes, в том числе
+`hermes serve` (`hermes_logging.py:403`). Поэтому монтирование в `hermes serve` проверяется по
+`gui.log`. Строка в `agent.log` относится к gateway, только если её время позже перезапуска
+`hermes-gateway.service` и в `gui.log` нет строки с тем же временем.
 
 ```bash
-journalctl --user -u hermes-autonomous.service --since "15 min ago" | grep "Mounted plugin API routes: /api/plugins/sound-scout/"
+grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/gui.log | tail -n 1
+grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/agent.log | tail -n 1
 ```
+
+Время строки должно быть позже перезапуска её процесса.
 
 Остальные процессы Hermes с общей конфигурацией подхватят пакет при своём следующем перезапуске.
 Их маршрут доставки ответит `local chat <id>: no gateway in this process owns its session` — это

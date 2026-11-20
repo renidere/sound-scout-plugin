@@ -448,6 +448,35 @@ def test_criterion_2_instruction_enables_in_process_and_removes_the_package() ->
     assert "desktop-plugins\\sound-scout" in removal
 
 
+MOUNT_LINE = "Mounted plugin API routes: /api/plugins/sound-scout/"
+
+
+def _install_step(text: str) -> str:
+    lines = text.splitlines()
+    start = lines.index("### 2. Установка (Linux, backend)")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("#"))
+    return "\n".join(lines[start + 1 : end])
+
+
+def _journal_lookups(step: str) -> list[str]:
+    return [line for line in step.splitlines() if MOUNT_LINE in line and "journalctl" in line]
+
+
+def test_install_step_finds_the_mount_line_in_the_log_files_not_the_journal() -> None:
+    step = _install_step(DECISION.read_text(encoding="utf-8"))
+    assert _journal_lookups(step) == []
+    for log in ("gui.log", "agent.log"):
+        assert f'grep "{MOUNT_LINE}" ~/.hermes/logs/{log}' in step
+    assert "`hermes serve`" in step and "`hermes gateway run`" in step
+
+
+def test_journal_lookups_flag_a_journal_grep_for_the_mount_line() -> None:
+    journal = f'journalctl --user -u hermes-autonomous.service | grep "{MOUNT_LINE}"'
+    assert _journal_lookups(journal) == [journal]
+    assert _journal_lookups(f'grep "{MOUNT_LINE}" ~/.hermes/logs/gui.log') == []
+    assert _journal_lookups("journalctl --user -u hermes-autonomous.service -n 50") == []
+
+
 def test_criterion_6_decision_has_a_results_table_pending_the_owner() -> None:
     text = DECISION.read_text(encoding="utf-8")
     assert "результаты ожидают прогона владельцем" in text.splitlines()[2]
