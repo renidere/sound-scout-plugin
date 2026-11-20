@@ -34,7 +34,7 @@ README и описания выпусков написаны по-русски, 
 - v0.4.1–v0.4.2 — тот же `plugin.js`, SDK приходит в неподписанном Windows EXE со своими
   `HERMES_HOME` и `userData`, то есть вторым клиентом и вторым профилем.
 
-Целевое требование: плагин `sound-scout` работает в штатном Hermes Desktop только на штатных вызовах
+Целевое требование: плагин `sound-scout` должен работать в штатном Hermes Desktop только на штатных вызовах
 Desktop Plugin SDK; отдельный EXE, форк Hermes, второй профиль и второй клиент не нужны и не
 допускаются (0013 § 3.2, § 3.3). Опора — закоммиченный SDK Hermes Agent v0.23.1 (`3b4215785882`)
 без патча `retainSession` (0016).
@@ -60,7 +60,7 @@ Desktop Plugin SDK; отдельный EXE, форк Hermes, второй про
 > [!WARNING]
 > **Это направление больше не целевое.** Отдельный Windows EXE (Hermes Light, `Start-Voice-Note.cmd`) и второй профиль Hermes со своими `HERMES_HOME` и `userData` — не целевой путь. Плагин v0.4.0–v0.4.2 требует `host.retainSession`, которого нет в штатном Hermes Desktop Plugin SDK, поэтому в штатном клиенте он не работает.
 >
-> Целевое направление — один плагин `sound-scout` в репозитории [renidere/sound-scout-plugin](https://github.com/renidere/sound-scout-plugin). Он работает в штатном Hermes Desktop только на штатных вызовах Desktop Plugin SDK (`profileRoutes`, `retainProfile`, `session.resume`, `file.attach`), без `host.retainSession`, отдельного EXE, форка Hermes, второго профиля и второго клиента. Рекордер переносится туда из v0.4.2. Обоснование — [решение 0013](https://github.com/renidere/sound-scout-plugin/blob/main/docs/decisions/0013-voice-note-integration.md), ход работ — [эпик #92](https://github.com/renidere/sound-scout-plugin/issues/92); новый плагин ещё в разработке.
+> Целевое направление — один плагин `sound-scout` в репозитории [renidere/sound-scout-plugin](https://github.com/renidere/sound-scout-plugin). Он должен работать в штатном Hermes Desktop только на штатных вызовах Desktop Plugin SDK (`profileRoutes`, `retainProfile`, `session.resume`, `file.attach`), без `host.retainSession`, отдельного EXE, форка Hermes, второго профиля и второго клиента. Рекордер переносится туда из v0.4.2. Обоснование — [решение 0013](https://github.com/renidere/sound-scout-plugin/blob/main/docs/decisions/0013-voice-note-integration.md), ход работ — [эпик #92](https://github.com/renidere/sound-scout-plugin/issues/92); новый плагин ещё в разработке.
 >
 > Этот репозиторий, его выпуски и их файлы остаются доступны, ничего не удаляется. Текст ниже описывает прежнее направление и сохранён без изменений.
 <!-- sound-scout-direction-warning:end -->
@@ -73,7 +73,7 @@ Desktop Plugin SDK; отдельный EXE, форк Hermes, второй про
 > [!WARNING]
 > **Этот выпуск относится к прежнему, нецелевому направлению.** Его Windows-комплект — отдельный неофициальный неподписанный EXE со своими `HERMES_HOME` и `userData`, то есть второй клиент и второй профиль Hermes. Это не целевой путь. Плагин этого выпуска требует `host.retainSession`, которого нет в штатном Hermes Desktop Plugin SDK.
 >
-> Целевое направление — один плагин `sound-scout` в репозитории [renidere/sound-scout-plugin](https://github.com/renidere/sound-scout-plugin). Он работает в штатном Hermes Desktop только на штатных вызовах Desktop Plugin SDK, без отдельного EXE, форка Hermes, второго профиля и второго клиента. Обоснование — [решение 0013](https://github.com/renidere/sound-scout-plugin/blob/main/docs/decisions/0013-voice-note-integration.md), ход работ — [эпик #92](https://github.com/renidere/sound-scout-plugin/issues/92); новый плагин ещё в разработке.
+> Целевое направление — один плагин `sound-scout` в репозитории [renidere/sound-scout-plugin](https://github.com/renidere/sound-scout-plugin). Он должен работать в штатном Hermes Desktop только на штатных вызовах Desktop Plugin SDK, без `host.retainSession`, отдельного EXE, форка Hermes, второго профиля и второго клиента. Обоснование — [решение 0013](https://github.com/renidere/sound-scout-plugin/blob/main/docs/decisions/0013-voice-note-integration.md), ход работ — [эпик #92](https://github.com/renidere/sound-scout-plugin/issues/92); новый плагин ещё в разработке.
 >
 > Выпуск и все его файлы остаются доступны, ничего не удаляется. Текст ниже — исходное описание выпуска без изменений.
 <!-- sound-scout-direction-warning:end -->

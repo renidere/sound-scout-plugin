@@ -75,6 +75,48 @@ def test_blocks_give_no_install_or_connection_instruction_that_could_contradict_
         assert command not in block, command
 
 
+OLD_PLUGIN_FACT = "поэтому в штатном клиенте он не работает"
+REQUIREMENT = (
+    "Он должен работать в штатном Hermes Desktop только на штатных вызовах Desktop Plugin SDK"
+)
+
+
+def new_plugin_claims(flat: str) -> list[str]:
+    """Claims that something already works or passed, except the fact about the old plugin."""
+    rest = flat.replace(OLD_PLUGIN_FACT, "")
+    return re.findall(r"\bработа(?:ет|ют)\b|провер\w*|принят\w*", rest, re.I)
+
+
+def test_blocks_state_a_requirement_for_the_new_plugin_not_a_claim(block: str) -> None:
+    flat = " ".join(block.split())
+    assert flat.count(REQUIREMENT) == 1
+    assert "без `host.retainSession`" in flat.split(REQUIREMENT, 1)[1]
+    assert new_plugin_claims(flat) == []
+
+
+def test_the_old_plugin_fact_stays_as_it_is() -> None:
+    readme = " ".join(vnw.block(draft(), "readme").split())
+    assert (
+        "Плагин v0.4.0–v0.4.2 требует `host.retainSession`, которого нет в штатном Hermes Desktop "
+        f"Plugin SDK, {OLD_PLUGIN_FACT}." in readme
+    )
+
+
+def test_the_target_line_of_the_draft_is_a_requirement() -> None:
+    flat = " ".join(draft().split())
+    target = "Целевое требование: плагин `sound-scout` должен работать в штатном Hermes Desktop"
+    assert target in flat
+    assert "плагин `sound-scout` работает" not in flat
+
+
+@pytest.mark.parametrize(
+    "claim", ["Он работает в штатном Hermes Desktop", "Плагин проверен", "Плагин принят"]
+)
+def test_a_claim_about_the_new_plugin_is_caught(block: str, claim: str) -> None:
+    flat = " ".join(block.split()).replace(REQUIREMENT, claim)
+    assert new_plugin_claims(flat) != []
+
+
 def test_release_section_covers_both_releases() -> None:
     publish = section("Публикация (только после одобрения владельца)")
     assert "for TAG in v0.4.1 v0.4.2" in publish
