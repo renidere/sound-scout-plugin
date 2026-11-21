@@ -685,7 +685,9 @@ def test_reused_model_loads_once_and_restores_the_asr_functions(monkeypatch, tmp
 
 def test_run_report_names_the_verdict_the_hashes_and_holds_no_private_paths() -> None:
     report = (REPO / "docs/eval/2026-11-21-prosody-measure-1.md").read_text(encoding="utf-8")
-    assert "**Вердикт: INVALID.**" in report
+    assert "**Вердикт: INVALID.** Санитарная стадия не пройдена за 2 попытки" in report
+    assert "result.manual-2026-11-21T0833Z.json" in report
+    assert "отступление от буквы правила" not in report
     assert prosody.RULE_SHA256 in report and prosody.RINCO_SHA256 in report
     assert "23a224baf9e3c07e7bcd4b03d6c1eec41a200eee65aa0d422a3bd61b339ce3c7" in report
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)

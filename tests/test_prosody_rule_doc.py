@@ -57,7 +57,8 @@ def test_launch_approval_is_recorded_and_the_doc_holds_no_personal_paths() -> No
     document = DOC.read_text(encoding="utf-8")
     assert "**запуск одобрен владельцем 2026-11-21**" in document
     assert "issues/119#issuecomment-7059648322" in document
-    assert "**нужен владелец:** одобрить или отклонить предложение `prosody-measure-1`" in document
+    assert "**нужен владелец:** одобрить или отклонить" not in document
+    assert "История — вопрос закрыт: запуск одобрен 2026-11-21" in document
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", document)
 
 
