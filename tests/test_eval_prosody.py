@@ -1032,3 +1032,18 @@ def test_rinco_problems_name_a_wrong_archive(tmp_path: Path) -> None:
     archive.parent.mkdir(parents=True)
     archive.write_bytes(b"not the RINCO archive")
     assert prosody.rinco_problems(settings)
+
+
+def test_series_3_report_names_the_verdict_the_post_hoc_caveat_and_holds_no_private_paths() -> None:
+    name = "docs/eval/2026-11-21-prosody-measure-1-series-3.md"
+    report = (REPO / name).read_text(encoding="utf-8")
+    assert "**Вердикт: PASS, post hoc.**" in report
+    assert "AUC 0,761, 95 % CI 0,737–0,783, coverage 0,807" in report
+    flat = " ".join(report.split())
+    assert "более слабое свидетельство" in flat and "не независимое подтверждение" in flat
+    assert "PASS сам по себе не добавляет `word_prominence`" in flat
+    assert prosody.RULE_SHA256 in report and prosody.RINCO_SHA256 in report
+    assert "8fa0199c114129685ff3e7fb870027ac8086843cc140868e5180e393efe7cd38" in report
+    assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
+    decision = (REPO / prosody.DECISION_DOC).read_text(encoding="utf-8")
+    assert name in decision and "**Серия 3 (2026-11-21): PASS, post hoc**" in decision

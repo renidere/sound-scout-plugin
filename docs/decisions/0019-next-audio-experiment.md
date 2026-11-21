@@ -30,6 +30,10 @@
   [решение 7064744998](https://github.com/renidere/sound-scout-plugin/issues/142#issuecomment-7064744998),
   задача [#142](https://github.com/renidere/sound-scout-plugin/issues/142). Правила исключения EAF
   E1 и E2 записаны до любого шага серии 3 и найдены после серии 2 (post hoc) — раздел «Серия 3».
+- **Серия 3 (2026-11-21): PASS, post hoc** — санитарная стадия пройдена с первой попытки (S1 3 из 3,
+  S2 — да); основной прогон: AUC 0,761, CI 0,737–0,783, coverage 0,807. Выборка определена после
+  результатов серии 2; `word_prominence` не добавляется без отдельного решения владельца. Отчёт —
+  `docs/eval/2026-11-21-prosody-measure-1-series-3.md`.
 - **Дата:** 2026-11-20; редакция 2 — 2026-11-21.
 - **Задача:** [#119](https://github.com/renidere/sound-scout-plugin/issues/119) (родитель —
   [#3](https://github.com/renidere/sound-scout-plugin/issues/3)). Связанная
