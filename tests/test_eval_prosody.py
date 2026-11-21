@@ -1047,3 +1047,14 @@ def test_series_3_report_names_the_verdict_the_post_hoc_caveat_and_holds_no_priv
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
     decision = (REPO / prosody.DECISION_DOC).read_text(encoding="utf-8")
     assert name in decision and "**Серия 3 (2026-11-21): PASS, post hoc**" in decision
+
+
+def test_series_2_report_names_memory_scope_only_in_the_files_that_hold_it() -> None:
+    report = (REPO / "docs/eval/2026-11-21-prosody-measure-1-series-2.md").read_text(
+        encoding="utf-8"
+    )
+    flat = " ".join(report.split())
+    assert "В `attempt-2.json` и `main/started.json`: `memory_scope` = [`8000000000`, `0`]." in flat
+    holders = re.findall(r"В ([^:]*): `memory_scope`", flat)
+    assert holders and all("result.json" not in h for h in holders)
+    assert "В `attempt-2.json`, `main/started.json` и `result.json`: `cpus` = 0–7" in flat

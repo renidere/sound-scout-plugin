@@ -39,10 +39,10 @@
 `OMP_NUM_THREADS=4`; ASR — `cpu_threads=4`. Сеть закрыта (`network.allow = false`), ASR —
 `local_files_only`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`. Загрузок не было.
 
-Код сам проверил scope и записал его. В `attempt-2.json`, `main/started.json` и `result.json`:
-`memory_scope` = [`8000000000`, `0`], `cpus` = 0–7, `main_wall_seconds` = 10 800,
-`ceiling_decision` — ссылка на решение 7062644385. Пиковая память scope основного прогона в замерах по ходу
-прогона — около 2 GB.
+Код сам проверил scope и записал его. В `attempt-2.json` и `main/started.json`: `memory_scope` =
+[`8000000000`, `0`]. В `attempt-2.json`, `main/started.json` и `result.json`: `cpus` = 0–7,
+`main_wall_seconds` = 10 800, `ceiling_decision` — ссылка на решение 7062644385. Пиковая память
+scope основного прогона в замерах по ходу прогона — около 2 GB.
 
 ### Что изменил коммит `879cd92`
 
