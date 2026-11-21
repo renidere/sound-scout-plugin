@@ -11,19 +11,20 @@ Three steps, each its own command, all under `<data_root>/prosody-measure-1/` (o
   the pins of `docs/dependencies.md`), lists the RINCO files of `pilot-1` (dev and held-out, from
   `corpus/pilot-1/provenance.json`) that the experiment leaves out, with the SHA-256 of that
   list, and counts the material that stays. It writes `prepare.json`.
-- `sanity` is one attempt of the sanity stage S1/S2 on the Gate 0 clips; each attempt is recorded
-  with its number and the SHA-256 of this file. The second failed attempt writes the verdict
-  INVALID and nothing more can run.
+- `sanity` is one attempt of the sanity stage S1/S2 on the Gate 0 clips, under the same memory
+  scope and CPU pin as the main run; each attempt is recorded with its number, the SHA-256 of
+  this file, the cgroup memory limits and the CPUs it ran on. The second failed attempt writes
+  the verdict INVALID and nothing more can run.
 - `run` is the main run, once: it needs a passed sanity attempt made by this very code, runs ASR
   and the index utterance by utterance under the 90 min wall-time ceiling, then computes the
   metric (AUC, its bootstrap CI and coverage) exactly once and writes `result.json` with the
   verdict. A second `run` is refused whatever the first one ended with.
 
-The run must sit in a cgroup with `memory.max` ≤ `MEMORY_MAX_BYTES` and no swap
-(`systemd-run --user --scope -p MemoryMax=8000000000 -p MemorySwapMax=0`) and is pinned to at most
-`MAX_CPUS` CPUs. The ASR model is loaded once per process and the weight files hashed once per
-process (`_reused_model`); the model, its parameters and the receipts `asr.transcribe` writes are
-those of the analysis path.
+A sanity attempt and the main run must sit in a cgroup with `memory.max` ≤ `MEMORY_MAX_BYTES`
+and no swap (`systemd-run --user --scope -p MemoryMax=8000000000 -p MemorySwapMax=0`); each pins
+itself to at most `MAX_CPUS` CPUs. The ASR model is loaded once per process and the weight files
+hashed once per process (`_reused_model`); the model, its parameters and the receipts
+`asr.transcribe` writes are those of the analysis path.
 """
 
 import argparse
@@ -780,7 +781,22 @@ def prepare(config_: config.Config, decision: Path = DECISION_DOC) -> dict:
     return record
 
 
-def run_sanity(config_: config.Config, decision: Path = DECISION_DOC, transcribe=None) -> dict:
+def _checked_scope(scope: tuple[str, str] | None | bool) -> tuple[str, str] | None | bool:
+    """The cgroup memory limits (read when `scope` is True); refuse when they break the rule."""
+    if scope is True:
+        scope = memory_scope()
+    issues = [] if scope is False else scope_problems(scope)
+    if issues:
+        raise ProsodyError("resource scope: " + "; ".join(issues))
+    return scope
+
+
+def run_sanity(
+    config_: config.Config,
+    decision: Path = DECISION_DOC,
+    transcribe=None,
+    scope: tuple[str, str] | None | bool = True,
+) -> dict:
     header = _header(decision)
     out = output_dir(config_)
     _refuse_if_decided(out)
@@ -792,6 +808,8 @@ def run_sanity(config_: config.Config, decision: Path = DECISION_DOC, transcribe
     started = len(list(attempts.glob("work-*")))  # an attempt that died without a record counts
     if started >= MAX_SANITY_ATTEMPTS:
         raise ProsodyError(f"{started} sanity attempts made, none passed")
+    scope = _checked_scope(scope)
+    cpus = pin_cpus()
     problems = q1(config_)
     if problems:
         return _invalid(out, header, "Q1: " + "; ".join(problems))
@@ -807,7 +825,7 @@ def run_sanity(config_: config.Config, decision: Path = DECISION_DOC, transcribe
             found = sanity(clips, transcribe or local_transcriber(config_), work)
     except Exception as error:  # a broken attempt is a failed attempt, recorded and counted
         found = {"passed": False, "error": f"{type(error).__name__}: {error}"}
-    record = {**header, "attempt": number, **found}
+    record = {**header, "attempt": number, "cpus": cpus, "memory_scope": scope, **found}
     _write_json(attempts / f"attempt-{number}.json", record)
     if not record["passed"] and number >= MAX_SANITY_ATTEMPTS:
         _invalid(out, header, f"санитарная стадия не пройдена за {number} попытки")
@@ -837,11 +855,7 @@ def run_main(
     passed = [a for a in map(_read_json, attempts) if a["passed"]]
     if not passed or passed[-1]["code_sha256"] != header["code_sha256"]:
         raise ProsodyError("no passed sanity attempt of this code; run `sanity` first")
-    if scope is True:
-        scope = memory_scope()
-    scope_issues = [] if scope is False else scope_problems(scope)
-    if scope_issues:
-        raise ProsodyError("resource scope: " + "; ".join(scope_issues))
+    scope = _checked_scope(scope)
     excluded = excluded_members(_read_json(config_.data_root / PILOT_PROVENANCE))
     if list_sha256(excluded) != prepared["exclusion"]["sha256"]:
         raise ProsodyError("the pilot-1 exclusion list changed since `prepare`")

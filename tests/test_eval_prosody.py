@@ -23,6 +23,7 @@ from tests.test_eval_corpus import eaf
 
 REPO = Path(__file__).resolve().parent.parent
 RATE = prosody.SAMPLE_RATE
+PIN_CPUS = prosody.pin_cpus
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
 
 
@@ -420,6 +421,8 @@ def sanity_setup(tmp_path, monkeypatch, variant_raised=True):
     hashes, words = gate0_clips(settings.data_root / prosody.GATE0_CLIPS, variant_raised)
     monkeypatch.setattr(prosody, "SANITY_CLIPS", hashes)
     monkeypatch.setattr(prosody, "q1", lambda _: [])
+    monkeypatch.setattr(prosody, "memory_scope", lambda: (str(prosody.MEMORY_MAX_BYTES), "0"))
+    monkeypatch.setattr(prosody, "pin_cpus", lambda: [0])
     archive = prosody.rinco_path(settings)
     archive.parent.mkdir(parents=True)
     rinco_archive(archive)
@@ -470,6 +473,45 @@ def test_two_failed_sanity_attempts_give_invalid_and_stop(tmp_path, monkeypatch)
         prosody.run_sanity(settings, decision, fake_transcriber(words))
     with pytest.raises(prosody.ProsodyError, match="verdict is out"):
         prosody.run_main(settings, decision, fake_transcriber(words), scope=False)
+
+
+@needs_ffmpeg
+def test_a_sanity_attempt_records_its_memory_scope_and_at_most_eight_cpus(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    decision = REPO / prosody.DECISION_DOC
+    pinned = []
+    monkeypatch.setattr(prosody, "pin_cpus", PIN_CPUS)
+    monkeypatch.setattr(prosody.os, "sched_getaffinity", lambda _: set(range(16)))
+    monkeypatch.setattr(prosody.os, "sched_setaffinity", lambda _, cpus: pinned.append(cpus))
+    prosody.prepare(settings, decision)
+    record = prosody.run_sanity(settings, decision, fake_transcriber(words))
+    assert pinned == [list(range(8))]
+    attempt = settings.data_root / prosody.OUTPUT_DIR / prosody.SANITY_DIR / "attempt-1.json"
+    saved = json.loads(attempt.read_text())
+    assert saved["cpus"] == record["cpus"] == list(range(8))
+    assert saved["memory_scope"] == [str(prosody.MEMORY_MAX_BYTES), "0"]
+
+
+@needs_ffmpeg
+def test_a_sanity_attempt_outside_the_memory_scope_is_refused_and_not_counted(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    decision = REPO / prosody.DECISION_DOC
+    prosody.prepare(settings, decision)
+    pinned = []
+    monkeypatch.setattr(prosody, "pin_cpus", lambda: pinned.append(1) or [0])
+    sanity_dir = settings.data_root / prosody.OUTPUT_DIR / prosody.SANITY_DIR
+    for scope in (("max", "0"), (str(prosody.MEMORY_MAX_BYTES), "max"), None):
+        monkeypatch.setattr(prosody, "memory_scope", lambda scope=scope: scope)
+        with pytest.raises(prosody.ProsodyError, match="resource scope"):
+            prosody.run_sanity(settings, decision, fake_transcriber(words))
+    assert pinned == [] and list(sanity_dir.iterdir()) == []
+    assert not (settings.data_root / prosody.OUTPUT_DIR / prosody.RESULT_FILE).exists()
+    monkeypatch.setattr(prosody, "memory_scope", lambda: (str(prosody.MEMORY_MAX_BYTES), "0"))
+    assert prosody.run_sanity(settings, decision, fake_transcriber(words))["attempt"] == 1
 
 
 # --- main run ------------------------------------------------------------------------------
