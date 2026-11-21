@@ -9,7 +9,6 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -29,16 +28,6 @@ PENDING = "ожидает прогона владельцем"
 spec = importlib.util.spec_from_file_location("probe_a_check_attach", SCRIPT)
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
-
-
-@pytest.fixture(scope="module")
-def node() -> str:
-    path = shutil.which("node")
-    if path is None:
-        if os.environ.get("CI"):
-            pytest.fail("node is not installed: CI must run the probe suite, not skip it")
-        pytest.skip("node is not installed")
-    return path
 
 
 @pytest.fixture(scope="module")

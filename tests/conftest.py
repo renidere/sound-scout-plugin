@@ -49,6 +49,17 @@ def pytest_configure(config: pytest.Config) -> None:
     use_a_temp_dir_outside_denied_names()
 
 
+@pytest.fixture(scope="session")
+def node() -> str:
+    """The `node` binary for the Desktop plugin suites in `tests/js/`; CI fails without it."""
+    path = shutil.which("node")
+    if path is None:
+        if os.environ.get("CI"):
+            pytest.fail("node is not installed: CI must run the tests/js suites, not skip them")
+        pytest.skip("node is not installed")
+    return path
+
+
 @functools.cache
 def ffmpeg_encoders() -> frozenset[str]:
     """The encoder names the installed ffmpeg lists; empty without ffmpeg."""

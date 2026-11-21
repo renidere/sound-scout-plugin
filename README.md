@@ -42,8 +42,10 @@ MCP — равноправные входы в ту же очередь (`docs/d
 плагина `hermes/plugin/sound-scout/` (маршруты `GET /health`, `POST /jobs`, `GET /jobs/<job_id>`
 под `/api/plugins/sound-scout/`; цикл доставки одной заметки с итогом задания в привязанный чат —
 `delivery.py`) и skill `hermes/skills/speech-review/`. Пакет на хосте Hermes ещё не развёрнут
-([#104](https://github.com/renidere/sound-scout-plugin/issues/104)), рекордера Desktop нет
-([#103](https://github.com/renidere/sound-scout-plugin/issues/103)). Решения по направлению —
+([#104](https://github.com/renidere/sound-scout-plugin/issues/104)). Рекордер Desktop есть в
+`hermes/plugin/sound-scout/desktop/plugin.js`
+([#103](https://github.com/renidere/sound-scout-plugin/issues/103)); на Windows-клиенте он не
+проверен ([#105](https://github.com/renidere/sound-scout-plugin/issues/105)). Решения по направлению —
 0013, 0015–0018: Spike B (0015), Spike A (0016), владелец session authority (0017), режимы
 плана и повтор (0018).
 

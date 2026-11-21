@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
-import { loadPlugin, PLUGIN_PATH } from './load_plugin.mjs'
+import { loadPlugin, PROBE_PATH } from './load_plugin.mjs'
 
 const RAW_CONN = 'station-registry-7f3a9c'
 const ROUTE = { connectionId: RAW_CONN, mode: 'remote', profile: 'default', targetProfile: 'default' }
@@ -601,7 +601,7 @@ test('the synthetic WAV holds the integer triangles exactly', async () => {
 })
 
 test('the plugin source uses only the SDK and the four RPC methods', async () => {
-  const source = await readFile(PLUGIN_PATH, 'utf8')
+  const source = await readFile(PROBE_PATH, 'utf8')
   for (const banned of [/\bfetch\(/, /XMLHttpRequest/, /WebSocket/, /retainSession\(/, /host\.request\(/, /\beval\b/]) {
     assert.doesNotMatch(source, banned)
   }

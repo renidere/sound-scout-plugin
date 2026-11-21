@@ -36,6 +36,7 @@ REPO = Path(__file__).resolve().parent.parent
 PACKAGE = REPO / "hermes" / "plugin" / "sound-scout"
 API = PACKAGE / "dashboard" / "plugin_api.py"
 PLUGIN_JS = PACKAGE / "desktop" / "plugin.js"
+RECORDER_SUITE = REPO / "tests" / "js" / "recorder.test.mjs"
 DECISION = REPO / "docs" / "decisions" / "0015-spike-b-backend-package.md"
 CLI = Path(sys.executable).with_name("sound-scout")
 ROUTES = {("GET", "/health"), ("POST", "/jobs"), ("GET", "/jobs/{job_id}")}
@@ -939,16 +940,20 @@ def _rest_calls(source: str) -> set[tuple[str, str]]:
     pattern = re.compile(
         r"ctx\.rest\(\s*[`'](?P<path>[^`']+)[`'](?:\s*,\s*\{\s*method:\s*'(?P<m>\w+)')?"
     )
-    return {(match["m"] or "GET", match["path"]) for match in pattern.finditer(source)}
+    return {
+        (match["m"] or "GET", re.sub(r"\$\{[^}]*\}", "{job_id}", match["path"].split("?")[0]))
+        for match in pattern.finditer(source)
+    }
 
 
-def test_desktop_plugin_calls_health_and_claims_the_directive(api) -> None:
+def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api) -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
     assert "id: 'sound-scout'" in source and "name: 'Sound Scout'" in source
     imports = set(re.findall(r"^import .* from '([^']+)'", source, re.MULTILINE))
     assert imports == {"@hermes/plugin-sdk", "react/jsx-runtime"}
     assert source.count("import ") == 2
-    assert _rest_calls(source) == {("GET", "/health")}
+    assert "retainSession" not in source and "composer.submit" not in source
+    assert _rest_calls(source) == ROUTES
     assert _rest_calls(source) <= set(api.router.routes)
     for gone in ("/spike/", "deliver", "runner", "lastToken"):
         assert gone not in source
@@ -957,6 +962,23 @@ def test_desktop_plugin_calls_health_and_claims_the_directive(api) -> None:
     job_pattern = re.search(r"const SPIKE_JOB = /(.+)/\n", source)[1]
     assert re.fullmatch(job_pattern, f"spike-{uuid.uuid4().hex}")
     assert not re.fullmatch(job_pattern, "spike-../../etc")
+
+
+def test_desktop_recorder_node_suite_passes(node: str) -> None:
+    """The recorder against a fake stock SDK: its contract, not the real Windows Desktop (#105)."""
+    result = subprocess.run(
+        [node, "--experimental-vm-modules", "--test", str(RECORDER_SUITE.relative_to(REPO))],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    tail = "\n".join((result.stdout + result.stderr).splitlines()[-40:])
+    assert result.returncode == 0, tail
+    declared = len(re.findall(r"^test\(", RECORDER_SUITE.read_text(encoding="utf-8"), re.MULTILINE))
+    passed = re.search(r"^[#ℹ] pass (\d+)$", result.stdout, re.MULTILINE)
+    assert declared >= 29 and passed and int(passed[1]) == declared, tail
+    assert re.search(r"^[#ℹ] (?:skipped|skip) 0$", result.stdout, re.MULTILINE), tail
 
 
 def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
