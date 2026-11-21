@@ -150,9 +150,11 @@ QWEN3OMNI_MODEL_DIR = (
     / QWEN3OMNI_REVISION
 )
 RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni")
+# runtime -> (model file, mmproj file, extra llama-server flags); without mmap the server's RSS
+# is its own memory, not 8e9 of mapped weights on top (0023 section 1, smoke)
 LLAMA_RUNTIMES = {
-    "llama": (MODEL_FILE, MMPROJ_FILE),
-    "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE),
+    "llama": (MODEL_FILE, MMPROJ_FILE, ()),
+    "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE, ("--load-mode", "none")),
 }
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 MEMINFO = Path("/proc/meminfo")
@@ -927,9 +929,9 @@ def server_argv(
     model_dir: Path,
     port: int,
     threads: int,
-    files: tuple[str, str] = (MODEL_FILE, MMPROJ_FILE),
+    files: tuple[str, str, tuple[str, ...]] = LLAMA_RUNTIMES["llama"],
 ) -> list[str]:
-    model_file, mmproj_file = files
+    model_file, mmproj_file, extra = files
     argv = [
         str(binary),
         "-m",
@@ -948,6 +950,7 @@ def server_argv(
         "--no-webui",
         "-t",
         str(threads),
+        *extra,
     ]
     if DOWNLOAD_FLAGS.intersection(argv):
         raise Gate0Error("the server argv must not carry a download flag")

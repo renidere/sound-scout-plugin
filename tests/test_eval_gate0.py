@@ -1396,7 +1396,11 @@ def test_qwen3omni_server_argv_is_the_llama_argv_with_its_local_files() -> None:
     gemma = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
     assert argv[argv.index("-m") + 1] == f"/models/{gate0.QWEN3OMNI_MODEL_FILE}"
     assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.QWEN3OMNI_MMPROJ_FILE}"
-    assert [a for a in argv if "/models/" not in a] == [a for a in gemma if "/models/" not in a]
+    assert [a for a in argv if "/models/" not in a] == [
+        *[a for a in gemma if "/models/" not in a],
+        "--load-mode",
+        "none",
+    ]
     assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
 
 
@@ -1440,6 +1444,7 @@ def test_qwen3omni_run_under_the_cap_uses_its_files_rule_v2_and_the_same_plan(
     assert record["argv"][record["argv"].index("--mmproj") + 1].endswith(
         gate0.QWEN3OMNI_MMPROJ_FILE
     )
+    assert record["argv"][-2:] == ["--load-mode", "none"]
     assert record["rule"] == gate0.RULE_V2 and record["encoder_tokens_per_s"] == 12.5
     assert record["limits"]["rss_limit_bytes"] == 25_500_000_000
     assert record["cgroup"]["memory_max"] == GIGACHAT_CAP

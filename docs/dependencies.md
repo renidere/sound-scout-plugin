@@ -247,7 +247,8 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 Сервер слушает только `127.0.0.1` на свободном порту, один анализ за раз (`--parallel 1`).
 
 Тот же `llama-server` b12359 запускает Qwen3-Omni-30B-A3B-Instruct (`gate0 run --runtime
-qwen3omni`, #144): тот же argv с файлами этой модели, тип проектора `qwen3a`. Запуск возможен
+qwen3omni`, #144): тот же argv с файлами этой модели и флагом `--load-mode none` (без mmap),
+тип проектора `qwen3a`. Запуск возможен
 только внутри cgroup `systemd-run --user --scope -p MemoryMax=26000000000 -p MemorySwapMax=0 -- …`
 (иначе отказ до попытки) и когда у хоста `MemAvailable` ≥ 22e9 байт; сторож RSS сервера —
 25,5e9 байт. Подробности и измерения — `docs/decisions/0023-gate0-qwen3-omni.md`.
