@@ -53,9 +53,10 @@ def test_prosody_rule_block_refuses_missing_doubled_or_other_rule(broken) -> Non
         rule_sha256(broken(DOC.read_text(encoding="utf-8")))
 
 
-def test_proposal_waits_for_the_owner_and_holds_no_personal_paths() -> None:
+def test_launch_approval_is_recorded_and_the_doc_holds_no_personal_paths() -> None:
     document = DOC.read_text(encoding="utf-8")
-    assert "**предложение; ждёт решения владельца.** Не одобрено" in document
+    assert "**запуск одобрен владельцем 2026-11-21**" in document
+    assert "issues/119#issuecomment-7059648322" in document
     assert "**нужен владелец:** одобрить или отклонить предложение `prosody-measure-1`" in document
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", document)
 
@@ -87,10 +88,10 @@ def test_revision_2_names_the_owner_decision_and_keeps_the_proposal_auxiliary() 
     assert REVISION_HEADING in document
     assert OWNER_DECISION in document
     flat = " ".join(document.split())
-    assert "**неодобренное вспомогательное предложение**" in flat
+    assert "**вспомогательное предложение**" in flat
     assert "не снимает блокировку #90" in flat
     assert "честный ограниченный режим" in flat
-    assert "редакция 2 его не разрешает" in flat
+    assert "редакция 2 запуск не разрешала" in flat
 
 
 def test_rejected_claims_appear_only_where_the_revision_names_them() -> None:
