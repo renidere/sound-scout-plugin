@@ -1,5 +1,6 @@
 import functools
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -58,6 +59,89 @@ def node() -> str:
             pytest.fail("node is not installed: CI must run the tests/js suites, not skip them")
         pytest.skip("node is not installed")
     return path
+
+
+LOOP_HEADER = re.compile(r"^ *for \(const .+? of (?P<rest>\[.*)$")
+TEST_CALL = re.compile(r"^ *test\(")
+
+
+def _array_length(text: str) -> int:
+    """Elements of the array literal at the start of `text`: top-level commas, strings skipped."""
+    depth, count, quote, empty, escaped = 0, 0, None, True, False
+    for char in text:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "'\"`":
+            quote = char
+        elif char in "[({":
+            depth += 1
+            if depth == 1:
+                continue
+        elif char in "])}":
+            depth -= 1
+            if depth == 0:
+                return count + (0 if empty else 1)
+        elif char == "," and depth == 1:
+            count, empty = count + 1, True
+            continue
+        if not char.isspace():
+            empty = False
+    raise ValueError("unclosed array literal in a for loop header")
+
+
+def declared_node_tests(source: str) -> int:
+    """Tests a `node --test` suite declares: each top-level `test(` call once, each one inside
+    `for (const … of [literal])` loops (top-level or nested) once per loop element. Test bodies
+    end at the `})` line of the call's indent and are skipped. Any other `test(` line raises
+    `ValueError`: the count would not match what node runs."""
+    lines = source.splitlines()
+    loops: list[tuple[int, int]] = []
+    total, test_body = 0, None
+    for index, line in enumerate(lines):
+        indent = len(line) - len(line.lstrip(" "))
+        if test_body is not None:
+            if indent == test_body and line.lstrip().startswith("})"):
+                test_body = None
+            continue
+        inside = indent > loops[-1][0] if loops else indent == 0
+        multiplier = loops[-1][1] if loops else 1
+        if (header := LOOP_HEADER.match(line)) and inside:
+            rest = "\n".join([header["rest"], *lines[index + 1 :]])
+            loops.append((indent, multiplier * _array_length(rest)))
+        elif loops and indent == loops[-1][0] and line.strip() == "}":
+            loops.pop()
+        elif TEST_CALL.match(line):
+            if not inside:
+                raise ValueError(f"line {index + 1}: test() call outside a counted loop")
+            total += multiplier
+            test_body = None if line.rstrip().endswith(")") else indent
+    return total
+
+
+def assert_node_suite_passes(node: str, suite: Path, cwd: Path) -> int:
+    """Run `suite` with `node --test`: every declared test passes, none is skipped or todo."""
+    result = subprocess.run(
+        [node, "--experimental-vm-modules", "--test", str(suite)],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    tail = "\n".join((result.stdout + result.stderr).splitlines()[-40:])
+    assert result.returncode == 0, tail
+    declared = declared_node_tests(suite.read_text(encoding="utf-8"))
+    assert declared > 0, f"{suite.name} declares no test() call"
+    passed = re.search(r"^[#ℹ] pass (\d+)$", result.stdout, re.MULTILINE)
+    assert passed and int(passed[1]) == declared, f"declared {declared}\n{tail}"
+    for status in ("skipped|skip", "todo"):
+        assert re.search(rf"^[#ℹ] (?:{status}) 0$", result.stdout, re.MULTILINE), tail
+    return declared
 
 
 @functools.cache

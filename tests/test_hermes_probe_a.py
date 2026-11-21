@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import assert_node_suite_passes, declared_node_tests
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = REPO_ROOT / "hermes" / "probe" / "sound-scout-probe-a" / "plugin.js"
 SCRIPT = REPO_ROOT / "scripts" / "probe_a_check_attach.py"
@@ -45,14 +47,56 @@ def tail(text: str) -> str:
 
 
 def test_probe_node_suite_passes(node: str) -> None:
-    result = subprocess.run(
-        [node, "--experimental-vm-modules", "--test", str(NODE_SUITE.relative_to(REPO_ROOT))],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=120,
+    assert assert_node_suite_passes(node, NODE_SUITE, REPO_ROOT) >= 43
+
+
+def test_declared_tests_count_each_loop_element() -> None:
+    source = """test('one', () => {})
+for (const [name, x] of [['a, b', [1, 2]], ['c\\'d', { y: [3] }], ['e', 4],]) {
+  test(`loop ${name}`, () => {
+    for (const z of [1, 2, 3]) {}
+  })
+}
+for (const a of ['p', 'q']) {
+  for (const b of [1, 2, 3]) {
+    test(`${a}${b}`, () => {})
+  }
+}
+test('two', async () => {
+  for (const round of [1, 2]) {}
+})
+"""
+    assert declared_node_tests(source) == 2 + 3 + 6
+
+
+def test_a_suite_without_test_calls_fails_the_check(node: str, tmp_path: Path) -> None:
+    suite = tmp_path / "empty.test.mjs"
+    suite.write_text("import test from 'node:test'\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="declares no test"):
+        assert_node_suite_passes(node, suite, REPO_ROOT)
+
+
+def test_a_suite_that_runs_fewer_tests_than_it_declares_fails(node: str, tmp_path: Path) -> None:
+    suite = tmp_path / "short.test.mjs"
+    suite.write_text(
+        "import test from 'node:test'\ntest('a', () => {})\nif (false) {\ntest('b', () => {})\n}\n",
+        encoding="utf-8",
     )
-    assert result.returncode == 0, f"{tail(result.stdout)}\n{tail(result.stderr)}"
+    with pytest.raises(AssertionError, match="declared 2"):
+        assert_node_suite_passes(node, suite, REPO_ROOT)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "test('a', () => {})\nif (false) {\n  test('b', () => {})\n}\n",
+        "for (const x of [1, 2]) {\ntest('b', () => {})\n}\n",
+    ],
+    ids=["indented-outside-loop", "not-deeper-than-loop"],
+)
+def test_an_uncounted_test_call_fails_closed(source: str) -> None:
+    with pytest.raises(ValueError, match="test\\(\\) call outside a counted loop"):
+        declared_node_tests(source)
 
 
 def test_probe_wav_is_byte_identical_to_the_backend_generator(node: str, reference: bytes) -> None:

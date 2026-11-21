@@ -30,7 +30,7 @@ import pytest
 from starlette.requests import Request
 
 from sound_scout import app, config
-from tests.conftest import WavFactory
+from tests.conftest import WavFactory, assert_node_suite_passes
 
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE = REPO / "hermes" / "plugin" / "sound-scout"
@@ -966,19 +966,7 @@ def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api)
 
 def test_desktop_recorder_node_suite_passes(node: str) -> None:
     """The recorder against a fake stock SDK: its contract, not the real Windows Desktop (#105)."""
-    result = subprocess.run(
-        [node, "--experimental-vm-modules", "--test", str(RECORDER_SUITE.relative_to(REPO))],
-        cwd=REPO,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    tail = "\n".join((result.stdout + result.stderr).splitlines()[-40:])
-    assert result.returncode == 0, tail
-    declared = len(re.findall(r"^test\(", RECORDER_SUITE.read_text(encoding="utf-8"), re.MULTILINE))
-    passed = re.search(r"^[#ℹ] pass (\d+)$", result.stdout, re.MULTILINE)
-    assert declared >= 29 and passed and int(passed[1]) == declared, tail
-    assert re.search(r"^[#ℹ] (?:skipped|skip) 0$", result.stdout, re.MULTILINE), tail
+    assert assert_node_suite_passes(node, RECORDER_SUITE, REPO) >= 29
 
 
 def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
