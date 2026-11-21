@@ -46,6 +46,7 @@ pytestmark = needs_ffmpeg
 
 REPO = Path(__file__).resolve().parent.parent
 FREED_SECONDS = 2.0
+DEADLINE_SECONDS = 5
 SERVE_WITH_BACKEND = (
     "import functools, pickle, sys\n"
     "sys.path[:0] = sys.argv[2:]\n"
@@ -103,10 +104,12 @@ def read_json(path: Path) -> dict:
 # --- T08: deadline and cancel ----------------------------------------------------------------
 
 
-def test_speech_analyze_past_a_one_second_deadline_is_partial_and_the_server_answers_next(
+def test_speech_analyze_past_its_deadline_is_partial_and_the_server_answers_next(
     loaded: Config, make_wav: WavFactory, pid_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    budgets = dataclasses.replace(loaded.budgets, worker_deadline_seconds=1)
+    """The deadline also covers the worker start, ingest and prepare; with the app-level twin's
+    deadline a loaded machine still reaches `audio_review` in time, and `partial` needs prepare."""
+    budgets = dataclasses.replace(loaded.budgets, worker_deadline_seconds=DEADLINE_SECONDS)
     loaded = dataclasses.replace(loaded, budgets=budgets)
     wav = make_wav("recordings/tone.wav")
     analyze_with(monkeypatch, SlowFakeBackend(pid_dir=str(pid_dir)))
@@ -130,7 +133,12 @@ def test_speech_analyze_past_a_one_second_deadline_is_partial_and_the_server_ans
     assert answer["status"] == "partial"
     assert {"stage": "audio_review", "code": app.DEADLINE_EXCEEDED} in answer["errors"]
     assert answer["stages"]["audio_review"]["status"] == "failed"
-    assert elapsed < 1 + FREED_SECONDS
+    assert answer["stages"]["prepare"]["status"] == "completed"
+    assert read_json(the_run(loaded.data_root) / "work/stage-prepare.json")["entry"]["status"] == (
+        "completed"
+    )
+    assert (pid_dir / "worker").is_file()
+    assert elapsed < DEADLINE_SECONDS + FREED_SECONDS
     assert following.is_error is not True
     assert "network_guard" in json.loads(following.content[0].text)
     assert process_gone(pid_of(pid_dir / "worker"), wait_seconds=1.0)
