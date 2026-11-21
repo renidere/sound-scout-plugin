@@ -7,13 +7,15 @@ fitted to data: the features, weights, metric and thresholds are the rule's.
 
 Three steps, each its own command, all in the directory of one series under `<data_root>/`
 (outside git). A series is one owner-approved run of the rule (`SERIES`): the second one, after
-the ASR trust rule of #135, sits in `prosody-measure-1-series-2/` and never reads the first.
+the ASR trust rule of #135, sits in `prosody-measure-1-series-2/` and never reads the first; the
+third one also leaves out what the EAF rules E1 and E2 of 0019 «Серия 3» name (`rule_exclusions`).
 
 - `prepare` checks precondition Q1 (network guard, the ASR weights and the RINCO archive against
   the pins of `docs/dependencies.md`), lists the RINCO files of `pilot-1` (dev and held-out, from
-  `corpus/pilot-1/provenance.json`) and those the series names, that the experiment leaves out,
-  with the SHA-256 of that list, and counts the material that stays. It writes `prepare.json`
-  with the data changes of the series (`data_changes`).
+  `corpus/pilot-1/provenance.json`), those the series names and, in series 3, those the EAF
+  rules name (`series_exclusion`), that the experiment leaves out, with the SHA-256 of that
+  list, and counts the material that stays. It writes `prepare.json` with the data changes of
+  the series (`data_changes`).
 - `sanity` is one attempt of the sanity stage S1/S2 on the Gate 0 clips, under the same memory
   scope and CPU pin as the main run; each attempt is recorded with its number, the SHA-256 of
   this file, the cgroup memory limits, the CPUs it ran on and the main-run ceiling. The second
@@ -21,7 +23,7 @@ the ASR trust rule of #135, sits in `prosody-measure-1-series-2/` and never read
   second attempt after a passed first one, with code of another SHA-256 (`sanity_after_pass`).
 - `run` is the main run, once: it needs a passed sanity attempt made by this very code, runs ASR
   and the index utterance by utterance under the wall-time ceiling of the series (90 min; series
-  2 — 180 min, `main_wall_seconds`), then computes the
+  2 and 3 — 180 min, `main_wall_seconds`), then computes the
   metric (AUC, its bootstrap CI and coverage) exactly once and writes `result.json` with the
   verdict. A second `run` is refused whatever the first one ended with.
 
@@ -44,6 +46,7 @@ import time
 import uuid
 import wave
 import zipfile
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -68,6 +71,24 @@ ASR_WEIGHTS_SHA256 = {
 }
 RINCO_SHA256 = "243688e816bfdf9adbfd65ef5c6104acccd0742ec9bb78b00edb2a299a7148f1"
 
+# The RINCO files #135 read to check its rule (decision 0021, «Файлы RINCO»).
+FILES_READ_BY_135 = (
+    "INTON-EAF/1-Questions/q-1122.wav",
+    "INTON-EAF/2-Imperatives/i-1113.wav",
+    "INTON-EAF/2-Imperatives/i-12124_2.wav",
+    "INTON-EAF/3-Statements/s-218.WAV",
+    "INTON-EAF/3-Statements/s-221.WAV",
+)
+ASR_RULE_135 = {
+    "change": "ASR trust rule: no_vad_speech flags suspect_hallucination",
+    "issue": "https://github.com/renidere/sound-scout-plugin/issues/135",
+    "commit": "fe18c4aa99c622d23f3eaa31ac06bb62c020b71d",
+    "decision": "docs/decisions/0021-asr-vad-hallucination.md",
+}
+SERIES_3_DECISION = (
+    "https://github.com/renidere/sound-scout-plugin/issues/142#issuecomment-7064744998"
+)
+
 # One series is one owner-approved run in a directory of its own; nothing carries over between
 # series. `data_changes` are changes of the data definition since series 1, with their commit.
 SERIES = {
@@ -80,20 +101,24 @@ SERIES = {
         "ceiling_decision": "https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7062644385",
         "main_wall_seconds": 180 * 60,
         "sanity_after_pass": True,
-        # The RINCO files #135 read to check its rule (decision 0021, «Файлы RINCO»).
-        "excluded": (
-            "INTON-EAF/1-Questions/q-1122.wav",
-            "INTON-EAF/2-Imperatives/i-1113.wav",
-            "INTON-EAF/2-Imperatives/i-12124_2.wav",
-            "INTON-EAF/3-Statements/s-218.WAV",
-            "INTON-EAF/3-Statements/s-221.WAV",
-        ),
+        "excluded": FILES_READ_BY_135,
+        "data_changes": (ASR_RULE_135,),
+    },
+    3: {
+        "dir": "prosody-measure-1-series-3",
+        # The owner approved one series 3 with the limits of series 2 (ceiling 180 min).
+        "owner_decision": SERIES_3_DECISION,
+        "ceiling_decision": SERIES_3_DECISION,
+        "main_wall_seconds": 180 * 60,
+        "eaf_rules": True,
+        "excluded": FILES_READ_BY_135,
         "data_changes": (
+            ASR_RULE_135,
             {
-                "change": "ASR trust rule: no_vad_speech flags suspect_hallucination",
-                "issue": "https://github.com/renidere/sound-scout-plugin/issues/135",
-                "commit": "fe18c4aa99c622d23f3eaa31ac06bb62c020b71d",
-                "decision": "docs/decisions/0021-asr-vad-hallucination.md",
+                "change": "EAF rules E1 (no time alignment) and E2 (WAV with more than one EAF)",
+                "issue": "https://github.com/renidere/sound-scout-plugin/issues/142",
+                "commit": "14ba9273756b30068654976e65df6c2935dc24cb",
+                "decision": "docs/decisions/0019-next-audio-experiment.md (Серия 3)",
             },
         ),
     },
@@ -130,6 +155,8 @@ MAIN_WALL_SECONDS = 90 * 60
 MEMORY_MAX_BYTES = 8_000_000_000
 MAX_CPUS = 8
 FEATURES = ("f0", "rms", "dur")
+RULE_E1 = "E1: EAF without time alignment"
+RULE_E2 = "E2: WAV with more than one EAF"
 
 # Decision 0010 § 2.1: the Gate 0 clips, the PCM SHA-256 of each, the target word number per pair.
 SANITY_CLIPS = {
@@ -425,6 +452,35 @@ def series_excluded(config_: config.Config, series: int) -> list[str]:
     return excluded_members(provenance, SERIES[series]["excluded"])
 
 
+def without_time_alignment(file: corpus.RincoFile) -> bool:
+    """Rule E1: at least two annotations, and every start and end of them on a whole second."""
+    found = [a for annotations in file.annotations.values() for a in annotations]
+    times = [t for a in found for t in (a.start, a.end)]
+    return len(found) >= 2 and all(round(t * 1000) % 1000 == 0 for t in times)
+
+
+def rule_exclusions(files: list[corpus.RincoFile]) -> dict[str, str]:
+    """EAF and WAV members the rules E1 and E2 of 0019 «Серия 3» leave out, with the rule.
+
+    Both read only the EAF/WAV pairing and the annotation times, never a text or a sample.
+    """
+    eafs_per_wav = Counter(f.wav_member for f in files)
+    shared = [f for f in files if eafs_per_wav[f.wav_member] > 1]
+    found = {m: RULE_E2 for f in shared for m in (f.wav_member, f.eaf_member)}
+    found |= {f.eaf_member: RULE_E1 for f in files if without_time_alignment(f)}
+    return dict(sorted(found.items()))
+
+
+def series_exclusion(config_: config.Config, series: int, archive: zipfile.ZipFile) -> dict:
+    """Every member the series leaves out (WAV or EAF), its count and the SHA-256 of the list."""
+    rules = (
+        rule_exclusions(corpus.rinco_files(archive)[0]) if SERIES[series].get("eaf_rules") else {}
+    )
+    members = sorted(set(series_excluded(config_, series)) | set(rules))
+    record = {"members": members, "count": len(members), "sha256": list_sha256(members)}
+    return {**record, "rules": rules} if rules else record
+
+
 def list_sha256(members: list[str]) -> str:
     return hashlib.sha256("".join(f"{m}\n" for m in members).encode("utf-8")).hexdigest()
 
@@ -459,11 +515,15 @@ def utterances(file: corpus.RincoFile) -> list[Utterance]:
 
 
 def material(archive: zipfile.ZipFile, excluded: list[str]) -> tuple[list[corpus.RincoFile], dict]:
+    """The paired RINCO files without those whose WAV or EAF member is excluded, and counts."""
     files, stats = corpus.rinco_files(archive)
-    missing = sorted(set(excluded) - {f.wav_member for f in files})
+    left_out = set(excluded)
+    missing = sorted(left_out - {m for f in files for m in (f.wav_member, f.eaf_member)})
     if missing:
-        raise ProsodyError(f"pilot-1 names RINCO members the archive does not pair: {missing}")
-    kept = [f for f in files if f.wav_member not in set(excluded)]
+        raise ProsodyError(
+            f"the exclusion names RINCO members the archive does not pair: {missing}"
+        )
+    kept = [f for f in files if not {f.wav_member, f.eaf_member} & left_out]
     found = [u for f in kept for u in utterances(f)]
     words = [w for u in found for w in u.words]
     counts = {
@@ -511,11 +571,16 @@ def q1(config_: config.Config) -> list[str]:
             found = asr._sha256_file(snapshot / name)
             if found != pinned:
                 problems.append(f"ASR {name} SHA-256 {found}, pinned {pinned}")
+    return problems + rinco_problems(config_)
+
+
+def rinco_problems(config_: config.Config) -> list[str]:
+    """The RINCO part of Q1: the pin of `corpus.SOURCES` and the archive on disk."""
     source = rinco_source()
+    problems = []
     if source.sha256 != RINCO_SHA256:
         problems.append(f"corpus.SOURCES pins RINCO {source.sha256}, dependencies {RINCO_SHA256}")
-    problems += corpus.check_source(config_.data_root / CORPUS_DIR, source)
-    return problems
+    return problems + corpus.check_source(config_.data_root / CORPUS_DIR, source)
 
 
 def memory_scope(proc_root: Path = Path("/proc"), cgroup_root: Path = Path("/sys/fs/cgroup")):
@@ -825,15 +890,10 @@ def prepare(config_: config.Config, decision: Path = DECISION_DOC, series: int =
     problems = q1(config_)
     if problems:
         return _invalid(out, header, "Q1: " + "; ".join(problems))
-    excluded = series_excluded(config_, series)
     with zipfile.ZipFile(rinco_path(config_)) as archive:
-        _, counts = material(archive, excluded)
-    record = {
-        **header,
-        "q1": "ok",
-        "exclusion": {"members": excluded, "count": len(excluded), "sha256": list_sha256(excluded)},
-        "material": counts,
-    }
+        exclusion = series_exclusion(config_, series, archive)
+        _, counts = material(archive, exclusion["members"])
+    record = {**header, "q1": "ok", "exclusion": exclusion, "material": counts}
     _write_json(out / PREPARE_FILE, record)
     return record
 
@@ -921,9 +981,13 @@ def run_main(
     if not passed or passed[-1]["code_sha256"] != header["code_sha256"]:
         raise ProsodyError("no passed sanity attempt of this code; run `sanity` first")
     scope = _checked_scope(scope)
-    excluded = series_excluded(config_, series)
+    problems = rinco_problems(config_)  # before the archive is read for the exclusion list
+    if problems:
+        return _invalid(out, header, "Q1: " + "; ".join(problems))
+    with zipfile.ZipFile(rinco_path(config_)) as archive:
+        excluded = series_exclusion(config_, series, archive)["members"]
     if list_sha256(excluded) != prepared["exclusion"]["sha256"]:
-        raise ProsodyError("the pilot-1 exclusion list changed since `prepare`")
+        raise ProsodyError("the exclusion list changed since `prepare`")
     _mkdir(main_dir)
     cpus = pin_cpus()
     started = time.monotonic()

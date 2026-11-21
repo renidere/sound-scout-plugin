@@ -421,6 +421,7 @@ def sanity_setup(tmp_path, monkeypatch, variant_raised=True):
     hashes, words = gate0_clips(settings.data_root / prosody.GATE0_CLIPS, variant_raised)
     monkeypatch.setattr(prosody, "SANITY_CLIPS", hashes)
     monkeypatch.setattr(prosody, "q1", lambda _: [])
+    monkeypatch.setattr(prosody, "rinco_problems", lambda _: [])
     monkeypatch.setattr(prosody, "memory_scope", lambda: (str(prosody.MEMORY_MAX_BYTES), "0"))
     monkeypatch.setattr(prosody, "pin_cpus", lambda: [0])
     archive = prosody.rinco_path(settings)
@@ -749,11 +750,11 @@ def test_series_2_runs_in_its_own_directory_after_a_decided_series_1(tmp_path, m
 
 def test_an_unapproved_series_is_refused_before_any_file(tmp_path, monkeypatch) -> None:
     settings, _ = sanity_setup(tmp_path, monkeypatch)
-    with pytest.raises(prosody.ProsodyError, match="series 3 is not approved"):
-        prosody.prepare(settings, REPO / prosody.DECISION_DOC, series=3)
+    with pytest.raises(prosody.ProsodyError, match="series 4 is not approved"):
+        prosody.prepare(settings, REPO / prosody.DECISION_DOC, series=4)
     assert not any(p.name.startswith("prosody-measure-1") for p in settings.data_root.iterdir())
     with pytest.raises(SystemExit):
-        prosody.main(["prepare", "--series", "3"])
+        prosody.main(["prepare", "--series", "4"])
 
 
 def test_the_cli_passes_the_series_to_the_step(tmp_path, monkeypatch, capsys) -> None:
@@ -885,3 +886,149 @@ def test_series_2_report_names_the_verdict_the_numbers_and_holds_no_private_path
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
     decision = (REPO / prosody.DECISION_DOC).read_text(encoding="utf-8")
     assert name in decision
+
+
+# --- series 3: the EAF rules E1 and E2 -----------------------------------------------------
+
+QUESTIONS = "INTON-EAF/1-Questions"
+
+
+def add_rule_files(archive_path: Path) -> None:
+    """A whole-second grid EAF, a WAV with two EAF files and a one-annotation whole-second EAF."""
+    signal = words_signal(3, raised=2)[0]
+    grid = [(0.0, 1.0, ACCENT), (1.0, 2.0, ACCENT)]
+    aligned = [(0.0, 1.13, ACCENT), (1.13, 2.207, ACCENT)]
+    with zipfile.ZipFile(archive_path, "a") as archive:
+        for stem in ("g-0", "d-0", "s-0"):
+            archive.writestr(f"{QUESTIONS}/{stem}.wav", wav_bytes(signal))
+        archive.writestr(f"{QUESTIONS}/g-0.eaf", eaf("g-0.wav", {"Accent": grid}))
+        archive.writestr(f"{QUESTIONS}/d-0.eaf", eaf("d-0.wav", {"Accent": aligned}))
+        archive.writestr(f"{QUESTIONS}/d-0--v1.eaf", eaf("d-0.wav", {"Accent": aligned}))
+        archive.writestr(f"{QUESTIONS}/s-0.eaf", eaf("s-0.wav", {"Accent": [(0.0, 2.0, ACCENT)]}))
+
+
+def test_rules_e1_and_e2_read_only_the_pairing_and_the_annotation_times(tmp_path: Path) -> None:
+    path = rinco_archive(tmp_path / "r.zip")
+    add_rule_files(path)
+    with zipfile.ZipFile(path) as archive:
+        files, _ = corpus.rinco_files(archive)
+    assert prosody.rule_exclusions(files) == {
+        f"{QUESTIONS}/d-0--v1.eaf": prosody.RULE_E2,
+        f"{QUESTIONS}/d-0.eaf": prosody.RULE_E2,
+        f"{QUESTIONS}/d-0.wav": prosody.RULE_E2,
+        f"{QUESTIONS}/g-0.eaf": prosody.RULE_E1,
+    }
+    by_eaf = {f.eaf_member: f for f in files}
+    assert prosody.without_time_alignment(by_eaf[f"{QUESTIONS}/g-0.eaf"])
+    assert not prosody.without_time_alignment(by_eaf[f"{QUESTIONS}/s-0.eaf"])
+    assert not prosody.without_time_alignment(by_eaf[f"{QUESTIONS}/x-0.eaf"])
+    assert prosody.rule_exclusions([by_eaf[f"{QUESTIONS}/x-1.eaf"]]) == {}
+
+
+def test_material_leaves_out_an_excluded_eaf_or_wav_member(tmp_path: Path) -> None:
+    path = rinco_archive(tmp_path / "r.zip")
+    add_rule_files(path)
+    excluded = [f"{QUESTIONS}/d-0.wav", f"{QUESTIONS}/g-0.eaf", f"{QUESTIONS}/x-0.wav"]
+    with zipfile.ZipFile(path) as archive:
+        files, counts = prosody.material(archive, excluded)
+        assert sorted(f.eaf_member for f in files) == [
+            f"{QUESTIONS}/s-0.eaf",
+            f"{QUESTIONS}/x-1.eaf",
+            f"{QUESTIONS}/x-2.eaf",
+        ]
+        assert counts["paired_files"] == 7 and counts["excluded_files"] == 4
+        with pytest.raises(prosody.ProsodyError, match="does not pair"):
+            prosody.material(archive, [f"{QUESTIONS}/none.eaf"])
+
+
+def test_series_3_has_its_own_dir_the_limits_of_series_2_and_names_both_data_changes() -> None:
+    third = prosody.SERIES[3]
+    dirs = {prosody.SERIES[n]["dir"] for n in (1, 2, 3)}
+    assert third["dir"] == "prosody-measure-1-series-3" and len(dirs) == 3
+    assert prosody.main_wall_seconds(3) == 180 * 60
+    assert third["owner_decision"].endswith("/issues/142#issuecomment-7064744998")
+    assert third["eaf_rules"] and not third.get("sanity_after_pass")
+    assert third["excluded"] == prosody.SERIES[2]["excluded"]
+    asr_rule, eaf_rules = third["data_changes"]
+    assert asr_rule == prosody.SERIES[2]["data_changes"][0]
+    assert eaf_rules["issue"].endswith("/issues/142")
+    assert re.fullmatch(r"[0-9a-f]{40}", eaf_rules["commit"])
+    assert prosody.MAX_SANITY_ATTEMPTS == 2
+    assert prosody.RULE_SHA256.startswith("b6ce9fcf") and prosody.RULE_SHA256.endswith("28cc65")
+    assert not prosody.SERIES[1].get("eaf_rules") and not prosody.SERIES[2].get("eaf_rules")
+
+
+@needs_ffmpeg
+def test_series_3_prepare_records_the_rule_exclusions_and_the_main_run_uses_them(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    add_rule_files(prosody.rinco_path(settings))
+    monkeypatch.setitem(prosody.SERIES, 3, dict(prosody.SERIES[3], excluded=()))
+    decision = REPO / prosody.DECISION_DOC
+    record = prosody.prepare(settings, decision, series=3)
+    rules = prosody.rule_exclusions(
+        corpus.rinco_files(zipfile.ZipFile(prosody.rinco_path(settings)))[0]
+    )
+    members = sorted([*rules, f"{QUESTIONS}/x-0.wav"])
+    assert len(members) == 5 and rules[f"{QUESTIONS}/g-0.eaf"] == prosody.RULE_E1
+    assert record["exclusion"] == {
+        "members": members,
+        "count": 5,
+        "sha256": prosody.list_sha256(members),
+        "rules": rules,
+    }
+    assert record["material"]["files"] == 3 and record["material"]["excluded_files"] == 4
+    assert record["data_changes"] == list(prosody.SERIES[3]["data_changes"])
+    assert prosody.run_sanity(settings, decision, fake_transcriber(words), series=3)["passed"]
+    calls = []
+    result = prosody.run_main(
+        settings, decision, fake_transcriber({}, calls), scope=False, series=3
+    )
+    assert len(calls) == 5  # x-1 and x-2 with 2 utterances each, s-0 with one
+    assert result["exclusion_sha256"] == prosody.list_sha256(members)
+    assert result["main_wall_seconds"] == 180 * 60
+    out = settings.data_root / prosody.SERIES[3]["dir"]
+    assert (out / prosody.RESULT_FILE).exists()
+    assert not (settings.data_root / prosody.SERIES[2]["dir"]).exists()
+    assert not (settings.data_root / prosody.SERIES[1]["dir"]).exists()
+
+
+@needs_ffmpeg
+def test_series_3_main_run_refuses_when_the_rule_exclusions_changed_since_prepare(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    add_rule_files(prosody.rinco_path(settings))
+    monkeypatch.setitem(prosody.SERIES, 3, dict(prosody.SERIES[3], excluded=()))
+    decision = REPO / prosody.DECISION_DOC
+    prosody.prepare(settings, decision, series=3)
+    assert prosody.run_sanity(settings, decision, fake_transcriber(words), series=3)["passed"]
+    monkeypatch.setattr(prosody, "rule_exclusions", lambda files: {})
+    with pytest.raises(prosody.ProsodyError, match="exclusion list changed"):
+        prosody.run_main(settings, decision, fake_transcriber({}), scope=False, series=3)
+    assert not (settings.data_root / prosody.SERIES[3]["dir"] / prosody.MAIN_DIR).exists()
+
+
+@needs_ffmpeg
+def test_series_3_main_run_with_a_broken_rinco_archive_is_invalid_before_reading_it(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    decision = REPO / prosody.DECISION_DOC
+    monkeypatch.setitem(prosody.SERIES, 3, dict(prosody.SERIES[3], excluded=()))
+    prosody.prepare(settings, decision, series=3)
+    assert prosody.run_sanity(settings, decision, fake_transcriber(words), series=3)["passed"]
+    prosody.rinco_path(settings).write_bytes(b"not a zip")
+    monkeypatch.setattr(prosody, "rinco_problems", lambda _: ["RINCO SHA-256 differs"])
+    result = prosody.run_main(settings, decision, fake_transcriber({}), scope=False, series=3)
+    assert result["verdict"] == prosody.INVALID and result["reason"].startswith("Q1: RINCO")
+    assert not (settings.data_root / prosody.SERIES[3]["dir"] / prosody.MAIN_DIR).exists()
+
+
+def test_rinco_problems_name_a_wrong_archive(tmp_path: Path) -> None:
+    settings = make_config(tmp_path)
+    archive = prosody.rinco_path(settings)
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"not the RINCO archive")
+    assert prosody.rinco_problems(settings)
