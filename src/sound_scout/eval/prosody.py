@@ -5,12 +5,15 @@ rule is the block between its `prosody-rule` markers, and every command refuses 
 the SHA-256 of that block is `RULE_SHA256`, the value recorded before any run. Nothing here is
 fitted to data: the features, weights, metric and thresholds are the rule's.
 
-Three steps, each its own command, all under `<data_root>/prosody-measure-1/` (outside git):
+Three steps, each its own command, all in the directory of one series under `<data_root>/`
+(outside git). A series is one owner-approved run of the rule (`SERIES`): the second one, after
+the ASR trust rule of #135, sits in `prosody-measure-1-series-2/` and never reads the first.
 
 - `prepare` checks precondition Q1 (network guard, the ASR weights and the RINCO archive against
   the pins of `docs/dependencies.md`), lists the RINCO files of `pilot-1` (dev and held-out, from
-  `corpus/pilot-1/provenance.json`) that the experiment leaves out, with the SHA-256 of that
-  list, and counts the material that stays. It writes `prepare.json`.
+  `corpus/pilot-1/provenance.json`) and those the series names, that the experiment leaves out,
+  with the SHA-256 of that list, and counts the material that stays. It writes `prepare.json`
+  with the data changes of the series (`data_changes`).
 - `sanity` is one attempt of the sanity stage S1/S2 on the Gate 0 clips, under the same memory
   scope and CPU pin as the main run; each attempt is recorded with its number, the SHA-256 of
   this file, the cgroup memory limits and the CPUs it ran on. The second failed attempt writes
@@ -63,7 +66,32 @@ ASR_WEIGHTS_SHA256 = {
 }
 RINCO_SHA256 = "243688e816bfdf9adbfd65ef5c6104acccd0742ec9bb78b00edb2a299a7148f1"
 
-OUTPUT_DIR = "prosody-measure-1"
+# One series is one owner-approved run in a directory of its own; nothing carries over between
+# series. `data_changes` are changes of the data definition since series 1, with their commit.
+SERIES = {
+    1: {"dir": "prosody-measure-1", "excluded": (), "data_changes": ()},
+    2: {
+        "dir": "prosody-measure-1-series-2",
+        "owner_decision": "https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7060595460",
+        # The RINCO files #135 read to check its rule (decision 0021, «Файлы RINCO»).
+        "excluded": (
+            "INTON-EAF/1-Questions/q-1122.wav",
+            "INTON-EAF/2-Imperatives/i-1113.wav",
+            "INTON-EAF/2-Imperatives/i-12124_2.wav",
+            "INTON-EAF/3-Statements/s-218.WAV",
+            "INTON-EAF/3-Statements/s-221.WAV",
+        ),
+        "data_changes": (
+            {
+                "change": "ASR trust rule: no_vad_speech flags suspect_hallucination",
+                "issue": "https://github.com/renidere/sound-scout-plugin/issues/135",
+                "commit": "fe18c4aa99c622d23f3eaa31ac06bb62c020b71d",
+                "decision": "docs/decisions/0021-asr-vad-hallucination.md",
+            },
+        ),
+    },
+}
+OUTPUT_DIR = SERIES[1]["dir"]
 CORPUS_DIR = "corpus"
 PILOT_PROVENANCE = Path("corpus/pilot-1/provenance.json")
 PILOT_RINCO_KINDS = ("rinco_candidate", "corrupted_asr")
@@ -372,8 +400,8 @@ def metric(utterances: list[dict]) -> dict:
 # --- material ------------------------------------------------------------------------------
 
 
-def excluded_members(provenance: dict) -> list[str]:
-    """The RINCO WAV members of `pilot-1` (dev and held-out), sorted and unique."""
+def excluded_members(provenance: dict, extra: tuple[str, ...] = ()) -> list[str]:
+    """The RINCO WAV members of `pilot-1` (dev and held-out) and `extra`, sorted and unique."""
     return sorted(
         {
             clip["member"]
@@ -381,7 +409,13 @@ def excluded_members(provenance: dict) -> list[str]:
             if clip.get("kind") in PILOT_RINCO_KINDS
             and str(clip.get("source", "")).endswith(corpus.RINCO_ARCHIVE)
         }
+        | set(extra)
     )
+
+
+def series_excluded(config_: config.Config, series: int) -> list[str]:
+    provenance = _read_json(config_.data_root / PILOT_PROVENANCE)
+    return excluded_members(provenance, SERIES[series]["excluded"])
 
 
 def list_sha256(members: list[str]) -> str:
@@ -724,15 +758,21 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def output_dir(config_: config.Config) -> Path:
-    return _mkdir(paths.resolve_output(config_.data_root, OUTPUT_DIR, config_))
+def output_dir(config_: config.Config, series: int = 1) -> Path:
+    return _mkdir(paths.resolve_output(config_.data_root, SERIES[series]["dir"], config_))
 
 
-def _header(decision: Path) -> dict:
+def _header(decision: Path, series: int = 1) -> dict:
+    if series not in SERIES:
+        raise ProsodyError(f"series {series} is not approved; approved: {sorted(SERIES)}")
+    approved = SERIES[series]
     return {
         "format_version": FORMAT_VERSION,
         "experiment": "prosody-measure-1",
+        "series": series,
         "decision": "docs/decisions/0019-next-audio-experiment.md (редакция 2)",
+        **({"owner_decision": approved["owner_decision"]} if "owner_decision" in approved else {}),
+        "data_changes": list(approved["data_changes"]),
         "rule_sha256": check_rule(decision),
         "code_sha256": code_sha256(),
         "at": _now(),
@@ -759,16 +799,16 @@ def _refuse_if_decided(out: Path) -> None:
 # --- commands ------------------------------------------------------------------------------
 
 
-def prepare(config_: config.Config, decision: Path = DECISION_DOC) -> dict:
-    header = _header(decision)
-    out = output_dir(config_)
+def prepare(config_: config.Config, decision: Path = DECISION_DOC, series: int = 1) -> dict:
+    header = _header(decision, series)
+    out = output_dir(config_, series)
     _refuse_if_decided(out)
     if (out / PREPARE_FILE).exists():
         raise ProsodyError(f"{PREPARE_FILE} exists; prepare runs once")
     problems = q1(config_)
     if problems:
         return _invalid(out, header, "Q1: " + "; ".join(problems))
-    excluded = excluded_members(_read_json(config_.data_root / PILOT_PROVENANCE))
+    excluded = series_excluded(config_, series)
     with zipfile.ZipFile(rinco_path(config_)) as archive:
         _, counts = material(archive, excluded)
     record = {
@@ -796,9 +836,10 @@ def run_sanity(
     decision: Path = DECISION_DOC,
     transcribe=None,
     scope: tuple[str, str] | None | bool = True,
+    series: int = 1,
 ) -> dict:
-    header = _header(decision)
-    out = output_dir(config_)
+    header = _header(decision, series)
+    out = output_dir(config_, series)
     _refuse_if_decided(out)
     if not (out / PREPARE_FILE).exists():
         raise ProsodyError("run `prepare` first")
@@ -838,9 +879,10 @@ def run_main(
     transcribe=None,
     scope: tuple[str, str] | None | bool = True,
     wall_seconds: float = MAIN_WALL_SECONDS,
+    series: int = 1,
 ) -> dict:
-    header = _header(decision)
-    out = output_dir(config_)
+    header = _header(decision, series)
+    out = output_dir(config_, series)
     _refuse_if_decided(out)
     main_dir = out / MAIN_DIR
     if (main_dir / STARTED_FILE).exists():
@@ -856,7 +898,7 @@ def run_main(
     if not passed or passed[-1]["code_sha256"] != header["code_sha256"]:
         raise ProsodyError("no passed sanity attempt of this code; run `sanity` first")
     scope = _checked_scope(scope)
-    excluded = excluded_members(_read_json(config_.data_root / PILOT_PROVENANCE))
+    excluded = series_excluded(config_, series)
     if list_sha256(excluded) != prepared["exclusion"]["sha256"]:
         raise ProsodyError("the pilot-1 exclusion list changed since `prepare`")
     _mkdir(main_dir)
@@ -904,12 +946,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sound_scout.eval.prosody")
     parser.add_argument("command", choices=("prepare", "sanity", "run"))
     parser.add_argument("--decision", type=Path, default=DECISION_DOC)
+    parser.add_argument("--series", type=int, choices=sorted(SERIES), default=1)
     args = parser.parse_args(argv)
     try:
         config_ = config.load()
         guard.install_network_guard(config_)
         step = {"prepare": prepare, "sanity": run_sanity, "run": run_main}[args.command]
-        result = step(config_, args.decision)
+        result = step(config_, args.decision, series=args.series)
     except (ProsodyError, corpus.CorpusError, config.ConfigError, paths.PathDenied) as error:
         print(f"prosody: {error}", file=sys.stderr)
         return 2

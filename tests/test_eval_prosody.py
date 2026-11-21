@@ -691,3 +691,77 @@ def test_run_report_names_the_verdict_the_hashes_and_holds_no_private_paths() ->
     assert prosody.RULE_SHA256 in report and prosody.RINCO_SHA256 in report
     assert "23a224baf9e3c07e7bcd4b03d6c1eec41a200eee65aa0d422a3bd61b339ce3c7" in report
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
+
+
+# --- series --------------------------------------------------------------------------------
+
+
+def test_series_2_names_the_asr_rule_of_135_and_the_rinco_files_it_read() -> None:
+    second = prosody.SERIES[2]
+    assert second["dir"] == "prosody-measure-1-series-2" != prosody.SERIES[1]["dir"]
+    (change,) = second["data_changes"]
+    assert change["issue"].endswith("/issues/135")
+    assert re.fullmatch(r"[0-9a-f]{40}", change["commit"])
+    decision = (REPO / change["decision"]).read_text(encoding="utf-8")
+    listed = re.findall(r"^- `(INTON-EAF/[^`]+)`$", decision.split("## Файлы RINCO")[1], re.M)
+    assert sorted(listed) == list(second["excluded"])
+
+
+@needs_ffmpeg
+def test_series_2_runs_in_its_own_directory_after_a_decided_series_1(tmp_path, monkeypatch) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    decision = REPO / prosody.DECISION_DOC
+    first = settings.data_root / prosody.SERIES[1]["dir"]
+    first.mkdir()
+    (first / prosody.RESULT_FILE).write_text('{"verdict": "INVALID"}')
+    with pytest.raises(prosody.ProsodyError, match="verdict is out"):
+        prosody.prepare(settings, decision)
+    extra = ("INTON-EAF/1-Questions/x-1.wav",)
+    monkeypatch.setitem(prosody.SERIES, 2, dict(prosody.SERIES[2], excluded=extra))
+    record = prosody.prepare(settings, decision, series=2)
+    members = ["INTON-EAF/1-Questions/x-0.wav", *extra]
+    assert record["series"] == 2 and record["data_changes"] == list(
+        prosody.SERIES[2]["data_changes"]
+    )
+    assert record["exclusion"] == {
+        "members": members,
+        "count": 2,
+        "sha256": prosody.list_sha256(members),
+    }
+    assert record["material"]["files"] == 1
+    attempt = prosody.run_sanity(settings, decision, fake_transcriber(words), series=2)
+    assert attempt["attempt"] == 1 and attempt["passed"] and attempt["series"] == 2
+    calls = []
+    result = prosody.run_main(
+        settings, decision, fake_transcriber({}, calls), scope=False, series=2
+    )
+    assert len(calls) == 2 and result["verdict"] == prosody.PASS
+    assert result["exclusion_sha256"] == prosody.list_sha256(members)
+    second = settings.data_root / prosody.SERIES[2]["dir"]
+    assert sorted(p.name for p in second.iterdir()) == [
+        "main",
+        "prepare.json",
+        "result.json",
+        "sanity",
+    ]
+    assert sorted(p.name for p in first.iterdir()) == [prosody.RESULT_FILE]
+
+
+def test_an_unapproved_series_is_refused_before_any_file(tmp_path, monkeypatch) -> None:
+    settings, _ = sanity_setup(tmp_path, monkeypatch)
+    with pytest.raises(prosody.ProsodyError, match="series 3 is not approved"):
+        prosody.prepare(settings, REPO / prosody.DECISION_DOC, series=3)
+    assert not any(p.name.startswith("prosody-measure-1") for p in settings.data_root.iterdir())
+    with pytest.raises(SystemExit):
+        prosody.main(["prepare", "--series", "3"])
+
+
+def test_the_cli_passes_the_series_to_the_step(tmp_path, monkeypatch, capsys) -> None:
+    seen = []
+    monkeypatch.setattr(prosody.config, "load", lambda: make_config(tmp_path))
+    monkeypatch.setattr(prosody.guard, "install_network_guard", lambda _: True)
+    monkeypatch.setattr(
+        prosody, "run_sanity", lambda c, d, series: seen.append(series) or {"passed": True}
+    )
+    assert prosody.main(["sanity", "--series", "2"]) == 0
+    assert seen == [2] and json.loads(capsys.readouterr().out) == {"passed": True}
