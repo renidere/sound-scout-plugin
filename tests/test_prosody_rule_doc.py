@@ -174,3 +174,27 @@ def test_revision_record_has_the_dated_132_line_on_the_moved_k_count() -> None:
     assert "16/18 для всех ответов K1/K2, а не только для `S0`/`N1`/`T1`" in revision
     provenance = section(document, "## 7. Происхождение")
     assert "Поправка (2026-11-21, #132): перечитан комментарий 7024154195" in provenance
+
+
+SERIES_3_HEADING = "## Серия 3 (2026-11-21): правила исключения EAF до прогона"
+SERIES_3_DECISION = (
+    "https://github.com/renidere/sound-scout-plugin/issues/142#issuecomment-7064744998"
+)
+
+
+def test_series_3_section_states_both_exclusion_rules_as_post_hoc_and_keeps_the_rule() -> None:
+    document = DOC.read_text(encoding="utf-8")
+    rules = section(document, SERIES_3_HEADING)
+    assert SERIES_3_DECISION in rules
+    assert "Раздел записан до любого шага серии 3" in rules
+    assert "**Post hoc.** Оба правила найдены после серии 2" in rules
+    assert "более слабое свидетельство" in rules
+    assert "**E1. EAF без привязки ко времени.**" in rules and "кратно 1000 мс" in rules
+    assert "**E2. WAV с несколькими EAF.**" in rules and "вместе со всеми своими EAF" in rules
+    assert "только заголовки EAF и WAV и времена аннотаций" in rules
+    assert "не читают тексты аннотаций, ASR, отсчёты аудио и результаты серий 1 и 2" in rules
+    assert "PASS не добавляет `word_prominence`" in rules
+    assert document.index(SERIES_3_HEADING) < document.index("<!-- prosody-rule:begin -->")
+    header = section(document, "## 0. Шапка")
+    assert "**Серия 3 (2026-11-21): одобрена владельцем**" in header
+    assert SERIES_3_DECISION in header
