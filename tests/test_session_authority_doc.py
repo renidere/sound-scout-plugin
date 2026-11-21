@@ -1,11 +1,12 @@
-"""Decision 0017 records stage A of #120 and its remainder without personal data."""
+"""Decision 0017 records stages A and B of #120 and the remainder without personal data."""
 
 import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs/decisions/0017-session-authority-owner.md"
-ISSUE = "https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-"
+ISSUES = "https://github.com/renidere/sound-scout-plugin/issues/"
+ISSUE = f"{ISSUES}120#issuecomment-"
 
 
 def section(heading: str) -> str:
@@ -98,7 +99,7 @@ def test_client_check_2026_11_21_separates_report_check_and_open_items() -> None
     assert "Это сообщение владельца, а не сверка" in client
     assert "Только чтение, 2026-11-21 08:04–08:15 UTC" in client
     for fact in (
-        "на `:9120` — 0 соединений",
+        "на listener этапа A — 0 соединений",
         "Строк в `session_admissions` — 0",
         "`20261121_110129_a8cd31`",
         "`version: 0.0.1`, 5 файлов = `dcb530e`",
@@ -130,3 +131,81 @@ def test_step_b1_names_services_order_risks_and_rollback() -> None:
         assert part in step
     assert "Откат входит в то же разрешение и окно" in step
     assert "`hermes sessions adopt` и #104 в B1 не входят" in step
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_stage_b_records_listener_move_unit_stop_login_and_admission() -> None:
+    stage_b = flat(section("## Этап B (2026-11-21)"))
+    for link in (
+        f"{ISSUE}7060133566",
+        f"{ISSUE}7060203442",
+        f"{ISSUE}7060273214",
+        f"{ISSUE}7059680390",
+        f"{ISSUES}104#issuecomment-7060137735",
+        f"{ISSUES}114#issuecomment-7060137985",
+    ):
+        assert link in stage_b
+    for fact in (
+        "`webapp.port` → `9119`",
+        "Gateway слушает `0.0.0.0:9119`",
+        "Затем `stop hermes-autonomous.service` и `restart hermes-gateway.service`",
+        "stage-b-port9119-20261121T083255Z",
+        "`systemctl --user disable hermes-autonomous.service`: unit `inactive`, `disabled`",
+        "`login_success` (`basic`) с Windows-хоста",
+        "строка `session_admissions` seq 96, `owner_epoch` 14, `completed`",
+        "`hermes-autonomous.service`: inactive, disabled",
+        "Итог: у чатов Desktop один процесс-владелец — `hermes gateway run`",
+        "Откат этапа B",
+    ):
+        assert fact in stage_b
+    status = flat(DOC.read_text(encoding="utf-8").split("\n## Вопрос\n", 1)[0])
+    assert "Этап B выполнен 2026-11-21: gateway слушает `:9119`" in status
+    assert "три старых чата, которые назвал владелец, перенесены" in status
+    assert "кроме" not in status
+
+
+def test_stage_b_records_ssh_backend_gone_and_three_chats_adopted() -> None:
+    state = flat(section("### Состояние после этапа B"))
+    assert "Desktop SSH backend больше нет: процесса PID 2599942 нет" in state
+    assert "`pgrep -af ssh-session-token-file` пуст" in state
+    steps = flat(section("### Ход"))
+    assert "SSH-подключение `workstation`" in steps
+    for chat in ("20261102_120521_cf6e0f", "20261102_121441_41b4af", "20261117_002327_f834d5"):
+        assert f"`{chat}`" in steps
+    assert "`adopt_sessions` (`session.resume` и `session.detach`" in steps
+    assert "Итог: `adopted 3 skipped {}`" in steps
+    assert "`hermes sessions adopt --dry-run` — 1212 (было 1215)" in steps
+    backup = "До переноса — копия `state.db` через SQLite backup API, `integrity_check` = `ok`"
+    assert backup in steps
+    assert "adopt-3-20261121T085802Z" in steps
+    open_items = flat(section("### Не сделано и не проверено"))
+    assert "Остальные 1212 старых чатов не переносились: владелец назвал только три" in open_items
+    assert "не выполнялся" not in open_items
+    assert "Health с входом после этапа B не читался" in open_items
+    assert "Откат переноса трёх чатов" in section("### Откат этапа B")
+
+
+def test_9119_is_the_desktop_entry_and_9120_is_one_history_note() -> None:
+    document = DOC.read_text(encoding="utf-8")
+    assert "`0.0.0.0:9119` — единственный вход Desktop" in flat(section("## Ответ"))
+    assert document.count("9120") == 1
+    notes = [p for p in document.split("\n\n") if "9120" in p]
+    note = flat(notes[0])
+    assert note.startswith("**Порт (история).** На этапе A (2026-11-20)")
+    assert "2026-11-21 (этап B) Webapp перенесён на `:9119`" in note
+    for superseded in (
+        "### Остаток: клиентская проверка",
+        "### Остаток: этап B",
+        "### Шаг B1 (предложение 2026-11-21)",
+    ):
+        assert section(superseded).lstrip().startswith("**История")
+
+
+def test_stage_b_attributes_log_lines_as_the_104_report_does() -> None:
+    steps = flat(section("### Ход"))
+    assert "`agent.log`: `registered 9 tool(s)`" in steps
+    assert "После `restart hermes-gateway.service` — `Mounted plugin API routes:" in steps
+    assert "`agent.log`: `Mounted plugin API routes" not in steps

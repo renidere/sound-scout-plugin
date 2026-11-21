@@ -1001,11 +1001,11 @@ def test_criterion_2_instruction_enables_in_process_and_removes_the_package() ->
     assert "`host`" in instruction and "остановиться" in instruction
     install = instruction.index("cp -r <checkout sound-scout-plugin>/hermes/plugin/sound-scout")
     enable = instruction.index("hermes plugins enable sound-scout")
-    restart = instruction.index("systemctl --user restart hermes-autonomous.service")
+    restart = instruction.index("systemctl --user restart hermes-gateway.service")
     assert install < enable < restart
     removal = _section(text, "## Удаление")
     remove = removal.index("hermes plugins remove sound-scout")
-    assert remove < removal.index("systemctl --user restart hermes-autonomous.service")
+    assert remove < removal.index("systemctl --user restart hermes-gateway.service")
     assert "hermes plugins list" in removal
     assert "desktop-plugins\\sound-scout" in removal
 
@@ -1039,9 +1039,12 @@ def test_journal_lookups_flag_a_journal_grep_for_the_mount_line() -> None:
     assert _journal_lookups("journalctl --user -u hermes-autonomous.service -n 50") == []
 
 
-def test_criterion_6_decision_has_a_results_table_pending_the_owner() -> None:
+def test_criterion_6_decision_has_a_results_table_without_a_probe_run() -> None:
     text = DECISION.read_text(encoding="utf-8")
-    assert "результаты ожидают прогона владельцем" in text.splitlines()[2]
+    assert "прогона владельцем не было" in text.splitlines()[2]
+    instruction = " ".join(_section(text, "## Инструкция владельцу").split())
+    assert "**После этапа B (2026-11-21) инструкцию не выполнять.**" in instruction
+    assert "раздел «Удаление» удалил бы её (`hermes plugins remove sound-scout`)" in instruction
     rows = [
         line.split("|")[1:-1]
         for line in _section(text, "## Результаты").splitlines()
@@ -1050,7 +1053,7 @@ def test_criterion_6_decision_has_a_results_table_pending_the_owner() -> None:
     by_criterion = {cells[0].strip().split(".")[0]: cells[2].strip() for cells in rows}
     assert {"1", "2", "3", "4а", "4б", "4в", "5а", "5б", "5в", "6"} <= set(by_criterion)
     for criterion in ("3", "4а", "4б", "4в", "5а", "5б", "5в", "6"):
-        assert by_criterion[criterion] == "ожидает прогона владельцем"
+        assert by_criterion[criterion] == "не выполнено: прогона не было"
 
 
 def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them(

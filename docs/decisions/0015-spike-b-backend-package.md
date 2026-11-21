@@ -1,6 +1,7 @@
 # 0015 — Spike B: пакет-заглушка на backend (ctx.rest, доставка заметки, запуск runner)
 
-- **Статус:** инструкция готова; результаты ожидают прогона владельцем.
+- **Статус:** инструкция готова; прогона владельцем не было. После этапа B 0017 (2026-11-21)
+  инструкцию зонда не выполняют (раздел «Инструкция владельцу»).
 - **Дата:** 2026-11-20.
 - **Решение:** [Decision в #96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7023401575).
 - **Задача:** [#96](https://github.com/renidere/sound-scout-plugin/issues/96); эпик
@@ -48,7 +49,8 @@ SDKs»):
 
 При `plugins.isolation: in_process` (значение по умолчанию) gateway монтирует `plugin_api.py` в
 своём процессе при первом запросе к дашборду, и только если `sound-scout` есть в
-`plugins.enabled`. Веб-дашборд напишет в консоль браузера, что у плагина нет `dist/index.js`, и
+`plugins.enabled`. Webapp gateway прогревает дашборд при старте, поэтому маршруты монтируются сразу
+(0017, «Живые данные», «После этапа A»). Веб-дашборд напишет в консоль браузера, что у плагина нет `dist/index.js`, и
 продолжит работу.
 
 ## Маршруты
@@ -88,13 +90,28 @@ Sound Scout · spike B: тестовая заметка <token>, доставл�
 
 Все команды выполняет владелец. Агент ничего из этого не запускает.
 
+**После этапа B (2026-11-21) инструкцию не выполнять.** В `~/.hermes/plugins/sound-scout` gateway
+с 2026-11-21 стоит production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104).
+Шаг 2 записал бы пакет-зонд в тот же каталог, а раздел «Удаление» удалил бы её (`hermes plugins remove
+sound-scout`). До этапа B зонд не запускался (таблица «Результаты»). Доставку через #104 проверяет
+[#114](https://github.com/renidere/sound-scout-plugin/issues/114). Новый прогон зонда — только по
+отдельному решению владельца. Шаги ниже — запись инструкции зонда.
+
+Gateway с этапа B (2026-11-21) — `hermes-gateway.service` (`hermes gateway run`, Webapp на
+`:9119`); `hermes-autonomous.service` остановлен и отключён
+([0017, «Этап B (2026-11-21)»](0017-session-authority-owner.md#этап-b-2026-11-21)).
+
+История. До этапа B (по 2026-11-21) шаги 1, 2 и 6, строка 5а таблицы «Результаты» и раздел
+«Удаление» называли gateway unit `hermes-autonomous.service`. Таблица «Результаты» прогонов по
+этим шагам не записывает.
+
 ### 1. Проверка перед установкой (Linux, backend)
 
 ```bash
 cd <checkout sound-scout-plugin>
 git rev-parse --short HEAD
 hermes config get plugins.isolation
-systemctl --user show -p MainPID,ActiveState hermes-autonomous.service
+systemctl --user show -p MainPID,ActiveState hermes-gateway.service
 ```
 
 - Коммит checkout записать в таблицу результатов.
@@ -107,15 +124,15 @@ systemctl --user show -p MainPID,ActiveState hermes-autonomous.service
 ```bash
 cp -r <checkout sound-scout-plugin>/hermes/plugin/sound-scout ~/.hermes/plugins/sound-scout
 hermes plugins enable sound-scout
-systemctl --user restart hermes-autonomous.service
+systemctl --user restart hermes-gateway.service
 ```
 
 `hermes plugins enable` может сам попросить работающий gateway перечитать плагины; перезапуск всё
-равно нужен, чтобы прогон начался с чистого процесса. Маршруты монтируются при первом запросе к
-дашборду (например, команда «health» из шага 4). После него найти строку монтирования в файлах логов
-Hermes: процесс `hermes serve` (`hermes-autonomous.service`) пишет её в `~/.hermes/logs/gui.log`,
-процесс `hermes gateway run` (`hermes-gateway.service`) — в `~/.hermes/logs/agent.log`. В журнал
-unit она не попадает: logger `hermes_cli.web_server` относится к компоненту `gui`, и Hermes пишет
+равно нужен, чтобы прогон начался с чистого процесса. Gateway с Webapp монтирует маршруты при
+старте: строка монтирования появилась после перезапуска gateway после этапа A и на этапе B (0017).
+После перезапуска найти строку монтирования в файлах логов Hermes: процесс `hermes gateway run` (`hermes-gateway.service`) пишет её в
+`~/.hermes/logs/agent.log`, процесс `hermes serve` (до этапа B — `hermes-autonomous.service`) — в
+`~/.hermes/logs/gui.log`. В журнал unit она не попадает: logger `hermes_cli.web_server` относится к компоненту `gui`, и Hermes пишет
 его только в файлы логов (`hermes_logging.py:322`, `:402–407`; см. 0017, «Живые данные»).
 `agent.log` — общий файл без фильтра компонента: в него пишет каждый процесс Hermes, в том числе
 `hermes serve` (`hermes_logging.py:403`). Поэтому монтирование в `hermes serve` проверяется по
@@ -148,31 +165,38 @@ grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/agent
 
 ### 4. Критерий 3: `GET /health` через `ctx.rest` с Windows
 
-1. Палитра → `Sound Scout spike: health`. Ожидание зависит от адреса, на который `ctx.rest` ведёт
-   клиент ([0017, «Этап A (2026-11-20)»](0017-session-authority-owner.md#этап-a-2026-11-20)):
-   - `:9119` (`hermes serve`) — уведомление `ok=true pid=<N> session_owner=false`;
-   - `:9120` (gateway `hermes-gateway.service`) — уведомление `ok=true pid=<N> session_owner=true`.
+1. Палитра → `Sound Scout spike: health`. Ожидание зависит от процесса, на который `ctx.rest` ведёт
+   клиент ([0017, «Этап B (2026-11-21)»](0017-session-authority-owner.md#этап-b-2026-11-21)):
+   `:9119` (gateway `hermes-gateway.service`, с этапа B 2026-11-21) — единственный вход Desktop,
+   уведомление `ok=true pid=<N> session_owner=true`.
 
-   С 2026-11-20 топология выбрана, этап A выполнен: gateway слушает `:9120`. Windows-клиент пока
-   подключён к `:9119`.
-2. На Linux: `systemctl --user show -p MainPID hermes-autonomous.service` — `MainPID` должен
-   совпасть с `pid` для `:9119`; для `:9120` — `MainPID` у `hermes-gateway.service`.
+   История. С 2026-11-20 топология выбрана, этап A выполнен
+   ([0017, «Этап A (2026-11-20)»](0017-session-authority-owner.md#этап-a-2026-11-20)). До этапа B
+   `:9119` слушал `hermes serve` (уведомление `session_owner=false`), а gateway — временный порт
+   `:9120`; 2026-11-21 Webapp gateway перенесён на `:9119`. С 2026-11-21 в gateway стоит
+   production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104) без
+   `/spike/*`. Команда `Sound Scout spike: health` есть только в пакете-зонде, а инструкцию зонда
+   после этапа B не выполняют (раздел «Инструкция владельцу»).
+2. На Linux: `systemctl --user show -p MainPID hermes-gateway.service` — `MainPID` должен совпасть с
+   `pid`. `hermes-autonomous.service` с этапа B остановлен и отключён.
    `session_owner=false` значит, что этот процесс не владеет чатами Desktop
    (#94, пункт 5; владелец — `hermes-gateway.service`, см. 0017).
 3. Ошибку `ctx.rest` записать дословно.
 
 ### 5. Критерий 4: доставка заметки ровно один раз
 
-Доставка через `ctx.rest` на `:9119` идёт в `hermes serve` и возвращает `local chat <id>:
-no gateway in this process owns its session` (`check last delivery` → `state=failed`); см. 0017.
-После этапа A (2026-11-20) это верно: Windows-клиент пока подключён к `:9119`. Ошибка уходит, когда
-`ctx.rest` клиента доходит до gateway на `:9120` (0017, «Остаток: клиентская проверка»). Условие
-этапа B 0017 («Остаток: этап B») делает этот путь единственным: остановить и отключить
-`hermes-autonomous.service`, и Windows-клиент работает только через gateway; остальные предусловия
-этапа B — там же. Шаги 5.1–5.4 вызывают маршруты Spike B `/spike/*`, поэтому их выполняют до
-этапа B: на этапе B production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104)
-заменяет Spike B в gateway и убирает `/spike/*`. После этапа B доставку через #104 проверяет
-[#114](https://github.com/renidere/sound-scout-plugin/issues/114).
+История. До этапа B (по 2026-11-21) доставка через `ctx.rest` на `:9119` шла в `hermes serve` и
+возвращала `local chat <id>: no gateway in this process owns its session` (`check last delivery` →
+`state=failed`); см. 0017.
+
+С 2026-11-21 (0017, «Этап B (2026-11-21)») `:9119` слушает gateway, и `ctx.rest` клиента доходит до
+него. Условие этапа B 0017 («Остаток: этап B») выполнено: остановить и отключить
+`hermes-autonomous.service`, и Windows-клиент работает только через gateway. Шаги 5.1–5.4 вызывают
+маршруты Spike B `/spike/*`, поэтому их нужно было выполнить до этапа B. Они не выполнены (таблица
+«Результаты»). На этапе B production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104)
+заменила Spike B в gateway и убрала `/spike/*`. Доставку через #104 проверяет
+[#114](https://github.com/renidere/sound-scout-plugin/issues/114): 2026-11-21 заметка задания дошла
+в чат владельца ровно один раз.
 Шаги ниже описывают ожидание, когда клиент работает через gateway.
 
 1. **Открытый чат X.** Открыть чат X, палитра → `Sound Scout spike: deliver note to this chat in 30 s`,
@@ -196,12 +220,12 @@ no gateway in this process owns its session` (`check last delivery` → `state=f
    systemctl --user show sound-scout-spike-b.service -p ActiveState,MainPID,ControlGroup
    ```
 
-   `ControlGroup` должен лежать вне `hermes-autonomous.service` (ожидается окончание
+   `ControlGroup` должен лежать вне `hermes-gateway.service` (ожидается окончание
    `app.slice/sound-scout-spike-b.service`).
 3. Перезапустить gateway и посмотреть снова (или палитра → `Sound Scout spike: runner unit status`):
 
    ```bash
-   systemctl --user restart hermes-autonomous.service
+   systemctl --user restart hermes-gateway.service
    systemctl --user show sound-scout-spike-b.service -p ActiveState,MainPID,ControlGroup
    ```
 
@@ -228,20 +252,20 @@ gh issue comment 96 --repo renidere/sound-scout-plugin --body-file <файл с 
 
 ## Результаты
 
-Коммит checkout: ожидает прогона владельцем.
+Коммит checkout: прогона не было.
 
 | критерий | что наблюдать | результат |
 |---|---|---|
 | 1. пакет и `GET /health` без Hermes | `tests/test_hermes_plugin.py` | выполнено в репозитории |
 | 2. инструкция включения и удаления | этот документ, разделы «Инструкция владельцу» и «Удаление» | выполнено в репозитории |
-| 3. `GET /health` через `ctx.rest` с Windows | `ok`, `pid` = `MainPID` gateway, `session_owner` | ожидает прогона владельцем |
-| 4а. заметка в открытый чат | ровно одна заметка, `state=delivered` | ожидает прогона владельцем |
-| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | ожидает прогона владельцем |
-| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | ожидает прогона владельцем |
-| 5а. unit вне cgroup gateway | `ControlGroup` вне `hermes-autonomous.service` | ожидает прогона владельцем |
-| 5б. unit переживает перезапуск gateway | тот же `MainPID`, `ActiveState=active` | ожидает прогона владельцем |
-| 5в. повторный старт живого unit | отказ systemd | ожидает прогона владельцем |
-| 6. запись результатов | эта таблица заполнена | ожидает прогона владельцем |
+| 3. `GET /health` через `ctx.rest` с Windows | `ok`, `pid` = `MainPID` gateway, `session_owner` | не выполнено: прогона не было |
+| 4а. заметка в открытый чат | ровно одна заметка, `state=delivered` | не выполнено: прогона не было |
+| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | не выполнено: прогона не было |
+| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | не выполнено: прогона не было |
+| 5а. unit вне cgroup gateway | `ControlGroup` вне `hermes-gateway.service` | не выполнено: прогона не было |
+| 5б. unit переживает перезапуск gateway | тот же `MainPID`, `ActiveState=active` | не выполнено: прогона не было |
+| 5в. повторный старт живого unit | отказ systemd | не выполнено: прогона не было |
+| 6. запись результатов | эта таблица заполнена | не выполнено: прогона не было |
 
 Если директива не рисуется (заметки cron хранятся как `internal_notification`), действует запасной
 путь 0013 § 3.7: простой текст в заметке и карточка через опрос `GET /jobs/<id>`.
@@ -253,7 +277,7 @@ Linux:
 ```bash
 systemctl --user stop sound-scout-spike-b.service
 hermes plugins remove sound-scout
-systemctl --user restart hermes-autonomous.service
+systemctl --user restart hermes-gateway.service
 hermes plugins list
 ```
 
