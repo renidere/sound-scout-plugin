@@ -147,6 +147,29 @@ SHA-256 на диске с LFS sha256 из `GET /api/models/ggml-org/Qwen3-Omni-
 константе `QWEN3OMNI_WEIGHTS`, равной этой таблице. Не используются: `Q8_0` (32,5 GB) и `bf16`
 LLM, `mmproj-…-bf16.gguf`.
 
+#### Qwen2.5-Omni-7B — диагностический Gate 0 #145 (решение владельца 7065525535)
+
+Решение владельца — [комментарий 7065525535](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7065525535)
+(2026-11-21), п. 2: прогон по `GATE0-RULE v1` для понимания слабых мест, загрузка Q8_0 и mmproj
+f16 закреплённой ревизии, потолок памяти 18 GB. Репозиторий `ggml-org/Qwen2.5-Omni-7B-GGUF` на
+Hugging Face, ревизия `89b785438c8901d4635e42f50480ba5985a1bbf1` (lastModified 2025-05-26), не
+gated. Исходная модель `Qwen/Qwen2.5-Omni-7B`, ревизия `ae9e1690543ffd5c0221dc27f79834d0294cba00`.
+Лицензия: текст `LICENSE` исходной модели — Apache-2.0; карточка GGUF — `license_name:
+qwen-research`; расхождение принято владельцем для этого локального прогона. Каталог по
+умолчанию: `~/.cache/sound-scout/models/ggml-org--Qwen2.5-Omni-7B-GGUF/<ревизия>/`. Итог —
+`docs/decisions/0024-gate0-qwen25-omni.md`.
+
+| Файл | Байт | SHA-256 | Назначение |
+|---|---|---|---|
+| `Qwen2.5-Omni-7B-Q8_0.gguf` | 8 098 524 032 | `2cb12eb661bc8db5536463dd2dadd4a25c8bd42a2346bc1cefddd2e2245f641a` | языковая модель (thinker), Q8_0 |
+| `mmproj-Qwen2.5-Omni-7B-f16.gguf` | 2 643 656 480 | `7ed062b35f15f3c4cacdac72d5291db2f908f178ba4fb19e210b555f233e069d` | аудио/визуальный проектор (энкодер Qwen2-Audio, тип `qwen2.5o`), f16 |
+
+Загрузка — только по прямому URL `https://huggingface.co/ggml-org/Qwen2.5-Omni-7B-GGUF/resolve/<ревизия>/<файл>`
+(`curl --proto =https`) в файл `.part`; после загрузки размер и SHA-256 на диске сверены с LFS
+sha256 из API Hugging Face. `gate0 run --runtime qwen25omni` пересчитывает SHA-256 перед стартом
+сервера (предусловие P2) по константе `QWEN25OMNI_WEIGHTS`, равной этой таблице. Не используются:
+`Q4_K_M`, `f16` LLM (15,24 GB), `mmproj-…-Q8_0`.
+
 #### GigaChat3.1-Audio-10B-A1.8B — кандидат Gate 0 #85 (разрешение владельца 2026-11-19)
 
 Разрешение владельца — тело [#85](https://github.com/renidere/sound-scout-plugin/issues/85)
@@ -259,6 +282,12 @@ qwen3omni`, #144): тот же argv с файлами этой модели и �
 только внутри cgroup `systemd-run --user --scope -p MemoryMax=26000000000 -p MemorySwapMax=0 -- …`
 (иначе отказ до попытки) и когда у хоста `MemAvailable` ≥ 22e9 байт; сторож RSS сервера —
 25,5e9 байт. Подробности и измерения — `docs/decisions/0023-gate0-qwen3-omni.md`.
+
+Так же запускается Qwen2.5-Omni-7B (`gate0 run --runtime qwen25omni`, #145): тот же argv с
+файлами этой модели и `--load-mode none`, тип проектора `qwen2.5o`. Запуск возможен только внутри
+cgroup `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ
+до попытки) и когда у хоста `MemAvailable` ≥ 14e9 байт; сторож RSS сервера — 17,5e9 байт.
+Подробности и измерения — `docs/decisions/0024-gate0-qwen25-omni.md`.
 
 #### Runtime Borealis-5b-it (Gate 0 spike #68)
 

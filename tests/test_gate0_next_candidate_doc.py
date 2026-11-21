@@ -122,8 +122,11 @@ def test_owner_ask_names_model_revision_licence_size_and_ceiling() -> None:
         assert item in ask, item
 
 
-def test_no_weights_are_recorded_before_approval_and_links_resolve() -> None:
-    assert REVISION not in (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+def test_weights_are_recorded_only_under_the_owner_approval_and_links_resolve() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    sections = [part for part in dependencies.split("\n#### ") if REVISION in part]
+    assert len(sections) == 1  # #145, after owner decision 7065525535 on #90
+    assert sections[0].startswith("Qwen2.5-Omni-7B") and "issuecomment-7065525535" in sections[0]
     assert "веса не загружались, inference не было" in text()
     for name in re.findall(r"`(00\d\d)`", text()):
         assert len(list((REPO / "docs/decisions").glob(f"{name}-*.md"))) == 1, name

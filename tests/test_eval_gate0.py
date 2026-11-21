@@ -1594,3 +1594,118 @@ def test_qwen3omni_not_ready_packages_nothing_and_bounds_the_conclusion() -> Non
     assert "**Внешние данные — только на английском.**" in limits
     owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
     assert re.search(r"^1\. \*\*Решить судьбу Qwen3-Omni-30B-A3B-Instruct\*\*", owner, re.M)
+
+
+# --- the qwen25omni runtime of #145 under GATE0-RULE v1 (docs/decisions/0024-gate0-qwen25-omni.md)
+
+QWEN25OMNI_DOC = Path("docs/decisions/0024-gate0-qwen25-omni.md")
+QWEN25OMNI_CAP = "17999998976"  # memory.max of MemoryMax=18000000000 after the kernel's rounding
+
+
+def test_qwen25omni_decision_holds_rule_v1_unchanged() -> None:
+    document = (REPO / QWEN25OMNI_DOC).read_text(encoding="utf-8")
+    recorded = re.search(r"SHA-256 блока: `([0-9a-f]{64})`", document).group(1)
+    assert gate0.rule_sha256(document) == recorded == DECISION_RULE_SHA256
+    assert gate0.rule_name(gate0.rule_sha256(document)) == gate0.RULE_V1
+    assert _rule_lines(QWEN25OMNI_DOC) == _rule_lines(gate0.DECISION_DOC)
+    assert not re.search(r"/(home|Users)/", document)
+
+
+def test_qwen25omni_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    qwen = weights[weights.index("#### Qwen2.5-Omni-7B") :].split("\n#### ", 1)[0]
+    rows = dict(re.findall(r"^\| `([^`]+)` \| [\d ]+ \| `([0-9a-f]{64})` \|", qwen, re.M))
+    assert rows == gate0.QWEN25OMNI_WEIGHTS
+    assert gate0.QWEN25OMNI_REVISION in qwen and gate0.QWEN25OMNI_REPO in qwen
+    assert str(gate0.QWEN25OMNI_REVISION) in str(gate0.QWEN25OMNI_MODEL_DIR)
+
+
+def test_qwen25omni_server_argv_is_the_llama_argv_with_its_local_files() -> None:
+    files = gate0.LLAMA_RUNTIMES["qwen25omni"]
+    argv = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12, files)
+    gemma = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
+    assert argv[argv.index("-m") + 1] == f"/models/{gate0.QWEN25OMNI_MODEL_FILE}"
+    assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.QWEN25OMNI_MMPROJ_FILE}"
+    assert [a for a in argv if "/models/" not in a] == [
+        *[a for a in gemma if "/models/" not in a],
+        "--load-mode",
+        "none",
+    ]
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+
+
+QWEN25OMNI_DAY = "2026-11-24"
+
+
+def _qwen25_run(spike, tmp_path, memory_max=QWEN25OMNI_CAP, swap_max="0", available=16 * 10**9):
+    """The fake spike prepared again under the real GATE0-RULE v1 block of 0024, qwen weights."""
+    gate0.prepare_clips(
+        QWEN25OMNI_DAY,
+        spike["config"],
+        decision=REPO / QWEN25OMNI_DOC,
+        transcribe=_fake_transcribe,
+    )
+    models = spike["kwargs"]["model_dir"]
+    weights = {}
+    for name in gate0.QWEN25OMNI_WEIGHTS:
+        (models / name).write_bytes(name.encode())
+        weights[name] = hashlib.sha256(name.encode()).hexdigest()
+    return gate0.run_spike(
+        QWEN25OMNI_DAY,
+        spike["config"],
+        runtime="qwen25omni",
+        cgroup_root=_cgroup(tmp_path / "cgroup", memory_max, swap_max),
+        meminfo=_meminfo(tmp_path / "meminfo", available),
+        **{**spike["kwargs"], "decision": REPO / QWEN25OMNI_DOC, "weights": weights},
+    )
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_qwen25omni_run_under_the_18e9_cap_uses_its_files_rule_v1_and_the_same_plan(
+    spike, tmp_path
+) -> None:
+    result = _qwen25_run(spike, tmp_path)
+    attempt = spike["out"].parent / QWEN25OMNI_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    argv = record["argv"]
+    assert argv[argv.index("-m") + 1].endswith(gate0.QWEN25OMNI_MODEL_FILE)
+    assert argv[argv.index("--mmproj") + 1].endswith(gate0.QWEN25OMNI_MMPROJ_FILE)
+    assert argv[-2:] == ["--load-mode", "none"]
+    assert record["runtime"] == "qwen25omni" and record["rule"] == gate0.RULE_V1
+    assert record["limits"]["rss_limit_bytes"] == 17_500_000_000 < gate0.RSS_LIMIT_BYTES
+    assert record["cgroup"]["memory_max"] == QWEN25OMNI_CAP
+    assert record["requests_planned"] == 42
+    assert result["rule"] == gate0.RULE_V1 and result["audio_route"]["min_rate"] == 20.0
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+    assert gate0.RUNTIME_LIMITS["qwen25omni"] == (18 * 10**9, 17_500_000_000)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max", "available", "message"),
+    [
+        ("max", "0", 16 * 10**9, "MemoryMax=18000000000"),
+        (GIGACHAT_CAP, "0", 16 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "max", 16 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "0", gate0.QWEN25OMNI_MIN_AVAILABLE_BYTES - 4096, "MemAvailable"),
+    ],
+)
+def test_qwen25omni_run_without_the_cap_or_the_free_memory_is_refused_before_any_attempt(
+    spike, tmp_path, memory_max, swap_max, available, message
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match=message):
+        _qwen25_run(spike, tmp_path, memory_max, swap_max, available)
+    assert not (spike["out"].parent / QWEN25OMNI_DAY / gate0.ATTEMPTS_DIR).exists()
+    assert not spike["marker"].exists()
+
+
+def test_v1_p3_passes_on_750_padded_tokens_whatever_the_clip_length() -> None:
+    """llama.cpp pads every clip <= 30 s to one 30 s window: 750 positions (0024 section 2.2)."""
+    lines = _held_lines()
+    for line in lines:
+        if line.get("modality") == "audio":
+            line["audio_tokens"] = 750
+    result = gate0.decide(_synthetic_manifest(), RECORD, lines)
+    assert result["rule"] == gate0.RULE_V1
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
