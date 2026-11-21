@@ -137,3 +137,38 @@ def test_facts_limits_hypotheses_and_the_open_backend_question_have_sections() -
     backend = section(document, "### 4.8. Что остаётся нерешённым для audio backend (#90)")
     assert "Кандидата с вердиктом READY нет" in backend
     assert "Выбирать модель или техническую реализацию владельцу не нужно" in backend
+
+
+def moss_row_cells() -> list[str]:
+    lines = DOC.read_text(encoding="utf-8").splitlines()
+    (row,) = [line for line in lines if line.startswith("| MOSS-Audio-8B-Thinking-ru")]
+    return [cell.strip() for cell in row.strip("|").split("|")]
+
+
+def test_moss_k_count_covers_all_18_answers_not_the_controls() -> None:
+    _, _, controls, _, other = moss_row_cells()
+    assert "16 из 18" not in controls
+    assert "по контролям отдельно не дан" in controls and "`S0` дважды" in controls
+    assert "по всем 18 ответам на девяти клипах: K 16 из 18" in other
+
+
+def test_moss_row_other_figures_agree_with_comment_7024154195() -> None:
+    source, validity, controls, pairs, other = moss_row_cells()
+    assert "комментарий 7024154195" in source
+    assert "не формальный Gate 0" in validity and "READY не получен" in validity
+    assert "P 3/3 «нет речи»" in controls
+    assert pairs == "0/3: нет/нет, нет/нет, да/да"
+    assert "A по контракту 0 из 9 сырым, 3 из 9 после отделения reasoning" in other
+    assert "на тоне `T1` — замечания о произношении" in other
+    assert "маршрут DeepStack полностью не доказан" in other
+    assert "списано USD 0,157 из разрешённых 3" in other
+
+
+def test_revision_record_has_the_dated_132_line_on_the_moved_k_count() -> None:
+    document = DOC.read_text(encoding="utf-8")
+    revision = section(document, "## Редакция 2 (2026-11-21): что уточнено")
+    assert "**Поправка (2026-11-21, [#132](" in revision
+    assert "«K 16 из 18» перенесено из столбца «Контроли C» в «Прочее»" in revision
+    assert "16/18 для всех ответов K1/K2, а не только для `S0`/`N1`/`T1`" in revision
+    provenance = section(document, "## 7. Происхождение")
+    assert "Поправка (2026-11-21, #132): перечитан комментарий 7024154195" in provenance
