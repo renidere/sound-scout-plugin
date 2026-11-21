@@ -14,6 +14,8 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   word numbers and intervals. It records the SHA-256 of the verdict rule as the decision
   document holds it (between `RULE_BEGIN` and `RULE_END`), of the prompt and of the fixed
   questions. The audio backend is not touched.
+- `prepare --date D --reuse D0` copies the clips and words of the prepare of D0 under the rule
+  of `--decision`, each clip checked against D0's manifest (`reuse_clips`, #144).
 - `run --date D [--runtime llama|borealis|gigachat|qwen3omni]` checks the weights, the prompt,
   the rule and the clips against what was recorded, starts the local server — `llama-server`
   with local `-m`/`--mmproj` only (Gemma 4 E4B-it, or for `qwen3omni` Qwen3-Omni-30B-A3B-Instruct
@@ -526,20 +528,7 @@ def prepare_clips(
     transcribe: Callable[[Path, runs.Run, config.Config], dict] | None = None,
 ) -> dict:
     """Build the clips, the words and the manifest under `<data_root>/<day>/`; never overwrites."""
-    rule = rule_sha256(decision.read_text(encoding="utf-8"))
-    prompt = review.load_prompt()
-    if prompt.sha256 != PROMPT_SHA256:
-        raise Gate0Error(f"prompt A is {prompt.sha256}, the protocol fixes {PROMPT_SHA256}")
-    out = output_dir(day, config_)
-    _mkdir(out, config_)
-    if os.path.lexists(out / MANIFEST_FILE):
-        raise Gate0Error(f"{day}/{MANIFEST_FILE} already exists; prepare never overwrites")
-    leftovers = [name for name in (CLIPS_DIR, PREP_DIR, WORDS_FILE) if os.path.lexists(out / name)]
-    if leftovers:
-        raise Gate0Error(
-            f"{day}/ holds {leftovers} from a prepare that stopped midway; "
-            f"delete the directory {day}/ and run prepare again"
-        )
+    rule, prompt, out = _new_prepare(day, config_, decision)
     prep_dir = _mkdir(out / PREP_DIR, config_)
     transcribe = transcribe or transcribe_source
     if natural is None:
@@ -584,6 +573,67 @@ def prepare_clips(
     _write_json(out, WORDS_FILE, words, config_)
     _write_json(out, MANIFEST_FILE, manifest, config_)
     return manifest
+
+
+def reuse_clips(day: str, config_: config.Config, *, source: str, decision: Path) -> dict:
+    """The clips and words of the prepare of day `source` under the rule of `decision`, in
+    `<data_root>/<day>/`: each clip copied byte for byte after its SHA-256 matched that manifest.
+    A new rule gets its own manifest, and the run sends exactly the stimuli an earlier run sent
+    (#144: `V2`, `V3` of 2026-11-19 came from an unseeded resynthesis, 0010 section 2.1)."""
+    rule, prompt, out = _new_prepare(day, config_, decision)
+    origin = output_dir(source, config_)
+    old = _read_json(origin / MANIFEST_FILE)
+    if old["prompt"]["sha256"] != prompt.sha256 or old["questions_sha256"] != questions_sha256():
+        raise Gate0Error(f"{source}/{MANIFEST_FILE} holds another prompt A or other questions")
+    if old["rule_sha256"] == rule:
+        raise Gate0Error(f"{source} already has this rule; --reuse is for a new rule (--decision)")
+    words = _read_json(origin / WORDS_FILE)
+    copies = []
+    for clip in old["clips"]:
+        data = (origin / clip["file"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != clip["wav_sha256"]:
+            raise Gate0Error(f"{source}/{clip['file']} does not match its manifest; nothing copied")
+        copies.append((clip["file"], data))
+    clips_dir = _mkdir(out / CLIPS_DIR, config_)
+    for file, data in copies:
+        with paths.open_output(clips_dir, Path(file).name, config_) as target:
+            target.write(data)
+    manifest = {
+        **old,
+        "date": day,
+        "created_at": _now(),
+        "code": _code_identity(),
+        "rule_sha256": rule,
+        "reused_from": {
+            "date": source,
+            "manifest_sha256": _sha256_file(origin / MANIFEST_FILE),
+            "rule_sha256": old["rule_sha256"],
+            "created_at": old.get("created_at"),
+            "code": old.get("code"),
+        },
+    }
+    _write_json(out, WORDS_FILE, words, config_)
+    _write_json(out, MANIFEST_FILE, manifest, config_)
+    return manifest
+
+
+def _new_prepare(day: str, config_: config.Config, decision: Path) -> tuple:
+    """(rule SHA-256, prompt A, the new empty day directory) or `Gate0Error`; never overwrites."""
+    rule = rule_sha256(decision.read_text(encoding="utf-8"))
+    prompt = review.load_prompt()
+    if prompt.sha256 != PROMPT_SHA256:
+        raise Gate0Error(f"prompt A is {prompt.sha256}, the protocol fixes {PROMPT_SHA256}")
+    out = output_dir(day, config_)
+    _mkdir(out, config_)
+    if os.path.lexists(out / MANIFEST_FILE):
+        raise Gate0Error(f"{day}/{MANIFEST_FILE} already exists; prepare never overwrites")
+    leftovers = [name for name in (CLIPS_DIR, PREP_DIR, WORDS_FILE) if os.path.lexists(out / name)]
+    if leftovers:
+        raise Gate0Error(
+            f"{day}/ holds {leftovers} from a prepare that stopped midway; "
+            f"delete the directory {day}/ and run prepare again"
+        )
+    return rule, prompt, out
 
 
 def transcribe_source(path: Path, run: runs.Run, config_: config.Config) -> dict:
@@ -1717,6 +1767,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--decision", type=Path, default=DECISION_DOC)
     commands.choices["prepare"].add_argument("--sources", type=Path)
     commands.choices["prepare"].add_argument("--natural", type=Path)
+    commands.choices["prepare"].add_argument("--reuse", metavar="DATE")
     commands.choices["run"].add_argument("--runtime", choices=RUNTIMES, default="llama")
     commands.choices["run"].add_argument("--model-dir", type=Path)
     commands.choices["run"].add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR)
@@ -1727,13 +1778,20 @@ def main(argv: list[str] | None = None) -> int:
         config_ = config.load()
         if args.command == "prepare":
             guard.install_network_guard(config_)
-            manifest = prepare_clips(
-                args.date,
-                config_,
-                sources=args.sources,
-                natural=args.natural,
-                decision=args.decision,
-            )
+            if args.reuse is not None and (args.sources or args.natural):
+                raise Gate0Error("--reuse copies clips; it takes no --sources or --natural")
+            if args.reuse is not None:
+                manifest = reuse_clips(
+                    args.date, config_, source=args.reuse, decision=args.decision
+                )
+            else:
+                manifest = prepare_clips(
+                    args.date,
+                    config_,
+                    sources=args.sources,
+                    natural=args.natural,
+                    decision=args.decision,
+                )
             for clip in manifest["clips"]:
                 print(json.dumps({k: clip[k] for k in ("id", "duration_s", "pcm_sha256")}))
             for pair in manifest["pairs"]:

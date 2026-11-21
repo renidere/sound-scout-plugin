@@ -1474,3 +1474,81 @@ def test_rule_v2_with_a_runtime_without_an_encoder_rate_is_refused_before_any_at
         _qwen_run(qwen_spike, tmp_path, runtime="llama")
     assert not (qwen_spike["out"] / gate0.ATTEMPTS_DIR).exists()
     assert not qwen_spike["marker"].exists()
+
+
+def test_reuse_copies_the_clips_byte_for_byte_under_the_new_rule(spike) -> None:
+    manifest = gate0.reuse_clips(
+        "2026-11-22", spike["config"], source="2026-11-18", decision=REPO / QWEN3OMNI_DOC
+    )
+    old = spike["manifest"]
+    new_out = spike["out"].parent / "2026-11-22"
+    assert manifest["rule_sha256"] == gate0.RULE_V2_SHA256 != old["rule_sha256"]
+    assert manifest["clips"] == old["clips"] and manifest["pairs"] == old["pairs"]
+    assert manifest["date"] == "2026-11-22"
+    assert manifest["reused_from"]["date"] == "2026-11-18"
+    assert manifest["reused_from"]["rule_sha256"] == old["rule_sha256"]
+    recorded = hashlib.sha256((spike["out"] / gate0.MANIFEST_FILE).read_bytes()).hexdigest()
+    assert manifest["reused_from"]["manifest_sha256"] == recorded
+    for clip in old["clips"]:
+        assert (new_out / clip["file"]).read_bytes() == (spike["out"] / clip["file"]).read_bytes()
+    words = json.loads((new_out / gate0.WORDS_FILE).read_text(encoding="utf-8"))
+    assert words == json.loads((spike["out"] / gate0.WORDS_FILE).read_text(encoding="utf-8"))
+    assert json.loads((new_out / gate0.MANIFEST_FILE).read_text()) == manifest
+    with pytest.raises(gate0.Gate0Error, match="prepare never overwrites"):
+        gate0.reuse_clips(
+            "2026-11-22", spike["config"], source="2026-11-18", decision=REPO / QWEN3OMNI_DOC
+        )
+
+
+def test_reuse_refuses_a_clip_that_does_not_match_its_manifest_and_copies_nothing(spike) -> None:
+    (spike["out"] / "clips" / "V2.wav").write_bytes(b"changed")
+    with pytest.raises(gate0.Gate0Error, match="clips/V2.wav does not match"):
+        gate0.reuse_clips(
+            "2026-11-22", spike["config"], source="2026-11-18", decision=REPO / QWEN3OMNI_DOC
+        )
+    new_out = spike["out"].parent / "2026-11-22"
+    assert not (new_out / gate0.CLIPS_DIR).exists()
+    assert not (new_out / gate0.MANIFEST_FILE).exists()
+
+
+def test_reuse_under_the_same_rule_is_refused_before_anything_is_written(spike) -> None:
+    with pytest.raises(gate0.Gate0Error, match="already has this rule"):
+        gate0.reuse_clips(
+            "2026-11-22", spike["config"], source="2026-11-18", decision=spike["decision"]
+        )
+    assert not (spike["out"].parent / "2026-11-22" / gate0.CLIPS_DIR).exists()
+
+
+def test_prepare_cli_refuses_reuse_with_sources(spike, tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(gate0.config, "load", lambda: spike["config"])
+    monkeypatch.setattr(gate0.guard, "install_network_guard", lambda config_: None)
+    argv = ["prepare", "--date", "2026-11-22", "--reuse", "2026-11-18", "--sources", "x"]
+    assert gate0.main(argv) == 2
+    assert "--reuse copies clips" in capsys.readouterr().err
+    argv = ["prepare", "--date", "2026-11-22", "--reuse", "2026-11-18"]
+    assert gate0.main([*argv, "--decision", str(REPO / QWEN3OMNI_DOC)]) == 0
+    manifest = json.loads((spike["out"].parent / "2026-11-22" / gate0.MANIFEST_FILE).read_text())
+    assert manifest["rule_sha256"] == gate0.RULE_V2_SHA256
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_a_reused_prepare_runs_under_v2_with_the_clip_hashes_of_the_source(
+    qwen_spike, tmp_path
+) -> None:
+    gate0.reuse_clips(
+        "2026-11-23", qwen_spike["config"], source="2026-11-18", decision=REPO / QWEN3OMNI_DOC
+    )
+    root = _cgroup(tmp_path / "cgroup", GIGACHAT_CAP, "0")
+    meminfo = _meminfo(tmp_path / "meminfo", 24 * 10**9)
+    result = gate0.run_spike(
+        "2026-11-23",
+        qwen_spike["config"],
+        runtime="qwen3omni",
+        cgroup_root=root,
+        meminfo=meminfo,
+        **qwen_spike["kwargs"],
+    )
+    sent = qwen_spike["received"].read_text().split()
+    source = {clip["pcm_sha256"] for clip in qwen_spike["manifest"]["clips"]}
+    assert set(sent) == source and result["rule"] == gate0.RULE_V2
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
