@@ -514,3 +514,30 @@ def test_spec_readme_marks_its_17_november_status_as_history_and_links_current_d
     assert "../decisions/0013-voice-note-integration.md" in text
     assert "../../README.md" in text
     assert "../ACCEPTANCE.md" in text
+
+
+def test_claude_md_asr_row_names_the_vad_signal_and_both_decisions() -> None:
+    """#138: the asr.py row names `no_vad_speech`, links 0005 and 0021, and the VAD-less status."""
+    from sound_scout import asr
+
+    row = next(
+        line
+        for line in read("CLAUDE.md").splitlines()
+        if line.rstrip().endswith("| `src/sound_scout/asr.py` |")
+    )
+    for fragment in (
+        "сигнал `no_vad_speech`",
+        "`MIN_VAD_SPEECH_S`",
+        "`speech_spans` в `asr/raw.json`",
+        "без VAD этап `asr` — `unavailable` с `VAD_UNAVAILABLE_REASON`",
+    ):
+        assert fragment in row, fragment
+    old, new = "docs/decisions/0005-asr-silence-hallucination.md", "0021-asr-vad-hallucination.md"
+    links = re.findall(r"`(docs/decisions/[^`]+\.md)`", row)
+    assert links == [old, f"docs/decisions/{new}"]
+    for link in links:
+        assert (REPO_ROOT / link).is_file(), link
+    assert "no_vad_speech" in asr.HALLUCINATION_SIGNALS
+    assert asr.VAD_UNAVAILABLE_REASON and asr.MIN_VAD_SPEECH_S > 0
+    decision = read(f"docs/decisions/{new}")
+    assert "`asr` — `unavailable` с причиной `VAD_UNAVAILABLE_REASON`" in flat(decision)
