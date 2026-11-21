@@ -140,6 +140,49 @@ stdio сервер `sound-scout serve` в Hermes под именем `speech-rev
    `env.PATH` записи (см. «Регистрация в Hermes»). Версия в нём должна совпадать с записанной в
    `docs/dependencies.md`, раздел 2 (`ffmpeg -version`).
 
+## Обновление
+
+Runner заданий — долгоживущий процесс. Он держит код, который загрузил при старте. Worker каждой
+попытки загружает код с диска. После обновления кода перезапустите runner, иначе задания ждут в
+очереди.
+
+1. Остановить runner до обновления кода и зависимостей:
+
+   ```sh
+   systemctl --user stop sound-scout-jobs-runner
+   ```
+
+   Если runner уже завершился, `stop` ответит `not loaded`; это не ошибка. Если runner вёл
+   задание, `stop` прерывает попытку; её закрывает `jobs recover` в пункте 3.
+
+2. Обновить код и окружение:
+
+   ```sh
+   git pull --ff-only
+   uv sync --frozen
+   ```
+
+3. Запустить runner с тем же `SOUND_SCOUT_CONFIG` и тем же `PATH` к FFmpeg и закрыть прерванные
+   попытки:
+
+   ```sh
+   SOUND_SCOUT_CONFIG=<абсолютный путь к sound-scout.toml> uv run --offline sound-scout jobs start
+   SOUND_SCOUT_CONFIG=<абсолютный путь к sound-scout.toml> uv run --offline sound-scout jobs recover
+   ```
+
+   Прерванная попытка получит `interrupted`, задание встанет в очередь следующей попыткой.
+
+4. MCP-сервер `speech-review` тоже держит старый код. Примените обновление через `/reload-mcp`
+   или перезапуск gateway (раздел «Readback», пункт 2).
+
+Защита в runner (#139): перед каждой попыткой runner сравнивает отпечаток своего кода с
+установленным (`jobs.code_fingerprint`, SHA-256 файлов пакета `sound_scout`). При расхождении он
+не начинает попытку. Задание остаётся `queued` без новой попытки, runner пишет причину в журнал
+(`journalctl --user -u sound-scout-jobs-runner`) и завершается с кодом 0. `jobs start` создаёт
+unit через `systemd-run` без `Restart=` (по умолчанию `Restart=no`) и с `--collect`. systemd не
+перезапускает runner сам и освобождает имя unit, поэтому следующий `jobs start` проходит. Новый
+runner выполняет задание на новом коде. Без `jobs start` задание ждёт.
+
 ## Ограничения вложений Hermes
 
 Hermes не передаёт файлы по MCP: `speech_analyze` получает только строку абсолютного пути к файлу
@@ -309,7 +352,8 @@ hermes config set mcp_servers.speech-review.env.PATH /usr/local/bin:/usr/bin:/bi
      другой FFmpeg: проверить `env.PATH` записи (раздел «Регистрация в Hermes»);
    - перед разбором запустить runner заданий: `sound-scout jobs start` (или `jobs run`) с тем же
      `SOUND_SCOUT_CONFIG` и тем же `PATH` к FFmpeg, что в записи `mcp_servers.speech-review`
-     (`docs/mcp.md`); без runner задание остаётся `queued`. Runner сам удаляет staging-копии по
+     (`docs/mcp.md`); без runner задание остаётся `queued`. После обновления кода runner
+     перезапускается (раздел «Обновление»). Runner сам удаляет staging-копии по
      `jobs.staging_retention_seconds`; задание с доставкой `delivery_unconfirmed` доставляется
      повторно командой `sound-scout jobs redeliver <job_id>` или, по явной просьбе пользователя,
      инструментом `speech_job_redeliver`;

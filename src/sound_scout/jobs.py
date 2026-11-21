@@ -62,7 +62,18 @@ or a pid with another start time): its attempt is marked `interrupted` and the j
 `retry` puts a `failed` or `cancelled` job (an interrupted attempt that `recover` ended
 `cancelled` too) back to `queued` at the end of the queue, with the same `job_id` and
 `request_id`; the runner takes it as attempt n+1. Only a client calls `retry` or `recover`:
-nothing retries on its own. `runner_unit_argv` is the `systemd-run --user` command that starts the
+nothing retries on its own.
+
+The runner keeps the code it loaded at its start, while each attempt's worker (`app.analyze`,
+`spawn`) loads the code installed on disk at that moment: after an update the two would differ,
+and the old runner would check a new worker's result with its old schema (#139). So the runner
+takes `code_fingerprint` of the installed package when it starts, and `_claim_next` takes it
+again, under `jobs.lock`, before it moves a job to `running`. When the two differ (or the
+package cannot be read), the runner starts no attempt: the job stays `queued` untouched, no
+attempt and no lease, the runner logs why on stderr, releases `runner.lock` and returns, so
+`jobs run` exits 0. A runner that cannot read the package at its start logs that and returns
+too, before it takes `runner.lock`. A runner started after that (`jobs start`) loads the new
+code and runs the job. `runner_unit_argv` is the `systemd-run --user` command that starts the
 runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has
 `KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
 
@@ -110,6 +121,7 @@ JOB_FILE_NAME = "job.json"
 CANCEL_MARKER_NAME = "cancel.json"
 LOCK_FILE_NAME = "jobs.lock"
 RUNNER_LOCK_NAME = "runner.lock"
+PACKAGE_DIR = Path(__file__).resolve().parent
 RUNNER_UNIT = "sound-scout-jobs-runner"
 # Passed on to the transient unit when set: the decoder on PATH and the ASR model cache.
 RUNNER_ENV = ("PATH", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "XDG_CACHE_HOME")
@@ -168,6 +180,20 @@ class JobError(Exception):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+
+
+UNREADABLE_CODE = "cannot read the installed sound_scout package"
+CHANGED_CODE = "the installed sound_scout code changed since this runner started"
+
+
+class _CodeChanged(Exception):
+    """The installed code is not the code the runner loaded, or cannot be read (`reason`);
+    the job named stays `queued`."""
+
+    def __init__(self, job_id: str, reason: str) -> None:
+        super().__init__(job_id, reason)
+        self.job_id = job_id
+        self.reason = reason
 
 
 # The other refusals of this module with their reason codes; `ingest.IngestError` has its own.
@@ -512,6 +538,11 @@ def run_runner(
     """
     from sound_scout import app, staging
 
+    try:
+        loaded_code = code_fingerprint()
+    except OSError as error:
+        _log(f"{UNREADABLE_CODE} ({type(error).__name__}); exiting without starting an attempt")
+        return
     swept_at = None
     with _runner_lock(config.data_root):
         while True:
@@ -522,7 +553,14 @@ def run_runner(
                         _log(f"staging {item['name']} removed: {item['reason']}")
                 except (OSError, ValueError) as error:
                     _log(f"staging sweep failed: {type(error).__name__}")
-            claimed = _claim_next(config)
+            try:
+                claimed = _claim_next(config, loaded_code)
+            except _CodeChanged as changed:
+                _log(
+                    f"{changed.reason}; job {changed.job_id} stays queued; exiting: start a new "
+                    "runner (jobs start) to run it"
+                )
+                return
             if claimed is None:
                 if exit_when_idle:
                     return
@@ -622,8 +660,27 @@ def start_runner_unit(config_path: Path) -> dict:
     return {"unit": RUNNER_UNIT, "started": True}
 
 
-def _claim_next(config: Config) -> tuple[dict, dict] | None:
-    """The oldest `queued` job, now `running` with a new attempt and its lease; None if none."""
+def code_fingerprint(package_dir: Path | None = None) -> str:
+    """SHA-256 over the relative path and the bytes of every file of the installed `sound_scout`
+    package (`PACKAGE_DIR`: modules, schemas, prompt; `__pycache__` aside), read from disk: the
+    code a new process loads. About a megabyte, read once per attempt."""
+    package_dir = PACKAGE_DIR if package_dir is None else package_dir
+    digest = hashlib.sha256()
+    files = {
+        path.relative_to(package_dir).as_posix(): path
+        for path in package_dir.rglob("*")
+        if "__pycache__" not in path.relative_to(package_dir).parts and path.is_file()
+    }
+    for name in sorted(files):
+        data = files[name].read_bytes()
+        for part in (name.encode("utf-8"), data):
+            digest.update(len(part).to_bytes(8, "big") + part)
+    return digest.hexdigest()
+
+
+def _claim_next(config: Config, loaded_code: str) -> tuple[dict, dict] | None:
+    """The oldest `queued` job, now `running` with a new attempt and its lease; None if none.
+    Raises `_CodeChanged` and changes nothing when the installed code is not `loaded_code`."""
     with _store(config.data_root) as (jobs_dir, _):
         queued = [job for job in map(_load, _job_dirs(jobs_dir)) if job["state"] == QUEUED]
         if not queued:
@@ -632,6 +689,12 @@ def _claim_next(config: Config) -> tuple[dict, dict] | None:
             queued,
             key=lambda item: (item.get("queued_at") or item["submitted_at"], item["job_id"]),
         )
+        try:
+            installed_code = code_fingerprint()
+        except OSError as error:
+            raise _CodeChanged(job["job_id"], UNREADABLE_CODE) from error
+        if installed_code != loaded_code:
+            raise _CodeChanged(job["job_id"], CHANGED_CODE)
         number = len(job["attempts"]) + 1
         attempt = {
             "number": number,

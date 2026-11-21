@@ -28,7 +28,8 @@ failed or cancelled job again as its next attempt (`jobs.retry`). `jobs limits` 
 reads instead of the configuration file.
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
 is the runner in the foreground (`jobs.run_runner`; `--exit-when-idle` returns once no job is
-queued), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
+queued; it exits 0 without starting an attempt once the installed code differs from the code it
+loaded), one line per ended attempt on stderr; `jobs start` starts it through `systemd-run --user`
 as the transient unit `jobs.RUNNER_UNIT` with this configuration file. `jobs deliver-next
 --profile=<p> --loop=<id>` and `jobs deliver-end --outcome=<o> [--error=<text>] <job_id>` are the
 calls of the plugin's delivery loop (`sound_scout.delivery`): the next note to send with its

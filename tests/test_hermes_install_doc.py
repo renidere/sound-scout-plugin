@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import cli, ingest, mcp_server
+from sound_scout import cli, ingest, jobs, mcp_server
 from sound_scout.config import Budgets
 
 REPO = Path(__file__).resolve().parent.parent
@@ -288,3 +288,12 @@ def test_doc_lint_allows_only_the_generic_system_program_dirs() -> None:
     allowed = "`PATH=/usr/local/bin:/usr/bin:/bin`, обычно `/usr/bin`"
     assert doc_problems(allowed, (), ()) == []
     assert doc_problems("PATH=/opt/ffmpeg/bin", (), ()) == ["absolute path: =/opt/"]
+
+
+def test_update_section_says_to_restart_the_jobs_runner_after_an_update() -> None:
+    update = " ".join(section(DOC.read_text(encoding="utf-8"), "## Обновление").split())
+    assert "перезапустите runner" in update
+    assert "uv sync --frozen" in update
+    assert f"systemctl --user stop {jobs.RUNNER_UNIT}" in update
+    assert "sound-scout jobs start" in update and "sound-scout jobs recover" in update
+    assert "Restart=no" in update and "--collect" in update

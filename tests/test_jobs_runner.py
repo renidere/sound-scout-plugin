@@ -210,7 +210,7 @@ def test_a_busy_attempt_is_requeued_unless_a_cancel_landed_before_its_end(
 
     monkeypatch.setattr(jobs, "_store", store_with_a_cancel_first)
     monkeypatch.setattr(app, "analyze", busy)
-    job, attempt = jobs._claim_next(cfg)
+    job, attempt = jobs._claim_next(cfg, jobs.code_fingerprint())
 
     state = jobs._run_attempt(app, job, attempt, cfg)
 
@@ -1347,3 +1347,240 @@ def test_each_attempt_of_a_retried_control_job_has_its_own_comparison(
     assert second["compare"]["verdict"] == "inconclusive"
     answer = jobs.result(job_id, cfg)
     assert answer["attempt"] == 2 and answer["compare"] == second["compare"]
+
+
+# --- the runner never starts an attempt on code older than the installed code (#139) ----------
+
+
+@pytest.fixture
+def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A copy of the installed package that `code_fingerprint` reads instead of the real one."""
+    package = tmp_path / "installed" / "sound_scout"
+    shutil.copytree(jobs.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(jobs, "PACKAGE_DIR", package)
+    return package
+
+
+def runner_lock_held(cfg: Config) -> bool:
+    lock = cfg.data_root / "jobs" / "runner.lock"
+    if not lock.exists():
+        return False
+    fd = os.open(lock, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def edit_module(package: Path) -> None:
+    with (package / "asr.py").open("a", encoding="utf-8") as module:
+        module.write("\n# updated\n")
+
+
+def edit_schema(package: Path) -> None:
+    schema = package / "result.v1.schema.json"
+    schema.write_text(schema.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+
+def make_unreadable(package: Path) -> None:
+    (package / "report.py").chmod(0)
+
+
+def test_code_fingerprint_covers_every_packaged_file_but_not_pycache(installed: Path) -> None:
+    import sound_scout
+
+    real = jobs.code_fingerprint(Path(sound_scout.__file__).resolve().parent)
+    assert jobs.code_fingerprint() == real
+    (installed / "__pycache__").mkdir()
+    (installed / "__pycache__" / "asr.cpython-313.pyc").write_bytes(b"compiled")
+    assert jobs.code_fingerprint() == real
+    edit_schema(installed)
+    edited = jobs.code_fingerprint()
+    assert edited != real
+    (installed / "eval" / "new.py").write_text("", encoding="utf-8")
+    assert jobs.code_fingerprint() not in (real, edited)
+
+
+@pytest.mark.parametrize(
+    "change", [edit_module, edit_schema, make_unreadable], ids=["module", "schema", "unreadable"]
+)
+def test_criteria_1_4_a_runner_waiting_on_older_code_starts_no_attempt_and_exits(
+    cfg: Config,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    installed: Path,
+    change: Callable[[Path], None],
+) -> None:
+    if change is make_unreadable and os.geteuid() == 0:
+        pytest.skip("root reads a file without permissions")
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+    runner = threading.Thread(
+        target=jobs.run_runner, args=(cfg,), kwargs={"poll_seconds": POLL}, daemon=True
+    )
+    runner.start()
+    wait_until(lambda: runner_lock_held(cfg))
+
+    change(installed)
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    queued = job_file(cfg, job_id)
+    runner.join(timeout=30)
+
+    assert not runner.is_alive(), "the runner did not exit on the changed code"
+    assert calls == []
+    job = job_file(cfg, job_id)
+    assert job == queued and job["state"] == "queued" and job["attempts"] == []
+    assert not runner_lock_held(cfg)
+    err = capfd.readouterr().err
+    reason = jobs.UNREADABLE_CODE if change is make_unreadable else jobs.CHANGED_CODE
+    assert f"{reason}; job {job_id} stays queued" in err
+    assert (jobs.CHANGED_CODE in err) is (change is not make_unreadable)
+
+
+def test_a_runner_that_cannot_read_the_package_at_its_start_exits_and_leaves_jobs_queued(
+    cfg: Config,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    installed: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root reads a file without permissions")
+    calls: list[str] = []
+    monkeypatch.setattr(app, "analyze", substitute(calls))
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    queued = job_file(cfg, job_id)
+    make_unreadable(installed)
+
+    jobs.run_runner(cfg, poll_seconds=POLL)
+
+    assert calls == [] and job_file(cfg, job_id) == queued
+    assert not runner_lock_held(cfg)
+    err = capfd.readouterr().err
+    assert f"{jobs.UNREADABLE_CODE} (PermissionError)" in err
+    assert jobs.CHANGED_CODE not in err
+
+    (installed / "report.py").chmod(0o644)
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{job_id}-a1"] and job_file(cfg, job_id)["state"] == "finished"
+
+
+def test_criteria_2_3_an_update_between_attempts_leaves_the_next_job_to_a_new_runner(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, installed: Path
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    first, second = (queue(cfg, wav, request_id=f"r-{n}") for n in range(2))
+    calls: list[str] = []
+    analyze = substitute(calls)
+
+    def updated_while_running(request: app.AnalyzeRequest, config: Config, **kwargs: object):
+        edit_module(installed)
+        return analyze(request, config, **kwargs)
+
+    monkeypatch.setattr(app, "analyze", updated_while_running)
+    runner = threading.Thread(
+        target=jobs.run_runner, args=(cfg,), kwargs={"poll_seconds": POLL}, daemon=True
+    )
+    runner.start()
+    runner.join(timeout=30)
+
+    assert not runner.is_alive(), "the runner did not exit on the changed code"
+    assert calls == [f"{first}-a1"]
+    assert job_file(cfg, first)["state"] == "finished"
+    assert job_file(cfg, second)["state"] == "queued"
+    assert job_file(cfg, second)["attempts"] == []
+
+    monkeypatch.setattr(app, "analyze", analyze)
+    jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+
+    assert calls == [f"{first}-a1", f"{second}-a1"]
+    [attempt] = job_file(cfg, second)["attempts"]
+    assert attempt["outcome"] == "finished" and job_file(cfg, second)["state"] == "finished"
+
+
+UPDATED_LOG = """
+
+_log_of_the_old_code = _log
+
+
+def _log(line: str) -> None:
+    _log_of_the_old_code(f"[updated code] {line}")
+"""
+
+
+@needs_ffmpeg
+def test_criterion_3_a_new_jobs_run_process_runs_the_waiting_job_on_the_updated_code(
+    tmp_path: Path, make_wav: WavFactory
+) -> None:
+    site = tmp_path / "installed"
+    shutil.copytree(
+        jobs.PACKAGE_DIR, site / "sound_scout", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    for name in ("recordings", "data"):
+        (tmp_path / name).mkdir()
+    config_path = tmp_path / "sound-scout.toml"
+    config_path.write_text(
+        f"allowed_roots = [{json.dumps(str(tmp_path / 'recordings'))}]\n"
+        f"data_root = {json.dumps(str(tmp_path / 'data'))}\n"
+        f"[asr]\nmodel = {json.dumps(ABSENT_ASR_MODEL)}\n",
+        encoding="utf-8",
+    )
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    }
+    env.update({config.CONFIG_PATH_ENV: str(config_path), "PYTHONPATH": str(site)})
+
+    def cli(*args: str, **options: object):
+        return subprocess.run(
+            [sys.executable, "-m", "sound_scout", "jobs", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            **options,
+        )
+
+    where = subprocess.run(
+        [sys.executable, "-c", "import sound_scout; print(sound_scout.__file__)"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    assert Path(where.stdout.strip()).parent == site / "sound_scout"
+    old_runner = subprocess.Popen(
+        [sys.executable, "-m", "sound_scout", "jobs", "run"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        cfg = Config(allowed_roots=(tmp_path / "recordings",), data_root=tmp_path / "data")
+        wait_until(lambda: runner_lock_held(cfg))
+        with (site / "sound_scout" / "jobs.py").open("a", encoding="utf-8") as module:
+            module.write(UPDATED_LOG)
+        wav = make_wav("recordings/tone.wav", seconds=1.5)
+        job_id = json.loads(cli("submit", str(wav), "--json").stdout)["job_id"]
+        old_out, old_err = old_runner.communicate(timeout=60)
+    finally:
+        if old_runner.poll() is None:
+            old_runner.kill()
+            old_runner.communicate()
+
+    assert old_runner.returncode == 0, old_err
+    assert f"job {job_id} stays queued" in old_err and "[updated code]" not in old_err
+    waiting = json.loads(cli("status", job_id, "--json").stdout)
+    assert waiting["state"] == "queued" and waiting["attempts"] == 0
+
+    new_runner = cli("run", "--exit-when-idle", timeout=300)
+
+    assert new_runner.returncode == 0, new_runner.stderr
+    assert f"[updated code] job {job_id} attempt 1: finished" in new_runner.stderr
+    done = json.loads(cli("status", job_id, "--json").stdout)
+    assert done["state"] == "finished" and done["attempts"] == 1
