@@ -1042,6 +1042,8 @@ def test_series_3_report_names_the_verdict_the_post_hoc_caveat_and_holds_no_priv
     flat = " ".join(report.split())
     assert "более слабое свидетельство" in flat and "не независимое подтверждение" in flat
     assert "PASS сам по себе не добавляет `word_prominence`" in flat
+    assert "только бутстреп-интервал" in flat
+    assert "AUC сопоставленной части правилами не задаётся" not in flat
     assert prosody.RULE_SHA256 in report and prosody.RINCO_SHA256 in report
     assert "8fa0199c114129685ff3e7fb870027ac8086843cc140868e5180e393efe7cd38" in report
     assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
