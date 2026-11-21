@@ -214,13 +214,46 @@ def test_decision_0016_documents_the_probe_and_leaves_results_to_the_owner(
         *RPC_METHODS,
         "\n## Инструкция владельцу\n",
         "\n## Правило анализа\n",
+        "\n## Топология прогона\n",
     ):
         assert needle in text, needle
     results = text.split("\n## Результаты", 1)[1].split("\n## ", 1)[0]
     rows = [line for line in results.splitlines() if line.startswith("|")][2:]
-    assert len(rows) >= 7
+    assert len(rows) == 11
+    assert not any("неперенесённый" in row for row in rows)
     for row in rows:
         assert row.rstrip(" |").rsplit("|", 1)[1].strip() == PENDING, row
+
+
+def test_decision_0016_instruction_fits_the_gateway_topology() -> None:
+    text = DECISION.read_text(encoding="utf-8")
+    instruction = text.split("\n## Инструкция владельцу\n", 1)[1].split("\n## ", 1)[0]
+    for needle in (
+        hashlib.sha256(PLUGIN.read_bytes()).hexdigest(),
+        "Get-FileHash",
+        "H:\\SoundScout\\desktop-plugins\\sound-scout-probe-a\\",
+        "H:\\SoundScout\\probe-a\\probe-a-log.jsonl",
+        "H:\\SoundScout\\probe-a\\notes.txt",
+        "Open Desktop plugins folder",
+        "%LOCALAPPDATA%\\hermes",
+        "scripts/probe_a_check_attach.py",
+        "session_admissions",
+        "H:\\SoundScout\\probe-a\\probe-a-log.clipboard.jsonl",
+        "adopt_legacy_session",
+        "не перенесённые на этапе B, не открывать",
+    ):
+        assert needle in instruction, needle
+    assert "Открыть другой чат" not in instruction
+    assert "«probe-a test» до первого сообщения" not in instruction
+    topology = text.split("\n## Топология прогона\n", 1)[1].split("\n## ", 1)[0]
+    assert ":9119" in topology
+    assert "SSH backend нет" in topology
+    assert "комментарий к" not in instruction
+    assert "Журнал в issue не вставлять" in instruction
+    labels = set(re.findall(r"label: '(Probe A: [^']+)'", PLUGIN.read_text(encoding="utf-8")))
+    assert len(labels) == 8
+    told = set(re.findall(r"`(Probe A: [^`…]+)`", instruction))
+    assert told == labels, told ^ labels
 
 
 def test_plugin_is_one_esm_file_apart_from_the_spike_b_package() -> None:

@@ -3,15 +3,18 @@
 - **Статус:** инструкция готова; результаты ожидают прогона владельцем.
 - **Дата:** 2026-11-20.
 - **Решение:** [Decision в #95](https://github.com/renidere/sound-scout-plugin/issues/95#issuecomment-7024314864).
+- **Пересмотр под этап B 0017:** [Decision в #95](https://github.com/renidere/sound-scout-plugin/issues/95#issuecomment-7064941502)
+  (2026-11-21): код зонда не меняется, инструкция владельцу переписана под топологию gateway.
 - **Задача:** [#95](https://github.com/renidere/sound-scout-plugin/issues/95); эпик
-  [#92](https://github.com/renidere/sound-scout-plugin/issues/92). По порядку этапов из 0013 § 5
-  (решение владельца 20 ноября 2026) прогон относится к этапу Windows-клиента
-  ([#115](https://github.com/renidere/sound-scout-plugin/issues/115)), который стартует после
-  [#114](https://github.com/renidere/sound-scout-plugin/issues/114).
+  [#115](https://github.com/renidere/sound-scout-plugin/issues/115) (этап Windows-клиента по
+  порядку этапов из 0013 § 5, решение владельца 20 ноября 2026).
 - **Основание:** `docs/decisions/0013-voice-note-integration.md` § 3.3 (рекордер), § 3.4
   (отправка), § 5 шаг 2 (Spike A); `docs/decisions/0015-spike-b-backend-package.md` (Spike B,
-  отдельный пакет `sound-scout`); Hermes Agent `3b42157858` (закоммиченный SDK, без локального
-  патча `retainSession`); recorder Voice Note v0.4.2 (`ced69ea`, MIT).
+  отдельный пакет `sound-scout`); `docs/decisions/0017-session-authority-owner.md` (этап B:
+  владелец чатов Desktop — gateway); recorder Voice Note v0.4.2 (`ced69ea`, MIT).
+- **Hermes:** Hermes Agent v0.23.3, ревизия `caafe5389a`. Зонд написан по `3b42157858` (v0.23.1).
+  Вызовы SDK и параметры RPC зонда сверены с v0.23.3: изменений нет. `host.retainSession` в
+  закоммиченном SDK по-прежнему нет.
 - **Код:** `hermes/probe/sound-scout-probe-a/plugin.js` (id `sound-scout-probe-a`),
   `scripts/probe_a_check_attach.py`; тесты — `tests/js/probe_a.test.mjs`,
   `tests/js/load_plugin.mjs`, `tests/test_hermes_probe_a.py`.
@@ -33,6 +36,16 @@ Spike A отвечает на четыре вопроса:
 Тесты репозитория запускают зонд на поддельном SDK. Они доказывают только контракт зонда (порядок
 вызовов, release, вердикты, байты WAV, обезличивание), а не поведение Hermes. Ответы на вопросы дают
 только прогон владельца и журнал.
+
+## Топология прогона
+
+- Windows Desktop 0.23.3 входит напрямую в `hermes gateway run` станции, Webapp на `:9119`
+  (этап B 0017). Desktop SSH backend нет, `hermes-autonomous.service` остановлен.
+- `file.attach` пишет файл в `attachments/` профиля gateway на станции. Там его читает
+  `scripts/probe_a_check_attach.py`.
+- Каталог `desktop-plugins` и журнал зонда — локальные каталоги Windows, не станции.
+- Обмен файлами с владельцем — сетевая шара `H:\SoundScout\` (на станции
+  `/mnt/HybridHeap/SoundScout/`). Журнал возвращается на шару, а не в публичный issue.
 
 ## Устройство зонда
 
@@ -90,7 +103,9 @@ Sound Scout, ничего не делай, ответь одним словом 
 ### Журнал
 
 JSON Lines, запись `{seq, at, event, …}`. После каждой записи весь журнал пишется в
-`ctx.files.writeText('data', 'probe-a-log.jsonl', …)` (папка данных плагина); ошибка записи
+`ctx.files.writeText('data', 'probe-a-log.jsonl', …)` (папка данных плагина; по коду v0.23.3 —
+`%APPDATA%\Hermes\plugin-files\data\sound-scout-probe-a\probe-a-log.jsonl`, на Windows не
+проверено); ошибка записи
 фиксируется один раз записью `log_write_failed` и зонд не останавливает. События: `loaded`,
 `focus_change`, `snapshot`, `target_marked`, `attach`, `submit`, `refused`, `error`.
 
@@ -120,76 +135,114 @@ SHA-256 эталона:
 
 ## Инструкция владельцу
 
-Все шаги выполняет владелец. Агент ничего из этого не запускает: не ставит зонд, не пишет в чаты
-и не трогает конфигурацию Hermes.
+Все шаги выполняет владелец, кроме шага 7 (агент). Агент не ставит зонд, не пишет в чаты и не
+трогает конфигурацию Hermes.
 
 ### 1. Подготовка (Windows)
 
-1. Штатный Hermes Desktop, подключённый к удалённому gateway станции. Записать версию Desktop
-   (About).
-2. Создать отдельный тестовый чат, например «probe-a test». Зонд пишет только в чат, отмеченный
-   командой `Probe A: mark this chat as test target`. Каждый из четырёх submit-тестов — одно
-   сообщение и один ход агента в этом чате.
+1. Записать версию Desktop (About).
+2. Тестовый чат создаётся в шаге 3.2 как новый черновик. Только в него зонд пишет. Каждый из
+   четырёх submit-тестов — одно сообщение и один ход агента в этом чате.
 
 ### 2. Установка (Windows)
 
-1. Скопировать `hermes/probe/sound-scout-probe-a/plugin.js` из checkout в
-   `%USERPROFILE%\.hermes\desktop-plugins\sound-scout-probe-a\plugin.js`; если задан
-   `HERMES_HOME` — в `%HERMES_HOME%\desktop-plugins\sound-scout-probe-a\plugin.js`.
-2. Capabilities → Plugins: включить «Sound Scout probe A», затем в палитре (Ctrl+K) — «Reload
-   desktop plugins».
-3. В палитре должно появиться восемь команд `Probe A: …`.
-4. Если плагин не появился, записать, куда положен файл: это тоже результат о каталоге
-   `desktop-plugins`.
+1. Capabilities → Plugins → «Open Desktop plugins folder». В открытой папке уже лежит
+   `sound-scout`. По коду v0.23.3 это `<HERMES_HOME>\desktop-plugins`. `HERMES_HOME` берётся из
+   окружения или реестра; без него — `%LOCALAPPDATA%\hermes`, а `%USERPROFILE%\.hermes` — только
+   если `%LOCALAPPDATA%\hermes` нет, а `%USERPROFILE%\.hermes` есть.
+2. Скопировать туда папку `H:\SoundScout\desktop-plugins\sound-scout-probe-a\` (внутри один
+   `plugin.js`). Это `hermes/probe/sound-scout-probe-a/plugin.js` с `main`.
+3. Сверка в PowerShell: `Get-FileHash <папка>\sound-scout-probe-a\plugin.js` должен дать SHA-256
+   зонда:
+
+   ```text
+   b054e3b9d139d718ebc3ea28da3ac5ae3a817b124b4b7de044a89c11c03ab74f
+   ```
+
+4. Палитра (Ctrl+K) → `Reload desktop plugins`. Если «Sound Scout probe A» выключен в
+   Capabilities → Plugins, включить и повторить Reload.
+5. В палитре должно появиться восемь команд `Probe A: …`. Если их нет, записать это в
+   `notes.txt` (шаг 6): это тоже результат о каталоге `desktop-plugins`.
 
 ### 3. Критерий 2: owner, маршруты и каталог
 
-1. Открыть чат, который существовал до запуска Desktop → `Probe A: snapshot — old chat`.
-2. Переименовать этот чат → `Probe A: snapshot — renamed chat`.
-3. «Новый чат» (черновик) → `Probe A: snapshot — new chat`.
-4. Отправить в новый чат первое сообщение вручную → ещё раз `Probe A: snapshot — new chat`.
+Снимки ничего не пишут.
 
-Между снимками в журнале будут записи `focus_change`; в каждом снимке — `plugins_root`.
+1. Открыть один из трёх старых чатов, перенесённых на этапе B → `Probe A: snapshot — old chat`.
+2. Создать новый чат: появится черновик без названия. Это тестовый чат. У черновика Desktop 0.23.3
+   названия нет; оно появится после первого сообщения или в шаге 3.4. Черновик на экране →
+   `Probe A: snapshot — new chat`.
+3. Отправить в черновик вручную первое сообщение (например «привет»), дождаться ответа →
+   `Probe A: snapshot — new chat`.
+4. Переименовать тестовый чат (например в «probe-a test») → `Probe A: snapshot — renamed chat`.
 
-### 4. Критерий 3: attach и SHA-256
+Открытие старого чата в Desktop само вызывает `session.resume`; зонд в снимке RPC не делает. Между
+снимками в журнале будут записи `focus_change`; в каждом снимке — `plugins_root`.
 
-1. Открыть тестовый чат → `Probe A: mark this chat as test target` →
-   `Probe A: attach synthetic 30 s WAV to target` (цель на экране).
-2. Переключиться на другой чат → снова `Probe A: attach synthetic 30 s WAV to target` (цель скрыта:
-   сценарий «записал в X, переключился на Y»).
-3. Для каждой записи `attach` журнала выполнить на станции из checkout:
+Старые чаты, не перенесённые на этапе B, не открывать. В v0.23.3 `session.resume` такого чата от
+Desktop переносит его под gateway (`gateway/session_local_migration.py::adopt_legacy_session`, тот
+же путь, что у `hermes sessions adopt`). Это изменение живой системы, а зонд его вызывать не должен.
+После открытия чат уже перенесён, и снимок не показал бы неперенесённый случай. Поэтому этот случай
+Spike A не измеряет.
 
-   ```bash
-   uv run python -I scripts/probe_a_check_attach.py <path из журнала> --sha256 <sha256 из журнала>
-   ```
+### 4. Критерий 3: attach
 
-   `~` в `path` раскрывает shell станции. Скрипт только читает файл и печатает одну JSON-строку
-   (`ok`, `bytes`, `sha256`, `matches_log`, `matches_synthetic`, `wav`); путь и содержимое файла он
-   не печатает. Сохранить обе строки.
+1. Тестовый чат на экране → `Probe A: mark this chat as test target` →
+   `Probe A: attach synthetic 30 s WAV to target`.
+2. Открыть один из трёх перенесённых чатов (тестовый не висит плиткой) →
+   `Probe A: attach synthetic 30 s WAV to target`
+   (цель скрыта: сценарий «записал в X, переключился на Y»).
+3. Сообщений в чат attach не пишет. Сверку SHA-256 делает агент (шаг 7).
 
 ### 5. Критерий 4: настоящий ли ACK
 
 1. Тестовый чат на экране → `Probe A: prompt.submit to target`, дождаться уведомления с вердиктом
    (до ~40 с) → `Probe A: composer.submit to target`, дождаться уведомления.
-2. Переключиться на другой чат (тестовый не висит плиткой) → `Probe A: prompt.submit to target` →
-   `Probe A: composer.submit to target`.
-3. Открыть тестовый чат и глазами сверить число сообщений с маркерами `sound-scout-probe-a …` с
-   журналом.
+2. Открыть один из трёх перенесённых чатов (тестовый не висит плиткой) →
+   `Probe A: prompt.submit to target` → `Probe A: composer.submit to target`.
+3. Открыть тестовый чат и сосчитать сообщения с маркерами `sound-scout-probe-a …`.
 
 «Скрытый чат» здесь — тестовый чат, которого нет на экране. Флаг скрытой сессии зонд не трогает.
 
-### 6. Передача
+### 6. Возврат на шару
 
-`Probe A: copy log` → вставить журнал в комментарий к
-[#95](https://github.com/renidere/sound-scout-plugin/issues/95) вместе с JSON-строками скрипта,
-версией Desktop и наблюдениями из шага 5.3. Репозиторий публичный: перед отправкой глазами
-проверить, что в тексте нет имени пользователя и названий чатов.
+1. Скопировать `%APPDATA%\Hermes\plugin-files\data\sound-scout-probe-a\probe-a-log.jsonl` в
+   `H:\SoundScout\probe-a\probe-a-log.jsonl`.
+2. Всегда, даже если файл был: `Probe A: copy log` → Блокнот → вставить → «Сохранить как»
+   `H:\SoundScout\probe-a\probe-a-log.clipboard.jsonl` (UTF-8). Файл мог отстать или оборваться;
+   буфер — второй источник.
+3. Рядом положить `H:\SoundScout\probe-a\notes.txt`: версия Desktop; число маркеров из шага 5.3;
+   был ли файл журнала в шаге 6.1 (это результат о папке данных) и его путь.
+4. Написать в [#95](https://github.com/renidere/sound-scout-plugin/issues/95) одну строку: «журнал
+   на шаре». Журнал в issue не вставлять: репозиторий публичный.
 
-### 7. Удаление
+### 7. Агент
 
-- Windows: удалить папку `desktop-plugins\sound-scout-probe-a` и выполнить «Reload desktop
-  plugins»; команд `Probe A: …` в палитре быть не должно.
-- Станция: удалить файлы `~/.hermes/attachments/sound-scout-probe-a-*.wav` по `path` из журнала.
+1. Прочитать `/mnt/HybridHeap/SoundScout/probe-a/`. Журналом считать ту из копий
+   `probe-a-log.jsonl` и `probe-a-log.clipboard.jsonl`, в которой больше записей; при равенстве —
+   `probe-a-log.jsonl`. Расхождение копий записать в «Результаты».
+2. Для каждой записи `attach` выполнить на станции из checkout (`~` в `path` раскрыть):
+
+   ```bash
+   uv run python -I scripts/probe_a_check_attach.py <path из журнала> --sha256 <sha256 из журнала>
+   ```
+
+   Скрипт только читает файл и печатает одну JSON-строку (`ok`, `bytes`, `sha256`, `matches_log`,
+   `matches_synthetic`, `wav`); путь и содержимое файла он не печатает.
+3. По `stored` из снимков сверить через `state.db` (`mode=ro`), был ли чат перенесён и есть ли у
+   тестового чата строки `session_admissions` после каждого submit.
+4. Заполнить «Результаты», сменить статус документа, отчитаться в #95 без содержимого журнала сверх
+   полей вердиктов.
+
+### 8. Удаление
+
+- Windows: удалить папку `sound-scout-probe-a` и выполнить `Reload desktop plugins`; команд
+  `Probe A: …` в палитре быть не должно.
+- Шара: агент удаляет `desktop-plugins/sound-scout-probe-a/` и `probe-a/` после заполнения этого
+  документа.
+- Станция: файлы `attachments/sound-scout-probe-a-*.wav` лежат в профиле Hermes. Агент удаляет их
+  только по явному «удаляй» владельца в #95 и по точным именам из журнала. Без этого их удаляет
+  владелец.
 - Тестовый чат — по желанию.
 
 ## Результаты
@@ -199,7 +252,7 @@ SHA-256 эталона:
 | пункт | что наблюдать | результат |
 |---|---|---|
 | установка, каталог `desktop-plugins` | восемь команд в палитре, `plugins_root` в снимке | ожидает прогона владельцем |
-| 2а. старый чат | `stored`, `owner`, `routes`, `owner_matches` | ожидает прогона владельцем |
+| 2а. старый перенесённый чат | `stored`, `owner`, `routes`, `owner_matches` | ожидает прогона владельцем |
 | 2б. переименованный чат | тот же `stored`, `owner` не `null`, `owner_matches = 1` | ожидает прогона владельцем |
 | 2в. новый чат до и после первого сообщения | `stored`, `owner`, `owner_matches` | ожидает прогона владельцем |
 | 3а. attach, цель на экране | запись `attach`, `matches_log && matches_synthetic` | ожидает прогона владельцем |
@@ -212,7 +265,7 @@ SHA-256 эталона:
 
 ## Правило анализа
 
-Таблицу заполняет агент по журналу и строкам скрипта из комментария владельца в #95, затем меняет
+Таблицу заполняет агент по журналу и `notes.txt` с шары и строкам скрипта (шаг 7), затем меняет
 статус этого документа.
 
 - **ACK настоящий**, если вердикт `real` и для цели на экране, и для скрытой.
@@ -223,7 +276,11 @@ SHA-256 эталона:
   - `null` у старого или переименованного чата → в 0013 § 3.3 действует правило перечитывания при
     отправке;
   - смена `stored` при переименовании → id не стабилен, нужен пересмотр 0013;
-  - `owner_matches ≠ 1` → `ambiguous_route` в рекордере.
+  - `owner_matches ≠ 1` → `ambiguous_route` в рекордере;
+  - неперенесённый старый чат не измеряется (шаг 3): открытие переносит его под gateway.
+- **Каталог:** `plugins_root` должен совпасть с папкой, куда владелец положил `sound-scout`.
+- **`session_admissions`:** вердикт `real` у `prompt.submit` должен иметь строку в
+  `session_admissions` тестового чата.
 - **Attach:** `matches_log && matches_synthetic` для обеих записей `attach`. Иначе путь
   `file.attach` для рекордера не подтверждён.
 - `loaded.sdk.retainSession` на штатном клиенте ожидается `undefined`; другое значение значит, что
