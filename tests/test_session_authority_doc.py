@@ -90,3 +90,43 @@ def test_old_readbacks_are_dated_and_doc_holds_no_private_data() -> None:
     assert not re.search(r"/(home|Users)/|[A-Za-z]:\\", document)
     assert not re.search(r"\b(?:192\.168|10)\.\d{1,3}\.\d{1,3}\b", document)
     assert not re.search(r"(?i)password\s*[:=]|bearer\s+[a-z0-9._-]{16,}", document)
+
+
+def test_client_check_2026_11_21_separates_report_check_and_open_items() -> None:
+    client = " ".join(section("### Клиентская проверка (2026-11-21)").split())
+    assert f"{ISSUE}7059648596" in client
+    assert "Это сообщение владельца, а не сверка" in client
+    assert "Только чтение, 2026-11-21 08:04–08:15 UTC" in client
+    for fact in (
+        "на `:9120` — 0 соединений",
+        "Строк в `session_admissions` — 0",
+        "`20261121_110129_a8cd31`",
+        "`version: 0.0.1`, 5 файлов = `dcb530e`",
+    ):
+        assert fact in client
+    assert "Вывод: сообщение владельца проверкой не подтверждено" in client
+    assert "Это вывод по адресам потоков, а не запись процесса о себе" in client
+    assert "Вывод: за 08:01:30–08:01:48 второго писателя у этого чата не видно" in client
+    assert "Исключительное владение чатом одним процессом не проверено" in client
+    assert "к процессу и listener'у не отнесены" in client
+    open_items = client.split("**Ещё не проверено:**", 1)[1]
+    for item in ("Доставка заметки", "Перенос старых чатов", "Версия Windows Desktop"):
+        assert item in open_items
+
+
+def test_step_b1_names_services_order_risks_and_rollback() -> None:
+    step = " ".join(section("### Шаг B1 (предложение 2026-11-21)").split())
+    assert "`systemctl --user stop hermes-autonomous.service`" in step
+    assert "без `disable`" in step
+    assert "Агент процесс не останавливает" in step
+    assert "`stop` unit'а его не завершает" in step
+    assert "Для B1 достаточно условия 4" in step
+    assert "`hermes-gateway.service`: не трогается" in step
+    for part in (
+        "Порядок:",
+        "Риски:",
+        "Откат B1: `systemctl --user start hermes-autonomous.service`",
+    ):
+        assert part in step
+    assert "Откат входит в то же разрешение и окно" in step
+    assert "`hermes sessions adopt` и #104 в B1 не входят" in step
