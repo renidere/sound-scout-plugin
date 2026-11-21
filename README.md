@@ -22,7 +22,10 @@ NOT READY (`docs/decisions/0011-gate0-gigachat-audio.md`): не выполнен
 говорит. Qwen3-Omni-30B-A3B-Instruct (GGUF Q4_K_M, решение владельца на
 [#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7065525535)) прошёл
 предусловия правила `GATE0-RULE v2`, но получил NOT READY по отрицательным контролям: 2 пустых или
-обрезанных ответа из 12, выдуманной речи нет (`docs/decisions/0023-gate0-qwen3-omni.md`). Четвёртый кандидат MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
+обрезанных ответа из 12, выдуманной речи нет (`docs/decisions/0023-gate0-qwen3-omni.md`). Qwen2.5-Omni-7B
+(GGUF Q8_0, диагностический прогон по `GATE0-RULE v1`) тоже получил NOT READY по контролям: прошли
+7 из 12; `да` в вопросе P на тишине и шуме, выдуманное наблюдение о произношении в A на всех трёх
+контролях (`docs/decisions/0024-gate0-qwen25-omni.md`). Четвёртый кандидат MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
 формальный Gate 0: READY не получен
 ([#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195)).
 Следующий ограниченный эксперимент предлагает агент, утверждает владелец

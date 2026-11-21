@@ -1709,3 +1709,54 @@ def test_v1_p3_passes_on_750_padded_tokens_whatever_the_clip_length() -> None:
     result = gate0.decide(_synthetic_manifest(), RECORD, lines)
     assert result["rule"] == gate0.RULE_V1
     assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+
+
+def test_qwen25omni_decision_records_p3_peak_memory_latency_and_the_cli_verdict() -> None:
+    flat_doc = re.sub(r"\s+", " ", (REPO / QWEN25OMNI_DOC).read_text(encoding="utf-8"))
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    assert "**P3: выполнено по построению.**" in results and "**752 аудиотокена**" in results
+    assert "Наклон по K1 — 0 токенов/с" in results
+    peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
+    assert peak <= gate0.QWEN25OMNI_RSS_LIMIT_BYTES < gate0.RSS_LIMIT_BYTES
+    assert "`memory.peak` scope" in results and "`oom_kill 0`" in results
+    assert "**Задержка на клип**" in results and "медиана 41,1 с" in results
+    assert "**49 мин 47 с** wall time" in results
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("## 6.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-19 --attempt 3`" in verdict
+    answer = json.dumps(
+        {
+            "verdict": "NOT READY",
+            "reason": "C: не прошли 5 из 12 пунктов контролей: "
+            "['P(S0)', 'A(S0)', 'P(N1)', 'A(N1)', 'A(T1)']",
+        },
+        ensure_ascii=False,
+    )
+    assert f"`{answer}`" in verdict
+
+
+def test_qwen25omni_record_lists_weak_points_per_criterion_against_earlier_runs() -> None:
+    document = (REPO / QWEN25OMNI_DOC).read_text(encoding="utf-8")
+    weak = document.split("### 5.1. Слабые места по критериям", 1)[1].split("\n## 6.", 1)[0]
+    header = next(line for line in weak.splitlines() if line.startswith("| Критерий |"))
+    for run in ("0007", "0010", "0011", "0023", "0024"):
+        assert run in header, run
+    rows = [line.split("|")[1].strip() for line in weak.splitlines() if line.startswith("| ")]
+    for criterion in ("C1: K1, K2 на контролях", "C2: P на контролях", "C3: A на контролях"):
+        assert criterion in rows, criterion
+    assert "S: пар различено" in rows and "P3, аудиотокенов на с" in rows
+    for heading in ("**C1 —", "**C2 —", "**C3 —", "**S —", "**P3 и маршрут"):
+        assert heading in weak, heading
+
+
+def test_qwen25omni_not_ready_packages_nothing_and_bounds_the_conclusion() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    example = (REPO / "sound-scout.example.toml").read_text(encoding="utf-8")
+    assert "qwen" not in example.lower()
+    document = (REPO / QWEN25OMNI_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", document)
+    assert "**Вердикт: NOT READY**" in document
+    assert "ничего не упаковывается, `backend` остаётся `none`" in flat_doc
+    limits = flat_doc.split("## 6. Ограничения", 1)[1].split("## 7.", 1)[0]
+    assert "**Квантование и runtime.**" in limits and "Q8_0" in limits and "30 с" in limits
+    owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    assert re.search(r"^1\. \*\*Решить судьбу Qwen2\.5-Omni-7B\*\*", owner, re.M)
