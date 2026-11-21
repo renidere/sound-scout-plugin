@@ -478,9 +478,10 @@ def asr_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
 
 def dev_recording(folder: Path, *, silent: bool = False, seconds: float = 2.0) -> Path:
     rate = 48_000
-    t = np.arange(round(seconds * rate)) / rate
-    tone = np.zeros_like(t) if silent else 0.3 * 32767 * np.sin(2 * np.pi * 180.0 * t)
-    return write_wav(folder / "dev.wav", np.round(tone).astype(np.int16), rate)
+    frames = round(seconds * rate)
+    # formant vowels, not a tone: the ASR rule trusts no text the speech detector does not cover
+    voice = np.zeros(frames) if silent else 32767 * smoke.speech_like_control(seconds, rate)
+    return write_wav(folder / "dev.wav", np.round(voice).astype(np.int16), rate)
 
 
 def point_at(monkeypatch: pytest.MonkeyPatch, recording: Path) -> None:

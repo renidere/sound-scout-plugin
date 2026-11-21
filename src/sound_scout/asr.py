@@ -26,13 +26,17 @@ path and SHA-256 of the raw file it refers to and items in the shape of the resu
 `correction`.
 
 `suspect_hallucination` is a rule here, not a model opinion: a segment with text over a
-span of the signal that is digital silence (RMS below `SILENT_SPAN_RMS_DBFS`), or with
-Whisper's own no-speech, log-probability or compression-ratio signals past their thresholds,
-is flagged in `segments[].suspect_hallucination`, and `flags` carries the flag for the whole
-transcript. On this workstation the installed model answers 5 s of digital silence with a
-confident phrase (word probabilities near 0.9), so the signal rule is the one that catches it.
-Consumers of the transcript therefore rely on the flag, never on word probabilities
-(docs/decisions/0005-asr-silence-hallucination.md): `trusted_segments` is the one place that
+span of the signal that is digital silence (RMS below `SILENT_SPAN_RMS_DBFS`), with less than
+`MIN_VAD_SPEECH_S` of Silero VAD speech under it (`acoustics.speech_activity` on the same
+array, its spans kept in `raw["speech_spans"]`), or with Whisper's own no-speech,
+log-probability or compression-ratio signals past their thresholds, is flagged in
+`segments[].suspect_hallucination`, and `flags` carries the flag for the whole transcript. On
+this workstation the installed model answers 5 s of digital silence, 10 s of pink noise and
+10 s of a pure tone with a confident phrase and normal Whisper signals, so the signal rules
+are the ones that catch it. Without the speech detector the stage is `unavailable`: text is
+never trusted unchecked. Consumers of the transcript therefore rely on the flag, never on word
+probabilities (docs/decisions/0005-asr-silence-hallucination.md,
+docs/decisions/0021-asr-vad-hallucination.md): `trusted_segments` is the one place that
 splits the text into trusted and flagged segments, and `suspect_segments` gives the flagged
 ones as the result contract's `transcript.suspect_segments` — intervals and signals, no text.
 
@@ -57,7 +61,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sound_scout import __version__, doctor, guard, paths, schema
+from sound_scout import __version__, acoustics, doctor, guard, paths, schema
 from sound_scout._schema_messages import schema_errors
 from sound_scout.config import MIB, Config
 from sound_scout.runs import Run
@@ -86,20 +90,26 @@ INFERENCE_PARAMETERS: dict[str, object] = {
     "hotwords": None,
 }
 MODEL_UNAVAILABLE_REASON = "модель не установлена; загрузка требует разрешения владельца"
+VAD_UNAVAILABLE_REASON = "детектор речи недоступен, текст ASR нельзя проверить"
 MODEL_IMPLEMENTATION = "faster_whisper.transcribe.WhisperModel"
 SUSPECT_HALLUCINATION = "suspect_hallucination"
 SILENT_SPAN_RMS_DBFS = -60.0
 NO_SPEECH_THRESHOLD = 0.6
 LOGPROB_THRESHOLD = -1.0
 COMPRESSION_RATIO_THRESHOLD = 2.4
+# The detector's own shortest speech span: less than that under a segment is no speech at all.
+MIN_VAD_SPEECH_S = acoustics.VAD_MIN_SPEECH_MS / 1000
 HALLUCINATION_SIGNALS = (
     "silent_span",
     "no_speech_prob",
     "low_avg_logprob",
     "high_compression_ratio",
+    "no_vad_speech",
 )
 HALLUCINATION_RULE = {
     "silent_span_rms_dbfs": SILENT_SPAN_RMS_DBFS,
+    "min_vad_speech_s": MIN_VAD_SPEECH_S,
+    "vad": "silero_vad",
     "no_speech_threshold": NO_SPEECH_THRESHOLD,
     "logprob_threshold": LOGPROB_THRESHOLD,
     "compression_ratio_threshold": COMPRESSION_RATIO_THRESHOLD,
@@ -181,6 +191,11 @@ def transcribe(mono16k: np.ndarray, run: Run, config: Config) -> Transcription:
         if model_reason.startswith(doctor.WEIGHTS_NOT_CACHED):
             model_reason = MODEL_UNAVAILABLE_REASON
         return Transcription("unavailable", model_reason, _elapsed_ms(started))
+    try:
+        speech_spans = acoustics.speech_activity(mono16k, SAMPLE_RATE)
+    except acoustics.VadUnavailable as error:
+        reason = f"{VAD_UNAVAILABLE_REASON}: {error.reason}"
+        return Transcription("unavailable", reason, _elapsed_ms(started))
     snapshot_dir = doctor.snapshot_dir(model["repo"], model["revision"])
     os.environ.update(guard.OFFLINE_ENV)
     try:
@@ -194,7 +209,7 @@ def transcribe(mono16k: np.ndarray, run: Run, config: Config) -> Transcription:
         inference_ms = _elapsed_ms(inference_started)
     except Exception as error:  # a stage boundary: the reason is reported, not raised (R11)
         return Transcription("failed", f"{type(error).__name__}: {error}", _elapsed_ms(started))
-    segments = flag_segments(segments, mono16k)
+    segments = flag_segments(segments, mono16k, speech_spans)
     raw = {
         "format_version": RAW_FORMAT_VERSION,
         "kind": "transcript_raw",
@@ -225,6 +240,7 @@ def transcribe(mono16k: np.ndarray, run: Run, config: Config) -> Transcription:
         if any(segment[SUSPECT_HALLUCINATION] for segment in segments)
         else [],
         "hallucination_rule": dict(HALLUCINATION_RULE),
+        "speech_spans": speech_spans,
         "text_postprocessing": TEXT_POSTPROCESSING,
         "timing": {"model_load_ms": model_load_ms, "inference_ms": inference_ms},
         "versions": _versions(versions),
@@ -243,23 +259,32 @@ def transcribe(mono16k: np.ndarray, run: Run, config: Config) -> Transcription:
     )
 
 
-def flag_segments(segments: list[dict], mono16k: np.ndarray) -> list[dict]:
+def flag_segments(
+    segments: list[dict], mono16k: np.ndarray, speech_spans: list[Mapping[str, float]]
+) -> list[dict]:
     """Copy of `segments` with `hallucination_signals` and `suspect_hallucination` on each."""
     flagged = []
     for segment in segments:
-        signals = hallucination_signals(segment, mono16k)
+        signals = hallucination_signals(segment, mono16k, speech_spans)
         flagged.append(
             {**segment, "hallucination_signals": signals, SUSPECT_HALLUCINATION: bool(signals)}
         )
     return flagged
 
 
-def hallucination_signals(segment: Mapping[str, object], mono16k: np.ndarray) -> list[str]:
+def hallucination_signals(
+    segment: Mapping[str, object],
+    mono16k: np.ndarray,
+    speech_spans: list[Mapping[str, float]],
+) -> list[str]:
     """Why a segment's text is suspect; empty for a segment without text or without signals.
 
     `silent_span`: the signal under the segment is digital silence (RMS below
-    `SILENT_SPAN_RMS_DBFS`), so there was nothing to transcribe. The other three are Whisper's
-    own quality signals past the thresholds Whisper itself uses for a retry.
+    `SILENT_SPAN_RMS_DBFS`), so there was nothing to transcribe. `no_vad_speech`: the speech
+    spans of the detector (`acoustics.speech_activity` on the same array) cover less than
+    `MIN_VAD_SPEECH_S` of the segment — noise, a tone or a hum, however confident the text.
+    The other three are Whisper's own quality signals past the thresholds Whisper itself uses
+    for a retry.
     """
     text = segment.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -270,6 +295,7 @@ def hallucination_signals(segment: Mapping[str, object], mono16k: np.ndarray) ->
         _number(segment.get("no_speech_prob"), 0.0) > NO_SPEECH_THRESHOLD,
         _number(segment.get("avg_logprob"), 0.0) < LOGPROB_THRESHOLD,
         _number(segment.get("compression_ratio"), 0.0) > COMPRESSION_RATIO_THRESHOLD,
+        _vad_speech_s(segment, speech_spans) < MIN_VAD_SPEECH_S,
     )
     return [name for name, found in zip(HALLUCINATION_SIGNALS, present, strict=True) if found]
 
@@ -472,6 +498,12 @@ def _require_audio(mono16k: object, config: Config) -> None:
             f"{len(mono16k)} frames, the limit is {limit} "
             f"({config.budgets.max_duration_seconds} s at {SAMPLE_RATE} Hz)",
         )
+
+
+def _vad_speech_s(segment: Mapping[str, object], speech_spans: list[Mapping[str, float]]) -> float:
+    """Seconds of the segment's interval that the detector's speech spans cover."""
+    start, end = _number(segment.get("start"), 0.0), _number(segment.get("end"), 0.0)
+    return sum(max(0.0, min(end, span["end"]) - max(start, span["start"])) for span in speech_spans)
 
 
 def _span_rms_dbfs(segment: Mapping[str, object], mono16k: np.ndarray) -> float | None:

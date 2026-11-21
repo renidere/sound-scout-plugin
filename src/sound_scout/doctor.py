@@ -48,7 +48,7 @@ TEST_DOUBLE = "test-double"
 MAX_RECEIPT_BYTES = 1 * MIB
 VERSION_OUTPUT_BYTES = 64 * 1024
 DISTRIBUTIONS = {
-    "asr": ("faster-whisper", "ctranslate2"),
+    "asr": ("faster-whisper", "ctranslate2", "onnxruntime"),
     "acoustics": ("praat-parselmouth", "onnxruntime", "faster-whisper"),
 }
 DECODER_TOOLS = ("ffmpeg", "ffprobe")
@@ -339,21 +339,24 @@ def _tool_version(executable: str, tool: str, config: Config) -> tuple[str | Non
 def _probe_asr(config: Config) -> tuple[dict[str, object], str | None]:
     versions, reason = distribution_versions("asr")
     model, model_reason = snapshot(config.asr.model, config.asr.revision)
-    return {"versions": versions, "model": model}, reason or model_reason
+    # the suspect_hallucination rule checks the text against the Silero VAD (decision 0021)
+    vad, vad_reason = _vad_asset()
+    return {"versions": versions, "model": model, "vad": vad}, reason or model_reason or vad_reason
 
 
 def _probe_acoustics() -> tuple[dict[str, object], str | None]:
     versions, reason = distribution_versions("acoustics")
-    vad: dict[str, object] = {"asset": None, "size": None}
+    vad, vad_reason = _vad_asset()
+    return {"versions": versions, "vad": vad}, reason or vad_reason
+
+
+def _vad_asset() -> tuple[dict[str, object], str | None]:
     assets = package_dir(VAD_PACKAGE)
     if assets is not None:
         for name, size in _regular_files(assets / "assets").items():
             if VAD_ASSET.match(name):
-                vad = {"asset": name, "size": size}
-                break
-    if vad["asset"] is None:
-        reason = reason or f"Silero VAD asset not found in {VAD_PACKAGE}"
-    return {"versions": versions, "vad": vad}, reason
+                return {"asset": name, "size": size}, None
+    return {"asset": None, "size": None}, f"Silero VAD asset not found in {VAD_PACKAGE}"
 
 
 def distribution_versions(component: str) -> tuple[dict[str, str | None], str | None]:

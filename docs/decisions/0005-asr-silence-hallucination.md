@@ -7,6 +7,8 @@
 - **Основание:** `docs/spec/REQUIREMENTS.md` R03, R05 (сомнительное слово — `uncertain`, не
   реплика пользователя), T05 (ноль уверенных выдуманных реплик на отрицательных контролях),
   раздел 4 (контракт результата), раздел 6 (ASR-процедура).
+- **Дополнено:** `0021-asr-vad-hallucination.md` (#135) — сигнал `no_vad_speech` для текста
+  на шуме и тоне, где речи по VAD нет.
 - **Код:** `src/sound_scout/asr.py` (`hallucination_signals`, `trusted_segments`,
   `suspect_segments`, `HALLUCINATION_SIGNALS`), `schema/result.v1.schema.json`
   (`transcript.suspect_segments`, контракт `1.2`).

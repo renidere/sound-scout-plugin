@@ -13,13 +13,16 @@ import re
 import shutil
 import stat
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import parselmouth
 import pytest
+from parselmouth.praat import call
 
-from sound_scout import asr, channels, doctor, guard, ingest, prepare, schema, smoke
+from sound_scout import acoustics, asr, channels, doctor, guard, ingest, prepare, schema, smoke
 from sound_scout._schema_messages import schema_errors
 from sound_scout.asr import (
     INFERENCE_PARAMETERS,
@@ -35,6 +38,7 @@ from sound_scout.asr import (
     write_smoke_receipt,
 )
 from sound_scout.config import Asr, Budgets, Config
+from sound_scout.eval import corpus, gate0, synthetic
 from sound_scout.runs import open_run
 
 SR = asr.SAMPLE_RATE
@@ -113,8 +117,17 @@ def segment(
 
 
 def speech_like(seconds: float = 2.0) -> np.ndarray:
+    """Formant-synthesised vowels: the speech detector finds speech in them, unlike a tone."""
+    return smoke.speech_like_control(seconds, SR)
+
+
+def tone(seconds: float = 2.0) -> np.ndarray:
     t = np.arange(int(seconds * SR)) / SR
     return (0.3 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+
+
+def spans(*intervals: tuple[float, float]) -> list[dict]:
+    return [{"start": start, "end": end} for start, end in intervals]
 
 
 def silence(seconds: float = 5.0) -> np.ndarray:
@@ -543,50 +556,68 @@ def test_rule_flags_text_over_digital_silence_even_with_high_probabilities() -> 
         "words": [{"start": 0.0, "end": 1.34, "word": " Продолжение", "probability": 0.886}],
     }
 
-    assert hallucination_signals(confident, silence(5.0)) == ["silent_span"]
-    flagged = flag_segments([confident], silence(5.0))
+    assert hallucination_signals(confident, silence(5.0), []) == ["silent_span", "no_vad_speech"]
+    flagged = flag_segments([confident], silence(5.0), [])
     assert flagged[0][SUSPECT_HALLUCINATION] is True
-    assert flagged[0]["hallucination_signals"] == ["silent_span"]
+    assert flagged[0]["hallucination_signals"] == ["silent_span", "no_vad_speech"]
     assert flagged[0]["text"] == confident["text"], "the rule flags, it does not rewrite"
 
 
 def test_rule_uses_the_signal_under_the_segment_not_the_whole_file() -> None:
-    audio = np.concatenate([speech_like(2.0), silence(3.0)])
+    audio = np.concatenate([tone(2.0), silence(3.0)])
+    speech = spans((0.0, 2.0))
 
-    assert hallucination_signals({"start": 0.0, "end": 2.0, "text": " речь"}, audio) == []
-    assert hallucination_signals({"start": 2.5, "end": 4.9, "text": " эхо"}, audio) == [
-        "silent_span"
+    assert hallucination_signals({"start": 0.0, "end": 2.0, "text": " речь"}, audio, speech) == []
+    assert hallucination_signals({"start": 2.5, "end": 4.9, "text": " эхо"}, audio, speech) == [
+        "silent_span",
+        "no_vad_speech",
     ]
-    assert hallucination_signals({"start": 1.5, "end": 4.9, "text": " край"}, audio) == []
+    assert hallucination_signals({"start": 1.5, "end": 4.9, "text": " край"}, audio, speech) == []
 
 
 def test_rule_flags_whispers_own_signals_and_ignores_empty_text() -> None:
-    audio = speech_like(3.0)
+    audio, speech = tone(3.0), spans((0.0, 3.0))
     base = {"start": 0.0, "end": 3.0, "text": " слово"}
 
-    assert hallucination_signals({**base, "no_speech_prob": 0.61}, audio) == ["no_speech_prob"]
-    assert hallucination_signals({**base, "avg_logprob": -1.01}, audio) == ["low_avg_logprob"]
-    assert hallucination_signals({**base, "compression_ratio": 2.5}, audio) == [
-        "high_compression_ratio"
-    ]
-    assert hallucination_signals(
+    def signals(segment: dict, samples: np.ndarray = audio, found: list = speech) -> list[str]:
+        return hallucination_signals(segment, samples, found)
+
+    assert signals({**base, "no_speech_prob": 0.61}) == ["no_speech_prob"]
+    assert signals({**base, "avg_logprob": -1.01}) == ["low_avg_logprob"]
+    assert signals({**base, "compression_ratio": 2.5}) == ["high_compression_ratio"]
+    assert signals(
         {**base, "no_speech_prob": 0.9, "avg_logprob": -2.0, "compression_ratio": 3.0},
         silence(3.0),
-    ) == ["silent_span", "no_speech_prob", "low_avg_logprob", "high_compression_ratio"]
-    assert hallucination_signals({**base, "no_speech_prob": 0.6}, audio) == []
-    assert hallucination_signals({**base, "text": "   "}, silence(3.0)) == []
-    assert hallucination_signals({"start": 0.0, "end": 1.0}, silence(3.0)) == []
-    assert hallucination_signals({**base, "end": 0.0}, audio) == ["silent_span"]
+        [],
+    ) == list(asr.HALLUCINATION_SIGNALS)
+    assert signals({**base, "no_speech_prob": 0.6}) == []
+    assert signals({**base, "text": "   "}, silence(3.0), []) == []
+    assert signals({"start": 0.0, "end": 1.0}, silence(3.0), []) == []
+    assert signals({**base, "end": 0.0}) == ["silent_span", "no_vad_speech"]
+
+
+def test_rule_flags_text_the_speech_detector_does_not_cover() -> None:
+    """Noise or a tone: a signal well above silence, Whisper's own signals normal (#135)."""
+    audio = tone(4.0)
+    base = {"start": 1.0, "end": 3.0, "text": " уверенно", "no_speech_prob": 0.0}
+
+    assert hallucination_signals(base, audio, []) == ["no_vad_speech"]
+    assert hallucination_signals(base, audio, spans((3.0, 4.0))) == ["no_vad_speech"]
+    assert hallucination_signals(base, audio, spans((0.0, 1.09))) == ["no_vad_speech"]
+    assert hallucination_signals(base, audio, spans((0.0, 1.1))) == []
+    assert hallucination_signals(base, audio, spans((1.0, 1.06), (2.95, 4.0))) == []
+    assert asr.MIN_VAD_SPEECH_S == 0.1
 
 
 def test_quiet_but_not_silent_speech_is_not_flagged_by_the_signal_rule() -> None:
-    quiet = (speech_like(2.0) * 0.01).astype(np.float32)  # about -53 dBFS RMS
+    quiet = (tone(2.0) * 0.01).astype(np.float32)  # about -53 dBFS RMS
+    speech = spans((0.0, 2.0))
 
-    assert hallucination_signals({"start": 0.0, "end": 2.0, "text": " тихо"}, quiet) == []
-    very_quiet = (speech_like(2.0) * 0.001).astype(np.float32)  # about -73 dBFS RMS
-    assert hallucination_signals({"start": 0.0, "end": 2.0, "text": " тихо"}, very_quiet) == [
-        "silent_span"
-    ]
+    assert hallucination_signals({"start": 0.0, "end": 2.0, "text": " тихо"}, quiet, speech) == []
+    very_quiet = (tone(2.0) * 0.001).astype(np.float32)  # about -73 dBFS RMS
+    assert hallucination_signals(
+        {"start": 0.0, "end": 2.0, "text": " тихо"}, very_quiet, speech
+    ) == ["silent_span"]
 
 
 def test_transcribe_marks_silence_segments_with_the_rule(config: Config, run, fake_model) -> None:
@@ -600,9 +631,50 @@ def test_transcribe_marks_silence_segments_with_the_rule(config: Config, run, fa
     assert result.flags == (SUSPECT_HALLUCINATION,)
     assert result.raw["flags"] == [SUSPECT_HALLUCINATION]
     assert result.raw["segments"][0][SUSPECT_HALLUCINATION] is True
-    assert result.raw["segments"][0]["hallucination_signals"] == ["silent_span"]
+    assert result.raw["segments"][0]["hallucination_signals"] == ["silent_span", "no_vad_speech"]
     assert result.raw["text"] == "Продолжение следует..."
     assert result.raw["hallucination_rule"] == asr.HALLUCINATION_RULE
+    assert result.raw["speech_spans"] == []
+
+
+def test_transcribe_without_the_speech_detector_is_unavailable_and_trusts_nothing(
+    config: Config, run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_detector(mono: np.ndarray, rate: int) -> list[dict]:
+        raise acoustics.VadUnavailable("Silero VAD asset not found in faster_whisper")
+
+    monkeypatch.setattr(acoustics, "speech_activity", no_detector)
+    monkeypatch.setattr(asr, "_load_model", never_load)
+
+    result = transcribe(speech_like(), run, config)
+
+    assert result.status == "unavailable"
+    assert result.reason == (
+        f"{asr.VAD_UNAVAILABLE_REASON}: Silero VAD asset not found in faster_whisper"
+    )
+    assert result.raw is None and result.flags == ()
+    assert not (run.path / "asr" / "raw.json").exists()
+
+
+def test_transcribe_checks_text_against_the_detector_on_the_same_array(
+    config: Config, run, fake_model
+) -> None:
+    """Text over a tone gets no trust; text over formant vowels keeps it (#135)."""
+    audio = np.concatenate([speech_like(2.0), tone(3.0)])
+    fake_model(
+        [
+            segment(0.0, 2.0, " речь", [word(0.0, 2.0, " речь", 0.9)]),
+            segment(2.5, 4.9, " тон", [word(2.5, 4.9, " тон", 0.95)]),
+        ]
+    )
+
+    result = transcribe(audio, run, config)
+
+    trusted, flagged = asr.trusted_segments(result.raw)
+    assert [s["text"] for s in trusted] == [" речь"]
+    assert [s["hallucination_signals"] for s in flagged] == [["no_vad_speech"]]
+    assert result.raw["speech_spans"] == acoustics.speech_activity(audio, SR)
+    assert result.raw["speech_spans"][0]["start"] < 0.1
 
 
 # --- the one rule of trust: trusted_segments / suspect_segments (docs/decisions/0005) ---------
@@ -611,7 +683,7 @@ def test_transcribe_marks_silence_segments_with_the_rule(config: Config, run, fa
 def test_confident_phrase_over_silence_is_flagged_and_quiet_speech_is_trusted(
     config: Config, run, fake_model
 ) -> None:
-    quiet = (speech_like(2.0) * 0.01).astype(np.float32)  # about -53 dBFS RMS, above the rule
+    quiet = (speech_like(2.0) * 0.03).astype(np.float32)  # about -51 dBFS RMS, above the rule
     audio = np.concatenate([quiet, silence(3.0)])
     fake_model(
         [
@@ -628,10 +700,15 @@ def test_confident_phrase_over_silence_is_flagged_and_quiet_speech_is_trusted(
 
     assert [s["text"] for s in trusted] == [" тихая речь"]
     assert [s["text"] for s in flagged] == [" Уверенная фраза"]
-    assert flagged[0]["hallucination_signals"] == ["silent_span"]
+    assert flagged[0]["hallucination_signals"] == ["silent_span", "no_vad_speech"]
     assert trusted[0] is result.raw["segments"][0] and flagged[0] is result.raw["segments"][2]
     assert asr.suspect_segments(result.raw, len(audio) / SR) == [
-        {"start": 2.5, "end": 4.9, "signals": ["silent_span"], "certainty": "uncertain"}
+        {
+            "start": 2.5,
+            "end": 4.9,
+            "signals": ["silent_span", "no_vad_speech"],
+            "certainty": "uncertain",
+        }
     ]
     assert raw_path.read_bytes() == raw_bytes, "the raw transcript is not changed (R05)"
     assert read_raw(run) == result.raw
@@ -709,7 +786,9 @@ def test_signal_names_are_one_list_from_the_rule_to_the_contract() -> None:
     item = schema.SCHEMA["$defs"]["suspect_segment"]["properties"]["signals"]["items"]
     assert tuple(item["enum"]) == asr.HALLUCINATION_SIGNALS
     every = {"no_speech_prob": 0.9, "avg_logprob": -2.0, "compression_ratio": 3.0}
-    signals = hallucination_signals({"start": 0.0, "end": 1.0, "text": " x", **every}, silence())
+    signals = hallucination_signals(
+        {"start": 0.0, "end": 1.0, "text": " x", **every}, silence(), []
+    )
     assert tuple(signals) == asr.HALLUCINATION_SIGNALS
 
 
@@ -1049,3 +1128,176 @@ def test_real_model_transcribes_the_dev_recording_and_writes_the_smoke_receipt(
     assert json.loads(text)["smoke"]["input"] == f"development recording, {source.duration_s:.1f} s"
     assert doctor.component_status("asr", config, config.data_root)["status"] == "ready"
     assert "faster_whisper" in sys.modules
+
+
+# --- noise, tone and rough voice on the real model (#135, docs/decisions/0021) ---------------
+
+CORPUS_DIR_ENV = "SOUND_SCOUT_CORPUS_DIR"
+# Files of the pilot-1 dev split, excluded from prosody-measure-1 (decision 0021 lists them).
+RINCO_DEV_MEMBERS = (
+    "INTON-EAF/2-Imperatives/i-1113.wav",
+    "INTON-EAF/2-Imperatives/i-12124_2.wav",
+    "INTON-EAF/3-Statements/s-221.WAV",
+    "INTON-EAF/3-Statements/s-218.WAV",
+    "INTON-EAF/1-Questions/q-1122.wav",
+)
+ROUGH_SENTENCES = (
+    "Сегодня утром я долго не мог найти ключи от машины.",
+    "Позвони мне вечером, когда закончишь работу, и мы всё обсудим.",
+    "В субботу мы поедем на дачу и будем сажать картошку.",
+)
+
+
+def real_transcription(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, audio):
+    config = Config(allowed_roots=(tmp_path,), data_root=tmp_path / name)
+    config.data_root.mkdir()
+    skip_without_model(config)
+    restore_offline_env(monkeypatch)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    run = open_run(name, IDENTITY, config.data_root)
+    result = transcribe(np.asarray(audio, dtype=np.float32), run, config)
+    assert result.status == "completed", result.reason
+    assert result.raw["model"]["implementation"] == asr.MODEL_IMPLEMENTATION
+    return result
+
+
+def as_clip(samples: np.ndarray) -> np.ndarray:
+    """The samples as Gate 0 stores a clip: 16-bit PCM."""
+    return np.frombuffer(gate0.pcm16(samples), "<i2").astype(np.float32) / 32767
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "control", [gate0.pink_noise, gate0.tone], ids=["N1_pink_noise", "T1_tone_440_hz"]
+)
+def test_real_model_text_on_the_gate0_noise_and_tone_controls_is_never_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control
+) -> None:
+    result = real_transcription(tmp_path, monkeypatch, "control", as_clip(control()))
+
+    with_text = [s for s in result.raw["segments"] if s["text"].strip()]
+    trusted, flagged = asr.trusted_segments(result.raw)
+    assert trusted == [], "no trusted text on a negative control (T05)"
+    assert [id(s) for s in flagged] == [id(s) for s in with_text]
+    assert all("no_vad_speech" in s["hallucination_signals"] for s in with_text)
+    assert result.raw["speech_spans"] == []
+
+
+def corpus_dir() -> Path:
+    value = os.environ.get(CORPUS_DIR_ENV)
+    if not value:
+        pytest.skip(f"{CORPUS_DIR_ENV} is not set")
+    return Path(value)
+
+
+def piper_voice():
+    pytest.importorskip("piper", reason="the corpus-tts extra is not installed")
+    try:
+        return synthetic.load_voice(corpus_dir())
+    except synthetic.SyntheticError as error:
+        pytest.skip(str(error))
+
+
+def to_16k(samples: np.ndarray, rate: int) -> np.ndarray:
+    sound = parselmouth.Sound(np.asarray(samples, dtype=np.float64), rate)
+    return call(sound, "Resample", SR, 50).values[0]
+
+
+def pulse_times(sound) -> np.ndarray:
+    pulses = call(call(sound, "To Manipulation", 0.01, 40, 500), "Extract pulses")
+    count = call(pulses, "Get number of points")
+    return np.array([call(pulses, "Get time from index", i + 1) for i in range(count)])
+
+
+def rough_voice(samples: np.ndarray, rate: int, kind: str) -> np.ndarray:
+    """A rough copy of the voice: period jitter and shimmer, creak (half F0, 10 % jitter),
+    a 30 Hz rattle with clipping, or breath noise at 5 dB SNR."""
+    rng = np.random.default_rng(1)
+    sound = parselmouth.Sound(np.asarray(samples, dtype=np.float64), rate)
+    if kind in ("jitter_shimmer", "creak"):
+        jitter = 0.03 if kind == "jitter_shimmer" else 0.10
+        manipulation = call(sound, "To Manipulation", 0.01, 40, 500)
+        if kind == "creak":
+            tier = call(manipulation, "Extract pitch tier")
+            call(tier, "Multiply frequencies", sound.xmin, sound.xmax, 0.5)
+            call([tier, manipulation], "Replace pitch tier")
+            sound = call(manipulation, "Get resynthesis (overlap-add)")
+            manipulation = call(sound, "To Manipulation", 0.01, 40, 500)
+        times = pulse_times(sound)
+        periods = np.diff(times)
+        voiced = periods < 0.025
+        shifted = np.where(
+            voiced, periods * (1 + jitter * rng.standard_normal(len(periods))), periods
+        )
+        jittered = np.clip(times[0] + np.concatenate([[0.0], np.cumsum(shifted)]), 0, sound.xmax)
+        pulses = call("Create empty PointProcess", "pulses", sound.xmin, sound.xmax)
+        for time in np.unique(jittered):
+            call(pulses, "Add point", float(time))
+        call([manipulation, pulses], "Replace pulses")
+        sound = call(manipulation, "Get resynthesis (overlap-add)")
+        out = sound.values[0].copy()
+        edges = [round(t * rate) for t in pulse_times(sound)] + [len(out)]
+        for start, end in zip(edges[:-1], edges[1:], strict=True):
+            if end - start < 0.025 * rate:
+                out[start:end] *= 10 ** (3.0 * rng.standard_normal() / 20)
+    elif kind == "rattle":
+        t = np.arange(len(samples)) / rate
+        out = samples * (0.6 + 0.4 * np.sin(2 * np.pi * 30.0 * t))
+        out = np.clip(out / np.max(np.abs(out)), -0.3, 0.3)
+    elif kind == "breathy":
+        width = round(0.02 * rate)
+        envelope = np.convolve(np.abs(samples), np.ones(width) / width, mode="same")
+        noise = rng.standard_normal(len(samples)) * envelope
+        noise *= np.sqrt(np.mean(samples**2) / np.mean(noise**2)) * 10 ** (-5.0 / 20)
+        out = samples + noise
+    else:
+        out = np.asarray(samples, dtype=np.float64)
+    return out / np.max(np.abs(out))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("kind", ["clean", "jitter_shimmer", "creak", "rattle", "breathy"])
+@pytest.mark.parametrize("sentence", ROUGH_SENTENCES, ids=["s1", "s2", "s3"])
+def test_real_model_keeps_trusted_text_for_rough_creaky_and_buzzy_voice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sentence: str, kind: str
+) -> None:
+    """Owner input on #135: a voice may rattle; the rule must not take its words away."""
+    voice = piper_voice()
+    chunks = list(voice.synthesize(sentence, synthetic._synthesis_config()))
+    rate = chunks[0].sample_rate
+    pause = np.zeros(round(0.5 * rate))
+    spoken = np.concatenate([pause, *(c.audio_float_array for c in chunks), pause])
+    audio = 0.5 * to_16k(rough_voice(spoken, rate, kind), rate)
+
+    result = real_transcription(tmp_path, monkeypatch, kind, audio)
+
+    trusted, flagged = asr.trusted_segments(result.raw)
+    words = [w for s in trusted for w in s["words"] or []]
+    assert len(words) >= len(sentence.split()), [s["hallucination_signals"] for s in flagged]
+    assert result.raw["speech_spans"], "the detector hears the rough voice"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("member", RINCO_DEV_MEMBERS, ids=lambda m: m.rsplit("/", 1)[1])
+def test_real_model_trusts_every_segment_of_rinco_dev_speech(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: str
+) -> None:
+    archive = corpus_dir() / "sources" / "rinco" / corpus.RINCO_ARCHIVE
+    if not archive.is_file():
+        pytest.skip(f"{corpus.RINCO_ARCHIVE} is not in {CORPUS_DIR_ENV}")
+    with zipfile.ZipFile(archive) as opened:
+        source = tmp_path / "rinco.wav"
+        source.write_bytes(opened.read(member))
+    config = Config(allowed_roots=(tmp_path,), data_root=tmp_path / "decode")
+    config.data_root.mkdir()
+    decoded = ingest.decode(source, open_run("decode", IDENTITY, config.data_root), config)
+    audio = channels.load(decoded)
+    mono, _ = channels.choose_mono(audio, channels.report(audio))
+    samples = prepare.mono16k(
+        mono, decoded.probe.sample_rate, open_run("prep", IDENTITY, config.data_root), config
+    ).samples
+
+    result = real_transcription(tmp_path, monkeypatch, "rinco", samples)
+
+    trusted, flagged = asr.trusted_segments(result.raw)
+    assert trusted and flagged == [], [s["hallucination_signals"] for s in flagged]

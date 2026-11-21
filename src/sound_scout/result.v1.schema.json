@@ -293,7 +293,13 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": {
-            "enum": ["silent_span", "no_speech_prob", "low_avg_logprob", "high_compression_ratio"]
+            "enum": [
+              "silent_span",
+              "no_speech_prob",
+              "low_avg_logprob",
+              "high_compression_ratio",
+              "no_vad_speech"
+            ]
           }
         },
         "certainty": { "const": "uncertain" }

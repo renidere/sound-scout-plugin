@@ -45,7 +45,7 @@
     "input_modalities": ["text"],
     "audio_payload_sha256": null,
     "prompt_sha256": null,
-    "schema_sha256": "70a69af134f0285d5fdb64952aeb1308c10f058587c8857d203c131ed854faf9",
+    "schema_sha256": "2bc104be234ab220d00e77015cdd4350aaf1423970c1b054c757e5fc224e116e",
     "transformations": [
       { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
     ],

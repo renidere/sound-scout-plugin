@@ -233,7 +233,12 @@ def test_failing_ffprobe_is_unavailable_with_its_exit_code(env: FakeEnv) -> None
 
 @pytest.mark.parametrize(
     ("component", "distribution"),
-    [("asr", "ctranslate2"), ("acoustics", "praat-parselmouth"), ("acoustics", "onnxruntime")],
+    [
+        ("asr", "ctranslate2"),
+        ("asr", "onnxruntime"),
+        ("acoustics", "praat-parselmouth"),
+        ("acoustics", "onnxruntime"),
+    ],
 )
 def test_missing_package_is_unavailable(env: FakeEnv, component: str, distribution: str) -> None:
     env.versions[distribution] = None
@@ -320,9 +325,11 @@ def test_configured_revision_prefix_selects_the_snapshot(env: FakeEnv) -> None:
     assert component["fingerprint"]["model"]["revision"] == REVISION
 
 
-def test_missing_vad_asset_is_unavailable(env: FakeEnv) -> None:
+@pytest.mark.parametrize("name", ["acoustics", "asr"])
+def test_missing_vad_asset_is_unavailable(env: FakeEnv, name: str) -> None:
+    """The asr stage checks its text against the Silero VAD too (decision 0021)."""
     (env.package / "assets" / "silero_vad_v6.onnx").unlink()
-    component = component_status("acoustics", env.config, env.data_root)
+    component = component_status(name, env.config, env.data_root)
     assert component["status"] == "unavailable"
     assert component["reason"] == "Silero VAD asset not found in faster_whisper"
     assert component["fingerprint"]["vad"] == {"asset": None, "size": None}

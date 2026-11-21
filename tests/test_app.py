@@ -9,6 +9,7 @@ skipped, with the reason, without it.
 import dataclasses
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -935,11 +936,15 @@ class WhisperModel:
         words = [Word(0.3, 0.95, " выдумка", 0.93)]
         return iter([Segment(0, 0, 0.0, 0.95, " выдумка", [1], -0.1, 0.9, 0.01, words)]), Info()
 """
+# The double's submodules (the Silero VAD the ASR rule needs) come from the installed package.
+[_INSTALLED] = importlib.util.find_spec("faster_whisper").submodule_search_locations
+FAKE_WHISPER += f"\n__path__.append({_INSTALLED!r})\n"
 
 
 def fake_asr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config, Path]:
     """The spawned worker imports `faster_whisper` from `sys.path`, so a test double package
-    placed first stands in for the model; the snapshot is a fake one in a fake HF cache.
+    placed first stands in for the model; its submodules (the Silero VAD) still come from the
+    installed package. The snapshot is a fake one in a fake HF cache.
     Returns the config and a recording of 1 s of digital silence, then 0.5 s of a tone."""
     fake = tmp_path / "fake-packages" / "faster_whisper"
     fake.mkdir(parents=True)
@@ -978,7 +983,12 @@ def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(
     assert result["stages"]["asr"]["status"] == "completed", result["stages"]
     assert result["stages"]["audio_review"]["status"] == "completed", result["stages"]
     assert result["transcript"]["suspect_segments"] == [
-        {"start": 0.0, "end": 0.95, "signals": ["silent_span"], "certainty": "uncertain"}
+        {
+            "start": 0.0,
+            "end": 0.95,
+            "signals": ["silent_span", "no_vad_speech"],
+            "certainty": "uncertain",
+        }
     ]
     assert app.HALLUCINATION_LIMITATION in result["provenance"]["limitations"]
     assert result["findings"][0]["category"] == "pronunciation"
