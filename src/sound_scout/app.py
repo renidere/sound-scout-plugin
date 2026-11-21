@@ -41,6 +41,14 @@ is in its `review_provenance` artifact. `report.write` checks and writes `result
 refused, never rerun.
 No stage is retried and the backend is called at most once per window (R11).
 
+The worker loads the code installed on disk when it starts, while a long-lived caller (the MCP
+server, the jobs runner) keeps the code it loaded, and that code checks the result. So `app`
+takes `doctor.code_fingerprint` once at import, `LOADED_CODE`, and the caller passes its own to
+the worker. The worker compares the two before its first stage; when they differ (or a package
+was unreadable) it writes nothing and exits `CODE_CHANGED_EXIT`. The caller then assembles no
+result, removes the run it just created with its index entry (`runs.discard_run`) and raises
+`CodeChanged` (`code_changed`): a repeat of the request after a restart is a new request (#141).
+
 `compare` reads two finished runs and compares them by one criterion (`sound_scout.comparison`).
 
 `stages` keeps the five keys of the contract: the channel choice is part of `prepare` and the
@@ -55,6 +63,7 @@ import fcntl
 import json
 import multiprocessing
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -89,6 +98,11 @@ from sound_scout import (
 )
 from sound_scout.config import Config
 
+try:
+    LOADED_CODE: str | None = doctor.code_fingerprint()
+except OSError:
+    LOADED_CODE = None
+
 LAYERS = ("content", "measurements", "sound")
 LAYER_STAGES = {"content": "asr", "measurements": "acoustics", "sound": "audio_review"}
 WORKER_STAGES = ("prepare", "acoustics", "asr", "audio_review")
@@ -104,6 +118,16 @@ DEADLINE_EXCEEDED = "deadline_exceeded"
 CANCELLED = "cancelled"
 WORKER_CRASHED = "worker_crashed"
 INTERNAL_ERROR = "internal_error"
+CODE_CHANGED = "code_changed"
+CODE_CHANGED_EXIT = 75  # EX_TEMPFAIL of sysexits: a temporary refusal, repeat later
+UNREADABLE_CODE = (
+    "cannot read the installed sound_scout package; no stage ran and the run was not kept; "
+    "start this process again once the package is readable and repeat the request"
+)
+CHANGED_CODE = (
+    "the installed sound_scout code changed since this process loaded it; no stage ran and the "
+    "run was not kept; start this process again and repeat the request with the same request_id"
+)
 REVIEW_CALL_FAILED = "review_call_failed"
 NETWORK_DENIED = "network_denied"
 ASR_FAILED = "asr_failed"
@@ -147,6 +171,11 @@ class RunIncomplete(Exception):
     """The request ID names a run that did not complete; nothing was run, use a new request ID."""
 
 
+class CodeChanged(Exception):
+    """The worker loaded other code than this process, or the package cannot be read; no stage
+    ran and the run was not kept."""
+
+
 class WorkerStopped(BaseException):
     """Raised in the worker by SIGTERM; not an `Exception`, so no stage boundary swallows it."""
 
@@ -160,6 +189,7 @@ REFUSALS = (
     (runs.RequestMismatch, "request_mismatch"),
     (runs.RequestRunMissing, "request_run_missing"),
     (runs.RequestIndexCorrupt, "request_index_corrupt"),
+    (CodeChanged, CODE_CHANGED),
 )
 
 
@@ -220,7 +250,8 @@ def analyze(
 
     Raises `InvalidRequest` for a bad request, `Busy`, `paths.PathDenied` and `ingest.IngestError`
     for an input refused before any run exists, `runs.RequestMismatch` (and the other `runs`
-    index errors) and `RunIncomplete` for a request ID that cannot be run again.
+    index errors) and `RunIncomplete` for a request ID that cannot be run again, `CodeChanged`
+    when the worker loaded other code than this process (the run is removed).
     """
     layers = _checked_layers(request.layers)
     request_id = runs.new_run_id() if request.request_id is None else request.request_id
@@ -241,7 +272,11 @@ def analyze(
                 f"request {request_id!r} names run {run.run_id}, which did not complete; "
                 "it is not run again, use a new request_id"
             )
-        interruption = _execute(request, config, run, backend, preflight.audio_sha256, cancel)
+        try:
+            interruption = _execute(request, config, run, backend, preflight.audio_sha256, cancel)
+        except CodeChanged:
+            runs.discard_run(run)
+            raise
         document = _assemble(run, request, config, _read_records(run), interruption, preflight)
         written = report.write(run, document, config=config)
         if interruption is None or interruption.code != CANCELLED:
@@ -367,6 +402,8 @@ def _execute(
                 return _Interruption(DEADLINE_EXCEEDED, f"прерван: deadline {deadline_seconds} с")
     finally:
         _stop(process)
+    if process.exitcode == CODE_CHANGED_EXIT:
+        raise CodeChanged(UNREADABLE_CODE if LOADED_CODE is None else CHANGED_CODE)
     if process.exitcode != 0:
         return _Interruption(WORKER_CRASHED, f"worker завершился с кодом {process.exitcode}")
     return None
@@ -383,7 +420,10 @@ def _start_worker(
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_work,
-        args=(request, config, run, backend, audio_sha256, os.getpid()),
+        args=(
+            LOADED_CODE,
+            pickle.dumps((request, config, run, backend, audio_sha256, os.getpid())),
+        ),
         name="sound-scout-worker",
         daemon=False,
     )
@@ -400,15 +440,13 @@ def _stop(process: BaseProcess) -> None:
         process.join()
 
 
-def _work(
-    request: AnalyzeRequest,
-    config: Config,
-    run: runs.Run,
-    backend: review.AudioBackend | None,
-    audio_sha256: str,
-    parent_pid: int,
-) -> None:
-    """The worker process: every stage in order, a record after each."""
+def _work(expected_code: str | None, payload: bytes) -> None:
+    """The worker process: every stage in order, a record after each; nothing at all on other
+    code than its caller's (`CODE_CHANGED_EXIT`). The arguments come pickled in `payload`, loaded
+    only after the check, so a change to them or their classes is still `code_changed`."""
+    if LOADED_CODE is None or expected_code != LOADED_CODE:
+        raise SystemExit(CODE_CHANGED_EXIT)
+    request, config, run, backend, audio_sha256, parent_pid = pickle.loads(payload)
     proc.die_with_parent(parent_pid)
     os.dup2(2, 1)
     sys.stdout = sys.stderr

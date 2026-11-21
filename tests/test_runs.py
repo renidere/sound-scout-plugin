@@ -521,3 +521,54 @@ def test_module_docstring_tells_operator_to_remove_entry_with_run_dir_and_not_ex
     assert "RequestRunMissing" in doc
     assert re.search(r"operator removes the index entry together with the run directory", doc)
     assert re.search(r"`open_run` does\s+not repair such an entry", doc)
+
+
+# --- discard_run: a run whose worker refused changed code (#141) -----------------------------
+
+
+def index_entry(data_root: Path, request_id: str) -> Path:
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    return data_root / "runs" / "by-request" / digest
+
+
+def test_discard_run_removes_the_index_entry_and_the_run_so_a_repeat_is_a_new_request(
+    data_root: Path,
+) -> None:
+    run = open_run("req", IDENTITY, data_root)
+
+    runs.discard_run(run)
+
+    assert not run.path.exists() and not index_entry(data_root, "req").exists()
+    again = open_run("req", IDENTITY, data_root)
+    assert again.created is True and again.run_id != run.run_id
+
+
+def test_discard_run_refuses_a_complete_run_or_one_this_call_did_not_create(
+    data_root: Path,
+) -> None:
+    run = open_run("req", IDENTITY, data_root)
+    not_created = open_run("req", IDENTITY, data_root)
+    assert not_created.created is False
+
+    with pytest.raises(ValueError, match="only a run this call created"):
+        runs.discard_run(not_created)
+    with pytest.raises(ValueError, match="only a run this call created"):
+        runs.discard_run(complete_run(run))
+
+    assert run.path.is_dir() and index_entry(data_root, "req").read_text() == run.run_id
+
+
+def test_discard_run_removes_nothing_when_the_index_names_another_run(data_root: Path) -> None:
+    run = open_run("req", IDENTITY, data_root)
+    entry = index_entry(data_root, "req")
+    entry.unlink()
+    entry.write_text("0" * 32)
+
+    with pytest.raises(RequestIndexCorrupt, match="does not name run"):
+        runs.discard_run(run)
+
+    assert run.path.is_dir() and entry.read_text() == "0" * 32
+    entry.unlink()
+    with pytest.raises(RequestIndexCorrupt, match="does not name run"):
+        runs.discard_run(run)
+    assert run.path.is_dir()

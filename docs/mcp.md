@@ -50,7 +50,12 @@ uv run sound-scout serve
   `{"error": {"code": "<код>", "message": "<сообщение>"}}`. Коды те же, что печатает CLI:
   `invalid_arguments`, `unknown_tool`, `path_denied`, коды приёма входа (`not_audio` и др.),
   `invalid_request`, `busy`, `run_incomplete`, `request_mismatch`, `request_run_missing`,
-  `request_index_corrupt`, коды `compare` (`run_not_found`, `criterion_invalid`, `same_run`, …).
+  `request_index_corrupt`, `code_changed`, коды `compare` (`run_not_found`, `criterion_invalid`,
+  `same_run`, …).
+  `code_changed` у `speech_analyze`: сервер держит код, загруженный при старте, а worker анализа
+  загрузил с диска другой, обновлённый. Ни один этап не выполнен, run не сохранён. Подсказка
+  `hint` велит перезагрузить сервер (`/reload-mcp` в Hermes или перезапуск gateway) и повторить
+  вызов с тем же `request_id` (#141).
   Неожиданная ошибка — `internal_error` только с именем типа: текст исключения может содержать
   путь или транскрипт. В сообщении о входе, который не декодируется, абсолютные пути заменены на
   `<input>`, `<allowed root>`, `<data root>`.

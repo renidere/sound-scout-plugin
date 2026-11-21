@@ -67,15 +67,18 @@ nothing retries on its own.
 The runner keeps the code it loaded at its start, while each attempt's worker (`app.analyze`,
 `spawn`) loads the code installed on disk at that moment: after an update the two would differ,
 and the old runner would check a new worker's result with its old schema (#139). So the runner
-takes `code_fingerprint` of the installed package when it starts, and `_claim_next` takes it
+takes `doctor.code_fingerprint` of the installed package when it starts, and `_claim_next` takes it
 again, under `jobs.lock`, before it moves a job to `running`. When the two differ (or the
 package cannot be read), the runner starts no attempt: the job stays `queued` untouched, no
 attempt and no lease, the runner logs why on stderr, releases `runner.lock` and returns, so
 `jobs run` exits 0. A runner that cannot read the package at its start logs that and returns
-too, before it takes `runner.lock`. A runner started after that (`jobs start`) loads the new
-code and runs the job. `runner_unit_argv` is the `systemd-run --user` command that starts the
-runner as the transient unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has
-`KillMode=mixed`, so its children die on each restart); `start_runner_unit` runs it.
+too, before it takes `runner.lock`. An update after the claim and before the attempt's worker
+starts is caught by the worker itself (`app.CodeChanged`, #141): the attempt and its lease are
+removed as for `Busy`, `state_reason` names the code change, and the runner returns the same way.
+A runner started after that (`jobs start`) loads the new code and runs the job.
+`runner_unit_argv` is the `systemd-run --user` command that starts the runner as the transient
+unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has `KillMode=mixed`, so its
+children die on each restart); `start_runner_unit` runs it.
 
 `delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
 kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. About once a minute
@@ -112,7 +115,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sound_scout import __version__, comparison, ingest, paths, proc, report, runs, schema
+from sound_scout import (
+    __version__,
+    comparison,
+    doctor,
+    ingest,
+    paths,
+    proc,
+    report,
+    runs,
+    schema,
+)
 from sound_scout.config import CONFIG_PATH_ENV, Budgets, Config
 
 JOBS_DIR_NAME = "jobs"
@@ -121,7 +134,6 @@ JOB_FILE_NAME = "job.json"
 CANCEL_MARKER_NAME = "cancel.json"
 LOCK_FILE_NAME = "jobs.lock"
 RUNNER_LOCK_NAME = "runner.lock"
-PACKAGE_DIR = Path(__file__).resolve().parent
 RUNNER_UNIT = "sound-scout-jobs-runner"
 # Passed on to the transient unit when set: the decoder on PATH and the ASR model cache.
 RUNNER_ENV = ("PATH", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "XDG_CACHE_HOME")
@@ -184,16 +196,22 @@ class JobError(Exception):
 
 UNREADABLE_CODE = "cannot read the installed sound_scout package"
 CHANGED_CODE = "the installed sound_scout code changed since this runner started"
+CODE_CHANGED_ATTEMPT = (
+    "the installed sound_scout code changed before the attempt's worker started; the job waits "
+    "for a new runner (jobs start)"
+)
+BUSY_REASON = "analyze.lock is held by another analysis; the job waits in the queue"
 
 
 class _CodeChanged(Exception):
     """The installed code is not the code the runner loaded, or cannot be read (`reason`);
-    the job named stays `queued`."""
+    the job named stays `queued` (or ends `cancelled`, its `state`, when a cancel came first)."""
 
-    def __init__(self, job_id: str, reason: str) -> None:
+    def __init__(self, job_id: str, reason: str, state: str = "queued") -> None:
         super().__init__(job_id, reason)
         self.job_id = job_id
         self.reason = reason
+        self.state = state
 
 
 # The other refusals of this module with their reason codes; `ingest.IngestError` has its own.
@@ -539,7 +557,7 @@ def run_runner(
     from sound_scout import app, staging
 
     try:
-        loaded_code = code_fingerprint()
+        loaded_code = doctor.code_fingerprint()
     except OSError as error:
         _log(f"{UNREADABLE_CODE} ({type(error).__name__}); exiting without starting an attempt")
         return
@@ -555,19 +573,24 @@ def run_runner(
                     _log(f"staging sweep failed: {type(error).__name__}")
             try:
                 claimed = _claim_next(config, loaded_code)
+                if claimed is None:
+                    if exit_when_idle:
+                        return
+                    time.sleep(poll_seconds)
+                    continue
+                job, attempt = claimed
+                outcome = _run_attempt(app, job, attempt, config)
             except _CodeChanged as changed:
-                _log(
-                    f"{changed.reason}; job {changed.job_id} stays queued; exiting: start a new "
-                    "runner (jobs start) to run it"
+                ended = (
+                    f"job {changed.job_id} cancelled"
+                    if changed.state == CANCELLED
+                    else f"job {changed.job_id} stays queued"
                 )
+                tail = (
+                    "start a new runner (jobs start) to run it" if changed.state == QUEUED else ""
+                )
+                _log(f"{changed.reason}; {ended}; exiting" + (f": {tail}" if tail else ""))
                 return
-            if claimed is None:
-                if exit_when_idle:
-                    return
-                time.sleep(poll_seconds)
-                continue
-            job, attempt = claimed
-            outcome = _run_attempt(app, job, attempt, config)
             _log(f"job {job['job_id']} attempt {attempt['number']}: {outcome}")
             if outcome == QUEUED:
                 time.sleep(poll_seconds)
@@ -660,24 +683,6 @@ def start_runner_unit(config_path: Path) -> dict:
     return {"unit": RUNNER_UNIT, "started": True}
 
 
-def code_fingerprint(package_dir: Path | None = None) -> str:
-    """SHA-256 over the relative path and the bytes of every file of the installed `sound_scout`
-    package (`PACKAGE_DIR`: modules, schemas, prompt; `__pycache__` aside), read from disk: the
-    code a new process loads. About a megabyte, read once per attempt."""
-    package_dir = PACKAGE_DIR if package_dir is None else package_dir
-    digest = hashlib.sha256()
-    files = {
-        path.relative_to(package_dir).as_posix(): path
-        for path in package_dir.rglob("*")
-        if "__pycache__" not in path.relative_to(package_dir).parts and path.is_file()
-    }
-    for name in sorted(files):
-        data = files[name].read_bytes()
-        for part in (name.encode("utf-8"), data):
-            digest.update(len(part).to_bytes(8, "big") + part)
-    return digest.hexdigest()
-
-
 def _claim_next(config: Config, loaded_code: str) -> tuple[dict, dict] | None:
     """The oldest `queued` job, now `running` with a new attempt and its lease; None if none.
     Raises `_CodeChanged` and changes nothing when the installed code is not `loaded_code`."""
@@ -690,7 +695,7 @@ def _claim_next(config: Config, loaded_code: str) -> tuple[dict, dict] | None:
             key=lambda item: (item.get("queued_at") or item["submitted_at"], item["job_id"]),
         )
         try:
-            installed_code = code_fingerprint()
+            installed_code = doctor.code_fingerprint()
         except OSError as error:
             raise _CodeChanged(job["job_id"], UNREADABLE_CODE) from error
         if installed_code != loaded_code:
@@ -713,7 +718,9 @@ def _claim_next(config: Config, loaded_code: str) -> tuple[dict, dict] | None:
 
 
 def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
-    """Run one attempt through `app.analyze` and record how it ended; the new job state."""
+    """Run one attempt through `app.analyze` and record how it ended; the new job state.
+    Raises `_CodeChanged` (state `queued`, or `cancelled` after a cancel) once the attempt is
+    recorded, when the worker refused changed code (#141)."""
     job_dir = config.data_root / JOBS_DIR_NAME / job["job_id"]
     request = job["request"]
     token = app.CancelToken()
@@ -744,6 +751,8 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
         compared = _compared(app, job, run_id, state, config)
     except app.Busy:
         state = QUEUED
+    except app.CodeChanged:
+        state, reason = QUEUED, CODE_CHANGED_ATTEMPT
     except JobError as error:
         state, reason = FAILED, f"{error.code}: {error.message}"
     except ingest.IngestError as error:
@@ -759,9 +768,12 @@ def _run_attempt(app, job: dict, attempt: dict, config: Config) -> str:
         watcher.join()
     if compared is None and state == FAILED and request.get("control"):
         compared = {"state": "not_run", "reason": FAILED}
-    return _end_attempt(
+    ended = _end_attempt(
         job_dir, attempt, state, reason, run_id, config, input_changed=changed, compare=compared
     )
+    if reason == CODE_CHANGED_ATTEMPT:
+        raise _CodeChanged(job["job_id"], CHANGED_CODE, ended)
+    return ended
 
 
 def _compared(app, job: dict, run_id: str, state: str, config: Config) -> dict | None:
@@ -827,7 +839,7 @@ def _end_attempt(
     answer the job's new state.
 
     Under `jobs.lock`, so a `cancel` cannot land between the cancel-marker check of a `Busy`
-    attempt and its requeue.
+    attempt and its requeue. A `QUEUED` attempt keeps the given reason, `BUSY_REASON` without one.
     """
     with _store(config.data_root):
         job = _load(job_dir)
@@ -835,10 +847,14 @@ def _end_attempt(
         if job["state"] != RUNNING or current is None or current["number"] != attempt["number"]:
             return job["state"]  # `jobs recover` took this attempt from a runner it saw as gone.
         if state == QUEUED and (job_dir / CANCEL_MARKER_NAME).exists():
-            state, reason = CANCELLED, "cancelled while waiting for analyze.lock"
+            state = CANCELLED
+            if reason is None:
+                reason = "cancelled while waiting for analyze.lock"
+            else:
+                reason = "cancelled before its attempt started"
         if state == QUEUED:
             job["attempts"].pop()
-            reason = "analyze.lock is held by another analysis; the job waits in the queue"
+            reason = reason or BUSY_REASON
         else:
             current.update(
                 run_id=run_id or _run_id_of(current["request_id"], config),

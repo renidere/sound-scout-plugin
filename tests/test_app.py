@@ -862,6 +862,45 @@ def test_the_lock_is_released_after_an_error(config: Config, make_wav: WavFactor
         os.close(fd)
 
 
+# --- a worker on other code than its caller (#141) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("loaded", "message"),
+    [("0" * 64, app.CHANGED_CODE), (None, app.UNREADABLE_CODE)],
+    ids=["changed", "unreadable"],
+)
+def test_a_worker_on_other_code_than_its_caller_runs_no_stage_and_the_run_is_not_kept(
+    config: Config, wav: Path, monkeypatch: pytest.MonkeyPatch, loaded: str | None, message: str
+) -> None:
+    assert doctor.code_fingerprint() == app.LOADED_CODE
+    runs_dir = config.data_root / "runs"
+    monkeypatch.setattr(app, "LOADED_CODE", loaded)
+
+    with pytest.raises(app.CodeChanged) as refused:
+        analyze(AnalyzeRequest(str(wav), request_id="r-1", layers=("measurements",)), config)
+
+    assert str(refused.value) == message
+    assert dict(app.REFUSALS)[app.CodeChanged] == app.CODE_CHANGED == "code_changed"
+    assert sorted(path.name for path in runs_dir.iterdir()) == ["by-request"]
+    assert list((runs_dir / "by-request").iterdir()) == []
+    assert list(runs_dir.rglob(app.CURRENT_STAGE)) == []
+
+    monkeypatch.undo()
+    analysis = analyze(AnalyzeRequest(str(wav), request_id="r-1", layers=("measurements",)), config)
+
+    assert analysis.reused is False and analysis.run.complete is True
+    assert analysis.result["stages"]["acoustics"]["status"] == "completed"
+
+
+def test_the_worker_checks_the_code_before_it_loads_its_arguments() -> None:
+    # Arguments the worker could not load (changed classes) still end in `code_changed`.
+    with pytest.raises(SystemExit) as refused:
+        app._work("0" * 64, b"not a pickle of this code's arguments")
+
+    assert refused.value.code == app.CODE_CHANGED_EXIT
+
+
 # --- the audio backend -----------------------------------------------------------------------
 
 

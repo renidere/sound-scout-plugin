@@ -20,6 +20,10 @@ and into the report.
 it; a receipt with a test double, an absolute path or a hand-edited fingerprint is refused or
 read as invalid. The network guard is installed by the process entry point (CLI, MCP), not here:
 `report` only tells whether it is active.
+
+`code_fingerprint` is the SHA-256 of the installed `sound_scout` package on disk: the jobs runner
+(#139) and `app.analyze` with its worker (#141) compare it to tell code a process loaded from
+code installed since.
 """
 
 import hashlib
@@ -56,11 +60,31 @@ WEIGHT_FILES = ("model.bin", "config.json")
 VAD_PACKAGE = "faster_whisper"
 VAD_ASSET = re.compile(r"silero.*\.onnx$")
 DIR_MODE = 0o700
+PACKAGE_DIR = Path(__file__).resolve().parent
 GATE0_REASON = "audio backend is not selected or allowed (backend = none, Gate 0)"
 WEIGHTS_NOT_CACHED = "model weights not in the local cache"
 _VERSION_LINE = re.compile(r"^(ffmpeg|ffprobe) version (\S+)")
 _PLAIN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def code_fingerprint(package_dir: Path | None = None) -> str:
+    """SHA-256 over the relative path and the bytes of every file of the installed `sound_scout`
+    package (`PACKAGE_DIR`: modules, schemas, prompt; `__pycache__` aside), read from disk: the
+    code a new process loads. About a megabyte, read at each import of `app` and once per
+    attempt."""
+    package_dir = PACKAGE_DIR if package_dir is None else package_dir
+    digest = hashlib.sha256()
+    files = {
+        path.relative_to(package_dir).as_posix(): path
+        for path in package_dir.rglob("*")
+        if "__pycache__" not in path.relative_to(package_dir).parts and path.is_file()
+    }
+    for name in sorted(files):
+        data = files[name].read_bytes()
+        for part in (name.encode("utf-8"), data):
+            digest.update(len(part).to_bytes(8, "big") + part)
+    return digest.hexdigest()
 
 
 class ReceiptInvalid(Exception):

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import app, config, ingest, jobs, report, runs
+from sound_scout import app, config, doctor, ingest, jobs, report, runs
 from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
 from tests.conftest import WavFactory
@@ -210,7 +210,7 @@ def test_a_busy_attempt_is_requeued_unless_a_cancel_landed_before_its_end(
 
     monkeypatch.setattr(jobs, "_store", store_with_a_cancel_first)
     monkeypatch.setattr(app, "analyze", busy)
-    job, attempt = jobs._claim_next(cfg, jobs.code_fingerprint())
+    job, attempt = jobs._claim_next(cfg, doctor.code_fingerprint())
 
     state = jobs._run_attempt(app, job, attempt, cfg)
 
@@ -1356,8 +1356,8 @@ def test_each_attempt_of_a_retried_control_job_has_its_own_comparison(
 def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A copy of the installed package that `code_fingerprint` reads instead of the real one."""
     package = tmp_path / "installed" / "sound_scout"
-    shutil.copytree(jobs.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
-    monkeypatch.setattr(jobs, "PACKAGE_DIR", package)
+    shutil.copytree(doctor.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(doctor, "PACKAGE_DIR", package)
     return package
 
 
@@ -1392,16 +1392,16 @@ def make_unreadable(package: Path) -> None:
 def test_code_fingerprint_covers_every_packaged_file_but_not_pycache(installed: Path) -> None:
     import sound_scout
 
-    real = jobs.code_fingerprint(Path(sound_scout.__file__).resolve().parent)
-    assert jobs.code_fingerprint() == real
+    real = doctor.code_fingerprint(Path(sound_scout.__file__).resolve().parent)
+    assert doctor.code_fingerprint() == real
     (installed / "__pycache__").mkdir()
     (installed / "__pycache__" / "asr.cpython-313.pyc").write_bytes(b"compiled")
-    assert jobs.code_fingerprint() == real
+    assert doctor.code_fingerprint() == real
     edit_schema(installed)
-    edited = jobs.code_fingerprint()
+    edited = doctor.code_fingerprint()
     assert edited != real
     (installed / "eval" / "new.py").write_text("", encoding="utf-8")
-    assert jobs.code_fingerprint() not in (real, edited)
+    assert doctor.code_fingerprint() not in (real, edited)
 
 
 @pytest.mark.parametrize(
@@ -1519,7 +1519,7 @@ def test_criterion_3_a_new_jobs_run_process_runs_the_waiting_job_on_the_updated_
 ) -> None:
     site = tmp_path / "installed"
     shutil.copytree(
-        jobs.PACKAGE_DIR, site / "sound_scout", ignore=shutil.ignore_patterns("__pycache__")
+        doctor.PACKAGE_DIR, site / "sound_scout", ignore=shutil.ignore_patterns("__pycache__")
     )
     for name in ("recordings", "data"):
         (tmp_path / name).mkdir()
@@ -1584,3 +1584,151 @@ def test_criterion_3_a_new_jobs_run_process_runs_the_waiting_job_on_the_updated_
     assert f"[updated code] job {job_id} attempt 1: finished" in new_runner.stderr
     done = json.loads(cli("status", job_id, "--json").stdout)
     assert done["state"] == "finished" and done["attempts"] == 1
+
+
+# --- an update after the claim and before the attempt's worker starts (#141) ------------------
+
+
+def code_changed(calls: list[str]) -> Callable[..., app.Analysis]:
+    """Stands in for `app.analyze` whose worker refused changed code: no run is kept."""
+
+    def analyze(request: app.AnalyzeRequest, config: Config, **kwargs: object) -> app.Analysis:
+        calls.append(request.request_id)
+        raise app.CodeChanged(app.CHANGED_CODE)
+
+    return analyze
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["queued", "cancel_marker"])
+def test_a_worker_refusing_changed_code_leaves_the_job_queued_and_the_runner_exits(
+    cfg: Config,
+    make_wav: WavFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    cancelled: bool,
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    queued_at = job_file(cfg, job_id)["queued_at"]
+    calls: list[str] = []
+    refuse = code_changed(calls)
+
+    def refused_after_a_cancel(request: app.AnalyzeRequest, config: Config, **kwargs: object):
+        (cfg.data_root / "jobs" / job_id / "cancel.json").touch()
+        return refuse(request, config, **kwargs)
+
+    monkeypatch.setattr(app, "analyze", refused_after_a_cancel if cancelled else refuse)
+
+    jobs.run_runner(cfg, poll_seconds=POLL)
+
+    assert calls == [f"{job_id}-a1"]
+    assert not runner_lock_held(cfg)
+    job = job_file(cfg, job_id)
+    assert job["queued_at"] == queued_at
+    err = capfd.readouterr().err
+    assert "internal_error" not in err
+    if cancelled:
+        [attempt] = job["attempts"]  # as after `Busy`: the cancel ends the attempt
+        assert attempt["outcome"] == "cancelled" and job["state"] == "cancelled"
+        assert job["state_reason"] == "cancelled before its attempt started"
+        assert f"{jobs.CHANGED_CODE}; job {job_id} cancelled; exiting\n" in err
+        assert "to run it" not in err
+    else:
+        assert job["attempts"] == [] and job["state"] == "queued"
+        assert job["state_reason"] == jobs.CODE_CHANGED_ATTEMPT
+        tail = "exiting: start a new runner (jobs start) to run it"
+        assert f"{jobs.CHANGED_CODE}; job {job_id} stays queued; {tail}" in err
+
+
+def test_busy_keeps_its_own_reason_for_a_requeued_attempt(
+    cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = queue(cfg, make_wav("recordings/a.wav"))
+    job, attempt = jobs._claim_next(cfg, doctor.code_fingerprint())
+    job_dir = cfg.data_root / "jobs" / job_id
+
+    assert jobs._end_attempt(job_dir, attempt, "queued", None, None, cfg) == "queued"
+    assert job_file(cfg, job_id)["state_reason"] == jobs.BUSY_REASON
+
+
+UPDATE_BEFORE_THE_WORKER = """
+
+_start_worker_of_the_loaded_code = _start_worker
+
+
+def _start_worker(*args, **kwargs):
+    marker = Path(os.environ["SOUND_SCOUT_TEST_UPDATE_MARKER"])
+    if marker.exists():
+        marker.unlink()
+        with (Path(__file__).parent / "asr.py").open("a", encoding="utf-8") as module:
+            module.write("\\n# updated after the claim\\n")
+    return _start_worker_of_the_loaded_code(*args, **kwargs)
+"""
+
+
+@needs_ffmpeg
+def test_criteria_3_4_an_update_between_the_claim_and_the_worker_start_leaves_the_job_queued(
+    tmp_path: Path, make_wav: WavFactory
+) -> None:
+    site = tmp_path / "installed"
+    package = site / "sound_scout"
+    shutil.copytree(doctor.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    with (package / "app.py").open("a", encoding="utf-8") as module:
+        module.write(UPDATE_BEFORE_THE_WORKER)
+    for name in ("recordings", "data"):
+        (tmp_path / name).mkdir()
+    config_path = tmp_path / "sound-scout.toml"
+    config_path.write_text(
+        f"allowed_roots = [{json.dumps(str(tmp_path / 'recordings'))}]\n"
+        f"data_root = {json.dumps(str(tmp_path / 'data'))}\n"
+        f"[asr]\nmodel = {json.dumps(ABSENT_ASR_MODEL)}\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "update-once"
+    marker.touch()
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    }
+    env.update(
+        {
+            config.CONFIG_PATH_ENV: str(config_path),
+            "PYTHONPATH": str(site),
+            "SOUND_SCOUT_TEST_UPDATE_MARKER": str(marker),
+        }
+    )
+
+    def cli(*args: str, **options: object):
+        return subprocess.run(
+            [sys.executable, "-m", "sound_scout", "jobs", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            **options,
+        )
+
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+    job_id = json.loads(cli("submit", str(wav), "--json").stdout)["job_id"]
+
+    old_runner = cli("run", timeout=120)
+
+    assert old_runner.returncode == 0, old_runner.stderr
+    assert not marker.exists(), "the update did not happen between the claim and the worker"
+    assert f"job {job_id} stays queued" in old_runner.stderr
+    assert "internal_error" not in old_runner.stderr
+    assert "ResultValidationError" not in old_runner.stderr
+    waiting = json.loads(cli("status", job_id, "--json").stdout)
+    assert waiting["state"] == "queued" and waiting["attempts"] == 0
+    assert waiting["state_reason"] == jobs.CODE_CHANGED_ATTEMPT
+    runs_dir = tmp_path / "data" / "runs"
+    assert sorted(path.name for path in runs_dir.iterdir()) == ["by-request"]
+    assert list((runs_dir / "by-request").iterdir()) == []
+
+    new_runner = cli("run", "--exit-when-idle", timeout=300)
+
+    assert new_runner.returncode == 0, new_runner.stderr
+    assert f"job {job_id} attempt 1: finished" in new_runner.stderr
+    done = json.loads(cli("status", job_id, "--json").stdout)
+    assert done["state"] == "finished" and done["attempts"] == 1
+    job = json.loads((tmp_path / "data" / "jobs" / job_id / "job.json").read_text("utf-8"))
+    [attempt] = job["attempts"]
+    assert attempt["request_id"] == f"{job_id}-a1" and attempt["outcome"] == "finished"

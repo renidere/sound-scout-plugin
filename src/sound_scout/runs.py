@@ -134,6 +134,29 @@ def complete_run(run: Run) -> Run:
     )
 
 
+def discard_run(run: Run) -> None:
+    """Remove a run this call created and that never started its work, with its index entry.
+
+    Only for `run.created and not run.complete` (else `ValueError`): `app.analyze` uses it when
+    its worker refused to start on changed code (#141), so no stage ran and nothing was charged.
+    An index entry that does not name the run raises `RequestIndexCorrupt` and nothing is removed.
+    The entry goes first, so a failure in between leaves an unindexed directory, never an entry
+    that names a missing run (`RequestRunMissing`).
+    """
+    if not run.created or run.complete:
+        raise ValueError("only a run this call created and did not complete can be discarded")
+    digest = hashlib.sha256(run.request_id.encode("utf-8")).hexdigest()
+    index_path = run.path.parent / INDEX_DIR_NAME / digest
+    try:
+        named = index_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        named = None
+    if named != run.run_id:
+        raise RequestIndexCorrupt(f"index entry {index_path.name} does not name run {run.run_id}")
+    os.unlink(index_path)
+    shutil.rmtree(run.path)
+
+
 def _publish_index_entry(index_dir: Path, index_path: Path, run_id: str) -> bool:
     """Bind the request to `run_id` atomically; false when another run already holds it."""
     staging = index_dir / f".{index_path.name}.{uuid.uuid4().hex}"

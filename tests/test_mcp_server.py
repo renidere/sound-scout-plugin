@@ -6,6 +6,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -16,7 +17,7 @@ import anyio
 import pytest
 from mcp import Client
 
-from sound_scout import app, config, delivery, jobs, mcp_server, report
+from sound_scout import app, config, delivery, doctor, jobs, mcp_server, report
 from tests.conftest import WavFactory
 from tests.test_cli import ABSENT_ASR_MODEL, needs_ffmpeg, offline_env, write_config
 
@@ -756,6 +757,57 @@ def test_cli_and_mcp_give_the_same_result_and_the_same_compact_answer(
     assert len(text.encode("utf-8")) <= report.COMPACT_MAX_BYTES
     assert not BASE64_RUN.search(text)
     assert str(tmp_path) not in text
+
+
+@needs_ffmpeg
+def test_criteria_1_2_4_speech_analyze_on_code_updated_after_the_server_started_is_code_changed(
+    stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
+) -> None:
+    """#141: the server keeps the code it loaded; its worker loads the code on disk."""
+    site = tmp_path / "installed"
+    shutil.copytree(
+        doctor.PACKAGE_DIR, site / "sound_scout", ignore=shutil.ignore_patterns("__pycache__")
+    )
+    env = {**stdio_env, "PYTHONPATH": str(site)}
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+    arguments = {"path": str(wav), "request_id": "r-1"}
+    runs_dir = tmp_path / "data" / "runs"
+    session = StdioSession(env)
+    session.initialize()
+    with (site / "sound_scout" / "asr.py").open("a", encoding="utf-8") as module:
+        module.write("\n# updated after the server started\n")
+
+    refused = session.call_tool("speech_analyze", arguments)
+    code, stderr = session.close()
+
+    assert code == 0, stderr
+    assert refused["isError"] is True
+    error = answer_of(refused)["error"]
+    assert error["code"] == "code_changed" and error["message"] == app.CHANGED_CODE
+    assert "/reload-mcp" in error["hint"] and "restart the gateway" in error["hint"]
+    assert error["hint"] == mcp_server.RELOAD_HINT
+    assert "speech_analyze refused: code_changed in " in stderr
+    assert "internal_error" not in stderr and "ResultValidationError" not in stderr
+    assert sorted(path.name for path in runs_dir.iterdir()) == ["by-request"]
+    assert list((runs_dir / "by-request").iterdir()) == []
+
+    session = StdioSession(env)
+    session.initialize()
+    analyzed = session.call_tool("speech_analyze", arguments)
+    code, stderr = session.close()
+
+    assert code == 0, stderr
+    assert analyzed.get("isError") is not True
+    answer = answer_of(analyzed)
+    assert answer["status"] == "partial" and answer["reused"] is False
+
+
+def test_only_a_code_changed_speech_analyze_gets_the_reload_hint() -> None:
+    assert mcp_server._error("code_changed", "m", "speech_analyze")["error"]["hint"] == (
+        mcp_server.RELOAD_HINT
+    )
+    assert "hint" not in mcp_server._error("busy", "m", "speech_analyze")["error"]
+    assert "hint" not in mcp_server._error("code_changed", "m", "speech_job_submit")["error"]
 
 
 # --- the job tools (decision 0013 § 3.1, § 3.8) -----------------------------------------------

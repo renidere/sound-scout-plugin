@@ -21,7 +21,9 @@ A refusal — invalid arguments, a path outside the allowed roots, a Windows pat
 input that is not audio, a busy data root, a request ID of another input, an unknown run — is a
 tool result with `isError: true` and `{"error": {"code", "message"}}`, never a protocol error, so
 the caller reads the reason; the codes are those the CLI prints. An unexpected error is
-`internal_error` with the type only: its message may carry a path or a transcript. The
+`internal_error` with the type only: its message may carry a path or a transcript. The server
+keeps the code it loaded at its start: a `speech_analyze` whose worker loaded an update is the
+refusal `code_changed` with a `hint` to reload the server (#141). The
 annotations say what a tool does: `speech_capabilities` reads, `speech_analyze` and
 `speech_compare` write run and comparison files under the data root, so neither is read-only;
 `speech_job_status` and `speech_job_result` read, `speech_job_submit` writes the job,
@@ -90,6 +92,10 @@ PATH_DENIED = "path_denied"
 PATH_HINT = (
     "path must be a local file on the host running sound-scout, inside an allowed root of the "
     "operator configuration; a Windows path, a URL or another host's path is not accepted"
+)
+RELOAD_HINT = (
+    "reload the MCP server (/reload-mcp in Hermes, or restart the gateway), then repeat the call "
+    "with the same request_id"
 )
 SUBMITTER = "mcp"
 HOME_PLACEHOLDER = "~"
@@ -480,6 +486,8 @@ def _error(code: str, message: str, tool: str) -> dict:
     error = {"code": code, "message": " ".join(message.split())}
     if tool in ("speech_analyze", "speech_job_submit") and code == PATH_DENIED:
         error["hint"] = PATH_HINT
+    if tool == "speech_analyze" and code == app.CODE_CHANGED:
+        error["hint"] = RELOAD_HINT
     return {"error": error}
 
 
