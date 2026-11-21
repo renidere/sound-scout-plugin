@@ -1039,21 +1039,64 @@ def test_journal_lookups_flag_a_journal_grep_for_the_mount_line() -> None:
     assert _journal_lookups("journalctl --user -u hermes-autonomous.service -n 50") == []
 
 
-def test_criterion_6_decision_has_a_results_table_without_a_probe_run() -> None:
+EVIDENCE = re.compile(r"issues/\d+#issuecomment-\d+")
+PROVEN = ("1", "2", "3", "4а", "5а", "5б", "5в", "6")
+UNPROVEN = {"4б": "issues/105", "4в": "issues/108"}
+
+
+def _results(section: str) -> dict[str, tuple[str, str]]:
+    rows = [
+        [cell.strip() for cell in line.split("|")[1:-1]]
+        for line in section.splitlines()
+        if line.startswith("| ") and not line.startswith("| критерий")
+    ]
+    return {cells[0].split(".")[0]: (cells[2], cells[3]) for cells in rows if len(cells) == 4}
+
+
+def _unsupported_results(results: dict[str, tuple[str, str]]) -> list[str]:
+    wrong = [
+        criterion
+        for criterion in PROVEN
+        if criterion not in results
+        or not results[criterion][0].startswith("выполнено")
+        or not EVIDENCE.search(results[criterion][1])
+    ]
+    wrong += [
+        criterion
+        for criterion, issue in UNPROVEN.items()
+        if criterion not in results
+        or not results[criterion][0].startswith("не доказано")
+        or issue not in results[criterion][1]
+    ]
+    wrong += [c for c, cells in results.items() if "прогона не было" in " ".join(cells)]
+    return sorted(set(wrong))
+
+
+def test_criterion_6_decision_records_the_results_with_evidence() -> None:
     text = DECISION.read_text(encoding="utf-8")
-    assert "прогона владельцем не было" in text.splitlines()[2]
+    assert "результаты записаны" in text.splitlines()[2]
     instruction = " ".join(_section(text, "## Инструкция владельцу").split())
     assert "**После этапа B (2026-11-21) инструкцию не выполнять.**" in instruction
     assert "раздел «Удаление» удалил бы её (`hermes plugins remove sound-scout`)" in instruction
-    rows = [
-        line.split("|")[1:-1]
-        for line in _section(text, "## Результаты").splitlines()
-        if line.startswith("| ") and not line.startswith("| критерий")
+    section = _section(text, "## Результаты")
+    results = _results(section)
+    assert {"1", "2", "3", "4а", "4б", "4в", "5а", "5б", "5в", "6"} <= set(results)
+    assert _unsupported_results(results) == []
+    assert "прогона не было" not in text
+
+
+def test_results_check_refuses_a_row_without_a_run_or_evidence() -> None:
+    link = "[#96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-1)"
+    rows = [f"| {c}. x | y | выполнено | {link} |" for c in PROVEN if c != "3"]
+    rows += [
+        f"| {c}. x | y | не доказано | [#](https://x/{issue}) |" for c, issue in UNPROVEN.items()
     ]
-    by_criterion = {cells[0].strip().split(".")[0]: cells[2].strip() for cells in rows}
-    assert {"1", "2", "3", "4а", "4б", "4в", "5а", "5б", "5в", "6"} <= set(by_criterion)
-    for criterion in ("3", "4а", "4б", "4в", "5а", "5б", "5в", "6"):
-        assert by_criterion[criterion] == "не выполнено: прогона не было"
+    good = _results("\n".join([*rows, f"| 3. x | y | выполнено | {link} |"]))
+    assert _unsupported_results(good) == []
+    stale = _results("\n".join([*rows, f"| 3. x | y | не выполнено: прогона не было | {link} |"]))
+    assert _unsupported_results(stale) == ["3"]
+    bare = _results("\n".join([*rows, "| 3. x | y | выполнено | тест |"]))
+    assert _unsupported_results(bare) == ["3"]
 
 
 def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them(

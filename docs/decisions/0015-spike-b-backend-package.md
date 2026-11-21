@@ -1,7 +1,10 @@
 # 0015 — Spike B: пакет-заглушка на backend (ctx.rest, доставка заметки, запуск runner)
 
-- **Статус:** инструкция готова; прогона владельцем не было. После этапа B 0017 (2026-11-21)
-  инструкцию зонда не выполняют (раздел «Инструкция владельцу»).
+- **Статус:** результаты записаны (2026-11-21): критерии 1–3 и 5 выполнены, 4а выполнен через
+  production-доставку; 4б и 4в не доказаны —
+  [#105](https://github.com/renidere/sound-scout-plugin/issues/105) и
+  [#108](https://github.com/renidere/sound-scout-plugin/issues/108). Инструкцию зонда после этапа B
+  0017 не выполняют.
 - **Дата:** 2026-11-20.
 - **Решение:** [Decision в #96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7023401575).
 - **Задача:** [#96](https://github.com/renidere/sound-scout-plugin/issues/96); эпик
@@ -93,7 +96,9 @@ Sound Scout · spike B: тестовая заметка <token>, доставл�
 **После этапа B (2026-11-21) инструкцию не выполнять.** В `~/.hermes/plugins/sound-scout` gateway
 с 2026-11-21 стоит production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104).
 Шаг 2 записал бы пакет-зонд в тот же каталог, а раздел «Удаление» удалил бы её (`hermes plugins remove
-sound-scout`). До этапа B зонд не запускался (таблица «Результаты»). Доставку через #104 проверяет
+sound-scout`). До этапа B зонд прогнан только на Linux: шаги 1, 2 и 6 (2026-11-20,
+[7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870));
+Windows-шаги 3–5 не выполнялись. Доставку через #104 проверяет
 [#114](https://github.com/renidere/sound-scout-plugin/issues/114). Новый прогон зонда — только по
 отдельному решению владельца. Шаги ниже — запись инструкции зонда.
 
@@ -102,8 +107,8 @@ Gateway с этапа B (2026-11-21) — `hermes-gateway.service` (`hermes gatew
 ([0017, «Этап B (2026-11-21)»](0017-session-authority-owner.md#этап-b-2026-11-21)).
 
 История. До этапа B (по 2026-11-21) шаги 1, 2 и 6, строка 5а таблицы «Результаты» и раздел
-«Удаление» называли gateway unit `hermes-autonomous.service`. Таблица «Результаты» прогонов по
-этим шагам не записывает.
+«Удаление» называли gateway unit `hermes-autonomous.service`. Строки 5а–5в таблицы «Результаты»
+записывают прогон шага 6 на `hermes-autonomous.service`.
 
 ### 1. Проверка перед установкой (Linux, backend)
 
@@ -192,8 +197,8 @@ grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/agent
 С 2026-11-21 (0017, «Этап B (2026-11-21)») `:9119` слушает gateway, и `ctx.rest` клиента доходит до
 него. Условие этапа B 0017 («Остаток: этап B») выполнено: остановить и отключить
 `hermes-autonomous.service`, и Windows-клиент работает только через gateway. Шаги 5.1–5.4 вызывают
-маршруты Spike B `/spike/*`, поэтому их нужно было выполнить до этапа B. Они не выполнены (таблица
-«Результаты»). На этапе B production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104)
+маршруты Spike B `/spike/*`, поэтому их нужно было выполнить до этапа B. Они не выполнены; таблица
+«Результаты» записывает 4а по production-доставке. На этапе B production-копия [#104](https://github.com/renidere/sound-scout-plugin/issues/104)
 заменила Spike B в gateway и убрала `/spike/*`. Доставку через #104 проверяет
 [#114](https://github.com/renidere/sound-scout-plugin/issues/114): 2026-11-21 заметка задания дошла
 в чат владельца ровно один раз.
@@ -212,6 +217,9 @@ grep "Mounted plugin API routes: /api/plugins/sound-scout/" ~/.hermes/logs/agent
    перезапуска gateway пуста (`unknown_token`).
 
 ### 6. Критерий 5: unit вне cgroup gateway переживает перезапуск
+
+Выполнено 2026-11-20 на `hermes-autonomous.service`, тогда процесс с пакетом; результаты — строки
+5а–5в.
 
 1. Палитра → `Sound Scout spike: start runner unit` → `unit=sound-scout-spike-b.service returncode=0`.
 2. На Linux:
@@ -252,20 +260,24 @@ gh issue comment 96 --repo renidere/sound-scout-plugin --body-file <файл с 
 
 ## Результаты
 
-Коммит checkout: прогона не было.
+Коммит checkout: `3287539` (Linux-часть, 2026-11-20), Hermes Agent v0.23.1 `3b4215785882`.
 
-| критерий | что наблюдать | результат |
-|---|---|---|
-| 1. пакет и `GET /health` без Hermes | `tests/test_hermes_plugin.py` | выполнено в репозитории |
-| 2. инструкция включения и удаления | этот документ, разделы «Инструкция владельцу» и «Удаление» | выполнено в репозитории |
-| 3. `GET /health` через `ctx.rest` с Windows | `ok`, `pid` = `MainPID` gateway, `session_owner` | не выполнено: прогона не было |
-| 4а. заметка в открытый чат | ровно одна заметка, `state=delivered` | не выполнено: прогона не было |
-| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | не выполнено: прогона не было |
-| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | не выполнено: прогона не было |
-| 5а. unit вне cgroup gateway | `ControlGroup` вне `hermes-gateway.service` | не выполнено: прогона не было |
-| 5б. unit переживает перезапуск gateway | тот же `MainPID`, `ActiveState=active` | не выполнено: прогона не было |
-| 5в. повторный старт живого unit | отказ systemd | не выполнено: прогона не было |
-| 6. запись результатов | эта таблица заполнена | не выполнено: прогона не было |
+| критерий | что наблюдать | результат | доказательство |
+|---|---|---|---|
+| 1. пакет и `GET /health` без Hermes | `tests/test_hermes_plugin.py` | выполнено в репозитории | [#96 7024144812](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024144812) |
+| 2. инструкция включения и удаления | этот документ, разделы «Инструкция владельцу» и «Удаление» | выполнено в репозитории | [#96 7024144812](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024144812); установка production-пакета при `in_process` по умолчанию — [#104 7060137735](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7060137735), [#104 7062974709](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7062974709) |
+| 3. `GET /health` через `ctx.rest` с Windows | `ok`, `pid` = `MainPID` gateway, `session_owner` | выполнено: production health 0.1.0, `session_owner=true`, `pid` = `MainPID` | палитра Desktop 0.23.3 → `Sound Scout: health`, `pid` = `MainPID` `hermes-gateway.service`: [#120 7062836106](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7062836106), [#120 7062968106](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7062968106) |
+| 4а. заметка в открытый чат | ровно одна заметка, `state=delivered` | выполнено по смыслу: production-доставка, ровно одно сообщение с меткой; состояние чата не записано | поток `sound-scout-delivery` в процессе gateway — [#104 7060137735](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7060137735); метка задания ровно в одном сообщении Desktop-чата владельца — [#114 7060137985](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7060137985); вторая сессия, Hermes v0.23.3 — [#114 7063057772](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7063057772) |
+| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | не доказано: проверяет #105 | Desktop-чат не закрывали; проверяет [#105](https://github.com/renidere/sound-scout-plugin/issues/105) |
+| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | не доказано: заметка без директивы, запасной путь 0013 § 3.7; карточка — #108 | Decision в #102 [#102 7026672015](https://github.com/renidere/sound-scout-plugin/issues/102#issuecomment-7026672015); карточка — [#108](https://github.com/renidere/sound-scout-plugin/issues/108) |
+| 5а. unit вне cgroup gateway | `ControlGroup` вне `hermes-gateway.service` | выполнено (зонд, Linux): `ControlGroup=…/app.slice/sound-scout-spike-b.service` | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870) |
+| 5б. unit переживает перезапуск gateway | тот же `MainPID`, `ActiveState=active` | выполнено (зонд, Linux): `MainPID` 725759 до и после `restart hermes-autonomous.service`, `ActiveState=active`; production: runner `sound-scout-jobs-runner.service` пережил два перезапуска `hermes-gateway.service` | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870); production — [#114 7063057772](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7063057772) |
+| 5в. повторный старт живого unit | отказ systemd | выполнено (зонд, Linux): `returncode=1`, `Unit sound-scout-spike-b.service was already loaded`; unit остановлен | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870) |
+| 6. запись результатов | эта таблица заполнена | выполнено: эта таблица | [#96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7065924531) |
+
+Что заменило зонд. Маршруты `/spike/*` убраны: production-копия 0.1.0 заменила зонд в gateway
+([#128 7060138271](https://github.com/renidere/sound-scout-plugin/issues/128#issuecomment-7060138271)). Критерии 3, 4а и 5 подтверждены production-путём #104, #114 и #120.
+Повторный прогон зонда запрещён: он вернул бы тестовые маршруты в живой gateway.
 
 Если директива не рисуется (заметки cron хранятся как `internal_notification`), действует запасной
 путь 0013 § 3.7: простой текст в заметке и карточка через опрос `GET /jobs/<id>`.
@@ -287,3 +299,10 @@ plugins remove` удаляет каталог `~/.hermes/plugins/sound-scout` и
 
 Windows: удалить каталог `desktop-plugins\sound-scout` клиента и выполнить «Reload desktop plugins»
 (или перезапустить Desktop). Команд `Sound Scout spike: …` в палитре быть не должно.
+
+Факт. Linux-копию зонда заменил пакет 0.1.0 2026-11-21
+([#104](https://github.com/renidere/sound-scout-plugin/issues/104),
+[#128](https://github.com/renidere/sound-scout-plugin/issues/128)). Unit
+`sound-scout-spike-b.service` остановлен 2026-11-20. Desktop-половину зонда на Windows не ставили:
+в клиенте стоит production `plugin.js`
+([#120 7062836106](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7062836106)).
