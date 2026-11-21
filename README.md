@@ -19,7 +19,10 @@ https://github.com/users/renidere/projects/1 автономным агентом
 проверенный по разрешению владельца тем же протоколом и правилом под потолком 26 GB, тоже получил
 NOT READY (`docs/decisions/0011-gate0-gigachat-audio.md`): не выполнено предусловие P3 правила
 (20 аудиотокенов на секунду при 6,25 позиции в секунду у его энкодера), о слухе модели это не
-говорит. Четвёртый кандидат MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
+говорит. Qwen3-Omni-30B-A3B-Instruct (GGUF Q4_K_M, решение владельца на
+[#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7065525535)) прошёл
+предусловия правила `GATE0-RULE v2`, но получил NOT READY по отрицательным контролям: 2 пустых или
+обрезанных ответа из 12, выдуманной речи нет (`docs/decisions/0023-gate0-qwen3-omni.md`). Четвёртый кандидат MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не
 формальный Gate 0: READY не получен
 ([#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195)).
 Следующий ограниченный эксперимент предлагает агент, утверждает владелец

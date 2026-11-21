@@ -1557,3 +1557,40 @@ def test_a_reused_prepare_runs_under_v2_with_the_clip_hashes_of_the_source(
     source = {clip["pcm_sha256"] for clip in qwen_spike["manifest"]["clips"]}
     assert set(sent) == source and result["rule"] == gate0.RULE_V2
     assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+
+
+def test_qwen3omni_decision_records_p3_peak_memory_latency_and_the_cli_verdict() -> None:
+    flat_doc = re.sub(r"\s+", " ", (REPO / QWEN3OMNI_DOC).read_text(encoding="utf-8"))
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    assert "**P3: выполнено.**" in results and "13,32–14,50 аудиотокена" in results
+    peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
+    assert peak <= 26 * 10**9
+    assert "`memory.peak` scope" in results and "`oom_kill 0`" in results
+    assert "**Задержка на клип**" in results and "медиана" in results
+    assert "**22 мин 31 с** wall time" in results
+    assert "### Попытка 1 (2026-11-21, `attempts/1/`): прервана, вердикта нет" in results
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("## 6.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-21 --attempt 2`" in verdict
+    answer = json.dumps(
+        {
+            "verdict": "NOT READY",
+            "reason": "C: не прошли 2 из 12 пунктов контролей: ['P(S0)', 'P(T1)']",
+        },
+        ensure_ascii=False,
+    )
+    assert f"`{answer}`" in verdict
+
+
+def test_qwen3omni_not_ready_packages_nothing_and_bounds_the_conclusion() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    example = (REPO / "sound-scout.example.toml").read_text(encoding="utf-8")
+    assert "qwen" not in example.lower()
+    document = (REPO / QWEN3OMNI_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", document)
+    assert "**Вердикт: NOT READY**" in document
+    assert "ничего не упаковывается, `backend` остаётся `none`" in flat_doc
+    limits = flat_doc.split("## 6. Ограничения", 1)[1].split("## 7.", 1)[0]
+    assert "**Квантование и runtime.**" in limits and "Q4_K_M" in limits
+    assert "**Внешние данные — только на английском.**" in limits
+    owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    assert re.search(r"^1\. \*\*Решить судьбу Qwen3-Omni-30B-A3B-Instruct\*\*", owner, re.M)
