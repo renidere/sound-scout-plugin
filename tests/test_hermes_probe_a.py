@@ -202,9 +202,7 @@ def test_the_script_runs_isolated_as_the_owner_runs_it(tmp_path: Path, reference
     assert json.loads(result.stdout)["ok"] is True
 
 
-def test_decision_0016_documents_the_probe_and_leaves_results_to_the_owner(
-    reference: bytes,
-) -> None:
+def test_decision_0016_records_the_owner_run_results(reference: bytes) -> None:
     text = DECISION.read_text(encoding="utf-8")
     for needle in (
         hashlib.sha256(reference).hexdigest(),
@@ -217,12 +215,46 @@ def test_decision_0016_documents_the_probe_and_leaves_results_to_the_owner(
         "\n## Топология прогона\n",
     ):
         assert needle in text, needle
+    status = next(line for line in text.splitlines() if line.startswith("- **Статус:**"))
+    assert "результаты прогона 2026-11-21" in status
+    status_block = text.split("- **Статус:**", 1)[1].split("\n- **", 1)[0]
+    assert "(2а)" in status_block and "(4б)" in status_block
+    assert PENDING not in text
+    assert "ожидают прогона" not in text
+
     results = text.split("\n## Результаты", 1)[1].split("\n## ", 1)[0]
     rows = [line for line in results.splitlines() if line.startswith("|")][2:]
     assert len(rows) == 11
     assert not any("неперенесённый" in row for row in rows)
     for row in rows:
-        assert row.rstrip(" |").rsplit("|", 1)[1].strip() == PENDING, row
+        cell = row.rstrip(" |").rsplit("|", 1)[1].strip()
+        assert len(cell) > 40, row
+    partial = [row for row in rows if "Измерено частично" in row]
+    assert [row.split("|")[1].strip()[:2] for row in partial] == ["2а", "4б"]
+    assert "probe-a-log.clipboard.jsonl" in results
+    assert "state.db" in results
+
+    conclusions = text.split("\n## Выводы для #103\n", 1)[1].split("\n## ", 1)[0]
+    for needle in (
+        "`prompt.submit` с `submission_id`",
+        "`composer.submit` — не путь доставки",
+        "fail-closed",
+        "`retainProfile` → `session.resume`",
+        "`file.attach`",
+        "Открыто:",
+        "ACK для скрытой цели не записан",
+        "предварительный",
+        "«удаляй»",
+    ):
+        assert needle in conclusions, needle
+
+    assert not re.search(r"/home/[a-z]|/root/|[A-Za-z]:\\Users\\[A-Za-z]", text)
+    filled = results + conclusions
+    assert "completed" not in filled, "not a session_admissions status value"
+    assert not re.search(r"local-[0-9a-f]{9,}", filled), "session ids must be shortened"
+    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", filled), "raw connectionId"
+    assert not re.search(r"\b[0-9a-f]{32}\b", filled), "raw admission id"
+    assert set(re.findall(r"conn-\w+", filled)) == {"conn-1", "conn-2"}
 
 
 def test_decision_0016_instruction_fits_the_gateway_topology() -> None:

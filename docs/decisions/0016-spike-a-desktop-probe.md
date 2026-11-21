@@ -1,7 +1,9 @@
 # 0016 — Spike A: зонд штатного Desktop (owner сессии, file.attach, настоящий ли ACK)
 
-- **Статус:** инструкция готова; результаты ожидают прогона владельцем.
-- **Дата:** 2026-11-20.
+- **Статус:** результаты прогона 2026-11-21; анализ журнала записан (шаг 7). Открыты случай
+  перенесённого старого чата (2а) и `prompt.submit` при скрытой цели (4б): вердикт зонда и повтор
+  `submission_id` не записаны.
+- **Дата:** 2026-11-20; прогон владельца и анализ агента — 2026-11-21.
 - **Решение:** [Decision в #95](https://github.com/renidere/sound-scout-plugin/issues/95#issuecomment-7024314864).
 - **Пересмотр под этап B 0017:** [Decision в #95](https://github.com/renidere/sound-scout-plugin/issues/95#issuecomment-7064941502)
   (2026-11-21): код зонда не меняется, инструкция владельцу переписана под топологию gateway.
@@ -247,21 +249,84 @@ Spike A не измеряет.
 
 ## Результаты
 
-Версия Desktop и коммит checkout: ожидает прогона владельцем.
+**Источники.** Все значения ниже взяты из этих источников. Тексты сообщений, названия чатов и
+сырые `connectionId` сюда не попадают; id сессий сокращены.
+
+- Desktop: Windows Desktop 0.23.3 (`notes.txt`, About). Зонд: `plugin.js` из `37d5470`, до
+  `78f1a7e` он не менялся. SHA-256 копии на шаре совпадает с `b054e3b9…` (агент сверил на
+  станции). Результат `Get-FileHash` на Windows в `notes.txt` не записан.
+- Журнал: одна копия, `probe-a-log.clipboard.jsonl`, 27 записей (seq 1–27, 16:45:46–16:58:29
+  UTC). Файл `probe-a-log.jsonl` с Windows не копировался (`notes.txt`). Сравнить копии нельзя.
+  Запись в папку данных плагина на Windows не подтверждена. Последний submit (`prompt.submit`,
+  цель скрыта) закончился после снятия копии, его записи `submit` в журнале нет.
+- `scripts/probe_a_check_attach.py` на станции для обоих файлов `attach` (квитанция оркестратора).
+- `state.db` Hermes, открыт `mode=ro` (данные оркестратора): маркеры зонда и `session_admissions`
+  тестового чата.
+- Чаты в журнале: тестовый чат `local-d483e1ff…` и второй чат `local-e1827bbe…`. Других
+  `stored`, кроме `null`, в журнале нет. Владелец сначала отметил целью второй чат (seq 11), затем
+  тестовый (seq 13). Цель всех пишущих команд — `local-d483e1ff…`. «Цель скрыта» везде значит:
+  на экране второй чат.
+- Маршруты: во всех четырёх снимках два маршрута профиля `default`. `conn-2` — `mode: local`,
+  `primary: null`. `conn-1` — `mode: remote`, `primary: true`. Owner во всех записях —
+  `conn-1`/`default`. `owner_fallback` во всех пишущих записях — `null`.
 
 | пункт | что наблюдать | результат |
 |---|---|---|
-| установка, каталог `desktop-plugins` | восемь команд в палитре, `plugins_root` в снимке | ожидает прогона владельцем |
-| 2а. старый перенесённый чат | `stored`, `owner`, `routes`, `owner_matches` | ожидает прогона владельцем |
-| 2б. переименованный чат | тот же `stored`, `owner` не `null`, `owner_matches = 1` | ожидает прогона владельцем |
-| 2в. новый чат до и после первого сообщения | `stored`, `owner`, `owner_matches` | ожидает прогона владельцем |
-| 3а. attach, цель на экране | запись `attach`, `matches_log && matches_synthetic` | ожидает прогона владельцем |
-| 3б. attach, цель скрыта | запись `attach`, `matches_log && matches_synthetic` | ожидает прогона владельцем |
-| 4а. `prompt.submit`, цель на экране | вердикт, `replay_same_admission`, `occurrences` | ожидает прогона владельцем |
-| 4б. `prompt.submit`, цель скрыта | вердикт, `replay_same_admission`, `occurrences` | ожидает прогона владельцем |
-| 4в. `composer.submit`, цель на экране | вердикт, `ack`, `occurrences` | ожидает прогона владельцем |
-| 4г. `composer.submit`, цель скрыта | вердикт, `ack`, `occurrences` | ожидает прогона владельцем |
-| 5. выбор пути для #103 | по правилу анализа ниже | ожидает прогона владельцем |
+| установка, каталог `desktop-plugins` | восемь команд в палитре, `plugins_root` в снимке | Зонд загрузился (seq 1 `loaded`). Владелец выполнил все восемь команд (seq 4–27, `copy log` — по `notes.txt`). `plugins_root` во всех снимках — `%USERPROFILE%\AppData\Local\hermes\desktop-plugins`: это ветка `%LOCALAPPDATA%\hermes` без `HERMES_HOME`. `loaded.sdk.retainSession = undefined`: клиент штатный. Что `sound-scout` лежит в той же папке, `notes.txt` отдельно не подтверждает. |
+| 2а. старый перенесённый чат | `stored`, `owner`, `routes`, `owner_matches` | Измерено частично. Снимок `old` (seq 6) сделан в тестовом чате `local-d483e1ff…`. Этот чат создан 2026-11-21 на gateway и на этапе B не переносился (`notes.txt`, данные оркестратора). В нём `stored = runtime`, owner `conn-1`/`default`, два маршрута, `owner_matches = 1`. Ни один из трёх перенесённых чатов в журнале не встречается: случай перенесённого чата не измерен. |
+| 2б. переименованный чат | тот же `stored`, `owner` не `null`, `owner_matches = 1` | `stored` до и после переименования один: `local-e1827bbe…` (seq 9 и seq 10). `runtime = stored`, owner `conn-1`/`default`, `owner_matches = 1`. Id при переименовании не меняется. Само переименование журнал не показывает: названия чатов не пишутся. |
+| 2в. новый чат до и после первого сообщения | `stored`, `owner`, `owner_matches` | Черновик (seq 4): `stored = null`, `runtime = null`, owner уже `conn-1`/`default`, `owner_matches = 1`. После первого сообщения (seq 8, seq 9): `stored = runtime = local-e1827bbe…`, owner тот же, `owner_matches = 1`. |
+| 3а. attach, цель на экране | запись `attach`, `matches_log && matches_synthetic` | seq 19: `visible: true`, `attached` и `uploaded` — `true`, 5 760 044 байт, SHA-256 равен эталону. Шаги: `retainProfile` 0 мс, `session.resume` 145 мс, кодирование 42 мс, `file.attach` 263 мс. Скрипт на станции: `ok`, `matches_log`, `matches_synthetic`, WAV 30 с, 48 кГц, стерео, PCM16. |
+| 3б. attach, цель скрыта | запись `attach`, `matches_log && matches_synthetic` | seq 17: `visible: false`, `attached` и `uploaded` — `true`, 5 760 044 байт, SHA-256 равен эталону. Шаги: `retainProfile` 0 мс, `session.resume` 157 мс, кодирование 45 мс, `file.attach` 244 мс. Скрипт на станции: `ok`, `matches_log`, `matches_synthetic`, WAV 30 с, 48 кГц, стерео, PCM16. |
+| 4а. `prompt.submit`, цель на экране | вердикт, `replay_same_admission`, `occurrences` | seq 22: вердикт `real`. ACK несёт `admission_id`, статус `queued`. Повтор того же `submission_id` вернул ту же admission (`replay_same_admission: true`). `occurrences = 1` через 2405 мс; чтений 15, все с `messages`, ошибок 0. В `state.db` маркер `d5e7ea2a99a4` есть один раз. |
+| 4б. `prompt.submit`, цель скрыта | вердикт, `replay_same_admission`, `occurrences` | Измерено частично. Записи `submit` в копии журнала нет: копию сняли раньше. `state.db`: маркер `0c715d42d1a5` есть в тестовом чате один раз (16:59:51 UTC). История подтверждает одну доставку. ACK на стороне клиента (`admission_id`, нет ошибки RPC), вердикт зонда и `replay_same_admission` не записаны. Две более ранние попытки (seq 21, seq 25) получили отказ `busy`: предыдущая команда ещё шла в окне проверки. |
+| 4в. `composer.submit`, цель на экране | вердикт, `ack`, `occurrences` | seq 26: вердикт `real`, `ack: true`, `occurrences = 1` через 2210 мс; чтений 15, все с `messages`, ошибок 0. В `state.db` маркер `526e9a078d3e` есть один раз. |
+| 4г. `composer.submit`, цель скрыта | вердикт, `ack`, `occurrences` | seq 27: вердикт `refused`, `ack: false`, `occurrences = 0`. Чтений 15, все с `messages`, ошибок 0; `message_count` 13 → 13. Ничего не записано: отказ fail-closed. Маркера `4a83b1f54e2a` среди маркеров тестового чата в `state.db` нет. |
+| 5. выбор пути для #103 | по правилу анализа ниже | Отправка — `prompt.submit` с `submission_id`: `real` на экране (seq 22), при скрытой цели сообщение дошло один раз (`state.db`), ACK клиента не записан: для скрытой цели выбор предварительный. `composer.submit` работает только для чата на экране. Attach — `retainProfile` → `session.resume` → `file.attach`. Подробно — «Выводы для #103». |
+
+`session_admissions` тестового чата: по чтению оркестратора (`state.db`, `mode=ro`) admissions
+117–119 завершены. Какая строка какому маркеру соответствует, здесь не установлено. О повторе
+`submission_id` при скрытой цели число строк ничего не говорит: повтор не измерен.
+
+## Выводы для #103
+
+Правило анализа требует вердикт `real` у `prompt.submit` и для цели на экране, и для скрытой. Для
+скрытой цели записи зонда нет. История `state.db` подтверждает одну доставку: маркер ровно один.
+ACK на стороне клиента (`admission_id`, нет ошибки RPC) и повтор `submission_id` не наблюдались.
+Поэтому выбор `prompt.submit` для скрытой цели предварительный.
+
+- **Отправка:** рекордер отправляет через `prompt.submit` с `submission_id` (через
+  `host.requestProfile`). Для чата на экране вердикт `real` (seq 22). Для скрытого чата сообщение
+  дошло один раз (история), ACK клиента не записан: выбор для этого случая предварительный. Другого
+  пути для скрытого чата нет: `composer.submit` там fail-closed.
+- **`composer.submit` — не путь доставки.** Он работает только для чата на экране. Для скрытого
+  чата ACK `false`, и ничего не записано (fail-closed).
+- **Attach:** `retainProfile` → `session.resume` (`omit_messages: true`) → `file.attach` работает
+  для цели на экране и для скрытой. Байты на станции совпали с эталоном (SHA-256). Каждый шаг
+  короче 0,3 с.
+- **Маршрут:** у этого Desktop два маршрута профиля `default`, локальный и удалённый. Выбор
+  только по `profile` дал бы два совпадения. Рекордер выбирает маршрут по `connectionId` и
+  `profile`, как зонд: тогда `owner_matches = 1`.
+- **Owner:** owner не `null` ни в одной записи, и у черновика тоже. Перечитывание owner
+  (`owner_fallback`) в прогоне не понадобилось. Правило перечитывания из 0013 § 3.3 остаётся:
+  перенесённый старый чат не измерен.
+- **Id чата:** при переименовании `stored` не меняется. У черновика до первого сообщения
+  `stored = null`: такой чат целью записи быть не может.
+- **Каталог:** на этом клиенте `desktop-plugins` — `%LOCALAPPDATA%\hermes\desktop-plugins`.
+
+Открыто:
+
+- 2а для перенесённого старого чата не измерен. Чат, не перенесённый на этапе B, Spike A не
+  измеряет по построению (шаг 3).
+- 4б: ACK для скрытой цели не записан. Записи `submit` (`admission_id`, ошибка RPC, вердикт) и
+  повтора `submission_id` при скрытой цели в копии журнала нет. Закрывает это повтор 4б владельцем
+  с записью `submit` в журнал.
+- Запись журнала в папку данных плагина на Windows не проверена: файл не копировался.
+
+**Файлы на станции.** Два синтетических WAV остаются в `attachments/` профиля gateway:
+`sound-scout-probe-a-52602a7ecd1a.wav` (цель скрыта) и `sound-scout-probe-a-19dcd34a54b2.wav`
+(цель на экране). Владелец не сказал «удаляй». Агент удалит их только после этого слова в #95 и
+только по этим именам.
 
 ## Правило анализа
 
