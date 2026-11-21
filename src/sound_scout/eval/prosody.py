@@ -16,10 +16,12 @@ the ASR trust rule of #135, sits in `prosody-measure-1-series-2/` and never read
   with the data changes of the series (`data_changes`).
 - `sanity` is one attempt of the sanity stage S1/S2 on the Gate 0 clips, under the same memory
   scope and CPU pin as the main run; each attempt is recorded with its number, the SHA-256 of
-  this file, the cgroup memory limits and the CPUs it ran on. The second failed attempt writes
-  the verdict INVALID and nothing more can run.
+  this file, the cgroup memory limits, the CPUs it ran on and the main-run ceiling. The second
+  failed attempt writes the verdict INVALID and nothing more can run. Series 2 may also make its
+  second attempt after a passed first one, with code of another SHA-256 (`sanity_after_pass`).
 - `run` is the main run, once: it needs a passed sanity attempt made by this very code, runs ASR
-  and the index utterance by utterance under the 90 min wall-time ceiling, then computes the
+  and the index utterance by utterance under the wall-time ceiling of the series (90 min; series
+  2 — 180 min, `main_wall_seconds`), then computes the
   metric (AUC, its bootstrap CI and coverage) exactly once and writes `result.json` with the
   verdict. A second `run` is refused whatever the first one ended with.
 
@@ -73,6 +75,11 @@ SERIES = {
     2: {
         "dir": "prosody-measure-1-series-2",
         "owner_decision": "https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7060595460",
+        # The owner raised the main-run ceiling of this series and allowed a second sanity attempt
+        # with the code of that ceiling after a passed first one.
+        "ceiling_decision": "https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7062644385",
+        "main_wall_seconds": 180 * 60,
+        "sanity_after_pass": True,
         # The RINCO files #135 read to check its rule (decision 0021, «Файлы RINCO»).
         "excluded": (
             "INTON-EAF/1-Questions/q-1122.wav",
@@ -758,6 +765,10 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def main_wall_seconds(series: int) -> float:
+    return SERIES[series].get("main_wall_seconds", MAIN_WALL_SECONDS)
+
+
 def output_dir(config_: config.Config, series: int = 1) -> Path:
     return _mkdir(paths.resolve_output(config_.data_root, SERIES[series]["dir"], config_))
 
@@ -773,6 +784,12 @@ def _header(decision: Path, series: int = 1) -> dict:
         "decision": "docs/decisions/0019-next-audio-experiment.md (редакция 2)",
         **({"owner_decision": approved["owner_decision"]} if "owner_decision" in approved else {}),
         "data_changes": list(approved["data_changes"]),
+        "main_wall_seconds": main_wall_seconds(series),
+        **(
+            {"ceiling_decision": approved["ceiling_decision"]}
+            if "ceiling_decision" in approved
+            else {}
+        ),
         "rule_sha256": check_rule(decision),
         "code_sha256": code_sha256(),
         "at": _now(),
@@ -844,8 +861,12 @@ def run_sanity(
     if not (out / PREPARE_FILE).exists():
         raise ProsodyError("run `prepare` first")
     attempts = _mkdir(out / SANITY_DIR)
-    if any(_read_json(p)["passed"] for p in attempts.glob("attempt-*.json")):
-        raise ProsodyError("a sanity attempt has passed already; run the main step")
+    passed = [a for a in map(_read_json, attempts.glob("attempt-*.json")) if a["passed"]]
+    after_pass = SERIES[series].get("sanity_after_pass", False)
+    if passed and not (
+        after_pass and all(a["code_sha256"] != header["code_sha256"] for a in passed)
+    ):
+        raise ProsodyError("a sanity attempt of this code has passed already; run the main step")
     started = len(list(attempts.glob("work-*")))  # an attempt that died without a record counts
     if started >= MAX_SANITY_ATTEMPTS:
         raise ProsodyError(f"{started} sanity attempts made, none passed")
@@ -878,10 +899,12 @@ def run_main(
     decision: Path = DECISION_DOC,
     transcribe=None,
     scope: tuple[str, str] | None | bool = True,
-    wall_seconds: float = MAIN_WALL_SECONDS,
+    wall_seconds: float | None = None,
     series: int = 1,
 ) -> dict:
     header = _header(decision, series)
+    if wall_seconds is None:
+        wall_seconds = header["main_wall_seconds"]
     out = output_dir(config_, series)
     _refuse_if_decided(out)
     main_dir = out / MAIN_DIR

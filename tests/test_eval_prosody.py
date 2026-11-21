@@ -765,3 +765,110 @@ def test_the_cli_passes_the_series_to_the_step(tmp_path, monkeypatch, capsys) ->
     )
     assert prosody.main(["sanity", "--series", "2"]) == 0
     assert seen == [2] and json.loads(capsys.readouterr().out) == {"passed": True}
+
+
+def test_series_2_has_a_180_min_ceiling_and_series_1_keeps_90() -> None:
+    assert prosody.main_wall_seconds(1) == prosody.MAIN_WALL_SECONDS == 90 * 60
+    assert prosody.main_wall_seconds(2) == 180 * 60
+    assert prosody.SERIES[2]["ceiling_decision"].endswith("#issuecomment-7062644385")
+    assert prosody.MAX_SANITY_ATTEMPTS == 2
+    assert not prosody.SERIES[1].get("sanity_after_pass")
+
+
+def series_2_passed(tmp_path, monkeypatch, variant_raised=True):
+    """Series 2 prepared, with a passed attempt 1 made by code of another SHA-256."""
+    settings, words = sanity_setup(tmp_path, monkeypatch, variant_raised)
+    monkeypatch.setitem(prosody.SERIES, 2, dict(prosody.SERIES[2], excluded=()))
+    decision = REPO / prosody.DECISION_DOC
+    prosody.prepare(settings, decision, series=2)
+    good = gate0_clips(tmp_path / "good")[1]
+    current = prosody.code_sha256()
+    monkeypatch.setattr(prosody, "code_sha256", lambda: "a" * 64)
+    first = prosody.run_sanity(settings, decision, fake_transcriber(good), series=2)
+    assert first["passed"] and first["main_wall_seconds"] == 180 * 60
+    monkeypatch.setattr(prosody, "code_sha256", lambda: current)
+    return settings, decision, words
+
+
+@needs_ffmpeg
+def test_series_2_makes_attempt_2_with_new_code_after_a_pass_and_runs_main_with_it(
+    tmp_path, monkeypatch
+) -> None:
+    settings, decision, words = series_2_passed(tmp_path, monkeypatch)
+    with pytest.raises(prosody.ProsodyError, match="sanity"):
+        prosody.run_main(settings, decision, fake_transcriber({}), scope=False, series=2)
+    second = prosody.run_sanity(settings, decision, fake_transcriber(words), series=2)
+    assert second["attempt"] == 2 and second["passed"]
+    assert second["code_sha256"] == prosody.code_sha256()
+    assert second["main_wall_seconds"] == 180 * 60
+    assert second["ceiling_decision"] == prosody.SERIES[2]["ceiling_decision"]
+    with pytest.raises(prosody.ProsodyError, match="of this code has passed already"):
+        prosody.run_sanity(settings, decision, fake_transcriber(words), series=2)
+    result = prosody.run_main(settings, decision, fake_transcriber({}), scope=False, series=2)
+    assert result["verdict"] == prosody.PASS and result["main_wall_seconds"] == 180 * 60
+    out = settings.data_root / prosody.SERIES[2]["dir"]
+    started = json.loads((out / prosody.MAIN_DIR / prosody.STARTED_FILE).read_text())
+    assert started["main_wall_seconds"] == 180 * 60
+
+
+@needs_ffmpeg
+def test_series_2_attempt_2_after_a_pass_refuses_the_same_code(tmp_path, monkeypatch) -> None:
+    settings, decision, words = series_2_passed(tmp_path, monkeypatch)
+    monkeypatch.setattr(prosody, "code_sha256", lambda: "a" * 64)
+    with pytest.raises(prosody.ProsodyError, match="of this code has passed already"):
+        prosody.run_sanity(settings, decision, fake_transcriber(words), series=2)
+    assert not (settings.data_root / prosody.SERIES[2]["dir"] / "sanity" / "work-2").exists()
+
+
+@needs_ffmpeg
+def test_series_2_failed_attempt_2_after_a_pass_gives_invalid(tmp_path, monkeypatch) -> None:
+    settings, decision, words = series_2_passed(tmp_path, monkeypatch, variant_raised=False)
+    second = prosody.run_sanity(settings, decision, fake_transcriber(words), series=2)
+    assert second["attempt"] == 2 and not second["passed"]
+    out = settings.data_root / prosody.SERIES[2]["dir"]
+    result = json.loads((out / prosody.RESULT_FILE).read_text())
+    assert result["verdict"] == prosody.INVALID and "2 попытки" in result["reason"]
+    assert result["main_wall_seconds"] == 180 * 60
+    with pytest.raises(prosody.ProsodyError, match="verdict is out"):
+        prosody.run_main(settings, decision, fake_transcriber({}), scope=False, series=2)
+
+
+@needs_ffmpeg
+def test_series_1_refuses_a_second_attempt_after_a_pass_even_with_new_code(
+    tmp_path, monkeypatch
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    decision = REPO / prosody.DECISION_DOC
+    prosody.prepare(settings, decision)
+    first = prosody.run_sanity(settings, decision, fake_transcriber(words))
+    assert first["passed"] and first["main_wall_seconds"] == 90 * 60
+    assert "ceiling_decision" not in first
+    monkeypatch.setattr(prosody, "code_sha256", lambda: "f" * 64)
+    with pytest.raises(prosody.ProsodyError, match="passed already"):
+        prosody.run_sanity(settings, decision, fake_transcriber(words))
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("series", "done", "verdict"), [(1, 3, "INCONCLUSIVE"), (2, 4, "PASS")])
+def test_the_main_run_stops_at_the_ceiling_of_its_series(
+    tmp_path, monkeypatch, series, done, verdict
+) -> None:
+    settings, words = sanity_setup(tmp_path, monkeypatch)
+    monkeypatch.setitem(prosody.SERIES, 2, dict(prosody.SERIES[2], excluded=()))
+    decision = REPO / prosody.DECISION_DOC
+    prosody.prepare(settings, decision, series=series)
+    assert prosody.run_sanity(settings, decision, fake_transcriber(words), series=series)["passed"]
+    slow, clock = fake_transcriber({}), [0.0]
+
+    def late(samples, run_dir):
+        clock[0] += 2500.0  # four utterances: 10 000 s, past 90 min and inside 180 min
+        return slow(samples, run_dir)
+
+    monkeypatch.setattr(prosody.time, "monotonic", lambda: clock[0])
+    result = prosody.run_main(settings, decision, late, scope=False, series=series)
+    assert result["verdict"] == verdict, result
+    assert result["main_wall_seconds"] == prosody.main_wall_seconds(series)
+    if series == 1:
+        assert result["utterances_done"] == done and "90 мин" in result["reason"]
+    else:
+        assert result["utterances"] == done
