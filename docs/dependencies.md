@@ -115,6 +115,31 @@ SHA-256 и runtime остаются записанными ниже (3.1, 3.2).
 Не используются: `gemma-4-E4B-it-BF16.gguf` (15 GB, вне бюджета), `Q4_0` и `mmproj-…-Q8_0`
 (запасной облегчённый вариант, решение владельца), `mtp-*` (speculative decoding, не нужен).
 
+#### Qwen3-Omni-30B-A3B-Instruct — кандидат Gate 0 #144 (решение владельца 7065525535)
+
+Решение владельца — [комментарий 7065525535](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7065525535)
+(2026-11-21): формальный Gate 0 по `GATE0-RULE v2`, загрузка GGUF Q4_K_M и mmproj Q8_0 с
+ревизией, закреплённой при загрузке, потолок памяти 26 GB. Репозиторий
+`ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF` на Hugging Face, ревизия
+`6e35a28f4a19b18730f8949b0c579c6429649ab8` (lastModified 2026-04-13), не gated. Исходная модель
+`Qwen/Qwen3-Omni-30B-A3B-Instruct`, ревизия `26291f793822fb6be9555850f06dfe95f2d7e695`. Лицензия
+Apache-2.0 по карточке исходной модели (`license_name: apache-2.0`); у карточки GGUF поля лицензии
+нет. Каталог по умолчанию:
+`~/.cache/sound-scout/models/ggml-org--Qwen3-Omni-30B-A3B-Instruct-GGUF/<ревизия>/`. Итог —
+`docs/decisions/0023-gate0-qwen3-omni.md`.
+
+| Файл | Байт | SHA-256 | Назначение |
+|---|---|---|---|
+| `Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf` | 18 557 053 952 | `d9e2876556e7873e02c0359f832432ee2d67ab7dd0cee3efe0f77fd7a1f4dd85` | языковая модель (thinker), Q4_K_M |
+| `mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf` | 1 325 020 128 | `1104376db833f1e89c84834144ac3863340c2cd1ddaeddb39cb0247fb5c20c8d` | аудио/визуальный проектор (энкодер AuT, тип `qwen3a`), Q8_0 |
+
+Загрузка — только по прямому URL `https://huggingface.co/ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF/resolve/<ревизия>/<файл>`
+(`curl --proto =https --proto-redir =https`) в файл `.part`; после загрузки сверяются размер и
+SHA-256 на диске с LFS sha256 из `GET /api/models/ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF/tree/<ревизия>`.
+`gate0 run --runtime qwen3omni` пересчитывает SHA-256 перед стартом сервера (предусловие P2) по
+константе `QWEN3OMNI_WEIGHTS`, равной этой таблице. Не используются: `Q8_0` (32,5 GB) и `bf16`
+LLM, `mmproj-…-bf16.gguf`.
+
 #### GigaChat3.1-Audio-10B-A1.8B — кандидат Gate 0 #85 (разрешение владельца 2026-11-19)
 
 Разрешение владельца — тело [#85](https://github.com/renidere/sound-scout-plugin/issues/85)
@@ -220,6 +245,12 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 Мультимодальность `llama-server` помечена в документации llama.cpp как experimental.
 
 Сервер слушает только `127.0.0.1` на свободном порту, один анализ за раз (`--parallel 1`).
+
+Тот же `llama-server` b12359 запускает Qwen3-Omni-30B-A3B-Instruct (`gate0 run --runtime
+qwen3omni`, #144): тот же argv с файлами этой модели, тип проектора `qwen3a`. Запуск возможен
+только внутри cgroup `systemd-run --user --scope -p MemoryMax=26000000000 -p MemorySwapMax=0 -- …`
+(иначе отказ до попытки) и когда у хоста `MemAvailable` ≥ 22e9 байт; сторож RSS сервера —
+25,5e9 байт. Подробности и измерения — `docs/decisions/0023-gate0-qwen3-omni.md`.
 
 #### Runtime Borealis-5b-it (Gate 0 spike #68)
 

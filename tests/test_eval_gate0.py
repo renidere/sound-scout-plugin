@@ -1307,3 +1307,170 @@ def test_gigachat_not_ready_packages_nothing_and_names_the_next_owner_step() -> 
     assert "ничего не упаковывается, `backend` остаётся `none`" in re.sub(r"\s+", " ", gigachat)
     owner = gigachat.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
     assert re.search(r"^1\. \*\*Решить судьбу GigaChat3\.1-Audio-10B-A1\.8B\*\*", owner, re.M)
+
+
+# --- GATE0-RULE v2 and the qwen3omni runtime of #144 (docs/decisions/0023-gate0-qwen3-omni.md) -
+
+QWEN3OMNI_DOC = Path("docs/decisions/0023-gate0-qwen3-omni.md")
+
+
+def _rule_lines(name: Path) -> list[str]:
+    return gate0.rule_block((REPO / name).read_text(encoding="utf-8")).splitlines()
+
+
+def test_v2_rule_block_is_pinned_and_differs_from_v1_only_in_header_p3_and_the_rss_limit() -> None:
+    document = (REPO / QWEN3OMNI_DOC).read_text(encoding="utf-8")
+    recorded = re.search(r"SHA-256 блока: `([0-9a-f]{64})`", document).group(1)
+    assert gate0.rule_sha256(document) == recorded == gate0.RULE_V2_SHA256
+    assert gate0.rule_name(gate0.RULE_V2_SHA256) == gate0.RULE_V2
+    assert gate0.rule_name(DECISION_RULE_SHA256) == gate0.RULE_V1
+    v1, v2 = _rule_lines(gate0.DECISION_DOC), _rule_lines(QWEN3OMNI_DOC)
+    changed_v1 = [line for line in v1 if line not in v2]
+    changed_v2 = [line for line in v2 if line not in v1]
+    assert [line.split()[0] for line in changed_v1] == ["GATE0-RULE", "P3.", "наклон", "Запрос,"]
+    assert changed_v2[0].startswith("GATE0-RULE v2 (sound-scout #144")
+    assert "R = max(0.8 * F, 10)" in " ".join(changed_v2)
+    assert "RSS > 26e9 байт" in changed_v2[-1] and "RSS > 18e9 байт" in changed_v1[-1]
+    assert [line for line in v1 if line in v2] == [line for line in v2 if line in v1]
+    assert not re.search(r"/(home|Users)/", document)
+
+
+def test_rule_block_refuses_a_v2_block_other_than_the_pinned_one() -> None:
+    document = (REPO / QWEN3OMNI_DOC).read_text(encoding="utf-8")
+    with pytest.raises(gate0.Gate0Error, match="RULE_V2_SHA256"):
+        gate0.rule_block(document.replace("R = max(0.8 * F, 10)", "R = max(0.5 * F, 5)"))
+
+
+@pytest.mark.parametrize(
+    ("rule", "encoder", "rate"),
+    [
+        (DECISION_RULE_SHA256, 12.5, 20.0),
+        ("a" * 64, None, 20.0),
+        (gate0.RULE_V2_SHA256, 12.5, 10.0),
+        (gate0.RULE_V2_SHA256, 25.0, 20.0),
+        (gate0.RULE_V2_SHA256, 5.0, 10.0),
+        (gate0.RULE_V2_SHA256, None, None),
+    ],
+)
+def test_p3_rate_is_20_under_v1_and_max_of_0_8_f_and_10_under_v2(rule, encoder, rate) -> None:
+    assert gate0.p3_rate(rule, encoder) == rate
+
+
+def _thirteen_per_second(lines: list[dict]) -> list[dict]:
+    for line in lines:
+        if line.get("modality") == "audio":
+            line["audio_tokens"] = 130  # 13 per second of a 10 s clip, as qwen3a gives
+    return lines
+
+
+def test_v2_passes_p3_at_13_tokens_per_s_where_v1_fails_and_names_its_rule() -> None:
+    lines = _thirteen_per_second(_held_lines())
+    v1 = gate0.decide(_synthetic_manifest() | {"rule_sha256": "a" * 64}, RECORD, lines)
+    assert v1["rule"] == gate0.RULE_V1 and v1["preconditions"]["P3"] is False
+    manifest = _synthetic_manifest() | {"rule_sha256": gate0.RULE_V2_SHA256}
+    record = {**RECORD, "encoder_tokens_per_s": 12.5}
+    v2 = gate0.decide(manifest, record, lines)
+    assert v2["rule"] == gate0.RULE_V2 and v2["audio_route"]["min_rate"] == 10.0
+    assert v2["preconditions"] == {"P1": True, "P2": True, "P3": True}
+    assert v2["verdict"] == "HELD"
+    lines[1]["audio_tokens"] = 99  # 9.9 per second
+    assert gate0.decide(manifest, record, lines)["reason"] == "протокол не выполнен: ['P3']"
+    without_f = gate0.decide(manifest, RECORD, _thirteen_per_second(_held_lines()))
+    assert without_f["preconditions"]["P3"] is False
+    assert without_f["audio_route"]["reason"] == "no encoder rate F for GATE0-RULE v2"
+
+
+def test_qwen3omni_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    qwen = weights[weights.index("#### Qwen3-Omni") :].split("\n#### ", 1)[0]
+    rows = dict(re.findall(r"^\| `([^`]+)` \| [\d ]+ \| `([0-9a-f]{64})` \|", qwen, re.M))
+    assert rows == gate0.QWEN3OMNI_WEIGHTS
+    assert gate0.QWEN3OMNI_REVISION in qwen and gate0.QWEN3OMNI_REPO in qwen
+    assert str(gate0.QWEN3OMNI_REVISION) in str(gate0.QWEN3OMNI_MODEL_DIR)
+
+
+def test_qwen3omni_server_argv_is_the_llama_argv_with_its_local_files() -> None:
+    files = gate0.LLAMA_RUNTIMES["qwen3omni"]
+    argv = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12, files)
+    gemma = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
+    assert argv[argv.index("-m") + 1] == f"/models/{gate0.QWEN3OMNI_MODEL_FILE}"
+    assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.QWEN3OMNI_MMPROJ_FILE}"
+    assert [a for a in argv if "/models/" not in a] == [a for a in gemma if "/models/" not in a]
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+
+
+@pytest.fixture
+def qwen_spike(spike, tmp_path) -> dict:
+    """The fake spike prepared again under the real GATE0-RULE v2 block, with qwen weights."""
+    gate0.prepare_clips(
+        "2026-11-21", spike["config"], decision=REPO / QWEN3OMNI_DOC, transcribe=_fake_transcribe
+    )
+    models = spike["kwargs"]["model_dir"]
+    weights = {}
+    for name in gate0.QWEN3OMNI_WEIGHTS:
+        (models / name).write_bytes(name.encode())
+        weights[name] = hashlib.sha256(name.encode()).hexdigest()
+    kwargs = {**spike["kwargs"], "decision": REPO / QWEN3OMNI_DOC, "weights": weights}
+    return {**spike, "kwargs": kwargs, "out": spike["out"].parent / "2026-11-21"}
+
+
+def _qwen_run(qwen_spike, tmp_path, memory_max=GIGACHAT_CAP, swap_max="0", **kw):
+    root = _cgroup(tmp_path / "cgroup", memory_max, swap_max)
+    meminfo = _meminfo(tmp_path / "meminfo", kw.pop("available", 24 * 10**9))
+    kwargs = {**qwen_spike["kwargs"], **kw}
+    return gate0.run_spike(
+        "2026-11-21",
+        qwen_spike["config"],
+        runtime=kw.pop("runtime", "qwen3omni"),
+        cgroup_root=root,
+        meminfo=meminfo,
+        **{k: v for k, v in kwargs.items() if k != "runtime"},
+    )
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_qwen3omni_run_under_the_cap_uses_its_files_rule_v2_and_the_same_plan(
+    qwen_spike, tmp_path
+) -> None:
+    result = _qwen_run(qwen_spike, tmp_path)
+    attempt = qwen_spike["out"] / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["argv"][record["argv"].index("-m") + 1].endswith(gate0.QWEN3OMNI_MODEL_FILE)
+    assert record["argv"][record["argv"].index("--mmproj") + 1].endswith(
+        gate0.QWEN3OMNI_MMPROJ_FILE
+    )
+    assert record["rule"] == gate0.RULE_V2 and record["encoder_tokens_per_s"] == 12.5
+    assert record["limits"]["rss_limit_bytes"] == 25_500_000_000
+    assert record["cgroup"]["memory_max"] == GIGACHAT_CAP
+    assert record["requests_planned"] == 42
+    assert result["rule"] == gate0.RULE_V2 and result["audio_route"]["min_rate"] == 10.0
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+    assert gate0.RUNTIME_LIMITS["qwen3omni"] == (26 * 10**9, 25_500_000_000)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max", "available", "message"),
+    [
+        ("max", "0", 24 * 10**9, "MemoryMax=26000000000"),
+        (GIGACHAT_CAP, "max", 24 * 10**9, "MemoryMax=26000000000"),
+        (GIGACHAT_CAP, "0", gate0.QWEN3OMNI_MIN_AVAILABLE_BYTES - 4096, "MemAvailable"),
+    ],
+)
+def test_qwen3omni_run_without_the_cap_or_the_free_memory_is_refused_before_any_attempt(
+    qwen_spike, tmp_path, memory_max, swap_max, available, message
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match=message):
+        _qwen_run(qwen_spike, tmp_path, memory_max, swap_max, available=available)
+    assert not (qwen_spike["out"] / gate0.ATTEMPTS_DIR).exists()
+    assert not qwen_spike["marker"].exists()
+
+
+def test_rule_v2_with_a_runtime_without_an_encoder_rate_is_refused_before_any_attempt(
+    qwen_spike, tmp_path
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match="needs the encoder's own audio token rate"):
+        _qwen_run(qwen_spike, tmp_path, runtime="llama")
+    assert not (qwen_spike["out"] / gate0.ATTEMPTS_DIR).exists()
+    assert not qwen_spike["marker"].exists()

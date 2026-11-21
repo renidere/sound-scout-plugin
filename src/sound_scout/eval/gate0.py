@@ -14,12 +14,14 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   word numbers and intervals. It records the SHA-256 of the verdict rule as the decision
   document holds it (between `RULE_BEGIN` and `RULE_END`), of the prompt and of the fixed
   questions. The audio backend is not touched.
-- `run --date D [--runtime llama|borealis|gigachat]` checks the weights, the prompt, the rule
-  and the clips against what was recorded, starts the local server — `llama-server` with local
-  `-m`/`--mmproj` only, or for `borealis` the `gate0_borealis` module with the local weights
-  directory (#68), which must run inside a cgroup capped at 20e9 bytes without swap, or for
-  `gigachat` the `gate0_gigachat` module (#85), capped at 26e9 bytes without swap and started
-  only when the host has `GIGACHAT_MIN_AVAILABLE_BYTES` available — on
+- `run --date D [--runtime llama|borealis|gigachat|qwen3omni]` checks the weights, the prompt,
+  the rule and the clips against what was recorded, starts the local server — `llama-server`
+  with local `-m`/`--mmproj` only (Gemma 4 E4B-it, or for `qwen3omni` Qwen3-Omni-30B-A3B-Instruct
+  of #144, capped at 26e9 bytes without swap), or for `borealis` the `gate0_borealis` module
+  with the local weights directory (#68), which must run inside a cgroup capped at 20e9 bytes
+  without swap, or for `gigachat` the `gate0_gigachat` module (#85), capped at 26e9 bytes
+  without swap; `gigachat` and `qwen3omni` start only when the host has
+  `MIN_AVAILABLE_BYTES` of their runtime available — on
   127.0.0.1 and a free port, sends the fixed list of requests one at a time and once each, and
   stops the server whatever happens. The empty input `E0` goes through the same
   `review.check_payload` as every audio request and is refused before any HTTP call. Every
@@ -29,6 +31,10 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   run: the rest are recorded as not sent. The run talks to nothing but the server it started (no
   proxy); the process-wide network guard is not installed here because it refuses loopback too.
 - `verdict --date D` recomputes the verdict from the saved answers alone (`decide`).
+
+The rule is GATE0-RULE v1 (0007 section 3) or, only for the block `RULE_V2_SHA256` pins,
+GATE0-RULE v2 (0023 section 3): v2 asks P3 for max(0.8 F, 10) audio tokens per second of clip,
+where F is the runtime's `ENCODER_TOKENS_PER_S`, instead of v1's 20.
 
 A test with a fake server proves this contract only, never what the model hears (CLAUDE.md).
 """
@@ -128,18 +134,44 @@ GIGACHAT_MODEL_DIR = (
     / GIGACHAT_REVISION
 )
 GIGACHAT_MODULE = "sound_scout.eval.gate0_gigachat"
-RUNTIMES = ("llama", "borealis", "gigachat")
+QWEN3OMNI_REPO = "ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF"
+QWEN3OMNI_REVISION = "6e35a28f4a19b18730f8949b0c579c6429649ab8"
+QWEN3OMNI_MODEL_FILE = "Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf"
+QWEN3OMNI_MMPROJ_FILE = "mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf"
+QWEN3OMNI_WEIGHTS = {
+    QWEN3OMNI_MODEL_FILE: "d9e2876556e7873e02c0359f832432ee2d67ab7dd0cee3efe0f77fd7a1f4dd85",
+    QWEN3OMNI_MMPROJ_FILE: "1104376db833f1e89c84834144ac3863340c2cd1ddaeddb39cb0247fb5c20c8d",
+}
+QWEN3OMNI_MODEL_DIR = (
+    Path.home()
+    / ".cache/sound-scout/models/ggml-org--Qwen3-Omni-30B-A3B-Instruct-GGUF"
+    / QWEN3OMNI_REVISION
+)
+RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni")
+LLAMA_RUNTIMES = {
+    "llama": (MODEL_FILE, MMPROJ_FILE),
+    "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE),
+}
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 MEMINFO = Path("/proc/meminfo")
 MEMORY_CAP_BYTES = 20 * 10**9
 GIGACHAT_MEMORY_CAP_BYTES = 26 * 10**9
 GIGACHAT_RSS_LIMIT_BYTES = 25_500_000_000
 GIGACHAT_MIN_AVAILABLE_BYTES = 22_500_000_000
+QWEN3OMNI_MIN_AVAILABLE_BYTES = 22 * 10**9
+MIN_AVAILABLE_BYTES = {
+    "gigachat": GIGACHAT_MIN_AVAILABLE_BYTES,
+    "qwen3omni": QWEN3OMNI_MIN_AVAILABLE_BYTES,
+}
 PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca"
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
 RULE_BEGIN = "<!-- gate0-rule:begin -->"
 RULE_END = "<!-- gate0-rule:end -->"
-RULE_HEADER = "```text\nGATE0-RULE v1 "
+RULE_HEADERS = ("```text\nGATE0-RULE v1 ", "```text\nGATE0-RULE v2 ")
+RULE_V1 = "GATE0-RULE v1"
+RULE_V2 = "GATE0-RULE v2"
+# the one GATE0-RULE v2 block, docs/decisions/0023-gate0-qwen3-omni.md section 3 (#144)
+RULE_V2_SHA256 = "3970b51359fa6d06973b7355b5d36042de7d2033d3ccb8190280d83cc92b9412"
 
 SAMPLE_RATE = 16_000
 MAX_CLIPS = 10
@@ -186,6 +218,7 @@ RUNTIME_LIMITS = {
     "llama": (None, RSS_LIMIT_BYTES),
     "borealis": (MEMORY_CAP_BYTES, RSS_LIMIT_BYTES),
     "gigachat": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
+    "qwen3omni": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
 }
 STOP_GRACE_S = 10.0
 DOWNLOAD_FLAGS = frozenset(
@@ -200,6 +233,11 @@ SAMPLING = {
     "chat_template_kwargs": {"enable_thinking": False},
 }
 MIN_AUDIO_TOKENS_PER_S = 20.0
+# F of GATE0-RULE v2 P3: the encoder's own audio token rate per second of sound, from the
+# model's primary source as its decision document records it (0023 section 1: AuT, 12.5 Hz)
+ENCODER_TOKENS_PER_S = {"qwen3omni": 12.5}
+V2_RATE_SHARE = 0.8
+V2_MIN_TOKENS_PER_S = 10.0
 
 K_OPTIONS = ("речь", "музыка", "тон", "шум", "тишина")
 P_OPTIONS = ("да", "нет", "нет речи")
@@ -254,13 +292,34 @@ def rule_block(document: str) -> str:
     begin = document.index(RULE_BEGIN) + len(RULE_BEGIN)
     end = document.index(RULE_END)
     block = document[begin:end].strip()
-    if end < begin or not block.startswith(RULE_HEADER):
-        raise Gate0Error("the rule block does not start with GATE0-RULE v1")
+    if end < begin or not block.startswith(RULE_HEADERS):
+        raise Gate0Error("the rule block does not start with GATE0-RULE v1 or v2")
+    if block.startswith(RULE_HEADERS[1]) and _sha256_text(block) != RULE_V2_SHA256:
+        raise Gate0Error("a GATE0-RULE v2 block must be the one of 0023 (RULE_V2_SHA256)")
     return block
 
 
 def rule_sha256(document: str) -> str:
-    return hashlib.sha256(rule_block(document).encode("utf-8")).hexdigest()
+    return _sha256_text(rule_block(document))
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def rule_name(rule_sha: str | None) -> str:
+    """GATE0-RULE v2 only for its one pinned block; every other block `rule_block` let in is v1."""
+    return RULE_V2 if rule_sha == RULE_V2_SHA256 else RULE_V1
+
+
+def p3_rate(rule_sha: str | None, encoder_rate: float | None) -> float | None:
+    """Audio tokens per second of clip P3 asks for: 20 under v1, max(0.8 F, 10) under v2;
+    None under v2 without F."""
+    if rule_name(rule_sha) == RULE_V1:
+        return MIN_AUDIO_TOKENS_PER_S
+    if encoder_rate is None:
+        return None
+    return max(V2_RATE_SHARE * encoder_rate, V2_MIN_TOKENS_PER_S)
 
 
 def questions_sha256() -> str:
@@ -813,13 +872,20 @@ def _content(body: object) -> str | None:
 # --- the run -------------------------------------------------------------------------------
 
 
-def server_argv(binary: Path, model_dir: Path, port: int, threads: int) -> list[str]:
+def server_argv(
+    binary: Path,
+    model_dir: Path,
+    port: int,
+    threads: int,
+    files: tuple[str, str] = (MODEL_FILE, MMPROJ_FILE),
+) -> list[str]:
+    model_file, mmproj_file = files
     argv = [
         str(binary),
         "-m",
-        str(model_dir / MODEL_FILE),
+        str(model_dir / model_file),
         "--mmproj",
-        str(model_dir / MMPROJ_FILE),
+        str(model_dir / mmproj_file),
         "--host",
         HOST,
         "--port",
@@ -1058,11 +1124,11 @@ def run_spike(
     """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict."""
     if runtime not in RUNTIMES:
         raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
-    llama = runtime == "llama"
     defaults = {
         "llama": (DEFAULT_MODEL_DIR, WEIGHTS),
         "borealis": (BOREALIS_MODEL_DIR, BOREALIS_WEIGHTS),
         "gigachat": (GIGACHAT_MODEL_DIR, GIGACHAT_WEIGHTS),
+        "qwen3omni": (QWEN3OMNI_MODEL_DIR, QWEN3OMNI_WEIGHTS),
     }
     model_dir = model_dir or defaults[runtime][0]
     if weights is None:
@@ -1079,11 +1145,16 @@ def run_spike(
     except (OSError, UnicodeDecodeError) as error:
         reason = getattr(error, "strerror", None) or error
         raise Gate0Error(f"cannot read the decision document {decision.name}: {reason}") from None
+    encoder_rate = ENCODER_TOKENS_PER_S.get(runtime)
+    if p3_rate(rule, encoder_rate) is None:
+        raise Gate0Error(
+            f"{RULE_V2} needs the encoder's own audio token rate F; runtime {runtime!r} has none"
+        )
     cgroup = memory_cap(cgroup_root)
     if cap_limit is not None:
         check_memory_cap(cgroup, cap_limit, runtime)
-    if runtime == "gigachat":
-        host = check_host_memory(GIGACHAT_MIN_AVAILABLE_BYTES, meminfo)
+    if runtime in MIN_AVAILABLE_BYTES:
+        host = check_host_memory(MIN_AVAILABLE_BYTES[runtime], meminfo)
     else:
         host = host_memory(meminfo)
     attempt = _new_attempt(out, config_)
@@ -1095,6 +1166,8 @@ def run_spike(
         "code": _code_identity(),
         "decision_sha256": hashlib.sha256(document).hexdigest(),
         "runtime": runtime,
+        "rule": rule_name(rule),
+        "encoder_tokens_per_s": encoder_rate,
         "cgroup": cgroup,
         "host_memory": host,
     }
@@ -1127,9 +1200,9 @@ def run_spike(
     others = _other_inference()
     threads = threads or (THREADS_BUSY if others else THREADS_IDLE)
     port = _free_port()
-    if llama:
+    if runtime in LLAMA_RUNTIMES:
         binary = llama_dir / SERVER_BINARY
-        argv = server_argv(binary, model_dir, port, threads)
+        argv = server_argv(binary, model_dir, port, threads, LLAMA_RUNTIMES[runtime])
         version_argv = [str(binary), "--version"]
     elif runtime == "borealis":
         argv = borealis_argv(model_dir, port, threads)
@@ -1360,11 +1433,14 @@ def evaluate(attempt: Path) -> dict:
 
 
 def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
-    """GATE0-RULE v1 over the trace of one attempt (docs/decisions/0007, section 3)."""
+    """The rule the manifest names over the trace of one attempt: GATE0-RULE v1
+    (docs/decisions/0007, section 3) or v2 (docs/decisions/0023, section 3), which differ in P3."""
     by_key = {(line["variant"], line["clip"], line.get("take")): line for line in lines}
     e0 = by_key.get(("E0", "E0", None))
     checks = (record.get("preconditions") or {}).get("checks") or {}
-    route = audio_route(lines)
+    rule = manifest.get("rule_sha256")
+    rate = p3_rate(rule, record.get("encoder_tokens_per_s"))
+    route = audio_route(lines, rate)
     preconditions = {
         "P1": bool(e0 and e0.get("rejected") is True and e0.get("server_calls") == 0),
         "P2": checks.get("weights") is True and checks.get("prompt") is True,
@@ -1390,7 +1466,7 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
             controls.append({"clip": clip, "variant": variant, "answer": answer, "passed": passed})
     c_passed = all(item["passed"] for item in controls)
     result: dict = {
-        "rule": "GATE0-RULE v1",
+        "rule": rule_name(rule),
         "mode": manifest["mode"],
         "preconditions": preconditions,
         "audio_route": route,
@@ -1450,21 +1526,29 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
     return result
 
 
-def audio_route(lines: list[Mapping]) -> dict:
-    """P3: audio tokens of each tokenized request; the K1 slope covers the requests without them."""
+def audio_route(lines: list[Mapping], rate: float | None = MIN_AUDIO_TOKENS_PER_S) -> dict:
+    """P3 at `rate` tokens per second of clip: audio tokens of each tokenized request; the K1
+    slope covers the requests without them."""
+    if rate is None:
+        return {"method": None, "passed": False, "reason": "no encoder rate F for GATE0-RULE v2"}
     answered = [
         line
         for line in lines
         if line.get("modality") == "audio" and line.get("sent") and line.get("http_status") == 200
     ]
     if not answered:
-        return {"method": None, "passed": False, "reason": "no answered audio request"}
+        return {
+            "method": None,
+            "passed": False,
+            "min_rate": rate,
+            "reason": "no answered audio request",
+        }
     tokenized = [line for line in answered if line.get("text_tokens") is not None]
     failing = [
         line["n"]
         for line in tokenized
         if not isinstance(line.get("audio_tokens"), int)
-        or line["audio_tokens"] < MIN_AUDIO_TOKENS_PER_S * line["duration_s"]
+        or line["audio_tokens"] < rate * line["duration_s"]
     ]
     rates = [
         line["audio_tokens"] / line["duration_s"]
@@ -1473,6 +1557,7 @@ def audio_route(lines: list[Mapping]) -> dict:
     ]
     route: dict = {
         "method": "tokenize",
+        "min_rate": rate,
         "passed": not failing,
         "failing": failing,
         "min_tokens_per_s": round(min(rates), 2) if rates else None,
@@ -1493,7 +1578,7 @@ def audio_route(lines: list[Mapping]) -> dict:
         return route
     durations, tokens = np.array(points, dtype=float).T
     route["slope"] = float(np.polyfit(durations, tokens, 1)[0])
-    route["passed"] = not failing and route["slope"] >= MIN_AUDIO_TOKENS_PER_S
+    route["passed"] = not failing and route["slope"] >= rate
     return route
 
 
