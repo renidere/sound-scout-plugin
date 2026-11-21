@@ -59,6 +59,14 @@ def test_decision_document_rule_block_hash_is_the_one_written_next_to_it() -> No
     assert gate0.rule_block(document).startswith("```text\nGATE0-RULE v1 (sound-scout #23")
 
 
+def test_decision_document_marks_the_natural_pair_claim_as_an_untested_prediction() -> None:
+    document = (REPO / gate0.DECISION_DOC).read_text(encoding="utf-8")
+    provenance = " ".join(document.split("## 9. Происхождение")[1].split())
+    assert "Поправка к разделу 5 (2026-11-21;" in provenance
+    assert "непроверенный прогноз, а не результат попытки 3" in provenance
+    assert "issues/119#issuecomment-7051943525" in provenance
+
+
 @pytest.mark.parametrize(
     "document",
     ["no markers", RULE_DOC + RULE_DOC, f"{gate0.RULE_BEGIN}\nsomething else\n{gate0.RULE_END}"],
