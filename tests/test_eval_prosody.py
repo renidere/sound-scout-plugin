@@ -872,3 +872,16 @@ def test_the_main_run_stops_at_the_ceiling_of_its_series(
         assert result["utterances_done"] == done and "90 мин" in result["reason"]
     else:
         assert result["utterances"] == done
+
+
+def test_series_2_report_names_the_verdict_the_numbers_and_holds_no_private_paths() -> None:
+    name = "docs/eval/2026-11-21-prosody-measure-1-series-2.md"
+    report = (REPO / name).read_text(encoding="utf-8")
+    assert "**Вердикт: INCONCLUSIVE.** Coverage 0,488 меньше порога 0,70" in report
+    assert "AUC 0,762, 95 % CI 0,742–0,778" in report
+    assert prosody.RULE_SHA256 in report and prosody.RINCO_SHA256 in report
+    assert "23a224baf9e3c07e7bcd4b03d6c1eec41a200eee65aa0d422a3bd61b339ce3c7" in report
+    assert "docs/eval/2026-11-21-prosody-measure-1.md" in report
+    assert not re.search(r"/(home|Users)/|~/|[A-Za-z]:\\", report)
+    decision = (REPO / prosody.DECISION_DOC).read_text(encoding="utf-8")
+    assert name in decision

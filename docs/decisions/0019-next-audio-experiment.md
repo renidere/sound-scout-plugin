@@ -20,6 +20,12 @@
 - **Поправка к результату (2026-11-21):** первый `result.json` был записан вручную после одной
   попытки; он отложен как `result.manual-2026-11-21T0833Z.json`. Попытка 2 (код `4a43842`)
   повторила попытку 1, и INVALID «за 2 попытки» записал сам код.
+- **Серия 2 (2026-11-21): INCONCLUSIVE** — после правила ASR #135, по решениям владельца
+  [7060595460](https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7060595460)
+  и [7062644385](https://github.com/renidere/sound-scout-plugin/issues/134#issuecomment-7062644385)
+  (потолок 180 мин). Санитарная стадия пройдена (S1 3 из 3, S2 — да); основной прогон: AUC
+  0,762, CI 0,742–0,778, coverage 0,488 < 0,70. Отчёт —
+  `docs/eval/2026-11-21-prosody-measure-1-series-2.md`.
 - **Дата:** 2026-11-20; редакция 2 — 2026-11-21.
 - **Задача:** [#119](https://github.com/renidere/sound-scout-plugin/issues/119) (родитель —
   [#3](https://github.com/renidere/sound-scout-plugin/issues/3)). Связанная
