@@ -241,7 +241,13 @@ Spike A не измеряет.
 - Windows: удалить папку `sound-scout-probe-a` и выполнить `Reload desktop plugins`; команд
   `Probe A: …` в палитре быть не должно.
 - Шара: агент удаляет `desktop-plugins/sound-scout-probe-a/` и `probe-a/` после заполнения этого
-  документа.
+  документа. Удалено 2026-11-22 ([#153](https://github.com/renidere/sound-scout-plugin/issues/153)):
+  новый прогон зонда не запланирован. Перед удалением обе папки упакованы в
+  `archive/153-spike-a-share/spike-a-share.tar.gz` в data root станции, вне git. SHA-256 архива —
+  `d9196cdadfab5c8e3fd34f8edc5e9cf750fb7e61777a20fb03525b26fde2fbef`, SHA-256 трёх файлов —
+  `files.sha256` рядом. Журнал `probe-a-log.clipboard.jsonl` и `notes.txt` — источники
+  «Результатов» — есть только в этом архиве. Для нового прогона `plugin.js` берётся из git, а
+  пустая `probe-a/` создаётся заново.
 - Станция: файлы `attachments/sound-scout-probe-a-*.wav` лежат в профиле Hermes. Агент удаляет их
   только по явному «удаляй» владельца в #95 и по точным именам из журнала. Без этого их удаляет
   владелец.
