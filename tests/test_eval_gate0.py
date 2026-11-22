@@ -1596,6 +1596,25 @@ def test_qwen3omni_not_ready_packages_nothing_and_bounds_the_conclusion() -> Non
     assert re.search(r"^1\. \*\*Решить судьбу Qwen3-Omni-30B-A3B-Instruct\*\*", owner, re.M)
 
 
+def test_qwen3omni_record_names_the_clip_set_and_the_rejected_uncertainty_shape() -> None:
+    """#154: clips are the 2026-11-19 set of 0010/0011; `uncertainties[0]` is an object."""
+    flat_doc = re.sub(r"\s+", " ", (REPO / QWEN3OMNI_DOC).read_text(encoding="utf-8"))
+    preamble = flat_doc.split("## 0. Шапка", 1)[0]
+    assert "Вопросы, клипы" not in preamble
+    assert "Клипы — набор 2026-11-19, тот же, что у 0010 и 0011" in preamble
+    assert "`V2` и `V3` в нём — не те файлы, что в 0007 (0010 §2.1, #86" in preamble
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    assert "пустая строка" not in results
+    fields = "`observation`, `confidence_note`, `impact`, `correction`"
+    assert f"первый элемент `uncertainties` — не строка, а объект с полями {fields}" in results
+    assert "(запросы 32, 35, 42)" in results
+    shape = {"observation": "x", "confidence_note": "x", "impact": "x", "correction": "x"}
+    answer = {"observations": [], "unlocalized_observations": [], "limitations": []}
+    _, errors, _ = review.validate_response(json.dumps({**answer, "uncertainties": [shape]}), 10.0)
+    assert errors == ["$.uncertainties[0]: must be a non-empty string"]
+    assert errors[0] in results
+
+
 # --- the qwen25omni runtime of #145 under GATE0-RULE v1 (docs/decisions/0024-gate0-qwen25-omni.md)
 
 QWEN25OMNI_DOC = Path("docs/decisions/0024-gate0-qwen25-omni.md")
@@ -1760,3 +1779,19 @@ def test_qwen25omni_not_ready_packages_nothing_and_bounds_the_conclusion() -> No
     assert "**Квантование и runtime.**" in limits and "Q8_0" in limits and "30 с" in limits
     owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
     assert re.search(r"^1\. \*\*Решить судьбу Qwen2\.5-Omni-7B\*\*", owner, re.M)
+
+
+def test_qwen25omni_record_names_the_clip_set_and_bounds_causes_three_pairs_cannot_prove() -> None:
+    """#154: the clips are the 2026-11-19 set; A and S claims stay within 12 answers, 3 pairs."""
+    flat_doc = re.sub(r"\s+", " ", (REPO / QWEN25OMNI_DOC).read_text(encoding="utf-8"))
+    preamble = flat_doc.split("## 0. Шапка", 1)[0]
+    assert "Вопросы, клипы" not in preamble
+    assert "Клипы — набор 2026-11-19, тот же, что у 0010, 0011 и 0023" in preamble
+    assert "`V2` и `V3` в нём — не те файлы, что в 0007 (0010 §2.1, #86" in preamble
+    weak = flat_doc.split("### 5.1. Слабые места по критериям", 1)[1].split("## 6.", 1)[0]
+    assert "Ответ не зависит от входа" not in weak
+    assert "то есть зависит от слова или фразы" not in weak
+    assert "На этих 12 входах форма ответа одна и та же" in weak
+    assert "но 12 ответов одного прогона этого не доказывают" in weak
+    assert "На этих трёх парах ответ следует за парой" in weak
+    assert "три пары по одному прогону не показывают" in weak

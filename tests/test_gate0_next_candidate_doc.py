@@ -72,6 +72,9 @@ def test_hypothesis_is_testable_and_states_no_result_as_fact() -> None:
     assert "не меньше 2 из 3 синтетических пар" in hypothesis
     assert "**Опровержение.**" in hypothesis
     assert "Агент исход не предсказывает" in hypothesis
+    assert "Клипы, вопросы" not in hypothesis  # #154: V2 and V3 are not the files of 0007
+    assert "Клипы — набор 2026-11-19, тот же, что у `0010` и `0011`" in hypothesis
+    assert "`V2` и `V3` в нём — не те файлы, что в `0007` (`0010` §2.1, #86)" in hypothesis
     for outcome in ("P1–P3 нарушено", "C не прошёл", "C прошёл, S не прошёл", "C и S прошли"):
         assert f"| {outcome} |" in section("### 3.2. Гипотеза H-Q25O")
     assert not re.search(r"(?i)пройд[её]т gate 0|получит ready|будет ready", text())
