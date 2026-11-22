@@ -412,12 +412,12 @@ def check_create_lost(o: Outcome, c: Checks) -> None:
 
 
 def check_spend_smooth(o: Outcome, c: Checks) -> None:
-    lines = o.ext_trace(M1) + o.ext_trace(M2) + o.gate0_trace(_days(M2))
+    lines = o.ext_trace(M1)
+    c("M2 skipped on the spend", o.model(M2).get("reason") == "spend", o.model(M2))
     c(
         "the agent stopped itself on the soft spend",
         any(line.get("not_sent") == "spend" for line in lines),
     )
-    c("credit read at block ends", bool(o.kinds("credit_seen")))
     first = next((e for e in o.kinds("destroy_requested")), {})
     c(
         "the watchdog ran, and the first destroy was the agent's own",
@@ -572,6 +572,12 @@ def _credit_jump(run) -> None:
     time.sleep(1.0)
 
 
+def _spend_reached(run) -> None:
+    """The clock-based estimate reaches the soft spend now; the credit, which the watchdog reads,
+    does not move (as it lags on Vast.ai)."""
+    run.package["spend_soft_usd"] = vast.spent_estimate(run)
+
+
 def _lose_now(run) -> None:
     run.host.lose()
 
@@ -695,17 +701,7 @@ SCENARIOS = [
     Scenario(
         "spend_smooth",
         "Расход по часам доходит до мягкого порога раньше раннего порога сторожа",
-        {
-            # 0.1 USD/s by the clock; the credit (what the watchdog reads) does not move
-            "fake": lambda fake: setattr(
-                fake, "offers", {vast_fake.OFFER_ID: {**vast_fake.OFFER, "dph_total": 360.0}}
-            ),
-            "package": {
-                "envelope": {"dph_total": {"lte": 400.0}},
-                "ceiling_usd": 1000.0,
-                "spend_soft_usd": 0.272 + 0.35,
-            },
-        },
+        {"hooks": _block_end(M1, "E-C", _spend_reached)},
         check_spend_smooth,
         watchdog=True,
     ),
