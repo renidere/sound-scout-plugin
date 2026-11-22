@@ -2,8 +2,9 @@
 
 Документ к #147 (`docs/decisions/0026-gpu-stack.md`). Здесь — ожидаемое время каждого шага
 `python -m sound_scout.eval.vast deploy` на одном арендованном инстансе Vast.ai с двумя моделями
-(Qwen2.5-Omni-7B и Qwen3-Omni-30B-A3B-Instruct, bf16). Все числа ниже — **оценки**. Измеряет их
-только платный пилот [#148](https://github.com/renidere/sound-scout-plugin/issues/148).
+(Qwen2.5-Omni-7B и Qwen3-Omni-30B-A3B-Instruct, bf16). Числа в разделе «Шаги» — **оценки**.
+Измеряет их только платный пилот [#148](https://github.com/renidere/sound-scout-plugin/issues/148);
+его замеры — в разделе «Попытка 1 пилота #148».
 
 ## Основания
 
@@ -37,6 +38,22 @@
 
 `smoke` и `run` идут для каждой модели пакета: первое число — Qwen2.5-Omni-7B, второе —
 Qwen3-Omni-30B-A3B-Instruct.
+
+## Попытка 1 пилота #148
+
+2026-11-22 06:12–06:17 UTC, попытка `20261122T061200Z-66c4813a`, offer `55773524` (1 × A40),
+инстанс `61922169`. Время — `elapsed_s` шагов журнала попытки. Попытка остановилась на
+preflight: `runtime differs from the pin in ['cuda']`. Дальше preflight шагов не было; инстанс
+удалён, отсутствие проверено по id и метке. Разбор и исправление preflight —
+[#158](https://github.com/renidere/sound-scout-plugin/issues/158), `docs/decisions/0026-gpu-stack.md` § 2.
+
+| Шаг | Оценка, мин | Попытка 1, с | Итог |
+|---|---|---|---|
+| `arm` | < 0,1 | 0,06 | ok |
+| `create` | < 1 | 3,0 | ok, один PUT |
+| `ready` | 15 | 294,6 | ok: pull образа ≈ 10 GB, `running`, SSH |
+| `preflight` | 5 | 20,2 | отказ по CUDA; найденные значения в журнал не попали |
+| `destroy` | 7 | 3,1 | ok: `destroyed`, `absence_verified` |
 
 ## Меряет только платный пилот
 

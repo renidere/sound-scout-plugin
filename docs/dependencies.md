@@ -444,7 +444,8 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 | Ссылка в create | `vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | принимает ли Vast ссылку по digest, проверяет #148 | — |
 | vLLM | `0.34.0` | Dockerfile тега | Apache-2.0 |
 | torch | `2.14.0` | Dockerfile тега | BSD-3-Clause |
-| CUDA | `13.0.3` | Dockerfile тега; драйвер хоста ≥ 580, compute capability ≥ 8.0 | NVIDIA EULA |
+| CUDA (torch) | `13.0` | `torch.version.cuda` колеса из индекса `cu130` (история образа: `--index-url …/whl/cu130`); preflight сверяет это значение (#158); драйвер хоста ≥ 580, compute capability ≥ 8.0 | NVIDIA EULA |
+| CUDA (образ) | `13.0.2` | `ENV CUDA_VERSION=13.0.2` в config blob `sha256:0372147e2b3daa1baa5c6aa9b90ae5de2f926e25742650f91fa24dbca9cc645a` манифеста amd64, чтение 2026-11-22; preflight только записывает | NVIDIA EULA |
 | Python образа | `3.12` | Dockerfile тега (Ubuntu 24.04) | PSF-2.0 |
 | transformers | `>=5.16.1,<5.23.0` | `requirements/common.txt` тега; точную версию в образе записывает preflight на хосте, #148 вносит её сюда | Apache-2.0 |
 

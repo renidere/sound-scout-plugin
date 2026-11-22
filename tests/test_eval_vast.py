@@ -881,8 +881,9 @@ def test_an_archive_with_a_link_is_refused(tmp_path: Path) -> None:
 
 
 def test_runtime_mismatches_name_each_component() -> None:
-    good = {"vllm": "0.34.0", "torch": "2.14.0+cu130", "cuda": "13.0.3", "transformers": "5.22.1"}
+    good = {"vllm": "0.34.0", "torch": "2.14.0+cu130", "cuda": "13.0", "transformers": "5.22.1"}
     assert vast.runtime_mismatches(good, "0.34.0\n") == []
+    assert vast.runtime_mismatches({**good, "cuda": "13.0.2"}, "0.34.0") == ["cuda"]
     bad = {**good, "torch": "2.13.0", "transformers": "5.23.0", "cuda": None}
     assert vast.runtime_mismatches(bad, "0.33.9") == ["vllm", "torch", "cuda", "transformers"]
 
@@ -930,6 +931,8 @@ def test_dependencies_document_pins_the_image_and_runtime_of_the_code() -> None:
         vast.IMAGE["amd64_digest"],
         f"{vast.IMAGE['repository']}:{vast.IMAGE['tag']}",
         f"{vast.IMAGE['compressed_bytes']:,}".replace(",", " "),
+        vast.IMAGE["config_digest"],
+        f"CUDA_VERSION={vast.IMAGE['cuda_env']}",
         *(vast.RUNTIME.values()),
     ):
         assert value in section, value
@@ -952,6 +955,22 @@ def test_timing_document_gives_every_step_an_estimate_a_basis_and_names_the_pilo
         assert re.search(r"\d", cells[1]), line
     assert "## Меряет только платный пилот" in text and "#148" in text
     assert "dry run" in text.lower()
+
+
+def test_timing_document_records_attempt_1_of_the_pilot() -> None:
+    text = (REPO / "docs" / "gpu-timing.md").read_text(encoding="utf-8")
+    section = text.split("## Попытка 1 пилота #148", 1)[1].split("\n## ", 1)[0]
+    measured = {}
+    for line in section.splitlines():
+        if line.startswith("| `"):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            measured[cells[0].strip("`")] = cells[2]
+    assert {step: measured[step] for step in ("ready", "preflight", "destroy")} == {
+        "ready": "294,6",
+        "preflight": "20,2",
+        "destroy": "3,1",
+    }
+    assert "20261122T061200Z-66c4813a" in section and "#158" in section
 
 
 def test_example_package_loads_and_holds_no_secret() -> None:
@@ -978,6 +997,7 @@ def test_a_malformed_package_is_refused(tmp_path: Path, change) -> None:
 
 
 def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CUDA_VERSION", raising=False)
     sentinel = tmp_path / "real-key-must-not-be-read"
     monkeypatch.setattr(vast, "KEY_PATH", sentinel)
     read = []
@@ -1005,6 +1025,15 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
         "destroy",
     ]
     assert all(step["ok"] for step in result["steps"])
+    (preflight,) = [step for step in result["steps"] if step["name"] == "preflight"]
+    assert _runtime_found(preflight["detail"]) == {
+        "vllm": "0.34.0",
+        "torch": "2.14.0",
+        "cuda": "13.0",
+        "transformers": "5.20.0",
+        "driver": "595.91.07",
+        "cuda_env": None,
+    }
     for step in result["steps"]:
         assert step["elapsed_s"] >= 0 and step["finished_at"] >= step["started_at"]
     runs_ = [s for s in result["steps"] if s["name"] == "run"]
@@ -1095,7 +1124,7 @@ def test_ssh_is_polled_until_it_answers_and_a_dead_host_ends_in_time() -> None:
 
 
 def test_vllm_version_takes_the_last_line_so_log_lines_before_it_pass() -> None:
-    found = {"vllm": "0.34.0", "torch": "2.14.0+cu130", "cuda": "13.0.3", "transformers": "5.20.0"}
+    found = {"vllm": "0.34.0", "torch": "2.14.0+cu130", "cuda": "13.0", "transformers": "5.20.0"}
     logged = "INFO 11-22 10:00:00 [__init__.py:1] Automatically detected platform cuda.\n0.34.0\n"
     assert vast.runtime_mismatches(found, logged) == []
     assert vast.runtime_mismatches(found, "0.34.0\nINFO done\n") == ["vllm"]
@@ -1128,6 +1157,58 @@ def test_a_step_failing_after_create_still_destroys_and_closes_the_attempt(
     assert absence == [vast_fake.FIRST_INSTANCE_ID]
     (closed,) = [e for e in events if e["event"] == "closed"]
     assert "destroy_requested" in closed["reason"]
+
+
+def _runtime_found(detail: dict) -> dict:
+    keys = ("vllm", "torch", "cuda", "transformers", "driver", "cuda_env")
+    return {key: detail["found"][key] for key in keys}
+
+
+def test_a_torch_built_for_another_cuda_fails_preflight_with_every_found_value_journaled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CUDA_VERSION", vast.RUNTIME["cuda"])
+    monkeypatch.setattr(vast, "FAKE_TORCH_CUDA", "12.9")
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(vast.VastError, match=r"runtime differs from the pin in \['cuda'\]"):
+        vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    (step,) = [e for e in events if e["event"] == "step" and e["name"] == "preflight"]
+    assert step["ok"] is False and "['cuda']" in step["detail"]["error"]
+    assert _runtime_found(step["detail"]) == {
+        "vllm": "0.34.0",
+        "torch": "2.14.0",
+        "cuda": "12.9",
+        "transformers": "5.20.0",
+        "driver": "595.91.07",
+        "cuda_env": vast.RUNTIME["cuda"],
+    }
+    assert step["detail"]["vllm_cli"].splitlines()[-1] == "0.34.0"
+    assert step["detail"]["gpu"].startswith("Fake A100")
+    assert [e["event"] for e in events].count("absence_verified") == 1
+
+
+@pytest.mark.parametrize("session_cuda", ["12.4", "13.0.3", None])
+def test_preflight_reads_cuda_from_torch_so_a_wrong_or_missing_ssh_cuda_version_passes(
+    tmp_path: Path, monkeypatch, session_cuda
+) -> None:
+    if session_cuda is None:
+        monkeypatch.delenv("CUDA_VERSION", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VERSION", session_cuda)
+    result = vast.dry_run(tmp_path / "data" / "dry", _dry_config(tmp_path))
+    (step,) = [s for s in result["steps"] if s["name"] == "preflight"]
+    assert step["ok"] is True
+    assert step["detail"]["found"]["cuda"] == vast.RUNTIME["cuda"] == "13.0"
+    assert step["detail"]["found"]["cuda_env"] == session_cuda
+    assert result["steps"][-1]["name"] == "destroy"
+
+
+def test_driver_is_the_last_field_of_the_first_nvidia_smi_line() -> None:
+    assert vast._driver("NVIDIA A40, 46068 MiB, 580.95.05\nNVIDIA A40, 46068 MiB, 1") == "580.95.05"
+    assert vast._driver("") is None
+    assert vast._driver("garbage") is None
 
 
 def test_a_failed_arm_closes_the_attempt_without_any_create(tmp_path: Path, monkeypatch) -> None:

@@ -236,3 +236,36 @@ def test_serve_runs_the_server_under_the_guard(tmp_path) -> None:
 def test_host_files_import_nothing_of_sound_scout(name) -> None:
     text = (HOST_DIR / name).read_text()
     assert "import sound_scout" not in text and "from sound_scout" not in text
+
+
+def test_image_env_reads_the_first_process_environment_not_the_session(tmp_path) -> None:
+    environ = tmp_path / "environ"
+    environ.write_bytes(b"PATH=/usr/bin\0CUDA_VERSION=13.0.2\0NVIDIA_VISIBLE_DEVICES=all\0")
+    assert hostrun._image_env("CUDA_VERSION", environ) == "13.0.2"
+    assert hostrun._image_env("CUDA_HOME", environ) is None
+    assert hostrun._image_env("CUDA_VERSION", tmp_path / "missing") is None
+
+
+def test_preflight_takes_cuda_from_torch_and_only_records_the_session_variable(tmp_path) -> None:
+    site = tmp_path / "site"
+    (site / "torch").mkdir(parents=True)
+    (site / "torch" / "__init__.py").write_text("")
+    (site / "torch" / "version.py").write_text("cuda = '13.0'\n")
+    env = {**os.environ, "PYTHONPATH": str(site), "CUDA_VERSION": "13.0.3"}
+    done = subprocess.run(
+        [sys.executable, str(HOST_DIR / "hostrun.py"), "preflight", "--workspace", str(tmp_path)],
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+    found = json.loads(done.stdout)
+    assert found["cuda"] == "13.0" and found["cuda_env"] == "13.0.3"
+    assert found["disk_free_bytes"] > 0
+    (site / "torch" / "version.py").write_text("raise ImportError('no torch')\n")
+    done = subprocess.run(
+        [sys.executable, str(HOST_DIR / "hostrun.py"), "preflight", "--workspace", str(tmp_path)],
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+    assert json.loads(done.stdout)["cuda"] is None

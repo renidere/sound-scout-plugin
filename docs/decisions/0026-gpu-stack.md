@@ -26,10 +26,37 @@
 
 `IMAGE` в коде: `vllm/vllm-openai:v0.34.0`, индекс `sha256:20fdb089…1ce1`, amd64
 `sha256:cf5b2fdd…c484`, 10 036 518 499 байт. В create идёт `IMAGE_REF` — тег вместе с digest
-индекса. `RUNTIME`: vLLM 0.34.0, torch 2.14.0, CUDA 13.0.3, Python 3.12, transformers
-`>=5.16.1,<5.23.0`. Preflight сверяет vLLM, torch и CUDA точно, transformers — по диапазону;
-Python записывается, но не сверяется. `MODELS` — ревизии и файлы двух моделей из публичного API
-HF; `spk_dict.pt` исключён.
+индекса. `RUNTIME`: vLLM 0.34.0, torch 2.14.0, CUDA 13.0 (`torch.version.cuda`), Python 3.12,
+transformers `>=5.16.1,<5.23.0`. Preflight сверяет vLLM, torch и CUDA точно, transformers — по
+диапазону; Python записывается, но не сверяется.
+
+`MODELS` — ревизии и файлы двух моделей из публичного API HF; `spk_dict.pt` исключён.
+
+**CUDA без окружения SSH (#158).** Попытка 1 пилота #148 остановилась на preflight:
+`runtime differs from the pin in ['cuda']`. Тогда preflight брал `CUDA_VERSION` из окружения
+SSH-сессии. SSH-сессия не обязана наследовать `ENV` образа. Пин `13.0.3` тоже не совпадал с
+образом. Найденные значения в журнал не попали, поэтому причина не доказана. Метаданные образа из
+реестра Docker Hub (2026-11-22, без загрузки слоёв):
+
+| что | значение |
+|---|---|
+| индекс тега `v0.34.0` | `sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` |
+| манифест linux/amd64 | `sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484` |
+| config blob amd64 | `sha256:0372147e2b3daa1baa5c6aa9b90ae5de2f926e25742650f91fa24dbca9cc645a`, 46 307 байт |
+| `ENV` | `CUDA_VERSION=13.0.2`, `NV_CUDA_CUDART_VERSION=13.0.96-1`, `NVIDIA_REQUIRE_CUDA=cuda>=13.0 …`, `VLLM_IMAGE_TAG=vllm/vllm-openai:v0.34.0` |
+| labels | `ai.vllm.image.tag=vllm/vllm-openai:v0.34.0`, `org.opencontainers.image.revision=62d4bc3c7e33b1b6c906e233e6af2d3506c482ca` |
+| установка torch (история) | `--index-url https://download.pytorch.org/whl/cu$(echo $CUDA_VERSION \| cut -d. -f1,2 \| tr -d '.')`, то есть `cu130` |
+
+Решение. Preflight сверяет `torch.version.cuda` с пином `13.0` в формате этого источника. Torch
+отдаёт CUDA своей сборки, окружение сессии на это не влияет. `CUDA_VERSION` образа (`13.0.2`)
+закреплён digest образа и записан в `IMAGE`. На хосте preflight только записывает его из
+окружения первого процесса контейнера (`cuda_image`, `/proc/1/environ`) и из сессии (`cuda_env`).
+Все найденные значения — vllm, torch, cuda, transformers, драйвер — попадают в `detail` шага
+`preflight` до сравнения. Отказ оставляет их в журнале.
+
+**Отличие от пакета #148.** #158 меняет пин CUDA в `RUNTIME` с `13.0.3` на `13.0`. Предрегистрация
+`0027` § 3 по-прежнему называет `13.0.3`; запись не меняется. Поэтому следующая попытка #148 — новый
+пакет. Ей нужно новое разрешение владельца.
 
 **Честная граница CPU smoke.** Образ на станцию не загружается (решение владельца). Dry run
 показывает работу Gate 0 клиента, guard и HTTP-контракта vLLM на CPU станции. Он не проверяет

@@ -72,14 +72,18 @@ IMAGE = {
     "index_digest": "sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1",
     "amd64_digest": "sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484",
     "compressed_bytes": 10036518499,
+    # config blob of the amd64 manifest (#158): `ENV CUDA_VERSION`, torch from the cu130 index
+    "config_digest": "sha256:0372147e2b3daa1baa5c6aa9b90ae5de2f926e25742650f91fa24dbca9cc645a",
+    "cuda_env": "13.0.2",
 }
 IMAGE_REF = f"{IMAGE['repository']}:{IMAGE['tag']}@{IMAGE['index_digest']}"
 # from the Dockerfile and requirements/common.txt of the tag; the exact transformers of the
-# image is known only on the host: preflight records it, #148 pins it in docs/dependencies.md
+# image is known only on the host: preflight records it, #148 pins it in docs/dependencies.md.
+# `cuda` is `torch.version.cuda` of the cu130 wheel: an SSH session may lack the image ENV (#158)
 RUNTIME = {
     "vllm": "0.34.0",
     "torch": "2.14.0",
-    "cuda": "13.0.3",
+    "cuda": "13.0",
     "python": "3.12",
     "transformers": ">=5.16.1,<5.23.0",
 }
@@ -1426,8 +1430,16 @@ def upload_host_files(host, attempt: Path, models: Mapping, key: str, timeout: f
     return {Path(remote).name: digest for remote, digest in zip(files, expected, strict=True)}
 
 
-def preflight(host, package: Mapping, models: Mapping, timeout: float) -> dict:
-    gpu = _checked(
+def _driver(gpu: str) -> str | None:
+    """`driver_version`, the last field of the first `nvidia-smi` CSV line."""
+    first = gpu.splitlines()[0] if gpu else ""
+    return first.rsplit(",", 1)[-1].strip() if "," in first else None
+
+
+def preflight(host, package: Mapping, models: Mapping, timeout: float, detail: dict) -> None:
+    """Fills `detail` with every found value before any comparison: a refusal keeps them in the
+    journal step."""
+    detail["gpu"] = gpu = _checked(
         host.run(
             ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
             timeout,
@@ -1435,12 +1447,14 @@ def preflight(host, package: Mapping, models: Mapping, timeout: float) -> dict:
         "nvidia-smi",
     ).strip()
     vllm_cli = _checked(host.run(["vllm", "--version"], timeout), "vllm --version")
-    found = json.loads(
+    detail["vllm_cli"] = vllm_cli.strip()
+    detail["found"] = found = json.loads(
         _checked(
             host.run(["python3", HOSTRUN, "preflight", "--workspace", WORKSPACE], timeout),
             "preflight",
         )
     )
+    found["driver"] = _driver(gpu)
     selftest_out = host.run(
         ["python3", HOSTRUN, "selftest", "--out", f"{WORKSPACE}/out/guard-selftest.json"], timeout
     )
@@ -1451,13 +1465,8 @@ def preflight(host, package: Mapping, models: Mapping, timeout: float) -> dict:
     need = sum(
         entry["size"] for model in package["models"] for entry in models[model["name"]]["files"]
     )
-    detail = {
-        "gpu": gpu,
-        "vllm_cli": vllm_cli.strip(),
-        "found": found,
-        "need_bytes": need + package["disk_margin_bytes"],
-        "selftest": selftest,
-    }
+    detail["need_bytes"] = need + package["disk_margin_bytes"]
+    detail["selftest"] = selftest
     bad = runtime_mismatches(found, vllm_cli)
     if bad:
         raise VastError(f"preflight: runtime differs from the pin in {bad}")
@@ -1465,7 +1474,6 @@ def preflight(host, package: Mapping, models: Mapping, timeout: float) -> dict:
         raise VastError("preflight: not enough free disk for the weights")
     if selftest.get("ok") is not True:
         raise VastError("preflight: the guard selftest failed")
-    return detail
 
 
 def fetch_weights(host, attempt: Path, name: str, models: Mapping, intervals: Mapping) -> Path:
@@ -1719,7 +1727,7 @@ def run_attempt(
             detail["status"] = instance.get("actual_status")
         with _step(journal, "preflight") as detail:
             detail["host_files"] = upload_host_files(host, attempt, models, api.key, timeout)
-            detail.update(preflight(host, package, models, timeout))
+            preflight(host, package, models, timeout, detail)
         receipts = {}
         with _step(journal, "weights") as detail:
             for entry in package["models"]:
@@ -1790,11 +1798,13 @@ PYTHON_SHIM = """#!/bin/sh
 PYTHONPATH="{site}${{PYTHONPATH:+:$PYTHONPATH}}" exec "{python}" "$@"
 """
 FAKE_DISTRIBUTIONS = {"vllm": "0.34.0", "torch": "2.14.0", "transformers": "5.20.0"}
+FAKE_TORCH_CUDA = RUNTIME["cuda"]
 
 
 def _fake_host_root(root: Path) -> dict:
-    """The dry run's host: fake `vllm`, `hf`, `nvidia-smi`, a `python3` that sees fake package
-    metadata of the pinned runtime, and `CUDA_VERSION` as the image sets it."""
+    """The dry run's host: fake `vllm`, `hf`, `nvidia-smi` and a `python3` that sees fake package
+    metadata of the pinned runtime and a `torch.version` with `FAKE_TORCH_CUDA`; no
+    `CUDA_VERSION`, as in an SSH session without the image ENV."""
     bin_dir, site = root / "bin", root / "fake-site"
     for directory in (root, bin_dir, site):
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -1807,10 +1817,10 @@ def _fake_host_root(root: Path) -> dict:
         info = site / f"{name}-{version}.dist-info"
         info.mkdir(exist_ok=True)
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
-    return {
-        "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-        "CUDA_VERSION": "13.0.3",
-    }
+    (site / "torch").mkdir(exist_ok=True)
+    (site / "torch" / "__init__.py").write_text("")
+    (site / "torch" / "version.py").write_text(f"cuda = {FAKE_TORCH_CUDA!r}\n")
+    return {"PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
 
 
 def _refuse_system(argv: list[str]) -> tuple[int, str]:

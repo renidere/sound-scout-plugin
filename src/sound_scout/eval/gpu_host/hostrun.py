@@ -1,6 +1,7 @@
 """Host side of a GPU reference run (#147): `serve`, `stop`, `selftest`, `preflight`, `weights`,
-`pack`. Stdlib only, Python 3.10+, never imports `sound_scout`: the station copies this file and
-`guard/sitecustomize.py` to `/workspace/ss/` and checks their SHA-256 there before use.
+`pack`. Stdlib only (`preflight` reads the image's own torch), Python 3.10+, never imports
+`sound_scout`: the station copies this file and `guard/sitecustomize.py` to `/workspace/ss/` and
+checks their SHA-256 there before use.
 
 `serve` starts the vLLM server in a new session with an allowlisted environment, offline
 variables and the audit-hook guard on `PYTHONPATH`. Every `POLL_S` it reads the socket inodes of
@@ -33,6 +34,7 @@ from pathlib import Path
 GUARD_DIR = Path(__file__).resolve().parent / "guard"
 ENV_KEEP = ("PATH", "HOME", "LANG", "LD_LIBRARY_PATH")
 ENV_PREFIXES = ("CUDA_", "NVIDIA_")
+INIT_ENVIRON = Path("/proc/1/environ")
 ENV_FIXED = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
@@ -450,6 +452,28 @@ def _version(name: str) -> str | None:
         return None
 
 
+def _torch_cuda() -> str | None:
+    """`torch.version.cuda`: the CUDA the torch wheel was built for, whatever the session env."""
+    try:
+        from torch import version
+    except Exception:
+        return None
+    return version.cuda if isinstance(version.cuda, str) else None
+
+
+def _image_env(name: str, environ: Path = INIT_ENVIRON) -> str | None:
+    """A variable of the container's first process, which starts with the image `ENV`."""
+    try:
+        entries = environ.read_bytes().split(b"\0")
+    except OSError:
+        return None
+    prefix = name.encode() + b"="
+    for entry in entries:
+        if entry.startswith(prefix):
+            return entry[len(prefix) :].decode("utf-8", "replace")
+    return None
+
+
 def preflight(args) -> int:
     print(
         json.dumps(
@@ -458,7 +482,9 @@ def preflight(args) -> int:
                 "vllm": _version("vllm"),
                 "torch": _version("torch"),
                 "transformers": _version("transformers"),
-                "cuda": os.environ.get("CUDA_VERSION"),
+                "cuda": _torch_cuda(),
+                "cuda_env": os.environ.get("CUDA_VERSION"),
+                "cuda_image": _image_env("CUDA_VERSION"),
                 "disk_free_bytes": shutil.disk_usage(args.workspace).free,
             },
             sort_keys=True,
