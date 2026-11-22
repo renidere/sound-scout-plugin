@@ -1128,6 +1128,15 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
         "evidence-qwen25omni.json",
         "evidence-qwen3omni.json",
     ]
+    kinds = [e["event"] for e in events]
+    assert kinds.count("credit_after_close") == 1 and kinds[-1] == "credit_after_close"
+    assert kinds.index("closed") < kinds.index("credit_after_close")
+    credit = events[-1]
+    assert set(credit) == CREDIT_FIELDS
+    assert (credit["credit"], credit["initial_credit"], credit["delta_usd"]) == (10.0, 10.0, 0.0)
+    assert credit["since_closed_s"] >= 0 and credit["t"] >= result["closed"]["t"]
+    assert result["credit_after_close"] == credit
+    assert sum(e["path"] == "/api/v0/users/current/" for e in log) == 2
     host = out / "gpu" / result["attempt_id"] / "host"
     assert (host / "guard-selftest.json").is_file()
     assert json.loads((host / "guard-selftest.json").read_text())["ok"] is True
@@ -1230,6 +1239,158 @@ def test_a_step_failing_after_create_still_destroys_and_closes_the_attempt(
     assert absence == [vast_fake.FIRST_INSTANCE_ID]
     (closed,) = [e for e in events if e["event"] == "closed"]
     assert "destroy_requested" in closed["reason"]
+
+
+USERS_PATH = "GET /api/v0/users/current/"
+CREDIT_FIELDS = {"event", "t", "since_closed_s", "initial_credit", "credit", "delta_usd"}
+
+
+def _no_secret_fields(event: dict, key: str) -> None:
+    text = json.dumps(event)
+    assert key not in text
+    assert not any(name.lower() in text.lower() for name in (*vast.SECRET_NAMES, "key", "token"))
+
+
+def test_a_failed_credit_read_after_close_is_journaled_and_changes_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    real_user = vast.Api.user
+    calls = []
+
+    def user(self):
+        calls.append(1)
+        if len(calls) == 1:
+            return real_user(self)
+        raise vast.ApiError(503, f"{USERS_PATH}: HTTP 503: echo {self.key}")
+
+    monkeypatch.setattr(vast.Api, "user", user)
+    config_ = _dry_config(tmp_path)
+    monkeypatch.setattr(vast.config, "load", lambda: config_)
+    out = tmp_path / "data" / "dry"
+    assert vast.main(["dry-run", "--out", str(out)]) == 0
+    assert len(calls) == 2
+    assert json.loads(capsys.readouterr().out)["closed"]["event"] == "closed"
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    kinds = [e["event"] for e in events]
+    assert kinds[-3:] == ["closed", "step", "credit_after_close"]
+    assert events[-2]["name"] == "destroy" and events[-2]["ok"] is True
+    credit = events[-1]
+    assert set(credit) == {"event", "t", "since_closed_s", "initial_credit", "error"}
+    assert credit["error"] == f"ApiError: {USERS_PATH}: HTTP 503: echo {vast.REDACTED}"
+    key = (out / "fake-api-key").read_text().strip()
+    _no_secret_fields(credit, key)
+    assert key.encode() not in journal_path.read_bytes()
+    assert vast.summarize(events)["closed"] is not None
+    timeline = json.loads((out / "timeline.json").read_text())
+    assert timeline["credit_after_close"] == credit
+
+
+def test_deploy_reads_the_credit_once_after_a_watchdog_close_and_the_watchdog_never_reads(
+    tmp_path: Path, key_file, fake
+) -> None:
+    journal, opened, _ = _created(tmp_path, fake, key_file)
+    api = vast.Api(fake.url, key_file[1])
+    assert vast.read_credit_after_close(journal, api) is None
+    assert fake.count("GET", "/api/v0/users") == 0
+    assert _tick(journal, opened["deadline_unix"]) == "closed"
+    assert fake.count("GET", "/api/v0/users") == 0
+    fake.credit = 9.25
+    assert vast.destroy_until_absent(journal, lambda _: api, _no_system, vast.INTERVALS) == "closed"
+    credit = vast.read_credit_after_close(journal, api)
+    assert fake.count("GET", "/api/v0/users") == 1
+    assert set(credit) == CREDIT_FIELDS
+    assert (credit["credit"], credit["delta_usd"]) == (9.25, 0.75)
+    assert _events(journal)[-2:] == ["closed", "credit_after_close"]
+    _no_secret_fields(credit, key_file[1])
+    status = vast.status(journal)
+    assert status["credit_after_close"] == credit
+    assert status["closed"]["reason"] == "deadline"
+
+
+def test_deploy_reads_the_credit_one_time_when_the_watchdog_closed_the_attempt_mid_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    out = tmp_path / "data" / "dry"
+
+    def wait_ready(api, instance_id, intervals):
+        (path,) = (out / "gpu").glob("*/journal.jsonl")
+        journal = vast.Journal.open(path)
+        closed = vast.watch_tick(journal, lambda _: api, runner=vast._refuse_system, cutoff=True)
+        assert closed == "closed"
+        raise vast.VastError("stopped after the watchdog close")
+
+    monkeypatch.setattr(vast, "wait_ready", wait_ready)
+    with pytest.raises(vast.VastError, match="stopped after the watchdog close"):
+        vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    kinds = [e["event"] for e in events]
+    assert kinds.count("closed") == 1 and kinds.count("credit_after_close") == 1
+    assert kinds.index("closed") < kinds.index("credit_after_close") == len(kinds) - 1
+    assert events[kinds.index("closed")]["reason"].startswith("deadline")
+    assert set(events[-1]) == CREDIT_FIELDS
+    log = [json.loads(line) for line in (out / "fake-api.jsonl").read_text().splitlines()]
+    assert sum(e["path"] == "/api/v0/users/current/" for e in log) == 2
+
+
+def test_a_credit_journal_failure_after_close_keeps_the_original_failure_and_destroy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    real_append = vast.Journal.append
+
+    def append(self, event, **fields):
+        if event == "credit_after_close":
+            raise KeyboardInterrupt("journal append interrupted")
+        return real_append(self, event, **fields)
+
+    def wait_ready(api, instance_id, intervals):
+        raise vast.VastError("the original failure")
+
+    monkeypatch.setattr(vast.Journal, "append", append)
+    monkeypatch.setattr(vast, "wait_ready", wait_ready)
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(vast.VastError, match="the original failure"):
+        vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    assert [e["event"] for e in events][-2:] == ["closed", "step"]
+    assert events[-1]["name"] == "destroy" and events[-1]["ok"] is True
+    assert vast.summarize(events)["closed"] is not None
+
+
+def test_a_failed_credit_read_through_the_fake_api_redacts_the_echoed_key_and_keeps_the_outcome(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    real_answer = vast_fake.FakeVast._answer
+
+    def answer(self, method, parts, body, query):
+        if parts[:3] == ["api", "v0", "users"] and self.count("DELETE") > 0:
+            return 503, {"error": "overloaded", "echo": f"Bearer {self.key}", "credit": None}
+        return real_answer(self, method, parts, body, query)
+
+    monkeypatch.setattr(vast_fake.FakeVast, "_answer", answer)
+    config_ = _dry_config(tmp_path)
+    monkeypatch.setattr(vast.config, "load", lambda: config_)
+    out = tmp_path / "data" / "dry"
+    assert vast.main(["dry-run", "--out", str(out)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["closed"]["reason"] == "destroy_requested"
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    steps = [e for e in events if e["event"] == "step"]
+    assert all(step["ok"] for step in steps) and steps[-1]["name"] == "destroy"
+    assert [e["event"] for e in events].count("credit_after_close") == 1
+    credit = events[-1]
+    assert set(credit) == {"event", "t", "since_closed_s", "initial_credit", "error"}
+    assert credit["error"].startswith(f"ApiError: {USERS_PATH}: HTTP 503: ")
+    assert vast.REDACTED in credit["error"]
+    key = (out / "fake-api-key").read_text().strip()
+    assert key not in json.dumps(credit)
+    assert key.encode() not in journal_path.read_bytes()
+    timeline = json.loads((out / "timeline.json").read_text())
+    assert timeline["credit_after_close"] == credit
+    assert timeline["fake_api"] == {"put": 1, "delete": 1, "instances_left": []}
 
 
 def _runtime_found(detail: dict) -> dict:
@@ -1478,6 +1639,7 @@ def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monke
         "absence_verified",
         "closed",
         "step:destroy",
+        "credit_after_close",
     ]
     (evidence,) = [e for e in events if e["event"] == "server_evidence"]
     assert "fake engine core died" in evidence["tails"]["server.log"]
@@ -1633,7 +1795,8 @@ def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -
         "destroy_response",
         "absence_verified",
     ]
-    assert events[-1]["event"] == "step" and events[-1]["name"] == "destroy" and events[-1]["ok"]
+    assert [e["event"] for e in events[-2:]] == ["step", "credit_after_close"]
+    assert events[-2]["name"] == "destroy" and events[-2]["ok"]
     assert not (attempt / "evidence-qwen25omni.json").exists()
 
 
@@ -1958,7 +2121,8 @@ def test_the_two_model_package_runs_each_full_day_under_its_rule_on_a_fresh_serv
     (first_exit,) = [r for r in stats["qwen25omni"] if r["event"] == "exit"]
     (second_start,) = [r for r in stats["qwen3omni"] if r["event"] == "started"]
     assert first_exit["reason"] == "stopped" and first_exit["t"] <= second_start["t"]
-    assert events[-1]["event"] == "step" and events[-1]["name"] == "destroy" and events[-1]["ok"]
+    assert events[-2]["event"] == "step" and events[-2]["name"] == "destroy" and events[-2]["ok"]
+    assert events[-1]["event"] == "credit_after_close"
 
 
 def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
@@ -1978,7 +2142,8 @@ def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
     (stopped,) = [e for e in events if e["event"] == "server_stopped"]
     assert stopped["returncode"] == 1
     assert [e["event"] for e in events].count("absence_verified") == 1
-    assert events[-1]["name"] == "destroy" and events[-1]["ok"]
+    assert events[-2]["name"] == "destroy" and events[-2]["ok"]
+    assert events[-1]["event"] == "credit_after_close"
 
 
 @pytest.mark.parametrize(

@@ -718,11 +718,12 @@ def summarize(events: list[dict]) -> dict:
         "destroy_requested": set(),
         "absent": set(),
         "closed": None,
+        "credit_after_close": None,
         "steps": [],
     }
     for event in events:
         kind = event["event"]
-        if kind in ("opened", "armed", "closed"):
+        if kind in ("opened", "armed", "closed", "credit_after_close"):
             state[kind] = event
         elif kind == "create_requested":
             state["create_requested"] = True
@@ -1102,6 +1103,32 @@ def destroy_until_absent(journal: Journal, api_factory, runner, intervals: Mappi
         if time.monotonic() > ends:
             raise VastError(f"destroy not verified ({outcome}); the watchdog timers keep trying")
         time.sleep(intervals["destroy_poll_s"])
+
+
+def read_credit_after_close(journal: Journal, api: Api) -> dict | None:
+    """One read-only credit read after `closed` (0027 § 9 item 5); a failure is journaled, never
+    raised: the attempt stays closed. An attempt still open gets no read here."""
+    state = summarize(journal.replay())
+    closed = state["closed"]
+    if closed is None:
+        return None
+    initial = state["opened"]["initial_credit"]
+    try:
+        credit = _number(api.user().get("credit"), "credit")
+    except Exception as error:
+        return journal.append(
+            "credit_after_close",
+            since_closed_s=round(time.time() - closed["t"], 3),
+            initial_credit=initial,
+            error=redact(f"{type(error).__name__}: {error}", api.key),
+        )
+    return journal.append(
+        "credit_after_close",
+        since_closed_s=round(time.time() - closed["t"], 3),
+        initial_credit=initial,
+        credit=credit,
+        delta_usd=round(initial - credit, 6),
+    )
 
 
 # --- hosts ---------------------------------------------------------------------------------
@@ -1981,6 +2008,10 @@ def run_attempt(
         except BaseException as error:
             failure = failure or error
         heartbeat.stop()
+        try:
+            read_credit_after_close(journal, api)
+        except BaseException as error:
+            failure = failure or error
     if failure is not None:
         raise failure
     return journal
@@ -2000,6 +2031,7 @@ def timeline(journal: Journal) -> dict:
         "dry_run": state["opened"].get("dry_run"),
         "steps": steps,
         "closed": state["closed"],
+        "credit_after_close": state["credit_after_close"],
     }
 
 

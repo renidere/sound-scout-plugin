@@ -198,7 +198,9 @@ exec. Рабочий под хуком: loopback и `AF_UNIX` работают, 
 каждой модели `smoke` (сервер под guard, туннель, пилот K1 на X1/X2) и `run`
 (`gate0.run_spike(runtime="vllm")`), `download` (SHA-256 архива и каждого файла по `SHA256SUMS`),
 `destroy`. Любая ошибка ведёт в destroy. Пути `decision` пакета — относительно корня репозитория:
-`deploy` запускается из него.
+`deploy` запускается из него. После шага `destroy` при `closed` (свой или сторожа) `deploy` один
+раз читает кредит: событие `credit_after_close` — `credit`, `since_closed_s`, `delta_usd` =
+`initial_credit` − `credit`; сбой чтения — `error` в том же событии, исход deploy не меняется (#162).
 
 `dry-run` идёт против поддельного API на 127.0.0.1: каталог вместо хоста, поддельные `vllm`, `hf`
 и `nvidia-smi`, поддельные метаданные пакетов runtime, синтетические веса, настоящий
