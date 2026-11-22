@@ -7,7 +7,7 @@
 конкретной станции сюда не пишутся; ниже — пути по умолчанию относительно домашнего каталога
 оператора.
 
-Обновлено: 2026-11-20.
+Обновлено: 2026-11-22.
 
 ## 1. Python-пакеты
 
@@ -422,3 +422,98 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 | Piper, голос `ru_RU-denis-medium` | rhasspy/piper-voices @ 04ca88f5685ca5253c701af3687e155b113bd512, ru/ru_RU/denis/medium | `ru_RU-denis-medium.onnx.json` | https://huggingface.co/rhasspy/piper-voices/resolve/04ca88f5685ca5253c701af3687e155b113bd512/ru/ru_RU/denis/medium/ru_RU-denis-medium.onnx.json | MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0 | 6196 | `git-blob-sha1:59da8d82e1416c9b53095278419c410ad2ed324b` | `5891b94580ae739a8cdc5d17591db6800333f85164d13599aca893883d99b9eb` |
 | Piper, голос `ru_RU-denis-medium` | rhasspy/piper-voices @ 04ca88f5685ca5253c701af3687e155b113bd512, ru/ru_RU/denis/medium | `MODEL_CARD` | https://huggingface.co/rhasspy/piper-voices/resolve/04ca88f5685ca5253c701af3687e155b113bd512/ru/ru_RU/denis/medium/MODEL_CARD | MIT (репозиторий голосов rhasspy/piper-voices), датасет голоса CC0 | 418 | `git-blob-sha1:a97e89d1da2fcbced2e4a42ac49a670a1c19c8a8` | `917110d5056810771fd3daea2644bbadf1341816b7631f2043b33be245903432` |
 | Open STT `asr_calls_2_val` | v1.0, DOI 10.5281/zenodo.4899885 | `asr_calls_2_val.tar.gz` | https://zenodo.org/records/4899885/files/asr_calls_2_val.tar.gz?download=1 | CC BY-NC 4.0 (README open_stt; поле Zenodo — CC BY 4.0, берётся более строгая) | 805251737 | `md5:5146eef0aa64af41e17c5ec18a9cab5c` | `aea64611133129e8c9b5d829953f5bfb9cc2d1bd95b9e429fa8e00e2c83f6461` |
+
+## 7. GPU-эталон (Vast.ai)
+
+Стек эталонных прогонов на арендованном GPU (#147, `docs/decisions/0026-gpu-stack.md`):
+`src/sound_scout/eval/vast.py`, файлы хоста `src/sound_scout/eval/gpu_host/`. Здесь закреплены
+образ, версии runtime и веса двух кандидатов; тест `tests/test_eval_vast.py` сверяет раздел с
+константами кода `IMAGE`, `RUNTIME` и `MODELS`. **Закреплено, на станцию не загружается; загрузка
+на арендованный хост — только по одобрению пакета (#148, #149).** Этот раздел появился раньше
+загрузки, хотя PROPOSAL § 5 п. 5 ставил запись в коммит загрузки: критерий 1 #147 требует
+закрепления сейчас. Новых Python-пакетов стек не добавляет: только stdlib и `numpy` из раздела 1.
+
+### 7.1. Образ и runtime
+
+| Что | Значение | Источник | Лицензия |
+|---|---|---|---|
+| Образ | `vllm/vllm-openai:v0.34.0` | Docker Hub, тег релиза vLLM `v0.34.0` (2026-11-16) | Apache-2.0 (vLLM) |
+| Индекс (multi-arch) | `sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | реестр Docker Hub, чтение 2026-11-21 | — |
+| Манифест amd64 | `sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484` | там же | — |
+| Размер в сжатом виде | 10 036 518 499 байт | там же | — |
+| Ссылка в create | `vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | принимает ли Vast ссылку по digest, проверяет #148 | — |
+| vLLM | `0.34.0` | Dockerfile тега | Apache-2.0 |
+| torch | `2.14.0` | Dockerfile тега | BSD-3-Clause |
+| CUDA | `13.0.3` | Dockerfile тега; драйвер хоста ≥ 580, compute capability ≥ 8.0 | NVIDIA EULA |
+| Python образа | `3.12` | Dockerfile тега (Ubuntu 24.04) | PSF-2.0 |
+| transformers | `>=5.16.1,<5.23.0` | `requirements/common.txt` тега; точную версию в образе записывает preflight на хосте, #148 вносит её сюда | Apache-2.0 |
+
+Запуск — `vast.vllm_argv`: локальный каталог весов, `--dtype bfloat16`, `--max-model-len 8192`,
+`--max-num-seqs 1`, `--seed 0`, `--enforce-eager`, `--generation-config vllm`, одно аудио на
+запрос, `127.0.0.1:8000`, без `--trust-remote-code` (загружается только thinker).
+
+### 7.2. Веса bf16
+
+Ревизии и хеши — из публичного API Hugging Face (чтение 2026-11-21), локально не считались.
+Сумма издателя у LFS-файлов — SHA-256 содержимого, у остальных — git blob SHA-1 на ревизии
+(как у GigaChat в разделе 3.1). `spk_dict.pt` Qwen2.5-Omni (pickle, нужен только talker) не
+загружается (`hf download --exclude spk_dict.pt`). Сверку на хосте делает `hostrun.py weights`,
+квитанцию — Gate 0 клиент до первого запроса.
+
+#### Qwen2.5-Omni-7B — `Qwen/Qwen2.5-Omni-7B` @ `ae9e1690543ffd5c0221dc27f79834d0294cba00`
+
+Лицензия: Apache-2.0 (файл `LICENSE`). Файлов: 19, байт: 22 379 037 779.
+
+| Файл | Байт | Сумма издателя |
+|---|---|---|
+| `.gitattributes` | 1570 | `git-blob-sha1:52373fe24473b1aa44333d318f578ae6bf04b49b` |
+| `LICENSE` | 11343 | `git-blob-sha1:9b1dd49441cd594560125cc7d79e886d0816cd8f` |
+| `README.md` | 36838 | `git-blob-sha1:9eb4a8e90deb0e208a9db6fdf1ea2e4c6dbf518f` |
+| `added_tokens.json` | 579 | `git-blob-sha1:4562256351969d3b68f81fd5623ae42a9c7fbb25` |
+| `chat_template.json` | 1313 | `git-blob-sha1:e696060ab7ab6e20f60e4e09b18e5da4c1830000` |
+| `config.json` | 13186 | `git-blob-sha1:633e1b2b157826cce16b51dee904750f02a7ac9c` |
+| `generation_config.json` | 74 | `git-blob-sha1:1c1ac9d737684b833c80a438e30fc3ba53e89bd4` |
+| `merges.txt` | 1671853 | `git-blob-sha1:31349551d90c7606f325fe0f11bbb8bd5fa0d7c7` |
+| `model-00001-of-00005.safetensors` | 4985055504 | `sha256:5edb02fd7c98803239468375cc9dc1bff492865c2aa086b78f348597021d6cbc` |
+| `model-00002-of-00005.safetensors` | 4991496800 | `sha256:7c99b55c6e5bc63fd4b19d4dc23cdc3ddac4b0101bb3c0958cc2b5d05c2bbafe` |
+| `model-00003-of-00005.safetensors` | 4991496904 | `sha256:ad00c3ac296300db905934ed213c4077ff49b85d30c0099270c814e2c77ec812` |
+| `model-00004-of-00005.safetensors` | 4969489824 | `sha256:152bc7d81441eaba22547d8d96c03d32dd592ce0e0e1d0e449347a4b23a532d3` |
+| `model-00005-of-00005.safetensors` | 2425322160 | `sha256:b8b18276481ba8cdf4fe2c98ac4c7a2da6e0d1c8a51850d162a391760cb2b81e` |
+| `model.safetensors.index.json` | 233160 | `git-blob-sha1:e8728f00dd29744bb14d7ed4f374c4f05c75b6c5` |
+| `preprocessor_config.json` | 667 | `git-blob-sha1:63c79f1c43bce173ab13d94096dea54b3688436f` |
+| `special_tokens_map.json` | 832 | `git-blob-sha1:8c2a71eaac0f526df324364d953503def113b7a1` |
+| `tokenizer.json` | 11421870 | `sha256:8441917e39ae0244e06d704b95b3124795cec478e297f9afac39ba670d7e9d99` |
+| `tokenizer_config.json` | 6469 | `git-blob-sha1:22c6d3668a32e4fe6dc09331bff96e7cc3a2290f` |
+| `vocab.json` | 2776833 | `git-blob-sha1:4783fe10ac3adce15ac8f358ef5462739852c569` |
+
+#### Qwen3-Omni-30B-A3B-Instruct — `Qwen/Qwen3-Omni-30B-A3B-Instruct` @ `26291f793822fb6be9555850f06dfe95f2d7e695`
+
+Лицензия: Apache-2.0 (`license_name` карточки; файла `LICENSE` нет). Файлов: 25, байт: 70 530 595 574.
+
+| Файл | Байт | Сумма издателя |
+|---|---|---|
+| `.gitattributes` | 1519 | `git-blob-sha1:a6344aac8c09253b3b630fb776ae94478aa0275b` |
+| `README.md` | 90295 | `git-blob-sha1:64fde95f19d9f979785606ece4e484d896cd7738` |
+| `chat_template.json` | 6772 | `git-blob-sha1:339ecf8a9f1ac161a9b59f833c85e6d92146b78c` |
+| `config.json` | 13671 | `git-blob-sha1:18c714a7fa2d8881e8e1441ec3759b6338c9c5ea` |
+| `generation_config.json` | 146 | `git-blob-sha1:59f9fe8f7db6b35dc244fc7eb52743b31533bbb5` |
+| `merges.txt` | 1671839 | `git-blob-sha1:20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0` |
+| `model-00001-of-00015.safetensors` | 4997899632 | `sha256:f95d142b727fbd0698f0ed9478e222d4f29467df855e21862e46bd1401049065` |
+| `model-00002-of-00015.safetensors` | 4997754216 | `sha256:320c1f31f7ddc4efd2501891590eca2c481ce4eca3db33d70ebbb637dae85764` |
+| `model-00003-of-00015.safetensors` | 4997754216 | `sha256:306f06b05ef032f1fa51eb62e72c3432324e7a084fa0d15ed17ff856adffcf33` |
+| `model-00004-of-00015.safetensors` | 4997755648 | `sha256:4cb551f433bfb4d83a5843e433e74688d71a96eeb1b62217b37d719026d559b5` |
+| `model-00005-of-00015.safetensors` | 4997755792 | `sha256:8aec5e8cc0e0b179a81f690af31a1149238f4b1d18ac60e3f690020fdf7d915f` |
+| `model-00006-of-00015.safetensors` | 4997755792 | `sha256:8ff40a3d9e9c59a35a10257c1c5b216f472e6a102a4d6059bd31183eee03cb4c` |
+| `model-00007-of-00015.safetensors` | 4997755792 | `sha256:f6d84cc1d47178850f9ba1fe9c01f45ee63d9a8b9975f92821ee2b4a0387860b` |
+| `model-00008-of-00015.safetensors` | 4997755792 | `sha256:9f369ccdc9d2d2a55df794005b23cdbce44494a72e4a0069a150ae471cfea720` |
+| `model-00009-of-00015.safetensors` | 4997755792 | `sha256:980f754b21c4b20f36e02d184b792f5625f7c9d24b8a5c9da94287cf3cfde11b` |
+| `model-00010-of-00015.safetensors` | 4997755792 | `sha256:5c5a798376321d74df2eb3f235e1c8c68669f09b0c753b5698a16e681204d808` |
+| `model-00011-of-00015.safetensors` | 4997755792 | `sha256:6f7c051bd391c89279b43e7342ff4a243ad2ba2144f4aa62233fd2b02d72fce0` |
+| `model-00012-of-00015.safetensors` | 4997755792 | `sha256:a8b09a9367cd31ebf928e87b9eaf002492379d9d21d352b480854c2fbe6d9978` |
+| `model-00013-of-00015.safetensors` | 4999771808 | `sha256:d9b7441c3a33e066d109cd6338e74ed680de9aa407d4df66eba5cb3c15c6d738` |
+| `model-00014-of-00015.safetensors` | 4996618552 | `sha256:73f09f187ff7b469a8937b39b8ac772e539e0d61311526c345558c5e6a6eb09a` |
+| `model-00015-of-00015.safetensors` | 553698794 | `sha256:68880d566a50643807a4e73f5227c4f468bb31532925ed5fae78a51bdd39492a` |
+| `model.safetensors.index.json` | 2727350 | `git-blob-sha1:037226d18d29071d0ef1ca6b2a85c43be5ce61aa` |
+| `preprocessor_config.json` | 603 | `git-blob-sha1:7df5b45379044a680218cb2b7ed4d01a6633f537` |
+| `tokenizer_config.json` | 7344 | `git-blob-sha1:6ff9fd60cc623bb54bbd603cbd418c97a11528d7` |
+| `vocab.json` | 2776833 | `git-blob-sha1:4783fe10ac3adce15ac8f358ef5462739852c569` |

@@ -1049,7 +1049,7 @@ def test_memory_usage_without_a_cgroup_is_empty_and_llama_runs_need_no_cap() -> 
 
 def test_unknown_runtime_is_refused(spike) -> None:
     with pytest.raises(gate0.Gate0Error, match="--runtime"):
-        gate0.run_spike("2026-11-18", spike["config"], runtime="vllm", **spike["kwargs"])
+        gate0.run_spike("2026-11-18", spike["config"], runtime="tgi", **spike["kwargs"])
 
 
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux /proc")
@@ -1807,3 +1807,150 @@ def test_qwen25omni_record_names_the_clip_set_and_bounds_causes_three_pairs_cann
     assert "но 12 ответов одного прогона этого не доказывают" in weak
     assert "На этих трёх парах ответ следует за парой" in weak
     assert "три пары по одному прогону не показывают" in weak
+
+
+# --- the vllm runtime and the controls-only prepare (#147) ---------------------------------
+
+
+@pytest.fixture
+def controls(tmp_path: Path) -> dict:
+    """A controls-only day and a vLLM-shaped fake server started by the test, not by the run."""
+    (tmp_path / "in").mkdir()
+    (tmp_path / "data").mkdir()
+    config_ = config.Config(
+        allowed_roots=((tmp_path / "in").resolve(),), data_root=(tmp_path / "data").resolve()
+    )
+    manifest = gate0.prepare_clips(
+        "2026-11-22", config_, decision=REPO / gate0.DECISION_DOC, controls_only=True
+    )
+    from sound_scout.eval import vast, vast_fake
+
+    models = vast_fake.synthetic_models()
+    spec = models["qwen25omni"]
+    model_dir = tmp_path / "model"
+    vast_fake.hf_download(
+        ["download", spec["repo"], "--revision", spec["revision"], "--local-dir", str(model_dir)]
+    )
+    expected = vast.expected_files(models, "qwen25omni")
+    receipt = tmp_path / "weights-receipt.json"
+    receipt.write_text(json.dumps({"ok": True, "files": expected}))
+    port = gate0._free_port()
+    server = subprocess.Popen(
+        [sys.executable, "-m", "sound_scout.eval.vast_fake", "vllm", "serve", str(model_dir)]
+        + ["--served-model-name", "qwen25omni", "--host", "127.0.0.1", "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    yield {
+        "config": config_,
+        "manifest": manifest,
+        "out": config_.data_root / "2026-11-22",
+        "kwargs": {
+            "decision": REPO / gate0.DECISION_DOC,
+            "runtime": "vllm",
+            "server_port": port,
+            "served_model": "qwen25omni",
+            "weights": expected,
+            "weights_receipt": receipt,
+            "remote": {"instance_id": 7, "tunnel_port": port},
+        },
+        "receipt": receipt,
+    }
+    server.kill()
+    server.wait()
+
+
+def test_controls_only_prepare_builds_three_generated_clips_and_a_nine_request_plan(
+    controls,
+) -> None:
+    manifest = controls["manifest"]
+    assert [clip["id"] for clip in manifest["clips"]] == list(gate0.CONTROLS)
+    assert manifest["pairs"] == [] and manifest["sources"] == []
+    assert manifest["controls_only"] is True and manifest["resynthesis"] is None
+    words = json.loads((controls["out"] / gate0.WORDS_FILE).read_text())
+    entries = gate0.plan(manifest, words, review.load_prompt())
+    assert len(entries) == 9
+    assert {entry["variant"] for entry in entries} == {"K1", "K2", "A"}
+
+
+def test_controls_only_takes_no_sources(tmp_path: Path) -> None:
+    config_ = config.Config(allowed_roots=(tmp_path.resolve(),), data_root=tmp_path.resolve())
+    with pytest.raises(gate0.Gate0Error, match="--controls-only"):
+        gate0.prepare_clips("2026-11-22", config_, sources=tmp_path, controls_only=True)
+
+
+def test_vllm_run_starts_no_server_sends_model_and_tokenizes_messages(controls) -> None:
+    result = gate0.run_spike("2026-11-22", controls["config"], **controls["kwargs"])
+    assert result["verdict"] == "not_applicable" and result["reason"] == "controls_only"
+    attempt = controls["out"] / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["argv"] is None and record["server_returncode"] is None
+    assert record["server_version"] == "vllm 0.34.0"
+    assert record["remote"] == controls["kwargs"]["remote"]
+    assert record["preconditions"]["checks"]["weights"] is True
+    assert record["stop_reason"] is None and record["requests_planned"] == 9
+    lines = [json.loads(line) for line in (attempt / gate0.TRACE_FILE).read_text().splitlines()]
+    sent = [line for line in lines if line.get("sent")]
+    assert len(sent) == 9 and all(line["http_status"] == 200 for line in sent)
+    assert all(isinstance(line["text_tokens"], int) for line in sent)
+    assert all(line["audio_tokens"] == 250 for line in sent)
+    for number in range(1, 10):
+        body = json.loads((attempt / gate0.REQUESTS_DIR / f"{number}.json").read_text())
+        assert body["model"] == "qwen25omni" and body["cache_prompt"] is False
+    assert result["audio_route"]["passed"] is True
+
+
+def test_vllm_receipt_mismatch_is_refused_before_any_request(controls) -> None:
+    receipt = json.loads(controls["receipt"].read_text())
+    receipt["files"]["config.json"]["git_oid"] = "0" * 40
+    controls["receipt"].write_text(json.dumps(receipt))
+    with pytest.raises(gate0.Gate0Error, match="weights"):
+        gate0.run_spike("2026-11-22", controls["config"], **controls["kwargs"])
+    attempt = controls["out"] / gate0.ATTEMPTS_DIR / "1"
+    assert not (attempt / gate0.TRACE_FILE).exists()
+    assert not (attempt / gate0.REQUESTS_DIR).exists()
+
+
+def test_vllm_receipt_not_ok_is_refused_too(controls) -> None:
+    receipt = json.loads(controls["receipt"].read_text())
+    controls["receipt"].write_text(json.dumps({**receipt, "ok": False}))
+    with pytest.raises(gate0.Gate0Error, match="weights"):
+        gate0.run_spike("2026-11-22", controls["config"], **controls["kwargs"])
+
+
+def test_vllm_without_a_reachable_server_stops_as_server_unreachable(controls) -> None:
+    kwargs = {**controls["kwargs"], "server_port": gate0._free_port(), "load_timeout": 0.5}
+    result = gate0.run_spike("2026-11-22", controls["config"], **kwargs)
+    record = json.loads((controls["out"] / gate0.ATTEMPTS_DIR / "1" / gate0.RUN_FILE).read_text())
+    assert record["stop_reason"] == "server_unreachable"
+    assert result["verdict"] == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"served_model": "gemma"}, {"server_port": None}, {"weights_receipt": None}],
+    ids=["unknown-model", "no-port", "no-receipt"],
+)
+def test_vllm_needs_a_served_model_a_port_and_a_receipt(controls, change) -> None:
+    with pytest.raises(gate0.Gate0Error, match="served-model|server-port"):
+        gate0.run_spike("2026-11-22", controls["config"], **{**controls["kwargs"], **change})
+
+
+def test_vllm_qwen3omni_uses_the_encoder_rate_of_rule_v2(tmp_path: Path) -> None:
+    config_ = config.Config(allowed_roots=(tmp_path.resolve(),), data_root=tmp_path.resolve())
+    gate0.prepare_clips("2026-11-23", config_, decision=REPO / QWEN3OMNI_DOC, controls_only=True)
+    receipt = tmp_path / "r.json"
+    receipt.write_text(json.dumps({"ok": False}))
+    with pytest.raises(gate0.Gate0Error, match="weights"):
+        gate0.run_spike(
+            "2026-11-23",
+            config_,
+            decision=REPO / QWEN3OMNI_DOC,
+            runtime="vllm",
+            server_port=1,
+            served_model="qwen3omni",
+            weights_receipt=receipt,
+        )
+    record = json.loads((tmp_path / "2026-11-23" / "attempts" / "1" / gate0.RUN_FILE).read_text())
+    assert record["rule"] == gate0.RULE_V2 and record["encoder_tokens_per_s"] == 12.5
+    assert record["served_model"] == "qwen3omni"

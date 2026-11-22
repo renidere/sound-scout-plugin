@@ -43,7 +43,8 @@ target-version = "py313"
 line-length = 100
 extend-exclude = [".work-task", ".revmux", "data", "runs", "local"]
 # The Hermes package runs on the Hermes interpreter, which requires Python >= 3.11.
-per-file-target-version = { "hermes/plugin/**/*.py" = "py311" }
+# The GPU host files run on the image's Python 3.12; they stay valid down to 3.10.
+per-file-target-version = { "hermes/plugin/**/*.py" = "py311", "src/sound_scout/eval/gpu_host/*.py" = "py310" }
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

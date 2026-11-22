@@ -34,6 +34,13 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   is kept verbatim. A request over the wall time limit or a server RSS over the limit ends the
   run: the rest are recorded as not sent. The run talks to nothing but the server it started (no
   proxy); the process-wide network guard is not installed here because it refuses loopback too.
+- `prepare --date D --controls-only` builds only `S0`, `N1`, `T1` from the generators: no ASR,
+  no recording, nine requests (K1, K2, A) and the verdict `not_applicable` (#147).
+- `run --date D --runtime vllm --server-port P --served-model qwen25omni|qwen3omni
+  --weights-receipt R` starts no server: it talks to the vLLM server of a rented GPU host
+  through the SSH tunnel of `sound_scout.eval.vast` (`/tokenize` with the messages, the field
+  `model` in every request), and its weights precondition is the host's receipt against the
+  pinned files (docs/decisions/0026-gpu-stack.md).
 - `verdict --date D` recomputes the verdict from the saved answers alone (`decide`).
 
 The rule is GATE0-RULE v1 (0007 section 3) or, only for the block `RULE_V2_SHA256` pins,
@@ -162,7 +169,10 @@ QWEN25OMNI_WEIGHTS = {
 QWEN25OMNI_MODEL_DIR = (
     Path.home() / ".cache/sound-scout/models/ggml-org--Qwen2.5-Omni-7B-GGUF" / QWEN25OMNI_REVISION
 )
-RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni")
+RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "vllm")
+# served models of the `vllm` runtime: a vLLM server on a rented GPU host behind an SSH tunnel
+# (`sound_scout.eval.vast`, docs/decisions/0026-gpu-stack.md); the run never starts it
+VLLM_MODELS = ("qwen25omni", "qwen3omni")
 # runtime -> (model file, mmproj file, extra llama-server flags); without mmap the server's RSS
 # is its own memory, not 8e9 of mapped weights on top (0023 section 1, smoke)
 LLAMA_RUNTIMES = {
@@ -242,6 +252,7 @@ RUNTIME_LIMITS = {
     "gigachat": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
     "qwen3omni": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
     "qwen25omni": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
+    "vllm": (None, None),
 }
 STOP_GRACE_S = 10.0
 DOWNLOAD_FLAGS = frozenset(
@@ -547,12 +558,21 @@ def prepare_clips(
     natural: Path | None = None,
     decision: Path = DECISION_DOC,
     transcribe: Callable[[Path, runs.Run, config.Config], dict] | None = None,
+    controls_only: bool = False,
 ) -> dict:
-    """Build the clips, the words and the manifest under `<data_root>/<day>/`; never overwrites."""
+    """Build the clips, the words and the manifest under `<data_root>/<day>/`; never overwrites.
+
+    `controls_only` builds only `S0`, `N1`, `T1` from the generators: no ASR, no recording, a
+    nine-request plan and the verdict `not_applicable` (the GPU stack's dry run and pilot)."""
+    if controls_only and (sources is not None or natural is not None):
+        raise Gate0Error("--controls-only takes no --sources or --natural")
     rule, prompt, out = _new_prepare(day, config_, decision)
     prep_dir = _mkdir(out / PREP_DIR, config_)
     transcribe = transcribe or transcribe_source
-    if natural is None:
+    if controls_only:
+        mode = "synthetic"
+        pending, pairs, sources_info, words = [], [], [], {}
+    elif natural is None:
         mode = "synthetic"
         pending, pairs, sources_info, words = _synthetic(
             sources or config_.allowed_roots[0], prep_dir, config_, transcribe
@@ -587,7 +607,8 @@ def prepare_clips(
         "sources": sources_info,
         "clips": clips,
         "pairs": pairs,
-        "resynthesis": resynthesis_record() if mode == "synthetic" else None,
+        "resynthesis": resynthesis_record() if mode == "synthetic" and pairs else None,
+        "controls_only": controls_only,
         "limits": {"max_clips": MAX_CLIPS, "max_clip_seconds": MAX_CLIP_SECONDS},
         "note": "V-клипы синтетически изменены (Praat PSOLA) и не заменяют естественные пары",
     }
@@ -1065,8 +1086,9 @@ def memory_usage(cap: Mapping, cgroup_root: Path = CGROUP_ROOT) -> dict:
 class Client:
     """HTTP to the local server only, without proxies; `calls` counts every request made."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, model: str | None = None) -> None:
         self.base = f"http://{HOST}:{port}"
+        self.model = model
         self.calls = 0
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -1092,6 +1114,8 @@ class Client:
     def text_tokens(self, text: str) -> int | None:
         """Prompt tokens of the same message without audio, by template and tokenizer only."""
         message = {"role": "user", "content": [{"type": "text", "text": text}]}
+        if self.model is not None:
+            return self._vllm_tokens(message)
         status, raw, _ = self.request(
             "/apply-template",
             {"messages": [message], "chat_template_kwargs": SAMPLING["chat_template_kwargs"]},
@@ -1107,6 +1131,39 @@ class Client:
         except (ValueError, KeyError, TypeError):
             return None
         return len(tokens) if isinstance(tokens, list) else None
+
+    def _vllm_tokens(self, message: dict) -> int | None:
+        """vLLM applies the chat template itself: `/tokenize` takes the messages."""
+        status, raw, _ = self.request(
+            "/tokenize",
+            {
+                "model": self.model,
+                "messages": [message],
+                "add_generation_prompt": True,
+                "chat_template_kwargs": SAMPLING["chat_template_kwargs"],
+            },
+        )
+        try:
+            count = json.loads(raw)["count"] if status == 200 else None
+        except (ValueError, KeyError, TypeError):
+            return None
+        return count if isinstance(count, int) and not isinstance(count, bool) else None
+
+
+class NoWatch:
+    """The RSS watch of a server this process did not start: nothing to read, nothing to stop."""
+
+    peak = window_peak = 0
+    exceeded = None
+
+    def current(self) -> None:
+        return None
+
+    def reset_window(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
 
 
 class RssWatch:
@@ -1192,16 +1249,34 @@ def run_spike(
     load_timeout: float = LOAD_TIMEOUT_S,
     cgroup_root: Path = CGROUP_ROOT,
     meminfo: Path = MEMINFO,
+    server_port: int | None = None,
+    served_model: str | None = None,
+    weights_receipt: Path | None = None,
+    remote: Mapping | None = None,
 ) -> dict:
-    """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict."""
+    """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict.
+
+    The `vllm` runtime starts nothing: it talks to the server already listening on
+    `server_port` (the SSH tunnel of `sound_scout.eval.vast`), and its weights precondition is
+    the host's `weights_receipt` against the pinned files of `served_model`."""
     if runtime not in RUNTIMES:
         raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
+    if runtime == "vllm":
+        if served_model not in VLLM_MODELS:
+            raise Gate0Error(f"--served-model must be one of {VLLM_MODELS}, got {served_model!r}")
+        if server_port is None or weights_receipt is None:
+            raise Gate0Error("the vllm runtime needs --server-port and --weights-receipt")
+        if weights is None:
+            from sound_scout.eval import vast
+
+            weights = vast.expected_files(vast.MODELS, served_model)
     defaults = {
         "llama": (DEFAULT_MODEL_DIR, WEIGHTS),
         "borealis": (BOREALIS_MODEL_DIR, BOREALIS_WEIGHTS),
         "gigachat": (GIGACHAT_MODEL_DIR, GIGACHAT_WEIGHTS),
         "qwen3omni": (QWEN3OMNI_MODEL_DIR, QWEN3OMNI_WEIGHTS),
         "qwen25omni": (QWEN25OMNI_MODEL_DIR, QWEN25OMNI_WEIGHTS),
+        "vllm": (None, None),
     }
     model_dir = model_dir or defaults[runtime][0]
     if weights is None:
@@ -1218,7 +1293,7 @@ def run_spike(
     except (OSError, UnicodeDecodeError) as error:
         reason = getattr(error, "strerror", None) or error
         raise Gate0Error(f"cannot read the decision document {decision.name}: {reason}") from None
-    encoder_rate = ENCODER_TOKENS_PER_S.get(runtime)
+    encoder_rate = ENCODER_TOKENS_PER_S.get(served_model if runtime == "vllm" else runtime)
     if p3_rate(rule, encoder_rate) is None:
         raise Gate0Error(
             f"{RULE_V2} needs the encoder's own audio token rate F; runtime {runtime!r} has none"
@@ -1239,12 +1314,19 @@ def run_spike(
         "code": _code_identity(),
         "decision_sha256": hashlib.sha256(document).hexdigest(),
         "runtime": runtime,
+        "served_model": served_model,
+        "remote": None if remote is None else dict(remote),
         "rule": rule_name(rule),
         "encoder_tokens_per_s": encoder_rate,
         "cgroup": cgroup,
         "host_memory": host,
     }
-    found = {name: _sha256_file(model_dir / name) for name in weights}
+    if runtime == "vllm":
+        receipt = _read_receipt(weights_receipt)
+        found = receipt.get("files") if receipt.get("ok") is True else None
+        record["weights_receipt_sha256"] = _sha256_file(weights_receipt)
+    else:
+        found = {name: _sha256_file(model_dir / name) for name in weights}
     clips_found = {
         clip["id"]: _sha256_file(out / clip["file"]) == clip["wav_sha256"]
         for clip in manifest["clips"]
@@ -1272,8 +1354,11 @@ def run_spike(
     entries = plan(manifest, words, prompt)
     others = _other_inference()
     threads = threads or (THREADS_BUSY if others else THREADS_IDLE)
-    port = _free_port()
-    if runtime in LLAMA_RUNTIMES:
+    port = server_port if runtime == "vllm" else _free_port()
+    client = Client(port, served_model if runtime == "vllm" else None)
+    if runtime == "vllm":
+        argv, version_argv = None, None
+    elif runtime in LLAMA_RUNTIMES:
         binary = llama_dir / SERVER_BINARY
         argv = server_argv(binary, model_dir, port, threads, LLAMA_RUNTIMES[runtime])
         version_argv = [str(binary), "--version"]
@@ -1286,7 +1371,7 @@ def run_spike(
     record.update(
         {
             "argv": argv,
-            "server_version": _server_version(version_argv),
+            "server_version": None if version_argv is None else _server_version(version_argv),
             "threads": threads,
             "other_inference": others,
             "cpu": _cpu_model(),
@@ -1304,18 +1389,22 @@ def run_spike(
     )
     _mkdir(attempt / REQUESTS_DIR, config_)
     _mkdir(attempt / RESPONSES_DIR, config_)
-    client = Client(port)
     stop_reason = None
     with (
         paths.open_output(attempt, TRACE_FILE, config_) as trace,
         paths.open_output(attempt, SERVER_LOG, config_) as log,
     ):
-        process, copier = proc.start(argv, log=log, max_log_bytes=SERVER_LOG_MAX_BYTES)
-        watch = RssWatch(process, rss_limit).start()
+        if argv is None:
+            process, copier, watch = None, None, NoWatch()
+        else:
+            process, copier = proc.start(argv, log=log, max_log_bytes=SERVER_LOG_MAX_BYTES)
+            watch = RssWatch(process, rss_limit).start()
         try:
             started = time.monotonic()
             stop_reason = _wait_ready(client, process, watch, load_timeout)
             record["model_load_s"] = round(time.monotonic() - started, 3)
+            if argv is None and stop_reason is None:
+                record["server_version"] = _vllm_version(client)
             _trace(trace, _empty_input(client))
             for entry in entries:
                 if stop_reason is not None:
@@ -1323,14 +1412,14 @@ def run_spike(
                     continue
                 line = _send(entry, out, manifest, client, watch, attempt, config_, request_timeout)
                 _trace(trace, line)
-                stop_reason = line.get("limit") or (
-                    "server_exited" if process.poll() is not None else None
-                )
+                exited = process is not None and process.poll() is not None
+                stop_reason = line.get("limit") or ("server_exited" if exited else None)
         finally:
-            status = proc_status(process.pid)
+            status = {} if process is None else proc_status(process.pid)
             watch.stop()
-            stop_server(process)
-            copier.join(STOP_GRACE_S)
+            if process is not None:
+                stop_server(process)
+                copier.join(STOP_GRACE_S)
             record.update(
                 {
                     "finished_at": _now(),
@@ -1338,7 +1427,7 @@ def run_spike(
                     "rss_exceeded_bytes": watch.exceeded,
                     "rss_peak_bytes": watch.peak,
                     "vm_hwm_bytes": status.get("VmHWM"),
-                    "server_returncode": process.returncode,
+                    "server_returncode": None if process is None else process.returncode,
                     "http_calls": client.calls,
                 }
             )
@@ -1349,18 +1438,19 @@ def run_spike(
     return result
 
 
-def _wait_ready(client: Client, process, watch: RssWatch, timeout: float) -> str | None:
+def _wait_ready(client: Client, process, watch, timeout: float) -> str | None:
+    """None when `/health` answers 200; without a process of its own, `server_unreachable`."""
     deadline = time.monotonic() + timeout
     while True:
         if watch.exceeded is not None:
             return "rss_limit"
-        if process.poll() is not None:
+        if process is not None and process.poll() is not None:
             return "server_exited"
         status, _, _ = client.request("/health", timeout=5)
         if status == 200:
             return None
         if time.monotonic() > deadline:
-            return "load_timeout"
+            return "load_timeout" if process is not None else "server_unreachable"
         time.sleep(RSS_POLL_S)
 
 
@@ -1414,6 +1504,8 @@ def _send(entry, out, manifest, client, watch, attempt, config_, request_timeout
         "max_tokens": entry["max_tokens"],
         **SAMPLING,
     }
+    if client.model is not None:
+        body["model"] = client.model
     if entry["json_response"]:
         body["response_format"] = {"type": "json_object"}
     _write_json(
@@ -1585,7 +1677,9 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
         second, outcome = result["N"], "READY"
         second_reason = "N: различено меньше 2 из 3 естественных пар"
         held_reason = "C и N проходят"
-    if not all(preconditions.values()):
+    if manifest.get("controls_only"):
+        result["verdict"], result["reason"] = "not_applicable", "controls_only"
+    elif not all(preconditions.values()):
         failed = [name for name, passed in preconditions.items() if not passed]
         result["verdict"], result["reason"] = "NOT READY", f"протокол не выполнен: {failed}"
     elif not c_passed:
@@ -1733,6 +1827,23 @@ def _code_identity() -> dict:
     return identity
 
 
+def _read_receipt(path: Path) -> dict:
+    try:
+        receipt = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return receipt if isinstance(receipt, dict) else {}
+
+
+def _vllm_version(client: Client) -> str | None:
+    status, raw, _ = client.request("/version", timeout=5)
+    try:
+        version = json.loads(raw)["version"] if status == 200 else None
+    except (ValueError, KeyError, TypeError):
+        return None
+    return f"vllm {version}" if isinstance(version, str) else None
+
+
 def _server_version(argv: list[str]) -> str | None:
     output = _output(argv, timeout=30, stderr=True)
     lines = (output or "").splitlines()
@@ -1791,18 +1902,24 @@ def main(argv: list[str] | None = None) -> int:
     commands.choices["prepare"].add_argument("--sources", type=Path)
     commands.choices["prepare"].add_argument("--natural", type=Path)
     commands.choices["prepare"].add_argument("--reuse", metavar="DATE")
+    commands.choices["prepare"].add_argument("--controls-only", action="store_true")
     commands.choices["run"].add_argument("--runtime", choices=RUNTIMES, default="llama")
     commands.choices["run"].add_argument("--model-dir", type=Path)
     commands.choices["run"].add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR)
     commands.choices["run"].add_argument("--threads", type=int)
+    commands.choices["run"].add_argument("--server-port", type=int)
+    commands.choices["run"].add_argument("--served-model", choices=VLLM_MODELS)
+    commands.choices["run"].add_argument("--weights-receipt", type=Path)
     commands.choices["verdict"].add_argument("--attempt")
     args = parser.parse_args(argv)
     try:
         config_ = config.load()
         if args.command == "prepare":
             guard.install_network_guard(config_)
-            if args.reuse is not None and (args.sources or args.natural):
-                raise Gate0Error("--reuse copies clips; it takes no --sources or --natural")
+            if args.reuse is not None and (args.sources or args.natural or args.controls_only):
+                raise Gate0Error(
+                    "--reuse copies clips; it takes no --sources, --natural or --controls-only"
+                )
             if args.reuse is not None:
                 manifest = reuse_clips(
                     args.date, config_, source=args.reuse, decision=args.decision
@@ -1814,6 +1931,7 @@ def main(argv: list[str] | None = None) -> int:
                     sources=args.sources,
                     natural=args.natural,
                     decision=args.decision,
+                    controls_only=args.controls_only,
                 )
             for clip in manifest["clips"]:
                 print(json.dumps({k: clip[k] for k in ("id", "duration_s", "pcm_sha256")}))
@@ -1829,6 +1947,9 @@ def main(argv: list[str] | None = None) -> int:
                 model_dir=args.model_dir,
                 llama_dir=args.llama_dir,
                 threads=args.threads,
+                server_port=args.server_port,
+                served_model=args.served_model,
+                weights_receipt=args.weights_receipt,
             )
         else:
             guard.install_network_guard(config_)
