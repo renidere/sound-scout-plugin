@@ -1967,3 +1967,79 @@ def test_vllm_qwen3omni_uses_the_encoder_rate_of_rule_v2(tmp_path: Path) -> None
     record = json.loads((tmp_path / "2026-11-23" / "attempts" / "1" / gate0.RUN_FILE).read_text())
     assert record["rule"] == gate0.RULE_V2 and record["encoder_tokens_per_s"] == 12.5
     assert record["served_model"] == "qwen3omni"
+
+
+# --- the stop and transport checks of the GPU run (#149) ----------------------------------
+
+
+def _trace(attempt: Path) -> list[dict]:
+    return [json.loads(line) for line in (attempt / gate0.TRACE_FILE).read_text().splitlines()]
+
+
+def test_a_stop_check_marks_every_request_after_it_not_sent(controls) -> None:
+    asked = []
+
+    def stop_check():
+        asked.append(1)
+        return "soft_end" if len(asked) > 3 else None
+
+    gate0.run_spike("2026-11-22", controls["config"], **controls["kwargs"], stop_check=stop_check)
+    attempt = controls["out"] / gate0.ATTEMPTS_DIR / "1"
+    lines = _trace(attempt)[1:]
+    assert [line.get("sent") for line in lines] == [True] * 3 + [False] * 6
+    assert {line["not_sent"] for line in lines[3:]} == {"soft_end"}
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["stop_reason"] == "soft_end"
+
+
+def test_a_transport_error_asks_the_check_once_and_its_reason_stops_the_day(
+    controls, monkeypatch
+) -> None:
+    kwargs = {**controls["kwargs"], "server_port": gate0._free_port()}
+    asked = []
+    monkeypatch.setattr(gate0, "_wait_ready", lambda *args: None)
+    gate0.run_spike(
+        "2026-11-22",
+        controls["config"],
+        **kwargs,
+        transport_check=lambda: asked.append(1) or "server_exited",
+    )
+    lines = _trace(controls["out"] / gate0.ATTEMPTS_DIR / "1")[1:]
+    assert len(asked) == 1
+    assert lines[0]["sent"] is True and lines[0]["http_status"] is None
+    assert [line["not_sent"] for line in lines[1:]] == ["server_exited"] * 8
+
+
+def test_send_checked_resends_once_after_the_tunnel_is_back_without_a_second_request_file():
+    calls = []
+
+    def send(write_request=True):
+        calls.append(write_request)
+        if len(calls) == 1:
+            return {"n": 4, "sent": True, "http_status": None, "error": "ConnectionRefusedError"}
+        return {"n": 4, "sent": True, "http_status": 200, "error": None}
+
+    line, stop = gate0.send_checked(send, lambda: "resend")
+    assert calls == [True, False] and stop is None
+    assert line["resent_after_tunnel"] is True and line["first_error"] == "ConnectionRefusedError"
+    again = {"n": 5, "sent": True, "http_status": None, "error": "x"}
+    line, stop = gate0.send_checked(lambda write_request=True: dict(again), lambda: "resend")
+    assert stop == "transport_errors" and line["resent_after_tunnel"] is True
+
+
+def test_a_timeout_is_no_transport_error_and_needs_no_check() -> None:
+    timeout = {"sent": True, "http_status": None, "limit": "request_timeout"}
+    assert gate0.transport_error(timeout) is False
+    assert gate0.transport_error({"sent": True, "http_status": None}) is True
+    assert gate0.transport_error({"sent": True, "http_status": 500}) is False
+    line, stop = gate0.send_checked(lambda write_request=True: dict(timeout), lambda: 1 / 0)
+    assert stop is None and line == timeout
+
+
+def test_q_s_parses_as_a_closed_answer_and_the_gate0_questions_keep_their_pin() -> None:
+    body = {"choices": [{"message": {"content": "Да."}}]}
+    assert gate0.answer_of({"variant": "Q-S"}, body) == "да"
+    assert "Q-S" not in gate0.QUESTIONS
+    assert gate0.questions_sha256() == (
+        "34871259fa7ad301b1cd5ee24182664e79c3b1b7439bb1741204038e56cced82"
+    )

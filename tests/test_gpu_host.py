@@ -153,7 +153,7 @@ def _manifest(tmp_path: Path) -> tuple[dict, Path]:
 
 def test_weights_receipt_matches_the_manifest_and_the_expected_files(tmp_path) -> None:
     models, directory = _manifest(tmp_path)
-    (directory / ".cache" / "huggingface").mkdir(parents=True)
+    (directory / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
     (directory / ".cache" / "huggingface" / "x.metadata").write_text("hf bookkeeping")
     receipt = hostrun.weights_receipt(models, "qwen25omni", directory)
     assert receipt["ok"] is True
@@ -183,6 +183,7 @@ def test_pack_writes_sums_of_regular_files_and_the_archive_passes_the_station_ch
     archive = tmp_path / "results.tar"
     assert hostrun.main(["pack", "--root", str(root), "--out", str(archive)]) == 0
     printed = json.loads(capsys.readouterr().out)
+    assert printed.pop("disk_free_bytes") > 0
     assert printed == {"archive_sha256": vast._sha256(archive), "files": 2}
     with tarfile.open(archive) as tar:
         assert sorted(tar.getnames()) == [
@@ -191,6 +192,56 @@ def test_pack_writes_sums_of_regular_files_and_the_archive_passes_the_station_ch
             "qwen25omni/server.log",
         ]
     assert vast.verify_archive(archive, tmp_path / "host") == 2
+    assert not (root / "SHA256SUMS").exists()
+
+
+def test_pack_of_a_log_another_process_keeps_appending_to_still_matches_its_sums(
+    tmp_path,
+) -> None:
+    """A sync packs `out/` while the live server writes its logs (#149): each file is read
+    once, so the archived bytes are the hashed bytes, and the station check passes."""
+    root = tmp_path / "out"
+    root.mkdir()
+    log = root / "server.log"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "with open(sys.argv[1], 'a') as f:\n"
+            "    for _ in range(40000):\n"
+            "        f.write('x' * 255 + '\\n'); f.flush(); time.sleep(0.0002)\n",
+            str(log),
+        ]
+    )
+    try:
+        time.sleep(0.3)
+        for number in range(4):
+            archive = tmp_path / f"sync-{number}.tar"
+            argv = [sys.executable, str(HOST_DIR / "hostrun.py"), "pack", "--root", str(root)]
+            done = subprocess.run([*argv, "--out", str(archive)], capture_output=True, timeout=60)
+            assert done.returncode == 0, done.stderr
+            assert vast.verify_archive(archive, tmp_path / f"host-{number}") == 1
+        assert writer.poll() is None, "the writer must still run while the packs are made"
+    finally:
+        writer.kill()
+        writer.wait()
+
+
+def test_size_counts_partial_downloads_and_reads_the_exit_code(tmp_path, capsys) -> None:
+    model = tmp_path / "models" / "m"
+    (model / ".cache" / "huggingface" / "download").mkdir(parents=True)
+    (model / "config.json").write_bytes(b"x" * 10)
+    (model / ".cache" / "huggingface" / "download" / "a.incomplete").write_bytes(b"y" * 5)
+    rc = tmp_path / "download.rc"
+    assert hostrun.main(["size", "--dir", str(model), "--rc-file", str(rc)]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert (first["bytes"], first["files"], first["rc"]) == (15, 2, None)
+    assert first["disk_free_bytes"] > 0
+    rc.write_text("3\n")
+    hostrun.main(["size", "--dir", str(tmp_path / "models" / "absent"), "--rc-file", str(rc)])
+    second = json.loads(capsys.readouterr().out)
+    assert (second["bytes"], second["rc"]) == (0, 3)
 
 
 def _serve(tmp_path: Path, *extra: str, child: str) -> tuple[int, list[dict]]:
@@ -212,6 +263,8 @@ def test_serve_kills_the_server_at_the_rss_limit(tmp_path) -> None:
         child="import time; time.sleep(60)",
     )
     assert code == 1 and lines[-1]["event"] == "exit" and lines[-1]["reason"] == "rss_limit"
+    peak = lines[-1]["peak"]
+    assert peak["rss_bytes"] > 1000 and set(peak) == set(hostrun.RSS_FIELDS.values())
 
 
 def test_serve_kills_the_server_at_the_deadline(tmp_path) -> None:

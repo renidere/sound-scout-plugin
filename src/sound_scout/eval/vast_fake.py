@@ -13,18 +13,29 @@
   failure mode, since `hostrun.py serve` passes no foreign variable: `{"exit": N, "line": …}`
   prints the line and exits with N before `/health`; `{"hang": true, "child": bool, "line": …}`
   prints the line, optionally starts a `multiprocessing` child and never listens.
-- `hf download …` writes the synthetic weights of `synthetic_models`; `nvidia-smi` prints one
-  fake GPU.
+  The file may instead map a served model name to its own mode (`{"qwen3omni": {...}}`), and a
+  mode may also slow the start (`slow_start_s`), crash the server after N completions
+  (`crash_after`), never answer given completions (`hang_at`), delay answers
+  (`latency_s: {closed, review}`), set the completion tokens of a review (`review_tokens`), the
+  audio token rate (`audio_tokens_per_s`, 12.5 for `qwen3omni` and 25 otherwise by default) and
+  the answers (`answers: {closed, review}`).
+- `hf download …` writes the synthetic weights of `synthetic_models`; `fake-hf.json` maps a repo
+  to a mode: `rate_bytes_s`, `fail` (exit code), `bad_hash`, `stall_after_bytes`.
+- `nvidia-smi` prints one fake GPU; `fake-gpu.json` sets `memory_used_mib` (0 by default).
+- `Forwarder` is a loopback TCP forwarder: the dry run's stand-in for the SSH tunnel, which a
+  rehearsal can kill and the stack reopens on the same port.
 
 A dry run with these fakes proves the order and the contract of the stack, never the image,
 vLLM, the model or the provider's real behaviour.
 """
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
 import multiprocessing
+import os
 import socket
 import sys
 import threading
@@ -39,6 +50,8 @@ OFFER_ID = 4242
 FIRST_INSTANCE_ID = 900001
 PAGE_SIZE = 1
 AUDIO_TOKENS_PER_S = 25
+QWEN3_AUDIO_TOKENS_PER_S = 12.5
+MODEL_NAMES = ("qwen25omni", "qwen3omni")
 VLLM_VERSION = "0.34.0"
 MAX_MODEL_LEN = 8192
 OFFER = {
@@ -74,6 +87,10 @@ class FakeVast:
         self.foreign: list[dict] = []
         self.log: list[dict] = []
         self.credit = 10.0
+        self.offers: dict[int, dict] | None = None
+        self.spend_per_s = 0.0
+        self.credit_jumps: list[tuple[float, float]] = []
+        self.created_at: float | None = None
         self.show_until_running = 1
         self.destroy_lag = 0
         self.timeout_s = 3.0
@@ -102,6 +119,14 @@ class FakeVast:
             self._next_id += 1
             self.instances[instance_id] = self._instance(instance_id, label, **fields)
         return instance_id
+
+    def current_credit(self, now: float | None = None) -> float:
+        """The base credit less a steady spend since the create and the jumps already due."""
+        if self.created_at is None:
+            return self.credit
+        since = (time.time() if now is None else now) - self.created_at
+        jumps = sum(usd for after, usd in self.credit_jumps if since >= after)
+        return self.credit - self.spend_per_s * since - jumps
 
     def count(self, method: str, prefix: str = "") -> int:
         return sum(1 for e in self.log if e["method"] == method and e["path"].startswith(prefix))
@@ -189,8 +214,11 @@ class FakeVast:
     def _answer(self, method, parts, body, query):
         if parts[:3] == ["api", "v0", "bundles"] and method == "POST":
             wanted = ((body or {}).get("ask_contract_id") or {}).get("eq")
-            return 200, {"offers": [dict(OFFER)] if wanted == OFFER_ID else []}
+            offers = self.offers if self.offers is not None else {OFFER_ID: OFFER}
+            return 200, {"offers": [dict(offers[wanted])] if wanted in offers else []}
         if parts[:3] == ["api", "v0", "asks"] and method == "PUT":
+            if self.created_at is None:
+                self.created_at = time.time()
             instance_id = self._next_id
             self._next_id += 1
             self.instances[instance_id] = self._instance(instance_id, (body or {}).get("label"))
@@ -200,8 +228,11 @@ class FakeVast:
             if self.create_mode == "500":
                 return 500, {"error": "internal"}
             return self.create_mode
+        if parts == ["fake", "credit"] and method == "POST":
+            self.credit -= float((body or {}).get("spend", 0))
+            return 200, {"credit": self.current_credit()}
         if parts[:3] == ["api", "v0", "users"]:
-            return 200, {"credit": self.credit}
+            return 200, {"credit": self.current_credit()}
         if parts[:3] == ["api", "v1", "instances"] and method == "GET":
             filters = json.loads((query.get("select_filters") or ["{}"])[0])
             label = (filters.get("label") or {}).get("eq")
@@ -272,13 +303,54 @@ def synthetic_models() -> dict:
     return models
 
 
+FAKE_HF_FILE = "fake-hf.json"
+FAKE_GPU_FILE = "fake-gpu.json"
+ROOT_VARIABLE = "SS_FAKE_ROOT"
+
+
+def fake_root() -> Path | None:
+    """The fake host root the shims of `vast._fake_host_root` name, or None outside them."""
+    root = os.environ.get(ROOT_VARIABLE)
+    return Path(root) if root else None
+
+
+def _root_mode(name: str) -> dict:
+    root = fake_root()
+    path = None if root is None else root / name
+    return json.loads(path.read_text()) if path is not None and path.is_file() else {}
+
+
 def hf_download(argv: list[str]) -> int:
     repo = argv[1]
     revision = argv[argv.index("--revision") + 1]
     target = Path(argv[argv.index("--local-dir") + 1])
     target.mkdir(parents=True, exist_ok=True)
+    mode = _root_mode(FAKE_HF_FILE).get(repo, {})
+    if "fail" in mode:
+        print(f"fake hf download failure {mode['fail']}", file=sys.stderr)
+        return int(mode["fail"])
+    partial = target / ".cache" / "huggingface" / "download"
+    partial.mkdir(parents=True, exist_ok=True)
+    rate = mode.get("rate_bytes_s")
+    stall = mode.get("stall_after_bytes")
+    written = 0
     for path in SYNTHETIC_FILES:
-        (target / path).write_bytes(synthetic_bytes(repo, revision, path))
+        data = synthetic_bytes(repo, revision, path)
+        if mode.get("bad_hash") and path.endswith(".safetensors"):
+            data = data[:-1] + b"?"
+        incomplete = partial / f"{path}.incomplete"
+        with open(incomplete, "wb") as out:
+            for start in range(0, len(data), 256):
+                if stall is not None and written >= stall:
+                    out.flush()
+                    _sleep_forever()
+                chunk = data[start : start + 256]
+                out.write(chunk)
+                out.flush()
+                written += len(chunk)
+                if rate:
+                    time.sleep(len(chunk) / rate)
+        os.replace(incomplete, target / path)
     print(f"downloaded {len(SYNTHETIC_FILES)} files")
     return 0
 
@@ -327,12 +399,20 @@ def _sleep_forever() -> None:
         time.sleep(60)
 
 
-def _failure_mode(model_dir: Path) -> int | None:
-    """The exit code of the `exit` mode; the `hang` mode never returns; None without a file."""
+def model_mode(model_dir: Path, served: str) -> dict:
+    """The fake mode of this served model: its own entry, or a flat mode for every model."""
     path = model_dir.parents[1] / FAKE_MODE_FILE
     if not path.is_file():
-        return None
+        return {}
     mode = json.loads(path.read_text())
+    keyed = bool(mode) and set(mode) <= set(MODEL_NAMES)
+    return mode.get(served, {}) if keyed else mode
+
+
+def _failure_mode(mode: dict) -> int | None:
+    """The exit code of the `exit` mode; the `hang` mode never returns; None otherwise."""
+    if "exit" not in mode and not mode.get("hang"):
+        return None
     print(mode.get("line", "fake vllm failure mode"), flush=True)
     if "exit" in mode:
         return int(mode["exit"])
@@ -358,9 +438,17 @@ def vllm(argv: list[str]) -> int:
         print(f"no model directory {model_dir.name}", file=sys.stderr)
         return 1
     print(f"guard_probe: {_guard_probe()}", flush=True)
-    code = _failure_mode(model_dir)
+    mode = model_mode(model_dir, served)
+    code = _failure_mode(mode)
     if code is not None:
         return code
+    time.sleep(float(mode.get("slow_start_s", 0)))
+    default_rate = QWEN3_AUDIO_TOKENS_PER_S if served == "qwen3omni" else AUDIO_TOKENS_PER_S
+    rate = float(mode.get("audio_tokens_per_s", default_rate))
+    latency = mode.get("latency_s") or {}
+    answers = mode.get("answers") or {}
+    completions = {"count": 0}
+    counter = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:
@@ -396,10 +484,24 @@ def vllm(argv: list[str]) -> int:
                 )
             if self.path != "/v1/chat/completions":
                 return self._reply(404, {"error": "not found"})
+            with counter:
+                completions["count"] += 1
+                number = completions["count"]
+            if "crash_after" in mode and number > int(mode["crash_after"]):
+                print(f"fake engine crash after {mode['crash_after']} completions", flush=True)
+                os._exit(1)
+            if number in mode.get("hang_at", ()):
+                time.sleep(3600)
             seconds = _audio_seconds(messages)
-            prompt = _text_tokens(messages) + round(AUDIO_TOKENS_PER_S * seconds)
+            prompt = _text_tokens(messages) + round(rate * seconds)
             json_answer = (body.get("response_format") or {}).get("type") == "json_object"
-            content = json.dumps(EMPTY_REVIEW) if json_answer else "тон"
+            if json_answer:
+                content = json.dumps(answers.get("review", EMPTY_REVIEW), ensure_ascii=False)
+                tokens = int(mode.get("review_tokens", 1))
+            else:
+                content, tokens = answers.get("closed", "тон"), 1
+            tokens = min(tokens, int(body.get("max_tokens") or tokens))
+            time.sleep(float(latency.get("review" if json_answer else "closed", 0)))
             self._reply(
                 200,
                 {
@@ -413,7 +515,7 @@ def vllm(argv: list[str]) -> int:
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": {"prompt_tokens": prompt, "completion_tokens": 1},
+                    "usage": {"prompt_tokens": prompt, "completion_tokens": tokens},
                 },
             )
 
@@ -425,10 +527,72 @@ def vllm(argv: list[str]) -> int:
 
 def nvidia_smi(argv: list[str]) -> int:
     if any(arg.startswith("--query-gpu=memory.used") for arg in argv):
-        print("1024")
+        print(int(_root_mode(FAKE_GPU_FILE).get("memory_used_mib", 0)))
     else:
         print("Fake A100 SXM4, 81920 MiB, 595.91.07")
     return 0
+
+
+class Forwarder:
+    """127.0.0.1:`port` → 127.0.0.1:`target`, one thread per connection; `stop` closes the
+    listener and every open connection, as a dead SSH tunnel would."""
+
+    def __init__(self, target: int, port: int = 0) -> None:
+        self.target = target
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((HOST, port))
+        self._listener.listen(16)
+        self.port = self._listener.getsockname()[1]
+        self._open: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+        self._thread.start()
+
+    def alive(self) -> bool:
+        return not self._stopped.is_set()
+
+    def _accept(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection((HOST, self.target), timeout=5)
+            except OSError:
+                client.close()
+                continue
+            upstream.settimeout(None)
+            with self._lock:
+                self._open += [client, upstream]
+            for source, sink in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._copy, args=(source, sink), daemon=True).start()
+
+    @staticmethod
+    def _copy(source: socket.socket, sink: socket.socket) -> None:
+        try:
+            while data := source.recv(1 << 16):
+                sink.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (source, sink):
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+    def stop(self) -> None:
+        self._stopped.set()
+        with contextlib.suppress(OSError):
+            self._listener.close()
+        with self._lock:
+            for sock in self._open:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+                with contextlib.suppress(OSError):
+                    sock.close()
+            self._open.clear()
 
 
 def main(argv: list[str] | None = None) -> int:

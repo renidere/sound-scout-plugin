@@ -1,7 +1,7 @@
 """Host side of a GPU reference run (#147): `serve`, `stop`, `state`, `evidence`, `selftest`,
-`preflight`, `weights`, `pack`. Stdlib only (`preflight` reads the image's own torch), Python
-3.10+, never imports `sound_scout`: the station copies this file and `guard/sitecustomize.py` to
-`/workspace/ss/` and checks their SHA-256 there before use.
+`preflight`, `weights`, `pack`, `size`. Stdlib only (`preflight` reads the image's own torch),
+Python 3.10+, never imports `sound_scout`: the station copies this file and
+`guard/sitecustomize.py` to `/workspace/ss/` and checks their SHA-256 there before use.
 
 `serve` starts the vLLM server in a new session with an allowlisted environment, offline
 variables and the audit-hook guard on `PYTHONPATH`. Every `POLL_S` it reads the socket inodes of
@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import hashlib
 import importlib.metadata
+import io
 import ipaddress
 import json
 import os
@@ -212,9 +213,19 @@ def _kill_session(child: subprocess.Popen, sig: int) -> None:
             os.kill(pid, sig)
 
 
-def monitor(child, *, deadline: float, rss_limit: int, stats: Path, stop: threading.Event):
-    """Watch the session of `child` until it exits or a limit ends it; the reason or None."""
+def monitor(
+    child,
+    *,
+    deadline: float,
+    rss_limit: int,
+    stats: Path,
+    stop: threading.Event,
+    peaks: dict | None = None,
+):
+    """Watch the session of `child` until it exits or a limit ends it; the reason or None.
+    `peaks` gets the maximum of every memory field over all polls, not only the stats lines."""
     next_stats = 0.0
+    peaks = {} if peaks is None else peaks
     while child.poll() is None:
         pids = session_pids(child.pid)
         reason = None
@@ -225,6 +236,8 @@ def monitor(child, *, deadline: float, rss_limit: int, stats: Path, stop: thread
             child.wait()
             return "violation"
         memory = tree_memory(pids)
+        for name, value in memory.items():
+            peaks[name] = max(peaks.get(name, 0), value)
         rss = memory["rss_bytes"]
         if time.monotonic() >= next_stats:
             next_stats = time.monotonic() + STATS_S
@@ -269,13 +282,25 @@ def serve(args) -> int:
     if args.pid_file:
         Path(args.pid_file).write_text(str(os.getpid()))
     _write_line(args.stats, {"event": "started", "t": time.time(), "pid": child.pid})
+    peaks: dict = {}
     reason = monitor(
-        child, deadline=args.deadline, rss_limit=args.rss_limit, stats=args.stats, stop=stop
+        child,
+        deadline=args.deadline,
+        rss_limit=args.rss_limit,
+        stats=args.stats,
+        stop=stop,
+        peaks=peaks,
     )
     _kill_session(child, signal.SIGKILL)
     _write_line(
         args.stats,
-        {"event": "exit", "t": time.time(), "reason": reason, "returncode": child.returncode},
+        {
+            "event": "exit",
+            "t": time.time(),
+            "reason": reason,
+            "returncode": child.returncode,
+            "peak": peaks,
+        },
     )
     return 0 if reason in (None, "stopped") else 1
 
@@ -682,23 +707,67 @@ def sha256_file(path: Path) -> str:
     return _digest(path, "sha256", 0)
 
 
+def _member(archive: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+    archive.addfile(info, io.BytesIO(data))
+
+
 def pack(args) -> int:
-    """`SHA256SUMS` of every regular file under the root (no symlinks), then one tar of both."""
+    """One tar of every regular file under the root (no symlinks) and their `SHA256SUMS`. Each
+    file is read once and the same bytes are hashed and archived, so a log the live server still
+    appends to is packed as it was at that read and its sum matches (#149)."""
     root, out = Path(args.root), Path(args.out)
     sums = []
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        if path.is_symlink() or not path.is_file() or relative == SUMS_FILE:
-            continue
-        if path.resolve() == out.resolve():
-            continue
-        sums.append((relative, sha256_file(path)))
-    (root / SUMS_FILE).write_text("".join(f"{digest}  {name}\n" for name, digest in sums))
     with tarfile.open(out, "w") as archive:
-        for name, _ in sums:
-            archive.add(root / name, arcname=name, recursive=False)
-        archive.add(root / SUMS_FILE, arcname=SUMS_FILE, recursive=False)
-    print(json.dumps({"archive_sha256": sha256_file(out), "files": len(sums)}))
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink() or not path.is_file() or relative == SUMS_FILE:
+                continue
+            if path.resolve() == out.resolve():
+                continue
+            data = path.read_bytes()
+            sums.append((relative, hashlib.sha256(data).hexdigest()))
+            _member(archive, relative, data)
+        listing = "".join(f"{digest}  {name}\n" for name, digest in sums).encode()
+        _member(archive, SUMS_FILE, listing)
+    print(
+        json.dumps(
+            {
+                "archive_sha256": sha256_file(out),
+                "files": len(sums),
+                "disk_free_bytes": shutil.disk_usage(out.parent).free,
+            }
+        )
+    )
+    return 0
+
+
+def size_command(args) -> int:
+    """Bytes under a directory (partial downloads in `.cache` too), the free disk there and the
+    exit code a background download wrote to `--rc-file` (None while it runs)."""
+    directory = Path(args.dir)
+    total = files = 0
+    for path in directory.rglob("*") if directory.is_dir() else ():
+        with contextlib.suppress(OSError):
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+                files += 1
+    rc = None
+    if args.rc_file:
+        with contextlib.suppress(OSError, ValueError):
+            rc = int(Path(args.rc_file).read_text().strip())
+    probe = directory if directory.is_dir() else directory.parent
+    print(
+        json.dumps(
+            {
+                "bytes": total,
+                "files": files,
+                "disk_free_bytes": shutil.disk_usage(probe).free,
+                "rc": rc,
+            }
+        )
+    )
     return 0
 
 
@@ -735,6 +804,9 @@ def main(argv=None) -> int:
     pack_ = commands.add_parser("pack")
     pack_.add_argument("--root", required=True)
     pack_.add_argument("--out", required=True)
+    size_ = commands.add_parser("size")
+    size_.add_argument("--dir", required=True)
+    size_.add_argument("--rc-file")
     args = parser.parse_args(argv)
     if args.command == "serve":
         if args.argv[:1] == ["--"]:
@@ -750,6 +822,7 @@ def main(argv=None) -> int:
         "preflight": preflight,
         "weights": weights,
         "pack": pack,
+        "size": size_command,
     }
     return handlers[args.command](args)
 

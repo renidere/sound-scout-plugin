@@ -106,7 +106,7 @@ def probe_sentence(**changes) -> synthetic.Sentence:
 
 @pytest.fixture(autouse=True)
 def piper_free_config(monkeypatch) -> None:
-    monkeypatch.setattr(synthetic, "_synthesis_config", lambda: None)
+    monkeypatch.setattr(synthetic, "_synthesis_config", lambda *_: None)
 
 
 # --- one clip -----------------------------------------------------------------------------------

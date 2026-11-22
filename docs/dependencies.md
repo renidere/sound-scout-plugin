@@ -380,7 +380,10 @@ GigaChat3.1-Audio-10B-A1.8B (spike #85):
 закреплённом коммите. Лицензия DEMAND расходится: текст записи Zenodo — CC BY-SA 3.0, поле
 лицензии — CC BY 4.0; принята более строгая CC BY-SA 3.0. Шумы MS-SNSD — Freesound CC0 по README
 набора (код MIT); источник отдельного файла README не называет. Как из них собран корпус —
-`docs/decisions/0009-corpus-pilot-1.md`.
+`docs/decisions/0009-corpus-pilot-1.md`. Исключение для #149 (решение владельца
+[7085422087](https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7085422087)):
+реплики RINCO без файлов `pilot-1` идут к моделям на арендованном инстансе этой задачи —
+`docs/decisions/0028-gpu-reference-gate0.md`, «Дополнение 2026-11-23», Д.7.
 
 | Набор | Версия / ревизия | Файл | Источник (URL) | Лицензия | Байт | Сумма издателя | SHA-256 |
 |---|---|---|---|---|---|---|---|
@@ -414,7 +417,9 @@ backend и в `analyze` не входит: он только создаёт си
 CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более строгая CC BY-NC 4.0. Голос `denis` дообучен
 от базовой модели `rdh` (CC0) и по `MODEL_CARD` требует Piper ≥ 1.5. Манифест
 `asr_calls_2_val.csv` не скачивается: пары wav/txt берутся из самого архива. Правила —
-`docs/decisions/0012-synthetic-diction-and-openstt.md`.
+`docs/decisions/0012-synthetic-diction-and-openstt.md`. Исключение для #149 (решение владельца
+7085422087): 20 новых фраз голоса `denis` вне `pilot-1` (`synthetic.GPU_EXT_SENTENCES`) идут к
+моделям на арендованном инстансе этой задачи — `0028`, «Дополнение 2026-11-23», Д.7.
 
 | Набор | Версия / ревизия | Файл | Источник (URL) | Лицензия | Байт | Сумма издателя | SHA-256 |
 |---|---|---|---|---|---|---|---|

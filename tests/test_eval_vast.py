@@ -26,11 +26,11 @@ import numpy as np
 import pytest
 
 from sound_scout import config
-from sound_scout.eval import gate0, vast, vast_fake
+from sound_scout.eval import gate0, gpu_ext, vast, vast_fake
 from sound_scout.smoke import speech_like_control
 
 REPO = Path(__file__).resolve().parent.parent
-DRY_STEPS = ["create", "ready", "weights", "smoke", "run", "download", "destroy"]
+DRY_STEPS = ["create", "ready", "weights", "smoke", "run", "extended", "download", "destroy"]
 
 
 @pytest.fixture
@@ -1034,19 +1034,63 @@ def test_timing_document_records_attempt_3_of_the_pilot() -> None:
 def test_example_package_loads_and_holds_no_secret() -> None:
     path = REPO / "docs" / "examples" / "gpu-package.example.json"
     package, digest = vast.load_package(path, vast.MODELS)
-    assert len(digest) == 64 and package["ceiling_usd"] == 4.0
+    assert len(digest) == 64 and package["ceiling_usd"] == 3.0
+    assert vast.offer_ids(package) == [34475479, 34475480]
     vast.check_no_secret(path.read_bytes(), None)
+
+
+def _model_limit(index: int, **fields) -> dict:
+    package = json.loads((REPO / "docs/examples/gpu-package.example.json").read_text())
+    package["models"][index].update(fields)
+    return {"models": package["models"]}
 
 
 @pytest.mark.parametrize(
     "change",
-    [{"ceiling_usd": math.inf}, {"early_stop_usd": 5.0}, {"envelope": {}}, {"models": []}],
-    ids=["inf", "early-over-ceiling", "no-dph-bound", "no-models"],
+    [
+        {"ceiling_usd": math.inf},
+        {"early_stop_usd": 5.0},
+        {"envelope": {}},
+        {"models": []},
+        {"deadline_minutes": 121},
+        {"soft_end_minutes": 105},
+        {"soft_end_minutes": None, "weights_late_minutes": 25},
+        {"spend_soft_usd": 2.3},
+        {"offer_ids": []},
+        {"offer_ids": [1, 1]},
+        {"offer_ids": [1, 2, 3, 4]},
+        {"offer_ids": [1], "offer_id": 1},
+        {"extended": {"dir": "../x", "manifest_sha256": "0" * 64, "plan_sha256": "0" * 64}},
+        {"extended": {"dir": "x", "manifest_sha256": "0" * 63}},
+        {"closed_timeout_s": 0},
+        _model_limit(0, slot_minutes=-1),
+        _model_limit(1, health_timeout_s=0),
+    ],
+    ids=[
+        "inf",
+        "early-over-ceiling",
+        "no-dph-bound",
+        "no-models",
+        "deadline-over-120",
+        "soft-end-at-deadline",
+        "weights-late-without-soft-end",
+        "spend-soft-over-early-stop",
+        "no-offers",
+        "same-offer-twice",
+        "four-offers",
+        "offer-id-and-offer-ids",
+        "extended-dir-outside",
+        "extended-bad-pin",
+        "zero-timeout",
+        "negative-slot",
+        "zero-health-timeout",
+    ],
 )
 def test_a_malformed_package_is_refused(tmp_path: Path, change) -> None:
     package = json.loads((REPO / "docs/examples/gpu-package.example.json").read_text())
     path = tmp_path / "p.json"
-    path.write_text(json.dumps({**package, **change}, allow_nan=True))
+    changed = {k: v for k, v in {**package, **change}.items() if v is not None}
+    path.write_text(json.dumps(changed, allow_nan=True))
     with pytest.raises(vast.VastError):
         vast.load_package(path, vast.MODELS)
 
@@ -1077,10 +1121,17 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
         "weights",
         "smoke",
         "run",
+        "extended",
+        "weights",
         "smoke",
         "run",
+        "extended",
         "download",
         "destroy",
+    ]
+    assert [(m["model"], m["outcome"]) for m in result["models"]] == [
+        ("qwen25omni", "ok"),
+        ("qwen3omni", "ok"),
     ]
     assert all(step["ok"] for step in result["steps"])
     (preflight,) = [step for step in result["steps"] if step["name"] == "preflight"]
@@ -1121,8 +1172,17 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
     assert per_model == [
         f"{event}:{model}"
         for model in ("qwen25omni", "qwen3omni")
-        for event in ("step:smoke", "server_evidence:", "step:run", "server_stopped:")
+        for event in (
+            "step:weights",
+            "step:smoke",
+            "step:run",
+            "step:extended",
+            "server_evidence:",
+            "server_stopped:",
+        )
     ]
+    syncs = [e for e in events if e["event"] == "sync"]
+    assert len(syncs) == 2 * len(gpu_ext.BLOCKS) and all(e["ok"] for e in syncs)
     assert all(e["returncode"] == 0 for e in events if e["event"] == "server_stopped")
     assert sorted(p.name for p in (out / "gpu" / result["attempt_id"]).glob("evidence-*")) == [
         "evidence-qwen25omni.json",
@@ -1136,7 +1196,9 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
     assert (credit["credit"], credit["initial_credit"], credit["delta_usd"]) == (10.0, 10.0, 0.0)
     assert credit["since_closed_s"] >= 0 and credit["t"] >= result["closed"]["t"]
     assert result["credit_after_close"] == credit
-    assert sum(e["path"] == "/api/v0/users/current/" for e in log) == 2
+    credit_reads = sum(e["event"] == "credit_seen" for e in events)
+    assert credit_reads == len(syncs)
+    assert sum(e["path"] == "/api/v0/users/current/" for e in log) == 2 + credit_reads
     host = out / "gpu" / result["attempt_id"] / "host"
     assert (host / "guard-selftest.json").is_file()
     assert json.loads((host / "guard-selftest.json").read_text())["ok"] is True
@@ -1268,10 +1330,12 @@ def test_a_failed_credit_read_after_close_is_journaled_and_changes_nothing(
     monkeypatch.setattr(vast.config, "load", lambda: config_)
     out = tmp_path / "data" / "dry"
     assert vast.main(["dry-run", "--out", str(out)]) == 0
-    assert len(calls) == 2
     assert json.loads(capsys.readouterr().out)["closed"]["event"] == "closed"
     (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
     events = vast.Journal(journal_path).replay()
+    seen = [e for e in events if e["event"] == "credit_seen"]
+    assert len(calls) == 2 + len(seen) and seen
+    assert all(e["error"].endswith(f"echo {vast.REDACTED}") for e in seen)
     kinds = [e["event"] for e in events]
     assert kinds[-3:] == ["closed", "step", "credit_after_close"]
     assert events[-2]["name"] == "destroy" and events[-2]["ok"] is True
@@ -1470,7 +1534,7 @@ class _JsonHost:
         name = argv[2] if argv[:2] == ["python3", vast.HOSTRUN] else argv[0]
         return vast.proc.RunResult(0, self.stdout[name], b"", False, False, 0.0)
 
-    def get(self, remote, local):
+    def get(self, remote, local, timeout=1800.0):
         self.got.append(remote)
         local.write_bytes(self.archive.read_bytes())
 
@@ -1522,6 +1586,7 @@ def test_download_takes_the_json_object_pack_prints(tmp_path: Path) -> None:
     assert vast.download(host, tmp_path / "attempt", journal, 60) == {
         "archive_sha256": digest,
         "files": 1,
+        "disk_free_bytes": None,
     }
     assert host.got == [f"{vast.WORKSPACE}/results.tar"]
 
@@ -1623,10 +1688,13 @@ def _no_key_anywhere(out: Path) -> None:
 def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monkeypatch) -> None:
     _with_fake_vllm_mode(monkeypatch, {"exit": 3, "line": "fake engine core died"})
     attempt, events = _failed_dry_run(
-        tmp_path, r"exited before /health \(reason None, exit code 3\)"
+        tmp_path,
+        r"no model gave a Gate 0 verdict: qwen25omni: smoke: .*exited before /health "
+        r"\(reason None, exit code 3\)",
     )
-    (smoke,) = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
-    assert smoke["ok"] is False and smoke["model"] == "qwen25omni"
+    smokes = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
+    assert [(e["model"], e["ok"]) for e in smokes] == [("qwen25omni", False), ("qwen3omni", False)]
+    smoke = smokes[0]
     assert smoke["detail"]["server_exit"] == {"reason": None, "returncode": 3}
     assert smoke["elapsed_s"] < vast.DRY_INTERVALS["health_timeout_s"] / 4
     assert "state_errors" not in smoke["detail"]
@@ -1634,6 +1702,14 @@ def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monke
         "step:smoke",
         "server_evidence",
         "server_stopped",
+        "model_outcome",
+        "weights_started",
+        "gpu_free",
+        "step:smoke",
+        "server_evidence",
+        "server_stopped",
+        "model_outcome",
+        "download_verified",
         "destroy_requested",
         "destroy_response",
         "absence_verified",
@@ -1641,7 +1717,7 @@ def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monke
         "step:destroy",
         "credit_after_close",
     ]
-    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    evidence = next(e for e in events if e["event"] == "server_evidence")
     assert "fake engine core died" in evidence["tails"]["server.log"]
     assert '"returncode": 3' in evidence["tails"]["server-stats.jsonl"]
 
@@ -1652,15 +1728,15 @@ def test_a_failed_smoke_journals_the_log_tail_and_the_process_list_before_destro
     _with_fake_vllm_mode(monkeypatch, {"hang": True, "child": True, "line": "fake loading forever"})
     monkeypatch.setattr(vast, "DRY_INTERVALS", {**vast.DRY_INTERVALS, "health_timeout_s": 4.0})
     attempt, events = _failed_dry_run(tmp_path, "did not answer /health in time")
-    (smoke,) = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
+    smoke = next(e for e in events if e["event"] == "step" and e["name"] == "smoke")
     assert "server_exit" not in smoke["detail"]
     assert _after_failure(events, "smoke")[:4] == [
         "step:smoke",
         "server_evidence",
         "server_stopped",
-        "destroy_requested",
+        "model_outcome",
     ]
-    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    evidence = next(e for e in events if e["event"] == "server_evidence")
     assert evidence["model"] == "qwen25omni" and evidence["file"] == "evidence-qwen25omni.json"
     assert "fake loading forever" in evidence["tails"]["server.log"]
     assert all(
@@ -1696,15 +1772,18 @@ def test_a_failed_run_also_journals_evidence(tmp_path, monkeypatch) -> None:
         raise vast.VastError("gate0 runner broke")
 
     monkeypatch.setattr(vast.gate0, "run_spike", broken)
-    attempt, events = _failed_dry_run(tmp_path, "gate0 runner broke")
-    assert not [e for e in events if e.get("model") == "qwen3omni"]
+    attempt, events = _failed_dry_run(tmp_path, "qwen25omni: run: gate0 runner broke")
     assert _after_failure(events, "run")[:4] == [
         "step:run",
         "server_evidence",
         "server_stopped",
-        "destroy_requested",
+        "model_outcome",
     ]
-    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    outcomes = [
+        (e["model"], e["outcome"], e["step"]) for e in events if e["event"] == "model_outcome"
+    ]
+    assert outcomes == [("qwen25omni", "failed", "run"), ("qwen3omni", "failed", "run")]
+    evidence = next(e for e in events if e["event"] == "server_evidence")
     assert "serving qwen25omni" in evidence["tails"]["server.log"]
     assert (attempt / "evidence-qwen25omni.json").is_file()
 
@@ -1738,7 +1817,12 @@ def test_a_server_that_dies_during_a_run_with_a_verdict_journals_evidence(
     assert second["model"] == "qwen3omni" and '"returncode": -9' not in str(second["tails"])
     assert '"returncode": -9' in evidence["tails"]["server-stats.jsonl"]
     assert (journal_path.parent / "evidence-qwen25omni.json").is_file()
-    assert events.index(evidence) < events.index(runs["qwen25omni"])
+    assert events.index(runs["qwen25omni"]) < events.index(evidence)
+    extended = next(e for e in events if e["event"] == "step" and e["name"] == "extended")
+    assert (
+        extended["model"] == "qwen25omni" and extended["detail"]["stop_reason"] == "server_exited"
+    )
+    assert all(b["sent"] == 0 for b in extended["detail"]["blocks"].values())
 
 
 def test_a_cancellation_during_evidence_after_a_run_still_destroys(tmp_path, monkeypatch) -> None:
@@ -1755,10 +1839,12 @@ def test_a_cancellation_during_evidence_after_a_run_still_destroys(tmp_path, mon
         vast.dry_run(out, _dry_config(tmp_path))
     (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
     events = vast.Journal(journal_path).replay()
-    runs = [e for e in events if e["event"] == "step" and e["name"] == "run"]
-    assert [(e["model"], e["ok"]) for e in runs] == [("qwen25omni", False)]
+    runs = [e for e in events if e["event"] == "step" and e["name"] in ("run", "extended")]
+    assert [(e["model"], e["ok"]) for e in runs] == [("qwen25omni", True), ("qwen25omni", True)]
+    assert not [e for e in events if e["event"] == "step" and e.get("model") == "qwen3omni"]
     (evidence,) = [e for e in events if e["event"] == "server_evidence"]
     assert evidence["error"] == "KeyboardInterrupt: "
+    assert any(e["event"] == "download_verified" for e in events)
     names = [e["event"] for e in events]
     assert names.index("server_stopped") < names.index("destroy_requested")
     assert vast.summarize(events)["closed"] is not None
@@ -1779,7 +1865,7 @@ def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -
 
     monkeypatch.setattr(vast.LocalHost, "run", run)
     attempt, events = _failed_dry_run(tmp_path, "exited before /health")
-    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    evidence = next(e for e in events if e["event"] == "server_evidence")
     assert evidence["model"] == "qwen25omni" and "processes" not in evidence
     assert (
         evidence["error"]
@@ -1788,12 +1874,16 @@ def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -
             "raises": "OSError: ssh dropped",
         }[failure]
     )
-    assert _after_failure(events, "smoke")[1:6] == [
+    assert _after_failure(events, "smoke")[1:4] == [
         "server_evidence",
         "server_stopped",
+        "model_outcome",
+    ]
+    assert _after_failure(events, "smoke")[-6:-2] == [
         "destroy_requested",
         "destroy_response",
         "absence_verified",
+        "closed",
     ]
     assert [e["event"] for e in events[-2:]] == ["step", "credit_after_close"]
     assert events[-2]["name"] == "destroy" and events[-2]["ok"]
@@ -2116,7 +2206,7 @@ def _stack(tmp_path: Path, config_: config.Config, package: dict) -> Path:
 def test_the_two_model_package_runs_each_full_day_under_its_rule_on_a_fresh_server(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(vast_fake, "OFFER", {**vast_fake.OFFER, "dph_total": 0.85})
+    monkeypatch.setattr(vast_fake, "OFFER", {**vast_fake.OFFER, "dph_total": 0.7})
     config_ = _dry_config(tmp_path)
     v1, v2 = _full_days(config_)
     assert [clip["id"] for clip in v1["clips"]] == [
@@ -2168,7 +2258,10 @@ def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
 
     monkeypatch.setattr(vast.LocalHost, "run", run)
     attempt, events = _failed_dry_run(tmp_path, "server of qwen25omni did not stop")
-    assert not [e for e in events if e.get("model") == "qwen3omni"]
+    assert not [e for e in events if e["event"] == "step" and e.get("model") == "qwen3omni"]
+    (outcome,) = [e for e in events if e["event"] == "model_outcome"]
+    assert outcome["model"] == "qwen25omni" and outcome["outcome"] == "ok"
+    assert any(e["event"] == "download_verified" for e in events)
     (stopped,) = [e for e in events if e["event"] == "server_stopped"]
     assert stopped["returncode"] == 1
     assert [e["event"] for e in events].count("absence_verified") == 1
@@ -2177,20 +2270,21 @@ def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
 
 
 @pytest.mark.parametrize(
-    ("dph", "refused"), [(1.2, True), (0.85, False)], ids=["over-cap", "within-cap"]
+    ("dph", "refused"), [(1.2, True), (0.7, False)], ids=["over-cap", "within-cap"]
 )
-def test_the_estimate_covers_the_whole_package_up_to_the_deadline(
+def test_the_estimate_covers_the_whole_package_up_to_the_deadline_and_the_cutoff_grace(
     tmp_path: Path, key_file, fake, monkeypatch, dph, refused
 ) -> None:
     monkeypatch.setattr(vast_fake, "OFFER", {**vast_fake.OFFER, "dph_total": dph})
     journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
     api = vast.Api(fake.url, key_file[1])
     package = _reference_package(envelope={"dph_total": {"lte": 2.0}})
-    assert vast.estimate_usd(vast_fake.OFFER, 1.0, package["in_gb"], 1.0) == pytest.approx(
-        dph + 102.95 * 0.0026042 + 0.0039063
+    assert vast.estimate_hours(package) == pytest.approx(75 / 60)
+    assert vast.estimate_usd(vast_fake.OFFER, 1.25, package["in_gb"], 1.0) == pytest.approx(
+        1.25 * dph + 102.95 * 0.0026042 + 0.0039063
     )
     if refused:
-        with pytest.raises(vast.VastError, match=r"estimate 1\.47 USD is over the ceiling"):
+        with pytest.raises(vast.VastError, match=r"estimate 1\.77 USD is over the ceiling"):
             vast.create_instance(api, journal, package, _no_system)
         assert fake.count("PUT") == 0
     else:
@@ -2258,3 +2352,168 @@ def test_the_0028_package_loads_with_a_quote_and_pins_the_rules_and_clips_it_lis
     argv = vast.vllm_argv("/m", "m")
     assert "`--no-enable-prefix-caching`" in text and "`--mm-processor-cache-gb 0`" in text
     assert "--no-enable-prefix-caching" in argv
+
+
+# --- the $3 package of #149: offers, the extended set, the soft stop ------------------------
+
+
+def test_create_passes_over_a_gone_or_dear_offer_to_the_next_approved_one(
+    tmp_path: Path, key_file, fake
+) -> None:
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    second, third = vast_fake.OFFER_ID + 1, vast_fake.OFFER_ID + 2
+    fake.offers = {
+        second: {**vast_fake.OFFER, "ask_contract_id": second, "dph_total": 9.0},
+        third: {**vast_fake.OFFER, "ask_contract_id": third},
+    }
+    package = _package(offer_ids=[vast_fake.OFFER_ID, second, third], deadline_minutes=100)
+    del package["offer_id"]
+    api = vast.Api(fake.url, key_file[1])
+    assert vast.create_instance(api, journal, package, _no_system)
+    events = journal.replay()
+    skipped = [(e["offer_id"], e["reason"]) for e in events if e["event"] == "offer_skipped"]
+    assert skipped[0] == (vast_fake.OFFER_ID, f"offer {vast_fake.OFFER_ID} is not available")
+    assert skipped[1][0] == second and "dph_total" in skipped[1][1]
+    (requested,) = [e for e in events if e["event"] == "create_requested"]
+    assert requested["offer_id"] == third
+    assert requested["prices"]["dph_total"] == vast_fake.OFFER["dph_total"]
+    assert fake.count("PUT") == 1 and fake.count("PUT", f"/api/v0/asks/{third}/") == 1
+
+
+def test_no_approved_offer_means_no_put_and_names_every_reason(
+    tmp_path: Path, key_file, fake
+) -> None:
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    fake.offers = {}
+    package = _package(offer_ids=[11, 12], deadline_minutes=100)
+    del package["offer_id"]
+    with pytest.raises(vast.VastError, match="create refused: 11: offer 11 .*; 12: offer 12"):
+        vast.create_instance(vast.Api(fake.url, key_file[1]), journal, package, _no_system)
+    assert fake.count("PUT") == 0
+
+
+def test_the_extended_set_must_match_its_pins_and_hold_no_gate0_clip(tmp_path: Path) -> None:
+    config_ = _dry_config(tmp_path)
+    found = gpu_ext.fixture(config_.data_root / "gpu-ext-x")
+    extended = {"dir": "gpu-ext-x", **{k: found[k] for k in ("manifest_sha256", "plan_sha256")}}
+    package = {"models": [{"clips": {"B1": "f" * 64}}], "extended": extended}
+    directory, manifest, entries = vast.check_extended(package, config_)
+    assert directory.name == "gpu-ext-x" and len(entries) == sum(
+        c["requests"] for c in found["counts"].values()
+    )
+    stolen = manifest["clips"][0]["wav_sha256"]
+    with pytest.raises(vast.VastError, match="pilot-1 or of a Gate 0 day"):
+        vast.check_extended({**package, "models": [{"clips": {"B1": stolen}}]}, config_)
+    with pytest.raises(vast.VastError, match="differs from the SHA-256 the package pins"):
+        vast.check_extended({**package, "extended": {**extended, "plan_sha256": "0" * 64}}, config_)
+    assert vast.check_extended({"models": []}, config_) is None
+
+
+def _soft_run(tmp_path: Path, fake, key_file, **package) -> vast.Run:
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    api = vast.Api(fake.url, key_file[1])
+    return vast.Run(api, journal, {**_package(), **package}, {}, None, vast.DRY_INTERVALS, None)
+
+
+def test_the_soft_stop_names_the_soft_end_the_spend_and_a_watchdog_destroy(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _soft_run(tmp_path, fake, key_file, spend_soft_usd=2.0)
+    assert vast.soft_stop(run) is None
+    run.soft_end = time.time() - 1
+    assert vast.soft_stop(run) == "soft_end"
+    run.soft_end = None
+    run.journal.append(
+        "create_requested",
+        offer_id=1,
+        prices={"dph_total": 1e7, "inet_down_cost": 0.0, "inet_up_cost": 0.0},
+    )
+    run.journal.append("create_response", instance_id=7)
+    time.sleep(0.01)
+    assert vast.spent_estimate(run) > 2.0 and vast.soft_stop(run) == "spend"
+    run.package["spend_soft_usd"] = 1e9
+    assert vast.soft_stop(run) is None
+    fake.credit = 1.0
+    run.package["spend_soft_usd"] = 9.0
+    vast.check_credit(run)
+    seen = [e for e in run.journal.replay() if e["event"] == "credit_seen"]
+    assert seen[-1]["spent_usd"] == 9.0
+    assert run.spend_seen and vast.soft_stop(run) == "spend"
+    run.journal.append("destroy_requested", instance_id=7, reason="early_stop")
+    assert vast.soft_stop(run) == "watchdog"
+    run.fatal = "ssh_lost"
+    assert vast.soft_stop(run) == "ssh_lost"
+
+
+def test_the_0028_addendum_package_loads_with_a_quote_and_pins_the_set_and_its_code(
+    tmp_path: Path,
+) -> None:
+    text = (REPO / "docs/decisions/0028-gpu-reference-gate0.md").read_text(encoding="utf-8")
+    addendum = text.split("\n## Дополнение 2026-11-23: пакет $3 и расширенный набор\n", 1)[1]
+    block = addendum.split("```json\n", 1)[1].split("\n```", 1)[0]
+    package = json.loads(block)
+    assert "offer_ids" not in package and "dph_total" not in package["envelope"]
+    package["offer_ids"] = [vast_fake.OFFER_ID, vast_fake.OFFER_ID + 1]
+    package["envelope"]["dph_total"] = {"lte": 1.2}
+    loaded = _load(tmp_path, package)
+    assert (loaded["ceiling_usd"], loaded["early_stop_usd"], loaded["deadline_minutes"]) == (
+        3.0,
+        2.25,
+        100,
+    )
+    assert loaded["early_stop_usd"] == 0.75 * loaded["ceiling_usd"]
+    assert loaded["deadline_minutes"] + vast.LOST_CREATE_GRACE_S / 60 <= 120
+    assert loaded["soft_end_minutes"] == loaded["deadline_minutes"] - 15
+    assert loaded["envelope"]["disk_space"] == {"gte": loaded["disk_gb"]} == {"gte": 150}
+    worst = vast.estimate_usd(
+        {"dph_total": 1.2, "inet_down_cost": 0.0043, "inet_up_cost": 0.0043},
+        vast.estimate_hours(loaded),
+        loaded["in_gb"],
+        loaded["out_gb"],
+    )
+    assert worst == pytest.approx(2.748, abs=0.001) and worst <= loaded["ceiling_usd"] - 0.25
+    assert [e["name"] for e in loaded["models"]] == ["qwen25omni", "qwen3omni"]
+    assert loaded["models"][0]["slot_minutes"] == 25 and "slot_minutes" not in loaded["models"][1]
+    for entry in loaded["models"]:
+        assert list(entry["clips"]) == ["B1", "V1", "B2", "V2", "B3", "V3", "S0", "N1", "T1"]
+    extended = loaded["extended"]
+    for name in ("manifest.json", "plan.json"):
+        digest = extended[f"{name.split('.')[0]}_sha256"]
+        assert f"| `{name}` | `{digest}` |" in addendum
+    assert f"`{gpu_ext.questions_sha256()}`" in addendum
+    assert f"`{gate0.questions_sha256()}`" in addendum and f"`{gate0.PROMPT_SHA256}`" in addendum
+    assert f"| `gpu_ext.py` при `prepare` (план и анализ) | `{gpu_ext.code_sha256()}` |" in addendum
+    assert f"`{gpu_ext.UTTERANCES_SERIES_3_SHA256}`" in addendum
+    rows = re.findall(r"^\| `(E-[0-9a-f]{8})` \| (E-[CPR]) \|", addendum, re.MULTILINE)
+    assert len(rows) == 148 and len({r[0] for r in rows}) == 148
+    blocks = [block for _, block in rows]
+    assert (blocks.count("E-C"), blocks.count("E-P"), blocks.count("E-R")) == (12, 40, 96)
+    assert "7085422087" in addendum and "7065928031" in addendum
+    assert (
+        "--approval https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7085422087"
+        in addendum
+    )
+
+
+def test_the_addendum_names_the_set_on_disk_when_the_station_has_it() -> None:
+    root = REPO / "data" if (REPO / "data").is_dir() else REPO.parents[1] / "data"
+    directory = root / "gate0" / "gpu-ext-149"
+    if not (directory / "manifest.json").is_file():
+        pytest.skip("the prepared set is on the station only")
+    text = (REPO / "docs/decisions/0028-gpu-reference-gate0.md").read_text(encoding="utf-8")
+    manifest, entries = gpu_ext.load_set(directory)
+    assert f"`{hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest()}`" in text
+    assert f"`{hashlib.sha256((directory / 'plan.json').read_bytes()).hexdigest()}`" in text
+    assert manifest["code_sha256"] == gpu_ext.code_sha256()
+    for clip in manifest["clips"]:
+        assert f"| `{clip['id']}` | {clip['block']} |" in text and clip["wav_sha256"] in text
+    assert len(entries) == 717
+
+
+def test_a_request_may_run_only_two_minutes_past_the_soft_end(tmp_path: Path, key_file, fake):
+    run = _soft_run(tmp_path, fake, key_file)
+    assert vast.timeout_cap(run) == math.inf
+    run.soft_end = time.time() + 600
+    assert 715 <= vast.timeout_cap(run) <= 720
+    run.soft_end = time.time() - 3600
+    assert vast.timeout_cap(run) == vast.MIN_REQUEST_TIMEOUT_S

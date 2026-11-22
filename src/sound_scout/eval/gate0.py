@@ -944,7 +944,7 @@ def answer_of(entry: Mapping, body: object) -> object:
     content = _content(body)
     if entry["variant"] in ("K1", "K2"):
         return INVALID if content is None else parse_closed(content, K_OPTIONS)
-    if entry["variant"] in ("P", "P-text"):
+    if entry["variant"] in ("P", "P-text", "Q-S"):
         return INVALID if content is None else parse_closed(content, P_OPTIONS)
     if content is None:
         return {"valid": False, "errors": ["no message content"]}
@@ -1264,12 +1264,20 @@ def run_spike(
     served_model: str | None = None,
     weights_receipt: Path | None = None,
     remote: Mapping | None = None,
+    stop_check: Callable[[], str | None] | None = None,
+    transport_check: Callable[[], str] | None = None,
+    timeout_cap: Callable[[], float] | None = None,
 ) -> dict:
     """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict.
 
     The `vllm` runtime starts nothing: it talks to the server already listening on
     `server_port` (the SSH tunnel of `sound_scout.eval.vast`), and its weights precondition is
-    the host's `weights_receipt` against the pinned files of `served_model`."""
+    the host's `weights_receipt` against the pinned files of `served_model`. Before each request
+    `stop_check` may name a reason to stop (the stack's soft end); after a request without any
+    HTTP answer `transport_check` says `resend` (the tunnel is back, the request goes once more)
+    or the reason to stop (`server_exited`, …), so a dead server costs one request, not the rest
+    of the plan at the request timeout (#149). `timeout_cap` lowers the timeout of each request
+    (the stack keeps a request from running far past its soft end)."""
     if runtime not in RUNTIMES:
         raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
     if runtime == "vllm":
@@ -1418,23 +1426,35 @@ def run_spike(
                 record["server_version"] = _vllm_version(client)
             _trace(trace, _empty_input(client))
             for entry in entries:
+                if stop_reason is None and stop_check is not None:
+                    stop_reason = stop_check()
                 if stop_reason is not None:
                     _trace(trace, {**_trace_keys(entry), "sent": False, "not_sent": stop_reason})
                     continue
-                line = _send(
-                    entry,
-                    out,
-                    manifest,
-                    client,
-                    watch,
-                    attempt,
-                    config_,
-                    request_timeout,
-                    sampling(runtime),
-                )
+
+                def send(write_request: bool = True, entry=entry) -> dict:
+                    timeout = request_timeout
+                    if timeout_cap is not None:
+                        timeout = min(timeout, timeout_cap())
+                    return _send(
+                        entry,
+                        out,
+                        manifest,
+                        client,
+                        watch,
+                        attempt,
+                        config_,
+                        timeout,
+                        sampling(runtime),
+                        write_request=write_request,
+                    )
+
+                line, transport_stop = send_checked(send, transport_check)
                 _trace(trace, line)
                 exited = process is not None and process.poll() is not None
-                stop_reason = line.get("limit") or ("server_exited" if exited else None)
+                stop_reason = (
+                    line.get("limit") or transport_stop or ("server_exited" if exited else None)
+                )
         finally:
             status = {} if process is None else proc_status(process.pid)
             watch.stop()
@@ -1498,8 +1518,40 @@ def _audio_part(clip: review.Clip, wav: bytes) -> dict:
     }
 
 
+def transport_error(line: Mapping) -> bool:
+    """No HTTP answer at all and no time limit: the connection itself failed."""
+    return line.get("sent") is True and line.get("http_status") is None and not line.get("limit")
+
+
+def send_checked(send: Callable[..., dict], transport_check) -> tuple[dict, str | None]:
+    """One request; after a transport error `transport_check` decides: `resend` sends it once
+    more without a second request file (`resent_after_tunnel`), any other answer is the reason
+    to stop. Returns the trace line and that reason or None."""
+    line = send()
+    if transport_check is None or not transport_error(line):
+        return line, None
+    decision = transport_check()
+    if decision != "resend":
+        return line, decision
+    again = send(write_request=False)
+    again.update(resent_after_tunnel=True, first_error=line.get("error"))
+    if transport_error(again):
+        return again, "transport_errors"
+    return again, None
+
+
 def _send(
-    entry, out, manifest, client, watch, attempt, config_, request_timeout, sampling_
+    entry,
+    out,
+    manifest,
+    client,
+    watch,
+    attempt,
+    config_,
+    request_timeout,
+    sampling_,
+    *,
+    write_request: bool = True,
 ) -> dict:
     line = {**_trace_keys(entry), "sent": True}
     content: list[dict] = [{"type": "text", "text": entry["text"]}]
@@ -1531,12 +1583,13 @@ def _send(
         body["model"] = client.model
     if entry["json_response"]:
         body["response_format"] = {"type": "json_object"}
-    _write_json(
-        attempt / REQUESTS_DIR,
-        f"{entry['n']}.json",
-        {**body, "messages": [{"role": "user", "content": redacted}]},
-        config_,
-    )
+    if write_request:
+        _write_json(
+            attempt / REQUESTS_DIR,
+            f"{entry['n']}.json",
+            {**body, "messages": [{"role": "user", "content": redacted}]},
+            config_,
+        )
     line["rss_before_bytes"] = watch.current()
     watch.reset_window()
     started = time.monotonic()

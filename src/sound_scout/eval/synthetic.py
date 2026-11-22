@@ -133,6 +133,66 @@ SENTENCES: tuple[Sentence, ...] = (
 )  # fmt: skip
 
 
+# The extended GPU set of #149 (docs/decisions/0028, «Дополнение 2026-11-23»): 20 sentences
+# whose target words are not among the 16 of `SENTENCES` above (that is, not in `pilot-1`).
+# Each is synthesized twice, as said right (`take="ok"`) and with its defect (`take="defect"`).
+GPU_EXT_SENTENCES: tuple[Sentence, ...] = (
+    _s("gx-doroge", "Мы долго шли по узкой дороге через густой лес.", 5,
+       "lexical_stress", "orthoepic", "dʌrˈoɡʲi", "dˈorʌɡʲi", "дорОге → дОроге"),
+    _s("gx-kruzhki", "На кухне стоят чистые кружки для чая и кофе.", 4,
+       "lexical_stress", "homograph", "krˈuʃkʲɪ", "kruʃkʲˈi", "крУжки → кружкИ"),
+    _s("gx-sveklu", "Повар добавил в суп свеклу и немного соли.", 4,
+       "lexical_stress", "orthoepic", "svʲˈekɭu", "svʲikɭˈu", "свЁклу → свеклУ"),
+    _s("gx-kvartal", "Этот новый квартал построили всего за два года.", 2,
+       "lexical_stress", "orthoepic", "kvartˈɑɭ", "kvˈɑrtʌɭ", "квартАл → квАртал"),
+    _s("gx-dogovor", "Директор подписал договор с новым поставщиком.", 2,
+       "lexical_stress", "orthoepic", "dʌɡʌvˈor", "dˈoɡʌvʌr", "договОр → дОговор"),
+    _s("gx-sredstva", "Для уборки нужны хорошие средства и чистая вода.", 4,
+       "lexical_stress", "homograph", "srʲˈetstva", "srʲitstvˈɑ", "срЕдства → средствА"),
+    _s("gx-oblegchit", "Новое лекарство должно облегчить боль у больного.", 3,
+       "lexical_stress", "orthoepic", "ʌbɭʲixtʃʲˈitʲ", "ʌbɭʲˈextʃʲitʲ",
+       "облегчИть → облЕгчить"),
+    _s("gx-kilometr", "До ближайшей станции остался один километр пути.", 5,
+       "lexical_stress", "orthoepic", "kʲiɭʌmʲˈetr", "kʲiɭˈomʲitr", "киломЕтр → килОметр"),
+    _s("gx-krapiva", "Вокруг старого дома росла высокая крапива.", 5,
+       "lexical_stress", "orthoepic", "krapʲˈiva", "krˈɑpʲivʌ", "крапИва → крАпива"),
+    _s("gx-krasivee", "Эта картина намного красивее прежней.", 3,
+       "lexical_stress", "orthoepic", "krasʲˈivʲijɪ", "krʌsʲivʲˈejɪ",
+       "красИвее → красивЕе"),
+    _s("gx-televizor", "В гостиной стоит большой телевизор и мягкий диван.", 4,
+       "word_distortion", "syllable_drop", "tʲiɭʲivʲˈizʌr", "tʲivʲˈizʌr",
+       "телевизор → тевизор"),
+    _s("gx-kholodilnik", "На кухне стоит новый холодильник и старая плита.", 4,
+       "word_distortion", "syllable_drop", "xʌɭʌdʲˈiɭnʲik", "xʌɭdʲˈiɭnʲik",
+       "холодильник → холдильник"),
+    _s("gx-konferentsiya", "Вчера в нашем городе прошла большая конференция.", 6,
+       "word_distortion", "syllable_drop", "kʌnfʲirʲˈentsyja", "kʌnfʲˈentsyja",
+       "конференция → конфенция"),
+    _s("gx-universitet", "Мой младший брат поступил в университет этим летом.", 5,
+       "word_distortion", "syllable_drop", "unʲivʲirsʲitʲˈet", "unʲivʲirtʲˈet",
+       "университет → универтет"),
+    _s("gx-udivitelnogo", "Мы услышали много удивительного о жизни в горах.", 3,
+       "word_distortion", "ending_slur", "udʲivʲˈitʲiɭnʌvʌ", "udʲivʲˈitʲiɭn",
+       "удивительного → удивительн"),
+    _s("gx-studentami",
+       "Преподаватель долго беседовал со студентами после лекции.", 4,
+       "word_distortion", "ending_slur", "studʲˈentʌmʲɪ", "studʲˈent",
+       "студентами → студент"),
+    _s("gx-sleduyushchego", "Встреча перенесена до следующего понедельника.", 3,
+       "word_distortion", "ending_slur", "sɭʲˈedujuɕivʌ", "sɭʲˈeduɕ",
+       "следующего → следущ"),
+    _s("gx-koshka", "На диване спит рыжая кошка и тихо мурлычет.", 4,
+       "word_distortion", "consonant_substitution", "kˈoʃka", "kˈoska",
+       "кошка → коска (ш → с)"),
+    _s("gx-ruku", "Мальчик поднял правую руку и задал вопрос.", 3,
+       "word_distortion", "consonant_substitution", "rˈuku", "ɭˈuku", "руку → луку (р → л)"),
+    _s("gx-sumku", "Мама положила в сумку хлеб и бутылку молока.", 3,
+       "word_distortion", "consonant_substitution", "sˈumku", "ʃˈumku",
+       "сумку → шумку (с → ш)"),
+)  # fmt: skip
+TAKES = ("ok", "defect")
+
+
 @dataclass(frozen=True)
 class Synthesis:
     samples: np.ndarray
@@ -199,8 +259,19 @@ def phoneme_samples(phonemes: list[str], ids: list[int], id_samples, id_map) -> 
     return counts
 
 
-def synthesize(voice, sentence: Sentence) -> Synthesis:
-    """One clip with the defect of `sentence` in its target word and that word's interval."""
+def synthesize(
+    voice,
+    sentence: Sentence,
+    *,
+    take: str = "defect",
+    noise_scale: float | None = None,
+    noise_w: float | None = None,
+) -> Synthesis:
+    """One clip of `sentence` and its target word's interval: with the defect in that word
+    (`take="defect"`) or as espeak-ng says it (`take="ok"`, the same checks and alignment).
+    `noise_scale` and `noise_w` override the voice's own (None keeps them)."""
+    if take not in TAKES:
+        raise SyntheticError(f"take must be one of {TAKES}, got {take!r}")
     sentences = voice.phonemize(sentence.text)
     if len(sentences) != 1:
         raise SyntheticError(f"{sentence.id}: espeak gave {len(sentences)} sentences, not one")
@@ -218,7 +289,10 @@ def synthesize(voice, sentence: Sentence) -> Synthesis:
             f"{sentence.id}: espeak gives {actual!r} for the target word, the table "
             f"{sentence.correct_ipa!r}"
         )
-    spoken = list(unicodedata.normalize("NFD", sentence.spoken_ipa))
+    if take == "defect":
+        spoken = list(unicodedata.normalize("NFD", sentence.spoken_ipa))
+    else:
+        spoken = phonemes[first : last + 1]
     id_map = voice.config.phoneme_id_map
     unknown = sorted({p for p in spoken if p not in id_map})
     if unknown:
@@ -226,7 +300,9 @@ def synthesize(voice, sentence: Sentence) -> Synthesis:
     phonemes = phonemes[:first] + spoken + phonemes[last + 1 :]
     last = first + len(spoken) - 1
     ids = voice.phonemes_to_ids(phonemes)
-    result = voice.phoneme_ids_to_audio(ids, _synthesis_config(), include_alignments=True)
+    result = voice.phoneme_ids_to_audio(
+        ids, _synthesis_config(noise_scale, noise_w), include_alignments=True
+    )
     if not isinstance(result, tuple) or result[1] is None or len(result[1]) != len(ids):
         raise SyntheticError(
             f"{sentence.id}: alignment is not available (the onnx package is needed)"
@@ -246,10 +322,10 @@ def synthesize(voice, sentence: Sentence) -> Synthesis:
     return Synthesis(audio / peak, rate, start / rate, end / rate, phonemes)
 
 
-def _synthesis_config():
+def _synthesis_config(noise_scale: float | None = None, noise_w: float | None = None):
     from piper import SynthesisConfig
 
-    return SynthesisConfig()
+    return SynthesisConfig(noise_scale=noise_scale, noise_w_scale=noise_w)
 
 
 def resample(samples: np.ndarray, rate: int, work: Path) -> np.ndarray:

@@ -383,3 +383,514 @@ GB × inet_up_cost`. Входящий трафик — 102,95 GB (образ 10,
   Qwen3-Omni, как записано до локальных прогонов.
 - Время Qwen3-Omni (`smoke`, `run`) не измерено: оценка раздела 7 — по объёму весов.
 - Сравнение пунктов не отделяет вклад dtype от вклада runtime: оба меняются вместе.
+
+## Дополнение 2026-11-23: пакет $3 и расширенный набор
+
+Статус: предрегистрация до аренды. Записана на `main` до аренды; аренды нет, расход по #149 —
+0 USD. Котировки здесь нет: свежую котировку, `offer_ids`, границы цены конверта и SHA-256 файла
+пакета публикует дополнение в #149 до аренды. Разделы 1–10 выше остаются записью пакета
+7083719621; для этого пакета действуют они вместе с заменами из Д.1. Результат пишется отдельным
+разделом после аренды; это дополнение после аренды не меняется.
+
+- Решение владельца: [#149, комментарий 7085422087](https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7085422087)
+  (2026-11-22). Одна аренда, потолок $3,00, ранний порог 75 % потолка, дедлайн не больше 120 мин.
+  Обе модели в bf16 на vLLM: полный Gate 0 (по 42 запроса, клипы 2026-11-19) и расширенный набор
+  только из открытых или синтетических данных: синтетика Piper и RINCO без файлов `pilot-1`;
+  held-out Gate 1 не трогается. До аренды: репетиция всей цепочки без денег, отказоустойчивость,
+  независимое ревью плана и кода; пакет и предрегистрация — в #149.
+- Согласие на клипы B/V: [7065928031](https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7065928031),
+  «в объёме протокола 0007». B1–B3, V1–V3 идут только в Gate 0; в расширенном наборе их нет
+  (Д.4, проверка `vast.check_extended`).
+- Код: `vast.py` (изоляция моделей, запасные offer, мягкий конец, синхронизация по ходу,
+  туннель), `gate0.py` (`stop_check`, `transport_check`), `gpu_host/hostrun.py` (`pack` читает
+  файл один раз, `size`, пики памяти), `gpu_ext.py` (набор, план, блоки, анализ),
+  `synthetic.py` (`take`, `GPU_EXT_SENTENCES`), `vast_fake.py` и `rehearsal.py` (репетиция).
+
+### Д.1. Что дополнение заменяет для этого пакета
+
+| Где | Было (пакет 7083719621) | Стало |
+|---|---|---|
+| § 2 «Любой сбой» | любой сбой шага → destroy | сбой одной модели (веса, `smoke`, пилот, выход сервера, ошибка блока) пишет `model_outcome` и не останавливает следующую модель. Всю попытку останавливают только: сбой `create`, `ready`, `preflight`; сервер не остановился; хост не отвечает по SSH три раза; мягкий конец, мягкий порог расхода, destroy сторожа; отмена |
+| § 2 порядок | веса обеих моделей до первого `smoke` | веса M1, `smoke` и Gate 0 M1; затем веса M2 качаются в фоне, пока идут блоки M1 |
+| § 2 после модели | `download` один раз в конце | синхронизация логов хоста после каждого блока (`sync-<n>.tar`) и финальный `download` в `finally` до destroy, если хост отвечает и сторож не удаляет инстанс |
+| § 4 запросы | 42 на модель + пилот | 42 Gate 0 + 717 расширенного набора + пилот 2 = 761 на модель |
+| § 5 offer | один offer, без запасного | до 3 одобренных offer по порядку в одном конверте; PUT только один, на первый подходящий. Отказ до PUT арендой не считается |
+| § 5 `smoke` | провал → destroy | провал → `run` этой модели не идёт, следующая модель идёт |
+| § 5 диск | 110 GB | 150 GB: запас под фоновую загрузку M2 при живых логах M1 |
+| § 5.1 конверт | `disk_space ≥ 110`, цены +10 % | `disk_space ≥ 150`; `dph_total ≤ min(котировка × 1,1; 1,20)`; `inet_down_cost` и `inet_up_cost ≤ min(котировка × 1,1; 0,0043)`; `compute_cap ≥ 800` |
+| § 7 деньги | $1,20, ранний порог $0,90, оценка на дедлайн 60 мин | $3,00, ранний порог $2,25, дедлайн 100 мин; оценка стека — на дедлайн + 15 мин (115 мин): столько живёт инстанс в худшем случае, пока cutoff ищет потерянный create |
+| § 8 сторож | порог $0,90 | порог $2,25; таймеры, `onstart` и `serve --deadline` — как в § 8 |
+| § 10 данные | только клипы Gate 0 | плюс открытые RINCO и новая синтетика Piper (Д.7) |
+| «Запуск» | одобрение 7083719621 | одобрение 7085422087 (Д.9) |
+
+### Д.2. Пакет
+
+Файл — `data/gate0/gpu/packages/gpu-ref-149.json` (раздел «Запуск»). Ниже — пакет без полей
+котировки: дополнение в #149 добавляет `offer_ids` и границы `dph_total`, `inet_down_cost`,
+`inet_up_cost` и публикует SHA-256 файла. Остальные строки совпадают с файлом.
+
+```json
+{
+  "envelope": {
+    "num_gpus": {"eq": 1},
+    "gpu_ram": {"gte": 79000},
+    "cpu_ram": {"gte": 64000},
+    "disk_space": {"gte": 150},
+    "compute_cap": {"gte": 800},
+    "cuda_max_good": {"gte": 13.0},
+    "cpu_arch": {"eq": "amd64"},
+    "verification": {"eq": "verified"},
+    "reliability2": {"gte": 0.99}
+  },
+  "ceiling_usd": 3.0,
+  "early_stop_usd": 2.25,
+  "spend_soft_usd": 2.1,
+  "deadline_minutes": 100,
+  "soft_end_minutes": 85,
+  "weights_late_minutes": 25,
+  "disk_gb": 150,
+  "in_gb": 103.1,
+  "out_gb": 1.0,
+  "disk_margin_bytes": 10000000000,
+  "gate0_request_timeout_s": 600,
+  "closed_timeout_s": 60,
+  "review_timeout_s": 180,
+  "models": [
+    {
+      "name": "qwen25omni",
+      "gate0_date": "2026-11-19",
+      "decision": "docs/decisions/0024-gate0-qwen25-omni.md",
+      "rss_limit_bytes": 18000000000,
+      "clips": {
+        "B1": "7289ed02800816d4c4d44f98f1a895cde829c33612740a2d692ac71a12444c31",
+        "V1": "2876b4088820682fca2f490f1f67992e2591287f4ca3206384facea50a0c9336",
+        "B2": "8faadcf2c53d357f59f94c81a9a88f136125aeaef78823518ac9b285fcd4ae19",
+        "V2": "a9b87ca0eb415e21a51d7581e02a5d749b9adab99fe4133a046c4cf23123157c",
+        "B3": "496130acb5b20e6cc8183f593f0e4e01ace7cdcc804a8a6e8579f7dbee9faf0d",
+        "V3": "d6ebfe69f1337af90f91be87f3cc0b6891b679877396606021279e3d92803994",
+        "S0": "ee7bea4232762775f8fce9b3e27e4d3948c8ac6a45a87ca769f703d6eed0b448",
+        "N1": "a1396475721921f4f74f01f81b1bc2ea6c8a94540d4ec84bc5f60cdb17267aa8",
+        "T1": "6ae7fb3b5fe423d8de855742bffbfb78bc4a56cb44ee117324bc539da9c457ab"
+      },
+      "slot_minutes": 25,
+      "health_timeout_s": 300,
+      "weights_timeout_s": 600
+    },
+    {
+      "name": "qwen3omni",
+      "gate0_date": "2026-11-21",
+      "decision": "docs/decisions/0023-gate0-qwen3-omni.md",
+      "rss_limit_bytes": 26000000000,
+      "clips": {
+        "B1": "7289ed02800816d4c4d44f98f1a895cde829c33612740a2d692ac71a12444c31",
+        "V1": "2876b4088820682fca2f490f1f67992e2591287f4ca3206384facea50a0c9336",
+        "B2": "8faadcf2c53d357f59f94c81a9a88f136125aeaef78823518ac9b285fcd4ae19",
+        "V2": "a9b87ca0eb415e21a51d7581e02a5d749b9adab99fe4133a046c4cf23123157c",
+        "B3": "496130acb5b20e6cc8183f593f0e4e01ace7cdcc804a8a6e8579f7dbee9faf0d",
+        "V3": "d6ebfe69f1337af90f91be87f3cc0b6891b679877396606021279e3d92803994",
+        "S0": "ee7bea4232762775f8fce9b3e27e4d3948c8ac6a45a87ca769f703d6eed0b448",
+        "N1": "a1396475721921f4f74f01f81b1bc2ea6c8a94540d4ec84bc5f60cdb17267aa8",
+        "T1": "6ae7fb3b5fe423d8de855742bffbfb78bc4a56cb44ee117324bc539da9c457ab"
+      },
+      "health_timeout_s": 600,
+      "weights_timeout_s": 1500
+    }
+  ],
+  "extended": {
+    "dir": "gpu-ext-149",
+    "manifest_sha256": "6cd25e0503cebd921ea594d9236403acacbdbfe881d321892dbca3f2f2bb3aaf",
+    "plan_sha256": "ab822b01d67c840443dcec1ca8620c492939154083024cc2b9f0b843f456da21"
+  },
+  "preregistration": "docs/decisions/0028-gpu-reference-gate0.md, Дополнение 2026-11-23 (#149, предрегистрация до аренды)"
+}
+```
+
+`spend_soft_usd`, `soft_end_minutes`, `weights_late_minutes`, `extended`, лимиты запросов и поля
+моделей `slot_minutes`, `health_timeout_s`, `weights_timeout_s` проверяет `vast.load_package`:
+дедлайн ≤ 120 мин, мягкий конец меньше дедлайна, `spend_soft_usd ≤ early_stop_usd`, 1–3 разных
+offer. `check_extended` до `opened` сверяет SHA-256 манифеста, плана и каждого клипа набора и
+отказывает, если в наборе есть клип Gate 0, который пакет закрепляет.
+
+### Д.3. Порядок шагов
+
+`arm` → `create` → `ready` → `preflight` → `weights` M1 → `smoke` M1 → `run` M1 (Gate 0) →
+фоновая загрузка M2 → `extended` M1 (блоки до `slot_minutes` = 25 мин от их начала, синхронизация
+после каждого блока) → улики и остановка сервера M1 → проверка памяти GPU (< 1 GiB, до 60 с) →
+ожидание весов M2 → `smoke` M2 → `run` M2 → `extended` M2 до мягкого конца → улики и остановка →
+финальный `download` → `destroy` и проверка отсутствия. M1 — Qwen2.5-Omni-7B (путь прошёл
+`smoke` в попытке 5 #148), M2 — Qwen3-Omni-30B-A3B-Instruct.
+
+- **Загрузка весов** — `hf download` в фоне на хосте с `HF_XET_CHUNK_CACHE_SIZE_BYTES=0`; стек
+  опрашивает байты каталога модели (с частичными файлами в `.cache`). Нет роста 300 с, ненулевой
+  код выхода или `weights_timeout_s` — модель `failed` на шаге `weights`. Веса M2 не готовы к
+  мягкому концу − 25 мин — `weights_late`. Затем хост считает хеши, квитанция сверяется с
+  `vast.MODELS`.
+- **Сбой запроса без HTTP-ответа** (Gate 0 и блоки): стек открывает упавший туннель заново на том
+  же порту, спрашивает состояние сервера на хосте и `/health`. Сервер вышел — модель
+  заканчивается (`not_sent: server_exited`), запрос не ждёт таймаута. Сервер жив — этот запрос
+  уходит ещё раз один раз (`resent_after_tunnel`). Хост не отвечает три раза — вся попытка
+  (`ssh_lost`).
+- **Таймаут запроса блока** — проба: `/health` за 5 с и текстовый запрос в 1 токен за 15 с.
+  Нет ответа — модель заканчивается (`server_unresponsive`). Второй таймаут в блоке закрывает
+  блок (`block_timeouts`), следующий блок идёт. Таймаут запроса Gate 0 — 600 с, первый таймаут
+  останавливает день, как в § 5.
+- **Мягкий конец** — 85 мин от `opened` (дедлайн − 15). Агент сам перестаёт слать запросы:
+  `not_sent: soft_end`. Тот же исход — `spend` при оценке расхода ≥ $2,10 по часам (`dph_total`
+  котировки create × часы + весь трафик пакета) или по кредиту на конце блока. Таймаут каждого
+  запроса (Gate 0 и блоков) срезается так, чтобы запрос кончился не позже чем через 2 мин после
+  мягкого конца (не меньше 10 с). Хвост до destroy в худшем случае: запрос в полёте 2 мин,
+  синхронизация блока 2 мин, улики 1 мин, остановка 2 мин, `download` (упаковка и копирование
+  вместе) 5 мин — 12 мин из 15.
+- **Жёсткий резерв не меняется** (§ 8): сторож удаляет на дедлайне, при пульсе агента старше
+  300 с, при наблюдаемом расходе ≥ $2,25; cutoff — дедлайн и дедлайн + 15 мин; `serve --deadline`
+  гасит vLLM на дедлайне; `onstart` — PID 1 через дедлайн + 300 с. В этом пути финального
+  `download` нет; на станции остаются `sync-<n>` и ответы клиента (`trace.jsonl` пишется с
+  `flush` на каждый запрос).
+- **Код выхода** `deploy` — 0, если хотя бы одна модель дала вердикт Gate 0 и финальный
+  `download` прошёл сверку; иначе 2 с причиной. Финальный `download`, пропущенный потому, что
+  сторож уже удаляет инстанс, — тоже 2 (`download_skipped` в журнале).
+- **Сервер не остановился** — `AttemptFatal` и после успешной модели, и после её сбоя: следующая
+  модель не стартует рядом с живым процессом сессии. Ошибка внутри блоков после Gate 0 не отнимает
+  у модели её вердикт: `model_outcome` остаётся `ok` с полем `extended_error`.
+
+### Д.4. Расширенный набор
+
+Каталог — `data/gate0/gpu-ext-149/` основного checkout (вне git), рядом с днями Gate 0; его
+`data_root` — тот же, что в разделе «Запуск». Набор построен один раз командой
+`uv run --extra corpus-tts python -m sound_scout.eval.gpu_ext prepare --corpus-root data --out data/gate0/gpu-ext-149`;
+повтор `prepare` даёт те же байты `manifest.json`, `plan.json` и всех WAV (тест
+`test_the_real_set_is_built_from_rinco_without_pilot_1_and_piper_twice`): времени создания в
+манифесте нет.
+
+| Что | SHA-256 |
+|---|---|
+| `manifest.json` | `6cd25e0503cebd921ea594d9236403acacbdbfe881d321892dbca3f2f2bb3aaf` |
+| `plan.json` | `ab822b01d67c840443dcec1ca8620c492939154083024cc2b9f0b843f456da21` |
+| Вопрос Q-S (`gpu_ext.questions_sha256()`) | `c7bfa094d832491d8cdb5448051337c2a7d54f841bed1030813b6841b9283c31` |
+| Вопросы Gate 0 (`gate0.questions_sha256()`, не меняются) | `34871259fa7ad301b1cd5ee24182664e79c3b1b7439bb1741204038e56cced82` |
+| Промпт A (`gate0.PROMPT_SHA256`, тот же) | `53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca` |
+| `gpu_ext.py` при `prepare` (план и анализ) | `f46225f140ed7c61889b977be28fba7e83cda488882d72d5db8a843d7259da31` |
+| `synthetic.py` при `prepare` | `b3602ee30d5a326661c4eacd665f3a6e269dda1312d6efb690c9f67ec4ada3e9` |
+| `utterances.jsonl` серии 3 (для AUC `PROSODY-RULE v1`) | `a20dd7e0efa82a379bf3d31dc8e189d7e357b30c58049ddfc60671ef7739f89c` |
+
+Q-S: «Правильно ли произнесено слово «{word}» на этой записи? Ответь одним из вариантов: да;
+нет; нет речи — если на записи нет речи.» Ответ разбирает `gate0.parse_closed` по вариантам P.
+Q-S живёт в `gpu_ext.QUESTIONS`, а не в `gate0.QUESTIONS`: хеш вопросов дней Gate 0 не меняется.
+
+Блоки в порядке отправки. Порядок — приоритет: если блок обрезан, его выполненное начало —
+подвыборка по заранее заданному порядку.
+
+| Блок | Состав | Запросы | Из них A |
+|---|---|---|---|
+| X (`smoke`) | пилот K1 на X1/X2, тон 1 кГц | 2 | 0 |
+| G (Gate 0) | день 2026-11-19 (M1, v1) или 2026-11-21 (M2, v2), 9 клипов; B/V только здесь | 42 | 12 |
+| E-C | 12 клипов без речи; K1, K2, P, A на каждом | 48 | 12 |
+| E-P | 20 пар Piper «верно/дефект»; на паре Q-S ok, Q-S defect, K1 ok, K1 defect, A ok, A defect | 120 | 40 |
+| E-R | 96 реплик RINCO; P отмеченного и неотмеченного слова по аудио, те же два P-text, K1 | 480 | 0 |
+| E-A | A на 16 самых длинных репликах E-R (в порядке E-R) | 16 | 16 |
+| E-D | повтор 5 запросов первых 10 реплик E-R; A на тишине 20 с и на обоих вариантах первой пары E-P | 53 | 3 |
+| **Всего на модель** | | **761** | **83** |
+
+- **Нейтральные id.** Промпт A несёт `clip_id`, поэтому id — `E-<8 hex>` (SHA-256
+  `gpu-ext-149|<блок>|<роль>`). Роль, слово, вариант и источник — только в `manifest.json` на
+  станции. Id с ролевым словом набор отказывает.
+- **max_tokens.** Закрытые — 8 (как Gate 0); A в блоках E — 512. A в Gate 0 остаётся 1024 ради
+  сравнимости с § 6. Таймауты блоков: закрытые 60 с, A 180 с.
+- **E-C.** Тишина 3 с и 20 с; розовый шум seed 1, −20 dBFS; белый seed 2, −30 dBFS; коричневый
+  seed 3, −30 dBFS; тон 220 Гц; лог-свип 100–4000 Гц; аккорд 261,63 + 329,63 + 392,0 Гц; щелчки
+  4 Гц; шум с долговременным спектром 20 фраз Piper «верно», seed 4, −30 dBFS (по 10 с); фразы
+  `gx-doroge` и `gx-televizor` «верно», обращённые во времени (RV1, RV2). Все — numpy, 16 кГц,
+  s16. P на E-C спрашивает о слове «сегодня», на RV — о слове своей фразы.
+- **E-P.** 20 новых фраз `synthetic.GPU_EXT_SENTENCES`; их целевые слова не входят в 16 слов
+  `synthetic.SENTENCES` (`pilot-1`). 10 на ударение (`дороге`, `кружки`, `свеклу`, `квартал`,
+  `договор`, `средства`, `облегчить`, `километр`, `крапива`, `красивее`), 10 на искажение
+  (выпадение: `телевизор`, `холодильник`, `конференция`, `университет`; обрыв окончания:
+  `удивительного`, `студентами`, `следующего`; замена согласного: `кошка`, `руку`, `сумку`).
+  Вариант «верно» — фонемы espeak-ng без изменений, «дефект» — `spoken_ipa`. `noise_scale = 0`,
+  `noise_w = 0`: синтез детерминирован. Варианты различаются не только словом: энкодер и
+  длительности VITS видят всю фразу, поэтому длительность и интервал слова у вариантов свои;
+  интервал — из выравнивания Piper для каждого варианта. Пары идут попеременно «ударение /
+  искажение», каждый вид — по SHA-256 id фразы.
+- **E-R.** Материал — `prosody.material` серии 3: RINCO v0.1 без всех RINCO-файлов `pilot-1`
+  (dev и held-out), без `q-1122` из `corrupted_asr` и без EAF/WAV по правилам E1/E2: исключено
+  20 членов архива, SHA-256 списка `8fa0199c114129685ff3e7fb870027ac8086843cc140868e5180e393efe7cd38`;
+  осталось 209 файлов, 965 реплик. Реплика годна, если в её аннотации Accent нет скобок (`(г,)`,
+  `()`): они склеивают буквы со словами; таких годных — 652. Правило отбора: длина 2,0–30,0 с;
+  есть отмеченное и неотмеченное слово; форма целевого слова встречается в реплике один раз и
+  имеет ≥ 2 гласных; порядок — SHA-256 `gpu-ext-149|<member>#<номер>`; первые 96, не больше 2 на
+  WAV. Целевое слово каждого вида — первое по SHA-256 `<member>#<номер>|<форма>`. Клип — вырезка
+  [start, end] из декодированного ffmpeg моно 16 кГц, без усиления. Вышло 96 реплик из 73 WAV,
+  4,37 мин, медиана 2,57 с. P-text получает расшифровку через `prosody.normalize` по словам: без
+  меток, знаков ударения, заглавных букв и пунктуации аннотации.
+
+Клипы набора (148; файлы и роли — в `manifest.json`, этот список совпадает с ним):
+
+| Клип | Блок | Источник | Длительность, с | SHA-256 WAV |
+|---|---|---|---|---|
+| `E-8c293606` | E-C | silence-3 | 3,000 | `d303811b8c84619667cd0501342f84ec6cbe69f7aa3856dcf52fabda374c92b8` |
+| `E-33a9b9e0` | E-C | silence-20 | 20,000 | `fe04e06676e54a18bce6696508d2696394f172b365445e1f2eb969dc0a10f163` |
+| `E-a50c2776` | E-C | pink | 10,000 | `bbd29704e544966c73c471586c4e19896387cb1d2be4baa9a55a95051fe435f8` |
+| `E-c01d89aa` | E-C | white | 10,000 | `0fac31f5174d8bb336a9cc48a4093e01482292cb87a6dc92e0d15febace1a521` |
+| `E-370dfcab` | E-C | brown | 10,000 | `60cbce87a8a95952254c91acaffc1f81d5f19eb474851a8c11b872ec1d0f4d5e` |
+| `E-0fb45a80` | E-C | tone | 10,000 | `8348edfd70372d706fca6e3e81cf0a88c74d5e4a8e07a67a6402f1875597e5d2` |
+| `E-1ff42f5c` | E-C | sweep | 10,000 | `2edf8305fbc775335a349bf810bdad09c94b7b42b61ad84a776ae86f57cbb852` |
+| `E-6a03dfb6` | E-C | chord | 10,000 | `819c53f33866b3ab8fb41718d67ad6964b5026d2f7820474366d4146e2109c43` |
+| `E-5a1b5ddb` | E-C | clicks | 10,000 | `b79b0270bdaaf3695ed55dfa44f51e30103b819008e436035f42a4dddf5c2f06` |
+| `E-5c4db0af` | E-C | speech-noise | 10,000 | `be3cb274f9f4c3a683466051b51c942fe5d0ea46e4329901c59d1b374812418e` |
+| `E-737b44d4` | E-C | rv-1 | 3,170 | `badd47408e6d1c0971a474acb96e3597a5622cb867321652fae219a9a2edb751` |
+| `E-1a966d88` | E-C | rv-2 | 3,460 | `4ef47c313652ad2eef5ffc5286dd2d5eb4fba08c43586ac3bd9355919077b6ef` |
+| `E-f652afce` | E-P | пара 1, `gx-kvartal`, ok | 3,355 | `81264584d709b53f4c00688c5868a07f0f499ebd00672423181f0538da27addc` |
+| `E-625a5633` | E-P | пара 1, `gx-kvartal`, defect | 3,321 | `b0112d86c4d091ff61b6b60b5c6802000c1c7ac6c0c25d2b74ff0b14b5ce45d0` |
+| `E-c4b46a1f` | E-P | пара 2, `gx-kholodilnik`, ok | 3,332 | `7fd579cfcd04d8fb389678111fa613802b6aae474ec3e8e0958019144b682ae6` |
+| `E-f6bb2a58` | E-P | пара 2, `gx-kholodilnik`, defect | 3,274 | `4c311579ad5ef9b34ffcf9eb2e6124cd3db6dd70e00465d239c2b88e95ae9cc2` |
+| `E-004fd8e1` | E-P | пара 3, `gx-kruzhki`, ok | 3,437 | `f48a4bc2f244378b17f40b046080b541b3ef5a02953080df4177d510be656ca0` |
+| `E-8db5f658` | E-P | пара 3, `gx-kruzhki`, defect | 3,402 | `35333a8f8b4c5889d98f4e9dfba42281ae7daf978c6d52c74ca04db177669af6` |
+| `E-b261b8eb` | E-P | пара 4, `gx-televizor`, ok | 3,460 | `ad7baa4b69e7597c50d6a595452825df58d986a2ff8cc659916678cee90d226c` |
+| `E-89eccac5` | E-P | пара 4, `gx-televizor`, defect | 3,286 | `0aea67fd68897418fbba2ebf84ef5e7c720af0b8d5db173166bc0f889492be88` |
+| `E-0285c822` | E-P | пара 5, `gx-doroge`, ok | 3,170 | `7bbb103531411ddf48e3e5afd2d81261090ae0e49a6868d5174af139f5cb7236` |
+| `E-4a156476` | E-P | пара 5, `gx-doroge`, defect | 3,111 | `41433c1ee95c037fc38b4141cf32665263fa1d88c66c1262cc14651e53f89307` |
+| `E-1d3e9786` | E-P | пара 6, `gx-ruku`, ok | 2,972 | `86c0a088b7d40d553f3583d1cea5d4d54ef0b593ca52efadb6e9b5d845c7cce9` |
+| `E-0dfb36e4` | E-P | пара 6, `gx-ruku`, defect | 2,972 | `b94359a33e01189c9ad840857e561aea6d45aa98b5cdd1d6e9bae35481cdb1f8` |
+| `E-eeffbd08` | E-P | пара 7, `gx-krapiva`, ok | 3,228 | `a1928fb57a1447e82535eb9402e7fededb9038411d2e423939ae6b7486d642ec` |
+| `E-8206a0d3` | E-P | пара 7, `gx-krapiva`, defect | 3,262 | `341dd41082b3c9f99f9b1661586b78af9565747bc750dd333c740d49bde41bbe` |
+| `E-55f786bb` | E-P | пара 8, `gx-studentami`, ok | 3,750 | `b8895736a434b790cdf403562a63a2b90ec9311f34fb65da55e81ec33788dd81` |
+| `E-6ef660d9` | E-P | пара 8, `gx-studentami`, defect | 3,587 | `cb7758c5d2d4ee83188c529b301cc26611b7d674feeac10868770eec4585cb9b` |
+| `E-2ec01bc1` | E-P | пара 9, `gx-krasivee`, ok | 2,891 | `f733333926f4ac96bf7f07db3b433958d3c2e965aef7499b247703de4bd9df41` |
+| `E-653e2e47` | E-P | пара 9, `gx-krasivee`, defect | 2,798 | `a810b37dfea20910325fe93ef6a3a684de86331b0e61870661686ecabda1b902` |
+| `E-c2f062fe` | E-P | пара 10, `gx-universitet`, ok | 3,297 | `a7052cfe2327e88c50d93696de1b6317de769b0f65359dcf901f8f57e041e49f` |
+| `E-f960100c` | E-P | пара 10, `gx-universitet`, defect | 3,135 | `2ebf5ce0e5d5fc9e90b3eb4ee322ceda30885601206265530939f532cf9a3fe2` |
+| `E-81838571` | E-P | пара 11, `gx-kilometr`, ok | 3,599 | `26ec26909583d859d3005e705e0fb0e70d66ae95ac3485829a33cff422b247d3` |
+| `E-43468878` | E-P | пара 11, `gx-kilometr`, defect | 3,611 | `eced9e5d5b71f355670fc64c58b388fd8ac324672e6c4fc8125a46c9ac42c5e9` |
+| `E-6d62ab4a` | E-P | пара 12, `gx-sumku`, ok | 3,321 | `b0e2d942735c32ce07fbee989d3f9c6d07090c723ecc4b1ac0f23e4c99629a40` |
+| `E-8f35dd6d` | E-P | пара 12, `gx-sumku`, defect | 3,309 | `47c4db5a2aee5361a2f8e18298529d136ac44612f36e32a260595f16dfbb93a8` |
+| `E-a261529b` | E-P | пара 13, `gx-sveklu`, ok | 3,100 | `806663dc429eb186581cce75e80362afb2613c6da1aa62f03165c6e11d595bea` |
+| `E-439a2e88` | E-P | пара 13, `gx-sveklu`, defect | 3,042 | `fb2e0d2dfe9780d0b8e4eff7104207e80b53b95bae7c3ddea81f4f90bc44e051` |
+| `E-24b18480` | E-P | пара 14, `gx-konferentsiya`, ok | 3,262 | `3f0c77a1fe70a831956ae32d633e2e0326f0894efd5528e58ebdcc5d8e3b0820` |
+| `E-ee40a22e` | E-P | пара 14, `gx-konferentsiya`, defect | 3,158 | `893fcdeaa77250682b648a27c03880b6882032a958d89be52355d38d92f161f9` |
+| `E-32364315` | E-P | пара 15, `gx-sredstva`, ok | 3,425 | `0e909eda99443ab4c3d7545fab1b54d99b45e2d57f939a7aba08a46c8ea572a8` |
+| `E-73ccbd70` | E-P | пара 15, `gx-sredstva`, defect | 3,587 | `f805375f1af1e8b2cb9b78b9d066042dd08f8ccab4ee1a139851ab5848e57256` |
+| `E-16ed1eb1` | E-P | пара 16, `gx-sleduyushchego`, ok | 3,158 | `2f63898504f71b2f818b0e510c76d21e0e6431d549978d98b5cc68dc4cc8dbcc` |
+| `E-2e1d9c02` | E-P | пара 16, `gx-sleduyushchego`, defect | 2,972 | `79454f3f125bb57474659b50c02a2f4a1da4d40c7c4a9795f88d9d8c20defbad` |
+| `E-5d18a39c` | E-P | пара 17, `gx-dogovor`, ok | 3,204 | `ca29e0baa7e3b491ff32f8815a92196a459ced76721ac95642e8efffa18c1015` |
+| `E-f46e78ee` | E-P | пара 17, `gx-dogovor`, defect | 3,135 | `3c09dd66b473a78ae2ff1e313dec2ca8725d22f49f4757ecfdaea6283dbb2668` |
+| `E-b8f4a3e2` | E-P | пара 18, `gx-udivitelnogo`, ok | 3,158 | `110d2588b4093a19dc811d97b3abe78edc29deef6bcb2882cfa7f152c0c7d399` |
+| `E-3a0f6d4a` | E-P | пара 18, `gx-udivitelnogo`, defect | 3,030 | `a8ddd7c0d435a1151f8ccd4093113f92c549047b4c2922acdd4f7d4d26ff217f` |
+| `E-60188f44` | E-P | пара 19, `gx-oblegchit`, ok | 3,077 | `fc614d7cac699cee603faf319b1c88b2d148db4dab08a342e650aaf7c093e00e` |
+| `E-cf83a985` | E-P | пара 19, `gx-oblegchit`, defect | 3,065 | `91c71142bfea3673034d930a4ea10d9cefffe3350d8834684ee7ccfa2cc7aea4` |
+| `E-0324f132` | E-P | пара 20, `gx-koshka`, ok | 3,077 | `baa78635469e64b969f0117a1d291dfd26cad91d7e02b4ce1a24bfdb5ce1f69f` |
+| `E-ef382ca0` | E-P | пара 20, `gx-koshka`, defect | 3,135 | `9818686482014e29c288d572128b4bf3af4294defd28b9ad6e22a1dff306de17` |
+| `E-cbefad8d` | E-R | `3-Statements/s-34.WAV#1` | 3,150 | `43c9dd8c04b660144ea7b9ec4dccae35a51b35d8b8ddc3880a4c74f3955a128a` |
+| `E-6b415498` | E-R | `3-Statements/s-12213.wav#0` | 2,065 | `6ace13b7312a6c3f8b3679ce79d9f7eb585ea6ad5e46772d3e5d93aa4535937f` |
+| `E-8afae7d6` | E-R | `3-Statements/s-72.WAV#1` | 2,570 | `4ce36f261baca3600ed66ca1294529979a9999ac8745deeff813b48a4b34c3bf` |
+| `E-8d6a5b17` | E-R | `2-Imperatives/i-12113.wav#0` | 2,436 | `f706858604613e44bb65b2b360e8a5c9ef6ccf180123144564486f68154a82e5` |
+| `E-064733a9` | E-R | `3-Statements/s-66.WAV#0` | 4,230 | `c8a1fdd5d36589333ac0d0a20adef31b08314ff94619f4a03e1fecfe0f02df84` |
+| `E-11dfcc14` | E-R | `1-Questions/q-178.wav#0` | 2,124 | `c96129b2936795c7c9a62cda2cab5fbbb4134ebd3ac9f946d94c227003603d48` |
+| `E-6168c1ac` | E-R | `2-Imperatives/i-25112.wav#4` | 3,165 | `248ff79d15916efaf7018e94515404045de3681e1a3927207d69f2028289443f` |
+| `E-3a629cb1` | E-R | `1-Questions/q-176.wav#1` | 2,240 | `27bc68c22b4148ef3caeef4d24ed9788f2894c0d1f693753a035988bad9a3427` |
+| `E-d2a2c18c` | E-R | `3-Statements/s-42.WAV#0` | 3,060 | `28fa6a7962c9733ca0ce840eb87884d154fde556c4de5f0d9e779bc57a2bb81d` |
+| `E-a2df0f17` | E-R | `2-Imperatives/i-1116.wav#1` | 2,111 | `3cd03533239d0438050a8e6af272cc65b167f9e5830be3d1392bb3776c92e6bd` |
+| `E-1664891b` | E-R | `1-Questions/q-24309.wav#1` | 2,099 | `a921c270bd3e213e16d38bfa0b1bed9f98f390220fbb8424285284a1a31699d6` |
+| `E-39949a83` | E-R | `1-Questions/q-2417.wav#0` | 2,157 | `22bb5a3c1a49b4b5b1aaa5c7c6d1d565e68a26a8356155ffb94ee753f04f1e43` |
+| `E-0f363bf0` | E-R | `1-Questions/q-178.wav#2` | 2,586 | `fef9560984db401b1a5d52fc69800ae2d45f585ba84874a8ffeb463ed99bfc15` |
+| `E-280ffb25` | E-R | `1-Questions/q-1506.wav#1` | 2,059 | `c09f8b4cfb98cd4307faf1e0294d4c86941f0bc534afb8977d8a85dfdf14fa49` |
+| `E-6903490c` | E-R | `1-Questions/q-1519.wav#0` | 2,755 | `3988cd01dc7b93b66b983e133a04f9de8fe045db9241b855734f686d48e62baa` |
+| `E-dad3bc34` | E-R | `3-Statements/s-32.WAV#9` | 3,880 | `d787b36704b504e36bf7acaaed50e31533232348495a8c71c0fc40890897c0c2` |
+| `E-32d66e02` | E-R | `3-Statements/s-65.WAV#1` | 2,220 | `b049f28ee78737978c3458c361d700829f6e071f1543aed9e7ee065c9ad7d9fd` |
+| `E-97a26202` | E-R | `3-Statements/s-44.WAV#1` | 2,770 | `a90c2f2a7b84e44e820ea10e8767bf62e301aaf99b2c7fdee3931a8a7ea7ef6a` |
+| `E-e3a8c215` | E-R | `1-Questions/q-1519.wav#1` | 2,179 | `3808d7914df4362fdbf454458306a69a10c4000f71024ad290ba7227f3776f11` |
+| `E-3eb144dc` | E-R | `1-Questions/q-113.wav#0` | 2,026 | `ffa2d628a818d28da3a7c95607d475b83dabe63f97e58893bf84dbf56c52e67a` |
+| `E-238faf04` | E-R | `1-Questions/q-2414.wav#0` | 2,512 | `2c0b407b8f852b47e89c6084248ac073120a988dbf08c4097c172acb95555116` |
+| `E-a2764269` | E-R | `3-Statements/s-64.WAV#1` | 2,825 | `5975eab6435ac1973764ef08330cf61f583b4cf792ed65ba423ec8a506a0f6a0` |
+| `E-fba9ea99` | E-R | `3-Statements/s-1211.wav#5` | 4,450 | `d9988a5be8efc10b109eeea957fcbc19415dbc2d01ce429e9020d524dcf9a125` |
+| `E-ce0af490` | E-R | `3-Statements/s-31.WAV#4` | 3,510 | `d3592431f0266f2ffa931b08196d6c4c7a079e6019caf34a4d3d52608dbf6fdc` |
+| `E-3eebc36f` | E-R | `3-Statements/s-214.wav#1` | 2,490 | `dab8c507989e021755f6fa10c81018527741adbf4e00eaf63b73285766fa3918` |
+| `E-15aeca68` | E-R | `3-Statements/s-113.wav#2` | 3,580 | `ddd5be982e12bcc67eee2da79be1982f800fd5be36e7adb6a2fe2fcdf6286e27` |
+| `E-dc098fbf` | E-R | `3-Statements/s-71.WAV#6` | 3,210 | `90a118bff7fee9eacb21c54538a8554b158e0760bad5a61183e49c96c487b71b` |
+| `E-027894db` | E-R | `3-Statements/s-73.WAV#1` | 4,260 | `b3716d23ca5400bff83d52eb90bbc9c99e8eddc82c39571733dd8576e904c0f1` |
+| `E-dfed4e22` | E-R | `1-Questions/q-227.wav#1` | 2,134 | `c69ce7af30c48763f73326535f5249c373461b597660b3621d359b0d4ed0f71d` |
+| `E-c1332708` | E-R | `2-Imperatives/i-225.wav#1` | 2,710 | `ec17e53dedf3f10b476a7bc39c7651ee440501693b7ed639765141ed3e0a9c11` |
+| `E-1d48034e` | E-R | `1-Questions/q-164.wav#1` | 3,585 | `66dbc727743380858fd657ab3a435166459bb12bcfa64008e1094b6c07dfb8b0` |
+| `E-18c3c626` | E-R | `3-Statements/s-62.WAV#1` | 2,748 | `b9f73e699e941a945a5b616482a4ac689d8c51cef490fadcb0936169a2b429b6` |
+| `E-a29d1003` | E-R | `3-Statements/s-71.WAV#3` | 2,470 | `b2d710d4ed32825dd6df7de16e3ebd3794c2850c80d7a286a49c4d41fd571a87` |
+| `E-67c2ed8a` | E-R | `3-Statements/s-411.WAV#2` | 3,680 | `208ad14e5d966b7a055125468bed395b8c24d2f5f9d817eff36e5e7d5ee83b4b` |
+| `E-dfd05441` | E-R | `3-Statements/s-113.wav#3` | 3,780 | `f641225a7aee374955d476db49e00f8c08dafc3ad27a62b8a2df2e475b115044` |
+| `E-e3d946c2` | E-R | `2-Imperatives/i-25112.wav#3` | 2,192 | `74be1510a38ebb26dcc25f1da0ff93231e7fff1364a0e89d894ffcd358cf40d6` |
+| `E-f1ebfb59` | E-R | `1-Questions/q-24404.wav#2` | 2,635 | `b32272fd7e40cc955b413a47c4787d0b7b28fab774219ccf235066cb289180a3` |
+| `E-c397e662` | E-R | `3-Statements/s-123.wav#0` | 2,562 | `7643e49b27200068ccd3fa1d7d4da6a2c85f768bfed8272d9325ab6a73720fd1` |
+| `E-34f225f3` | E-R | `3-Statements/s-61.WAV#0` | 4,670 | `084a0f28106534a09a0d561e9de48037bf3b005860783c373ce561f4838cfd8f` |
+| `E-09276fbd` | E-R | `3-Statements/s-34.WAV#0` | 5,010 | `e294f307128d4819a79b310adfc0190767220c53ea439fe2d9b978e1d4dcdd57` |
+| `E-26fc39cf` | E-R | `1-Questions/q-223.wav#0` | 2,020 | `11ea2248202edf1ef00078a358fcbd38cafe40a1f85886319056837f231f720c` |
+| `E-7a77eff8` | E-R | `3-Statements/s-67.WAV#2` | 2,860 | `381883ff5c9c2dc845b31834c5dfe0a24d25204ccd29207c3ab70bc25f06648d` |
+| `E-44edb00d` | E-R | `3-Statements/s-64.WAV#4` | 2,780 | `dee888aeb8ccac7b8a32f57e0c0b9f41ffc123c1f0ef22972fb0c4b782c0e346` |
+| `E-13430249` | E-R | `1-Questions/q-226.wav#1` | 2,846 | `b41fdd0c49068b7cdfeba5e380bfbf977b145794c305e53612577e2b7ff90ee2` |
+| `E-a00a922a` | E-R | `3-Statements/s-12233.wav#0` | 2,213 | `934549c19ab14ff38b36761340396859e292c8da9e616fcc158995f9da8f5362` |
+| `E-ad268221` | E-R | `1-Questions/q-161.wav#1` | 2,370 | `f941a989ae6ee427d8cab098cf4b55e04c068256a7626b318b176a94f55b9235` |
+| `E-5578b9fa` | E-R | `1-Questions/q-176.wav#0` | 2,000 | `a70f50ee1383dcb5ffec0d32ba4d4b5185f0411a468d56fd9eb3c065fb1f97f0` |
+| `E-bb8172af` | E-R | `3-Statements/s-63.WAV#1` | 2,570 | `e3be4f5d5fd0600b9441718a4e77e06c70fe6b84edc99720a60e5fe20abcea71` |
+| `E-e3af3786` | E-R | `1-Questions/q-2421.wav#1` | 2,347 | `939ad46f1a2cdf541c27be0a3590eb7429eb8286f3ac1f8b0cf06e5464cef3e0` |
+| `E-0a686be7` | E-R | `3-Statements/s-12222.wav#0` | 4,670 | `bd953c05db8616b53fad42bf5dea12a502bf850d37c753d26f3aeb7bd611a304` |
+| `E-07ff7fe0` | E-R | `3-Statements/s-74.WAV#3` | 2,270 | `e3fbc43c8c443008d1f452e2df517bdd238459a4aa2cf7561eeba33dd5f0f692` |
+| `E-a96ce203` | E-R | `1-Questions/q-24308.wav#1` | 2,226 | `7644c2a4abf29df138fc6906193f075a997bb5724872d8498e7a9f348b6799bf` |
+| `E-d1f30fe8` | E-R | `2-Imperatives/i-12113.wav#4` | 2,003 | `a1dcf92037aa73764ac2617ee723d6959714ba1b1305954aeea3a64b43561a4a` |
+| `E-1ebd8d1d` | E-R | `3-Statements/s-5.wav#9` | 2,132 | `7875da1dffb9430334ec80f057a071c787712eb51731a180cbe60889fd085c4a` |
+| `E-f25fea7e` | E-R | `3-Statements/s-66.WAV#1` | 2,640 | `7065d23a3b03612dfb32e81c9239209cd2a5757e702eb4a8f9f403338212cd1a` |
+| `E-50180a43` | E-R | `3-Statements/s-215.wav#4` | 2,080 | `4a877050a2d81f1689c24b3ba50369ca84ef5240d0ff8c9c8d0cba1b84b7c945` |
+| `E-d6ed2874` | E-R | `3-Statements/s-1211.wav#2` | 2,940 | `29bbd6c2b0fbe4bffb74886865e5b5c849e201f0e2f83a24b03f8d3c55c7da01` |
+| `E-1e23a991` | E-R | `2-Imperatives/i-245.wav#3` | 2,459 | `3072d8bdfe77a8039f230182d28c97707bb4066aa370ca1f34365ec67e6cdd9b` |
+| `E-1337f938` | E-R | `3-Statements/s-33.WAV#10` | 2,064 | `5fe9ff6cec5a0a18146a4b5173b3c4ee6e61188417d4ed2f4367a0ef923258cc` |
+| `E-c423ce3d` | E-R | `2-Imperatives/i-12123_2.wav#0` | 2,056 | `56ce4eee7cc2456037895d515ff1151a427344f872a45fd8636f249f435658ce` |
+| `E-7a3692cb` | E-R | `3-Statements/s-12221.wav#0` | 2,953 | `e23c5939ced95c2d1e3bd8f6c34d7e4c1fe035c76a517cd8812af2f67ed2b37b` |
+| `E-c7727d98` | E-R | `1-Questions/q-1510.wav#0` | 2,270 | `4f736ef43192ea8fb436f16b6c6086f936d59ddd7c0da25351017404c039b333` |
+| `E-78593468` | E-R | `1-Questions/q-224.wav#2` | 3,042 | `c2dfcee6e15ccf67e43a33b7f74b98a470c06d48ce9174b60006dafe75509281` |
+| `E-f31f940b` | E-R | `1-Questions/q-24408.wav#0` | 2,127 | `583fbe7c257c69401dae8668daaecd75404d10cc6bdd6e7c1566965a183aab4f` |
+| `E-613fcd42` | E-R | `3-Statements/s-12212.wav#2` | 3,560 | `318427aab790c757034cbe9cb0b9227062f8e079ef271c813cc9421aeb5314e0` |
+| `E-6d1d6782` | E-R | `2-Imperatives/i-231.wav#0` | 2,572 | `d4eddf4e28a075da7f1eb029c8517e9726b42f6b8f0585ea664e23d01828eb1e` |
+| `E-128e652f` | E-R | `3-Statements/s-5.wav#0` | 2,556 | `4cb43d033d5d1146caa76f9ae2ef3a7493da5d61ec7e680c5051b806eaf1eceb` |
+| `E-e985a56e` | E-R | `1-Questions/q-1512.wav#1` | 2,309 | `6cec59ade5c0ede30229fefe1b37072d23ce63420c7cfd33be059a1262a7e607` |
+| `E-a2a6e6ae` | E-R | `3-Statements/s-72.WAV#0` | 2,060 | `9ea48716c06a116cb650569ad338ea9c141f24a2bcbc18cdcf8f82436c5cbc7d` |
+| `E-16619aa5` | E-R | `3-Statements/s-12234.wav#1` | 2,568 | `f68aec1b50b0edafc74965034217c1fa1019be4cb1033fd74f5b47e744493b1d` |
+| `E-303686ac` | E-R | `3-Statements/s-68.WAV#0` | 2,790 | `690d7d4728e8973728c8135bd576b81c346d875e2bb661040915f65e0e22ffc3` |
+| `E-8d1fd9a7` | E-R | `3-Statements/s-33.WAV#1` | 3,310 | `c3947fb6230fa2558b985f807bf6a912a08922ecf28fab064aa2074fc7072bf5` |
+| `E-ffc39342` | E-R | `2-Imperatives/i-25113.wav#1` | 2,237 | `de5a18eaabb8d47cac9f5c41eb17f6d2883e8b7220593f3a6dfdd0f15f3819ad` |
+| `E-190724db` | E-R | `2-Imperatives/i-224.wav#3` | 2,874 | `338df6c3a01b0147b3d4096d3a4b1423544ffac2727c11ba9f0e2aa463dd0165` |
+| `E-80cd336e` | E-R | `1-Questions/q-23.wav#0` | 4,218 | `dd5002bfcf23267c17a701a605fe55ef1291d95da06ebfa097944bd8dbf9059e` |
+| `E-8c8661f1` | E-R | `1-Questions/q-2423.wav#0` | 2,632 | `b595d479c369f9d77190f10832cd1d4dbe22e0962e79cdb7eef940f6a170405c` |
+| `E-3ebac0de` | E-R | `3-Statements/s-31.WAV#5` | 2,320 | `b9d236e2f6ec3f23badeb0b77c5dd28d454af9e9bb9062e0c71319226058f357` |
+| `E-2329efa0` | E-R | `2-Imperatives/i-2513.wav#4` | 3,367 | `c23449c391b7c5af23ebd752a05d5a15f95dfb5c0d3c86088cfcde00e3abc1ba` |
+| `E-0cb713fc` | E-R | `2-Imperatives/i-2512.wav#0` | 2,678 | `ad718f51a76da52a11409d8e3f6723c1fbd5b175ede87b824058cf4e1f282c12` |
+| `E-a4e2c586` | E-R | `3-Statements/s-32.WAV#8` | 2,506 | `353ba2c1ad33907ee75a072355f2d23ff2b066a9debac6980f5b92770bf811ee` |
+| `E-ad570ff9` | E-R | `3-Statements/s-67.WAV#3` | 2,510 | `3815c37c0df77d820a4b65c4633f2c2d48d9a58fd86298f03ba5f6c58362ddfb` |
+| `E-8b39efc0` | E-R | `3-Statements/s-214.wav#2` | 2,910 | `39d6fa302c08f311edcf717f41ec4c700645856af54251df4db37d9cb7eaf209` |
+| `E-1e26fa3b` | E-R | `3-Statements/s-68.WAV#1` | 2,850 | `2baeb146bb4b2451e40a42f5a10e90e8e2fd08e4ebb862ba935345896cfeedd6` |
+| `E-40bf8762` | E-R | `3-Statements/s-216.wav#0` | 3,360 | `4909367a576e9f4768c734a7400f02641cfd7d849b7736dfb6d4bb223b33facc` |
+| `E-1e28cc29` | E-R | `1-Questions/q-24305.wav#6` | 2,020 | `d54132011d70504b86e8735806fe2156550bf8c8ff03e5b73f91205ee78c9be6` |
+| `E-5765693b` | E-R | `3-Statements/s-12212.wav#3` | 3,300 | `d45172e3b8ea59a4703bf6a96d4033b602cd243487f1c7ace8a2c5deca27b709` |
+| `E-50fc58df` | E-R | `2-Imperatives/i-2513.wav#3` | 2,244 | `55aeba19cf529c3febe39523bfcd70cda1dc2b339b58ebbe89e2f4edf3a4b770` |
+| `E-fe1abe2f` | E-R | `2-Imperatives/i-241.wav#2` | 2,344 | `1c6cc3190b575b9c93fe0d24ba1948d1ac95d860798dc05c7dafa4af45448ac0` |
+| `E-e49c1bf9` | E-R | `2-Imperatives/i-2133.wav#2` | 2,232 | `d3898ac724d89d24e7144371a529fe806e524f6053f2e6321023134d24ab7295` |
+| `E-c1eb08b3` | E-R | `3-Statements/s-73.WAV#0` | 2,920 | `b64d8939b0090ec4458b28df4a0af033e8a653e7baed8295cfdbfb738bc67039` |
+| `E-8d81c2ea` | E-R | `1-Questions/q-24302.wav#3` | 2,334 | `c4ec4044d049f5c9ffea5de97b4ab2e066d16381319ef957f68e1d8e5ad67adc` |
+| `E-75fdef6f` | E-R | `3-Statements/s-43.WAV#0` | 2,420 | `cdc12daa027c3626465e46bfd8b58fc1b647c95e66d899a339ed877acaa7f9e3` |
+| `E-038316ce` | E-R | `1-Questions/q-2451.wav#1` | 3,047 | `3b3c7668cb6b57df0f331c9ab326055c02006c484677bb18b03be1cc26941c0e` |
+| `E-dbdd86e4` | E-R | `2-Imperatives/i-12115.wav#0` | 2,029 | `0bf2f69907302b5fffcb7bef80352544c7be352237b9b856ed9dd0673ff49a04` |
+| `E-dfbf738f` | E-R | `1-Questions/q-24305.wav#1` | 2,058 | `c966307837498b1fc0e79910ea988d8efbb7d6bc54d374e3ff9b59925fb77354` |
+| `E-5ebe3094` | E-R | `1-Questions/q-222.wav#0` | 2,026 | `a11fb84921b612ee1ab43df8f7db39a1ad22934653cd57660739671c48adba67` |
+
+### Д.5. Вопросы, метрики и правила вывода
+
+Все числа считает `python -m sound_scout.eval.gpu_ext analyze` из сохранённых `trace.jsonl` и
+ответов попытки, код — `gpu_ext.py` с SHA-256 из Д.4. После ответов модели ничего не
+подстраивается. Каждый ответ, кроме HTTP 200, в метрики не входит; число таких — в отчёте.
+
+1. **Слышит ли модель выделенность слова (E-R).**
+   - R1 — balanced accuracy P по аудио против метки Accent («да» — предсказание «отмечено», любой
+     другой ответ — «не отмечено»); 95 % bootstrap CI по WAV-файлам, 1000 повторов, seed 0,
+     перцентили 2,5 и 97,5.
+   - R2 — P по аудио против P-text на тех же словах: точный двусторонний McNemar (b — верно по
+     аудио и неверно по тексту, c — наоборот).
+   - Вывод «слышит» — только если реплик с ответами на оба P по аудио ≥ 40, нижняя граница CI
+     R1 > 0,5, p McNemar < 0,05 и b > c. Меньше 40 реплик — `insufficient`; иначе — «не показано».
+   - Описательно, вне вывода: AUC индекса `PROSODY-RULE v1` серии 3 на тех же словах (слова без
+     оценки серии 3 пропускаются). `deploy` пишет `analysis.json` без него; AUC даёт второй
+     проход `analyze --utterances data/prosody-measure-1-series-3/main/utterances.jsonl --name analysis-utterances.json`.
+2. **Слышит ли модель ударение и искажение (E-P).**
+   - S1 — доля пар, где «верно» → «да» и «дефект» → «нет»; случайный уровень 0,25. Точный
+     односторонний биномиальный тест против 0,25; вывод «выше случайного» — при ≥ 10 полных парах
+     и p < 0,05. Неполная пара (нет ответа 200 на один из двух Q-S) исключается. Отдельно — по
+     ударению и по искажению, описательно.
+   - S2 — попадание A: наблюдение `pronunciation` с интервалом, пересекающим интервал слова
+     дефекта ± 0,3 с. S3 — ложная тревога: то же на варианте «верно». S2 против S3 — точный
+     McNemar по парам с обоими ответами A.
+3. **Выдумывает ли A на не-речи.** Доля клипов E-C с ≥ 1 наблюдением A (среди валидных ответов)
+   и та же доля вместе с контролями S0, N1, T1 Gate 0; число невалидных ответов A.
+4. **P и K на речи и на контролях.** Доля «нет речи» у P на E-C без RV (ожидание ≈ 1) и на E-R
+   (ожидание ≈ 0); на RV верны «нет» и «нет речи». Доля «речь» у K1 на E-R и E-P и у K1/K2 на
+   E-C.
+5. **Ложные тревоги A на живой речи (E-A).** Число наблюдений на минуту речи — верхняя граница,
+   а не доказанные ошибки.
+6. **Повторяемость (E-D).** Доля повторов, чей текст ответа побайтно совпал с первым ответом
+   (temperature 0, кэш энкодера vLLM — § 3.1).
+7. **Gate 0.** Вердикт и сравнение по критериям — как в § 6, без изменений.
+
+Ответы E-блоков в вердикт Gate 0 не входят и `backend` не меняют.
+
+### Д.6. Время и деньги
+
+Оценки, не измерения. Замеры #148 (A40, Qwen2.5-Omni-7B): K1 0,64–0,72 с, A 4,85–5,79 с при
+150–158 токенах; шаг `run` 22,2 с при сумме `wall_s` 18,6 с на 9 запросов (≈ 0,4 с накладных на
+запрос). Локальный Qwen3-Omni (`0023`, попытка 2 дня 2026-11-21): A на речи — 255–777 выходных
+токенов, около 450.
+
+| Шаг | Оценка, мин | Таймаут |
+|---|---|---|
+| `arm`, `create` | < 0,1 | HTTP 60 с, без повтора |
+| `ready` | 5 (в #148: 45–281 с) | 900 с; SSH 300 с |
+| `preflight` | 0,5 | 600 с на команду |
+| `weights` M1, 22,38 GB | 1,5 (274–519 MB/s и хеши) | 600 с; нет роста 300 с |
+| `smoke` M1 | 1,2 | `/health` 300 с, быстрый отказ по `state` |
+| `run` + `extended` M1 | 14–20: 676 закрытых × 0,6–0,9 с + 83 A × 5–7 с | слот блоков 25 мин |
+| `weights` M2, 70,53 GB, в фоне | 3,3–5,3 с хешами | 1500 с; нет роста 300 с; `weights_late` за 25 мин до мягкого конца |
+| `smoke` M2 | 5 (не измерено) | `/health` 600 с |
+| `run` + `extended` M2 | 34–75: закрытые × 1,2–1,8 с, A 15–60 с в Gate 0 (1024 токена) и 15–36 с в E (512) | до мягкого конца, ≈ 50–55 мин |
+| улики, остановка, `download`, `destroy` | 1–2 | 60 / 120 / 300 / 900 с |
+
+M2 начинает Gate 0 не позже ≈ 40 мин (слот M1 — 25 мин) и заканчивает его не позже ≈ 55 мин.
+Если M2 не успевает до мягкого конца, режется хвост: E-R, затем E-A и E-D; Gate 0, E-C и E-P идут
+первыми.
+
+Деньги — формула `vast.estimate_usd`. Вход — 103,1 GB: образ 10,04 + веса 92,91 + аудио запросов
+≈ 0,15. Стек отказывает в create, если оценка на 115 мин (дедлайн + 15) выше $3,00.
+
+| `dph_total`, $/ч | Трафик, $/GB | План ≈ 90 мин | Оценка стека, 115 мин |
+|---|---|---|---|
+| 0,977 (RTX 6000D, котировка 2026-11-22) | 0,0039 | 1,87 | 2,28 |
+| 1,154 (A100 PCIe, та же котировка) | 0,0039 | 2,14 | 2,62 |
+| 1,20 (верх конверта) | 0,0043 | 2,21: агент остановится по порогу $2,10 на ≈ 83 мин | 2,75 |
+
+- Предел `dph_total` при потолке $3,00 и трафике 0,0043 без резерва — 1,33 $/ч; конверт берёт
+  1,20 $/ч и оставляет резерв ≥ $0,25 на лаг биллинга и удаление.
+- Мягкий порог $2,10 по часам при 1,20 $/ч наступает на 83–85 мин (трафик 0,0043–0,0039 $/GB),
+  около мягкого конца; при более дешёвом offer первым наступает мягкий конец.
+  Наблюдаемый кредит отстаёт (в попытке 5 #148 через 5 мин после destroy видно было $0,0537 из
+  $0,0705), поэтому потолок держит время: оценка на 115 мин, сторож и cutoff. Порог по кредиту —
+  второй сигнал, не защита потолка.
+- Класс GPU: `compute_cap ≥ 800`, то есть A100, H100 и RTX 6000D (sm_120) проходят. По котировке
+  2026-11-22 H100 (от 2,43 $/ч) и A100 SXM4 (1,24 $/ч) в конверт не входят; A100 PCIe и RTX 6000D
+  входят. Обе модели на sm_120 не проверены: пилот #148 шёл на A40 (sm_86). Порядок `offer_ids` в
+  дополнении #149 — A100 перед RTX 6000D, если оба в конверте.
+
+### Д.7. Данные и маршрут
+
+- **RINCO** (CC BY 4.0, v0.1, DOI 10.5281/zenodo.8119302, SHA-256 архива
+  `243688e816bfdf9adbfd65ef5c6104acccd0742ec9bb78b00edb2a299a7148f1`) и **голос Piper `denis`**
+  записаны в `docs/dependencies.md` для локальной квалификации (#29), а решение 0012 (правило 6)
+  запрещает запускать модели на синтетике корпуса. Исключение для этой задачи дал владелец
+  (7085422087): RINCO без файлов `pilot-1` и новая синтетика Piper вне `pilot-1` идут к моделям
+  на инстансе этой задачи. Held-out Gate 1 не используется; синтетика `pilot-1` (`syn-*`) — тоже.
+  В результате указывается атрибуция RINCO.
+- **Маршрут** — как § 10: клипы уходят только в запросах клиента станции к vLLM инстанса через
+  SSH-туннель; файлы клипов на хост не копируются. Ответы, `trace.jsonl`, `run.json`,
+  `analysis.json` — в `data/gate0/gpu-ext-149/attempts/<attempt>-<модель>/` на станции, вне git.
+- B1–B3 и V1–V3 — только в Gate 0, ровно в объёме 7065928031; E-D их не повторяет.
+
+### Д.8. Ворота до аренды
+
+1. Репетиция всей цепочки без денег зелёная: `python -m sound_scout.eval.rehearsal --out <каталог>`
+   — обе модели пакета на поддельном API Vast, каталоге-хосте с настоящим `hostrun.py serve` и
+   guard, поддельном vLLM и настоящих клиентах Gate 0 и блоков; все сценарии плана с проверкой
+   выгрузки и destroy (`tests/test_eval_rehearsal.py`). Отчёт — вне git, путь — в дополнении #149.
+2. Независимое ревью кода и плана (revmux) — находки закрыты или отклонены с причиной; ссылка — в
+   дополнении #149.
+3. Дополнение в #149 со свежей котировкой, `offer_ids`, границами цены и SHA-256 файла пакета.
+4. Аренда — одна, только после 1–3.
+
+Репетиция не доказывает образ, vLLM, CUDA, драйвер, время и память настоящих моделей, их слух,
+поведение и биллинг Vast.ai, настоящий SSH, настоящий полный диск и скорость `hf download`.
+
+### Д.9. Запуск
+
+Как раздел «Запуск» (`SOUND_SCOUT_CONFIG=local/gate0.toml`, корень основного checkout), с
+одобрением 7085422087. Процесс `deploy` живёт до 115 мин, дольше сессии инструмента: его
+запускают через `systemd-run --user` (Linger уже нужен таймерам) под `systemd-inhibit` против
+сна, python — из основного checkout:
+`SOUND_SCOUT_CONFIG=local/gate0.toml python -m sound_scout.eval.vast deploy --package data/gate0/gpu/packages/gpu-ref-149.json --approval https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7085422087`.

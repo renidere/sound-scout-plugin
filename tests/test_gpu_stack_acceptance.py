@@ -200,8 +200,8 @@ def _pack_host(tmp_path: Path, corrupt: bool):
     (bin_dir / "python3").symlink_to(sys.executable)
 
     class Host(vast.LocalHost):
-        def get(self, remote: str, local: Path) -> None:
-            super().get(remote, local)
+        def get(self, remote: str, local: Path, timeout: float = 1800.0) -> None:
+            super().get(remote, local, timeout)
             if corrupt:
                 data = bytearray(local.read_bytes())
                 data[-1] ^= 0xFF

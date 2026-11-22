@@ -1,36 +1,48 @@
 {
-  "offer_id": 34475479,
+  "offer_ids": [34475479, 34475480],
   "envelope": {
-    "dph_total": {"lte": 1.533},
+    "dph_total": {"lte": 1.2},
     "num_gpus": {"eq": 1},
     "gpu_ram": {"gte": 79000},
     "cpu_ram": {"gte": 64000},
+    "disk_space": {"gte": 150},
     "compute_cap": {"gte": 800},
     "cuda_max_good": {"gte": 13.0},
     "cpu_arch": {"eq": "amd64"},
-    "inet_down_cost": {"lte": 0.0027},
-    "inet_up_cost": {"lte": 0.004}
+    "inet_down_cost": {"lte": 0.0043},
+    "inet_up_cost": {"lte": 0.0043}
   },
-  "ceiling_usd": 4.0,
-  "early_stop_usd": 2.5,
-  "deadline_minutes": 150,
+  "ceiling_usd": 3.0,
+  "early_stop_usd": 2.25,
+  "spend_soft_usd": 2.15,
+  "deadline_minutes": 105,
+  "soft_end_minutes": 90,
+  "weights_late_minutes": 25,
   "disk_gb": 150,
-  "in_gb": 102.95,
+  "in_gb": 103.1,
   "out_gb": 1.0,
   "disk_margin_bytes": 10000000000,
   "models": [
     {
       "name": "qwen25omni",
       "gate0_date": "2026-12-01",
-      "decision": "docs/decisions/0007-gate0-result.md",
-      "rss_limit_bytes": 18000000000
+      "decision": "docs/decisions/0024-gate0-qwen25-omni.md",
+      "rss_limit_bytes": 18000000000,
+      "slot_minutes": 25,
+      "health_timeout_s": 300
     },
     {
       "name": "qwen3omni",
       "gate0_date": "2026-12-02",
       "decision": "docs/decisions/0023-gate0-qwen3-omni.md",
-      "rss_limit_bytes": 26000000000
+      "rss_limit_bytes": 26000000000,
+      "health_timeout_s": 600
     }
   ],
-  "preregistration": "docs/decisions/<номер>-gpu-reference-gate0.md (#148, предрегистрация до аренды)"
+  "extended": {
+    "dir": "gpu-ext-149",
+    "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "plan_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "preregistration": "docs/decisions/<номер>-gpu-reference-gate0.md (предрегистрация до аренды)"
 }
