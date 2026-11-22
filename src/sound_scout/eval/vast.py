@@ -1358,7 +1358,11 @@ def check_days(package: Mapping, config_: config.Config) -> None:
         name, day = entry["name"], entry["gate0_date"]
         manifest_path = gate0.output_dir(day, config_) / gate0.MANIFEST_FILE
         if not manifest_path.is_file():
-            raise VastError(f"Gate 0 day {day} is not prepared")
+            raise VastError(
+                f"Gate 0 day {day} is not prepared under the configured data_root "
+                f"(no {day}/{gate0.MANIFEST_FILE}); set {config.CONFIG_PATH_ENV} to the "
+                "configuration whose data_root holds the Gate 0 days"
+            )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         try:
             rule = gate0.rule_sha256(Path(entry["decision"]).read_text(encoding="utf-8"))

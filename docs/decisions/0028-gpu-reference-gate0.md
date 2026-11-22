@@ -281,17 +281,38 @@ GB × inet_up_cost`. Входящий трафик — 102,95 GB (образ 10,
 
 ## Запуск
 
-Из корня основного checkout на коммите `main` с этим документом. Конфигурация — та же, что у
-локальных прогонов `0023` и `0024`: её `data_root` держит дни `2026-11-19` и `2026-11-21`
-(каталог `data/gate0/` основного checkout, вне git). Пути документов решений в пакете
-относительные, поэтому запуск — из корня. Команда:
-`python -m sound_scout.eval.vast deploy --package <файл пакета> --approval https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7083719621`.
-Попытки GPU лягут в `attempts/<k>/` этих дней рядом с локальными; журнал — в `gpu/<attempt>/` того
-же `data_root`.
+1. Из корня основного checkout на коммите `main` с этим документом. Пути документов решений в
+   пакете относительные, поэтому запуск — из корня.
+2. Конфигурация — файл `local/gate0.toml` основного checkout (вне git: `local/` в `.gitignore`).
+   Его называет `SOUND_SCOUT_CONFIG=local/gate0.toml`. Перед запуском исполнитель создаёт файл по
+   шаблону; `<checkout>` — абсолютный путь корня основного checkout:
+
+   ```toml
+   allowed_roots = ["<checkout>/data/dev"]
+   data_root = "<checkout>/data/gate0"
+   backend = "none"
+
+   [network]
+   allow = false
+   ```
+
+   Это тот же `data_root`, что у локальных прогонов `0023` и `0024`: каталог `data/gate0/`
+   основного checkout держит дни `2026-11-19` и `2026-11-21`. `sound-scout.toml` checkout для
+   deploy #149 не подходит: его `data_root` этих дней не держит. Данные не переносятся и не
+   копируются.
+3. Команда:
+   `SOUND_SCOUT_CONFIG=local/gate0.toml python -m sound_scout.eval.vast deploy --package data/gate0/gpu/packages/gpu-ref-149.json --approval https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-7083719621`.
+4. Первым шагом, до журнала и любого вызова API, `deploy` проверяет дни (`check_days`): правило
+   каждой модели и SHA-256 клипов из `clips` пакета. Отказ
+   `Gate 0 day … is not prepared under the configured data_root` значит, что
+   `SOUND_SCOUT_CONFIG` указывает не на этот файл.
+5. Попытки GPU лягут в `attempts/<k>/` этих дней рядом с локальными; журнал — в
+   `data/gate0/gpu/<attempt>/`.
 
 ## Пакет
 
-Файл пакета — вне git, в `<data_root>/gpu/packages/`. Ниже — пакет без полей котировки.
+Файл пакета — вне git, ровно `data/gate0/gpu/packages/gpu-ref-149.json`
+(`<data_root>/gpu/packages/` конфигурации из раздела «Запуск»). Ниже — пакет без полей котировки.
 Дополнение в #149 добавляет `offer_id` и границы `dph_total`, `inet_down_cost`, `inet_up_cost` и
 публикует SHA-256 файла. Остальные строки совпадают с файлом.
 

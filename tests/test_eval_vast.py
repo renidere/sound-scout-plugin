@@ -1999,8 +1999,38 @@ def test_a_day_prepared_under_another_rule_or_another_clip_set_is_refused(tmp_pa
     with pytest.raises(vast.VastError, match="not the clip set the package pins"):
         vast.check_days(package, config_)
     missing = _reference_package(models=[{**package["models"][0], "gate0_date": "2026-11-30"}])
-    with pytest.raises(vast.VastError, match="2026-11-30 is not prepared"):
+    with pytest.raises(
+        vast.VastError, match="2026-11-30 is not prepared under the configured data_root"
+    ):
         vast.check_days(missing, config_)
+
+
+def test_an_absent_day_says_it_looked_under_the_configured_data_root_and_names_sound_scout_config(
+    tmp_path: Path, key_file, fake
+) -> None:
+    config_ = _dry_config(tmp_path)
+    _controls_day(config_, "2026-11-19", DECISION_V1)
+    package = _reference_package()
+    with pytest.raises(vast.VastError) as raised:
+        vast.check_days(package, config_)
+    message = str(raised.value)
+    for part in ("2026-11-21", "configured data_root", "SOUND_SCOUT_CONFIG", "manifest.json"):
+        assert part in message
+    assert str(config_.data_root) not in message and str(tmp_path) not in message
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package))
+    with pytest.raises(vast.VastError) as through_deploy:
+        vast.run_attempt(
+            path,
+            api=vast.Api(fake.url, key_file[1]),
+            make_host=None,
+            config_=config_,
+            runner=_no_system,
+            dry_run=True,
+            key_path=key_file[0],
+        )
+    assert str(through_deploy.value) == message
+    assert fake.log == [] and not (config_.data_root / "gpu").exists()
 
 
 def test_a_full_day_off_its_clip_pins_is_refused(tmp_path: Path) -> None:
@@ -2166,6 +2196,33 @@ def test_the_estimate_covers_the_whole_package_up_to_the_deadline(
     else:
         assert vast.create_instance(api, journal, package, _no_system)
         assert fake.count("PUT") == 1
+
+
+def test_the_0028_launch_names_the_gate0_config_and_one_package_place(
+    tmp_path: Path, monkeypatch
+) -> None:
+    text = (REPO / "docs/decisions/0028-gpu-reference-gate0.md").read_text(encoding="utf-8")
+    launch = text.split("\n## Запуск\n", 1)[1].split("\n## ", 1)[0]
+    package_section = text.split("\n## Пакет\n", 1)[1].split("```json\n", 1)[0]
+    place = "data/gate0/gpu/packages/gpu-ref-149.json"
+    assert "SOUND_SCOUT_CONFIG=local/gate0.toml" in launch and "data/gate0/" in launch
+    assert f"--package {place}" in launch and place in package_section
+    assert re.findall(r"[\w<>/-]*gpu/packages/[\w.-]*", launch + package_section) == [
+        place,
+        place,
+        "<data_root>/gpu/packages/",
+    ]
+    template = launch.split("```toml\n", 1)[1].split("```", 1)[0]
+    template = "\n".join(line.strip() for line in template.splitlines())
+    (tmp_path / "data/gate0").mkdir(parents=True)
+    (tmp_path / "data/dev").mkdir()
+    config_file = tmp_path / "local" / "gate0.toml"
+    config_file.parent.mkdir()
+    config_file.write_text(template.replace("<checkout>", str(tmp_path)), encoding="utf-8")
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(config_file))
+    loaded = config.load()
+    assert loaded.data_root == (tmp_path / "data/gate0").resolve()
+    assert loaded.network.allow is False and loaded.backend == "none"
 
 
 def test_the_0028_package_loads_with_a_quote_and_pins_the_rules_and_clips_it_lists(
