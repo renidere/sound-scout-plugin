@@ -441,13 +441,13 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 | Индекс (multi-arch) | `sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | реестр Docker Hub, чтение 2026-11-21 | — |
 | Манифест amd64 | `sha256:cf5b2fdd087eb4f6d261736967cc5cde974bd22ff4df50365f8fa419b6b4c484` | там же | — |
 | Размер в сжатом виде | 10 036 518 499 байт | там же | — |
-| Ссылка в create | `vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | принимает ли Vast ссылку по digest, проверяет #148 | — |
+| Ссылка в create | `vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1` | Vast принял ссылку по digest: #148, попытки 1, 3, 5 (2026-11-22) | — |
 | vLLM | `0.34.0` | Dockerfile тега | Apache-2.0 |
 | torch | `2.14.0` | Dockerfile тега | BSD-3-Clause |
 | CUDA (torch) | `13.0` | `torch.version.cuda` колеса из индекса `cu130` (история образа: `--index-url …/whl/cu130`); preflight сверяет это значение (#158); драйвер хоста ≥ 580, compute capability ≥ 8.0 | NVIDIA EULA |
 | CUDA (образ) | `13.0.2` | `ENV CUDA_VERSION=13.0.2` в config blob `sha256:0372147e2b3daa1baa5c6aa9b90ae5de2f926e25742650f91fa24dbca9cc645a` манифеста amd64, чтение 2026-11-22; preflight только записывает | NVIDIA EULA |
 | Python образа | `3.12` | Dockerfile тега (Ubuntu 24.04) | PSF-2.0 |
-| transformers | `>=5.16.1,<5.23.0` | `requirements/common.txt` тега; точную версию в образе записывает preflight на хосте, #148 вносит её сюда | Apache-2.0 |
+| transformers | `>=5.16.1,<5.23.0`; в образе — `5.22.2` | `requirements/common.txt` тега; `5.22.2` — preflight на хосте, #148, попытки 3 и 5 (2026-11-22); preflight сверяет диапазон | Apache-2.0 |
 
 Запуск — `vast.vllm_argv`: локальный каталог весов, `--dtype bfloat16`, `--max-model-len 8192`,
 `--max-num-seqs 1`, `--seed 0`, `--enforce-eager`, `--generation-config vllm`, одно аудио на
