@@ -1896,8 +1896,21 @@ def test_vllm_run_starts_no_server_sends_model_and_tokenizes_messages(controls) 
     assert all(line["audio_tokens"] == 250 for line in sent)
     for number in range(1, 10):
         body = json.loads((attempt / gate0.REQUESTS_DIR / f"{number}.json").read_text())
-        assert body["model"] == "qwen25omni" and body["cache_prompt"] is False
+        assert body["model"] == "qwen25omni" and "cache_prompt" not in body
+        assert body["temperature"] == 0 and body["seed"] == 0
+    assert "cache_prompt" not in record["sampling"]
     assert result["audio_route"]["passed"] is True
+
+
+def test_sampling_drops_llama_only_fields_for_vllm_and_keeps_them_for_local_runtimes() -> None:
+    for runtime in ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni"):
+        assert gate0.sampling(runtime) is gate0.SAMPLING
+    assert gate0.SAMPLING["cache_prompt"] is False
+    assert gate0.sampling("vllm") == {
+        "temperature": 0,
+        "seed": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def test_vllm_receipt_mismatch_is_refused_before_any_request(controls) -> None:

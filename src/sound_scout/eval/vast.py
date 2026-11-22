@@ -282,7 +282,7 @@ def expected_files(models: Mapping, name: str) -> dict:
 
 
 def vllm_argv(model_dir: str, served_name: str, port: int = VLLM_PORT) -> list[str]:
-    """The vLLM server of one model: local directory, thinker only, no remote code."""
+    """The vLLM server of one model: local directory, thinker only, no remote code, no caches."""
     return [
         "vllm",
         "serve",
@@ -302,6 +302,9 @@ def vllm_argv(model_dir: str, served_name: str, port: int = VLLM_PORT) -> list[s
         "vllm",
         "--limit-mm-per-prompt",
         '{"audio":1,"image":0,"video":0}',
+        "--no-enable-prefix-caching",
+        "--mm-processor-cache-gb",
+        "0",
         "--host",
         "127.0.0.1",
         "--port",
@@ -1552,7 +1555,7 @@ def run_pilot(client: gate0.Client) -> dict:
             "model": client.model,
             "messages": [{"role": "user", "content": [audio, {"type": "text", "text": text}]}],
             "max_tokens": gate0.CLOSED_MAX_TOKENS,
-            **gate0.SAMPLING,
+            **gate0.sampling("vllm"),
         }
         status, raw, error = client.request(gate0.CHAT_ROUTE, body, timeout=gate0.REQUEST_TIMEOUT_S)
         try:

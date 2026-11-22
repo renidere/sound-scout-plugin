@@ -912,6 +912,38 @@ def test_vllm_argv_is_local_thinker_only_without_remote_code() -> None:
     assert argv[argv.index("--limit-mm-per-prompt") + 1] == '{"audio":1,"image":0,"video":0}'
 
 
+def test_vllm_argv_turns_off_the_prefix_and_multimodal_processor_caches() -> None:
+    # flag names of vLLM v0.34.0: vllm/engine/arg_utils.py (#161)
+    argv = vast.vllm_argv("/workspace/models/qwen25omni", "qwen25omni")
+    assert "--no-enable-prefix-caching" in argv and "--enable-prefix-caching" not in argv
+    assert argv[argv.index("--mm-processor-cache-gb") + 1] == "0"
+
+
+class _PilotClient:
+    model = "qwen25omni"
+
+    def __init__(self) -> None:
+        self.bodies: list[dict] = []
+
+    def text_tokens(self, text: str) -> int:
+        return 56
+
+    def request(self, route: str, body: dict, timeout: float):
+        self.bodies.append(body)
+        prompt = 56 + 25 * len(self.bodies)
+        return 200, json.dumps({"usage": {"prompt_tokens": prompt}}), None
+
+
+def test_pilot_request_sends_no_llama_only_field_to_vllm() -> None:
+    client = _PilotClient()
+    assert vast.run_pilot(client)["ok"] is True
+    assert len(client.bodies) == 2
+    for body in client.bodies:
+        assert not gate0.LLAMA_ONLY_FIELDS & body.keys()
+        assert body["temperature"] == 0 and body["seed"] == 0
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 def test_pilot_clips_are_1_khz_tones_of_3_and_6_s() -> None:
     clips = vast.pilot_clips()
     for clip_id, seconds in (("X1", 3.0), ("X2", 6.0)):

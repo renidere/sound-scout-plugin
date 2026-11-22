@@ -266,6 +266,17 @@ SAMPLING = {
     "cache_prompt": False,
     "chat_template_kwargs": {"enable_thinking": False},
 }
+# llama.cpp fields vLLM v0.34.0 ignores; its caches go off by server flags (`vast.vllm_argv`, #161)
+LLAMA_ONLY_FIELDS = frozenset({"cache_prompt"})
+
+
+def sampling(runtime: str) -> dict:
+    """The SAMPLING fields this runtime's server reads."""
+    if runtime == "vllm":
+        return {key: value for key, value in SAMPLING.items() if key not in LLAMA_ONLY_FIELDS}
+    return SAMPLING
+
+
 MIN_AUDIO_TOKENS_PER_S = 20.0
 # F of GATE0-RULE v2 P3: the encoder's own audio token rate per second of sound, from the
 # model's primary source as its decision document records it (0023 section 1: AuT, 12.5 Hz)
@@ -1383,7 +1394,7 @@ def run_spike(
                 "rss_limit_bytes": rss_limit,
                 "rss_poll_s": RSS_POLL_S,
             },
-            "sampling": SAMPLING,
+            "sampling": sampling(runtime),
             "requests_planned": len(entries),
         }
     )
@@ -1410,7 +1421,17 @@ def run_spike(
                 if stop_reason is not None:
                     _trace(trace, {**_trace_keys(entry), "sent": False, "not_sent": stop_reason})
                     continue
-                line = _send(entry, out, manifest, client, watch, attempt, config_, request_timeout)
+                line = _send(
+                    entry,
+                    out,
+                    manifest,
+                    client,
+                    watch,
+                    attempt,
+                    config_,
+                    request_timeout,
+                    sampling(runtime),
+                )
                 _trace(trace, line)
                 exited = process is not None and process.poll() is not None
                 stop_reason = line.get("limit") or ("server_exited" if exited else None)
@@ -1477,7 +1498,9 @@ def _audio_part(clip: review.Clip, wav: bytes) -> dict:
     }
 
 
-def _send(entry, out, manifest, client, watch, attempt, config_, request_timeout) -> dict:
+def _send(
+    entry, out, manifest, client, watch, attempt, config_, request_timeout, sampling_
+) -> dict:
     line = {**_trace_keys(entry), "sent": True}
     content: list[dict] = [{"type": "text", "text": entry["text"]}]
     redacted: list[dict] = [{"type": "text", "text": entry["text"]}]
@@ -1502,7 +1525,7 @@ def _send(entry, out, manifest, client, watch, attempt, config_, request_timeout
     body = {
         "messages": [{"role": "user", "content": content}],
         "max_tokens": entry["max_tokens"],
-        **SAMPLING,
+        **sampling_,
     }
     if client.model is not None:
         body["model"] = client.model

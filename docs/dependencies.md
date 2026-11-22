@@ -451,7 +451,14 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 
 Запуск — `vast.vllm_argv`: локальный каталог весов, `--dtype bfloat16`, `--max-model-len 8192`,
 `--max-num-seqs 1`, `--seed 0`, `--enforce-eager`, `--generation-config vllm`, одно аудио на
-запрос, `127.0.0.1:8000`, без `--trust-remote-code` (загружается только thinker).
+запрос, `--no-enable-prefix-caching` и `--mm-processor-cache-gb 0` (prefix cache и кэш
+мультимодального процессора выключены, #161), `127.0.0.1:8000`, без `--trust-remote-code`
+(загружается только thinker). Имена флагов — `vllm/engine/arg_utils.py` тега `v0.34.0`
+(`--enable-prefix-caching` как `BooleanOptionalAction`; `--mm-processor-cache-gb`, `0` выключает
+кэш — `vllm/config/multimodal.py`). Поле llama.cpp `cache_prompt` vLLM не читает:
+`gate0.sampling("vllm")` его не отправляет; остальные поля `SAMPLING` (`temperature`, `seed`,
+`chat_template_kwargs`) есть в `ChatCompletionRequest`
+(`vllm/entrypoints/openai/chat_completion/protocol.py` тега `v0.34.0`).
 
 ### 7.2. Веса bf16
 
