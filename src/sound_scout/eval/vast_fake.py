@@ -144,6 +144,12 @@ class FakeVast:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                if url.path == "/api/v1/instances":
+                    self.send_response(301)
+                    self.send_header("Location", url.path + "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if not auth:
                     return self._reply(401, {"error": "unauthorized"})
                 length = int(self.headers.get("Content-Length") or 0)
@@ -177,7 +183,7 @@ class FakeVast:
 
     def _answer(self, method, parts, body, query):
         if parts[:3] == ["api", "v0", "bundles"] and method == "POST":
-            wanted = ((body or {}).get("id") or {}).get("eq")
+            wanted = ((body or {}).get("ask_contract_id") or {}).get("eq")
             return 200, {"offers": [dict(OFFER)] if wanted == OFFER_ID else []}
         if parts[:3] == ["api", "v0", "asks"] and method == "PUT":
             instance_id = self._next_id

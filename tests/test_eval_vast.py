@@ -240,6 +240,85 @@ def test_instance_list_reads_every_page_and_keeps_only_the_label(key_file, fake)
     assert [item["id"] for item in api.instances("mine")] == ids
     assert len(api.instances()) == 4
     assert fake.count("GET", "/api/v1/instances") == 3 + 4
+    assert {entry["path"] for entry in fake.log} == {"/api/v1/instances/"}
+
+
+def test_the_fake_redirects_the_instance_list_without_the_slash_and_the_api_refuses(
+    key_file, fake
+) -> None:
+    api = vast.Api(fake.url, key_file[1])
+    with pytest.raises(vast.Redirected, match="301"):
+        api.call("GET", "/api/v1/instances")
+    with pytest.raises(vast.Redirected, match="301"):
+        api.call("GET", "/api/v1/instances", query={"select_filters": "{}"})
+    assert fake.count("GET") == 2
+
+
+def test_offer_is_read_by_ask_contract_id(monkeypatch, key_file, fake) -> None:
+    api = vast.Api(fake.url, key_file[1])
+    sent = []
+    real_call = api.call
+    monkeypatch.setattr(
+        api,
+        "call",
+        lambda method, path, body=None, query=None: (
+            sent.append((method, path, body)) or real_call(method, path, body, query)
+        ),
+    )
+    assert api.offer(vast_fake.OFFER_ID, 60)["ask_contract_id"] == vast_fake.OFFER_ID
+    method, path, body = sent[0]
+    assert (method, path) == ("POST", "/api/v0/bundles/")
+    assert body["ask_contract_id"] == {"eq": vast_fake.OFFER_ID} and "id" not in body
+    with pytest.raises(vast.VastError, match="offer 7 is not available"):
+        api.offer(7, 60)
+
+
+def test_offer_sends_post_bundles_with_ask_contract_id_and_returns_that_offer(key_file) -> None:
+    seen = []
+    other = {**vast_fake.OFFER, "id": 99, "ask_contract_id": 99}
+
+    class Recorder(BaseHTTPRequestHandler):
+        def log_message(self, *args) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((self.command, self.path, body))
+            wanted = (body.get("ask_contract_id") or {}).get("eq")
+            offers = [o for o in (other, vast_fake.OFFER) if o["ask_contract_id"] == wanted]
+            data = json.dumps({"offers": offers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        api = vast.Api(f"http://127.0.0.1:{server.server_port}", key_file[1])
+        assert api.offer(vast_fake.OFFER_ID, 60) == vast_fake.OFFER
+    finally:
+        server.shutdown()
+        server.server_close()
+    [(method, path, body)] = seen
+    assert (method, path) == ("POST", "/api/v0/bundles/")
+    assert body["ask_contract_id"] == {"eq": vast_fake.OFFER_ID} and "id" not in body
+
+
+def test_offer_refuses_an_answer_for_another_offer(monkeypatch, key_file) -> None:
+    api = vast.Api("http://127.0.0.1:9", key_file[1])
+    other = {**vast_fake.OFFER, "id": 99, "ask_contract_id": 99}
+    monkeypatch.setattr(api, "call", lambda *args, **kwargs: {"offers": [other]})
+    with pytest.raises(vast.VastError, match=f"offer {vast_fake.OFFER_ID} is not available"):
+        api.offer(vast_fake.OFFER_ID, 60)
+
+
+def test_the_fake_has_no_offer_for_a_query_by_id(key_file, fake) -> None:
+    api = vast.Api(fake.url, key_file[1])
+    by_id = {"id": {"eq": vast_fake.OFFER_ID}, "type": "ondemand", "limit": 1}
+    assert api.call("POST", "/api/v0/bundles/", by_id) == {"offers": []}
+    by_contract = {"ask_contract_id": {"eq": vast_fake.OFFER_ID}, "limit": 1}
+    assert api.call("POST", "/api/v0/bundles/", by_contract)["offers"] == [vast_fake.OFFER]
 
 
 # --- the one create ------------------------------------------------------------------------

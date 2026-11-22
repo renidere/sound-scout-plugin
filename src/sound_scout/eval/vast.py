@@ -496,9 +496,15 @@ class Api:
         return self.call("GET", "/api/v0/users/current/")
 
     def offer(self, offer_id: int, disk_gb: int) -> dict:
-        query = {"id": {"eq": offer_id}, "type": "ondemand", "allocated_storage": disk_gb}
+        query = {
+            "ask_contract_id": {"eq": offer_id},
+            "type": "ondemand",
+            "allocated_storage": disk_gb,
+        }
         offers = self.call("POST", "/api/v0/bundles/", {**query, "limit": 1}).get("offers")
         if not isinstance(offers, list) or len(offers) != 1 or not isinstance(offers[0], dict):
+            raise VastError(f"offer {offer_id} is not available")
+        if offers[0].get("ask_contract_id") != offer_id:
             raise VastError(f"offer {offer_id} is not available")
         return offers[0]
 
@@ -512,7 +518,7 @@ class Api:
             query["select_filters"] = json.dumps({"label": {"eq": label}})
         found = []
         for _ in range(MAX_PAGES):
-            answer = self.call("GET", "/api/v1/instances", query=query or None)
+            answer = self.call("GET", "/api/v1/instances/", query=query or None)
             page = answer.get("instances")
             if not isinstance(page, list):
                 raise VastError("instance list without an `instances` list")
