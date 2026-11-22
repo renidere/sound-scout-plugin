@@ -5,6 +5,7 @@ Every test uses `vast_fake.FakeVast` and a key file in a temp dir. No test reach
 the real key file or arms a real timer: the fakes prove the contract of the stack only.
 """
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -1224,3 +1225,124 @@ def test_a_failed_arm_closes_the_attempt_without_any_create(tmp_path: Path, monk
     (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
     (closed,) = [e for e in vast.Journal(journal_path).replay() if e["event"] == "closed"]
     assert closed["reason"] == "no_instance_created"
+
+
+class _JsonHost:
+    """Answers each host argv by its first word or `hostrun.py` command; `get` copies a file."""
+
+    def __init__(self, stdout: dict[str, bytes], archive: Path | None = None) -> None:
+        self.stdout, self.archive, self.got = stdout, archive, []
+
+    def run(self, argv, timeout):
+        name = argv[2] if argv[:2] == ["python3", vast.HOSTRUN] else argv[0]
+        return vast.proc.RunResult(0, self.stdout[name], b"", False, False, 0.0)
+
+    def get(self, remote, local):
+        self.got.append(remote)
+        local.write_bytes(self.archive.read_bytes())
+
+
+_FOUND = {
+    **{name: vast.RUNTIME[name] for name in ("vllm", "torch", "cuda")},
+    "transformers": "5.20.0",
+    "disk_free_bytes": 10**12,
+}
+_NOT_OBJECTS = [b"Traceback: not json\n", b"[1, 2]\n", b'"text"\n', b"", b"[" * 200_000]
+_NOT_OBJECT_IDS = ["not-json", "list", "string", "empty", "deeply-nested"]
+
+
+def _preflight_host(found: bytes) -> _JsonHost:
+    return _JsonHost(
+        {
+            "nvidia-smi": b"Fake A100, 81920 MiB, 595.91.07\n",
+            "vllm": vast.RUNTIME["vllm"].encode() + b"\n",
+            "preflight": found,
+            "selftest": b'{"ok": true}\n',
+        }
+    )
+
+
+def _preflight(host) -> dict:
+    detail: dict = {}
+    package = {"models": [{"name": "m"}], "disk_margin_bytes": 0}
+    vast.preflight(host, package, {"m": {"files": [{"size": 1}]}}, 60, detail)
+    return detail
+
+
+def test_preflight_takes_the_json_object_the_host_prints() -> None:
+    detail = _preflight(_preflight_host(json.dumps(_FOUND).encode()))
+    assert detail["found"] == {**_FOUND, "driver": "595.91.07"}
+
+
+@pytest.mark.parametrize("stdout", _NOT_OBJECTS, ids=_NOT_OBJECT_IDS)
+def test_preflight_refuses_host_stdout_that_is_not_a_json_object(stdout) -> None:
+    with pytest.raises(vast.VastError, match=r"^host: preflight printed "):
+        _preflight(_preflight_host(stdout))
+
+
+def test_download_takes_the_json_object_pack_prints(tmp_path: Path) -> None:
+    archive = _archive(tmp_path, {"a.json": b"{}"})
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    host = _JsonHost({"pack": json.dumps({"archive_sha256": digest}).encode()}, archive)
+    (tmp_path / "attempt").mkdir()
+    journal = vast.Journal.create(tmp_path / "attempt", vast.new_attempt_id(), "k3y")
+    assert vast.download(host, tmp_path / "attempt", journal, 60) == {
+        "archive_sha256": digest,
+        "files": 1,
+    }
+    assert host.got == [f"{vast.WORKSPACE}/results.tar"]
+
+
+@pytest.mark.parametrize("stdout", _NOT_OBJECTS, ids=_NOT_OBJECT_IDS)
+def test_download_refuses_pack_stdout_that_is_not_a_json_object(tmp_path: Path, stdout) -> None:
+    host = _JsonHost({"pack": stdout})
+    (tmp_path / "attempt").mkdir()
+    journal = vast.Journal.create(tmp_path / "attempt", vast.new_attempt_id(), "k3y")
+    with pytest.raises(vast.VastError, match=r"^host: pack printed "):
+        vast.download(host, tmp_path / "attempt", journal, 60)
+    assert host.got == []
+
+
+@pytest.mark.parametrize("stdout", [b"Traceback: not json\n", b"[1, 2]\n"], ids=["text", "list"])
+def test_a_preflight_without_a_json_object_is_one_vast_line_exit_2_and_still_destroys(
+    tmp_path: Path, monkeypatch, capsys, stdout
+) -> None:
+    real_run = vast.LocalHost.run
+
+    def run(self, argv, timeout):
+        done = real_run(self, argv, timeout)
+        if argv[:3] == ["python3", vast.HOSTRUN, "preflight"]:
+            return dataclasses.replace(done, stdout=stdout)
+        return done
+
+    monkeypatch.setattr(vast.LocalHost, "run", run)
+    config_ = _dry_config(tmp_path)
+    monkeypatch.setattr(vast.config, "load", lambda: config_)
+    out = tmp_path / "data" / "dry"
+    assert vast.main(["dry-run", "--out", str(out)]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("vast: host: preflight printed ")
+    assert captured.err.count("\n") == 1 and "Traceback (most recent" not in captured.err
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    steps = [e for e in events if e["event"] == "step"]
+    (step,) = [e for e in steps if e["name"] == "preflight"]
+    assert step["ok"] is False and step["detail"]["error"].startswith("VastError: host: preflight")
+    assert [e["name"] for e in steps][-1] == "destroy" and steps[-1]["ok"] is True
+    assert [e["event"] for e in events].count("absence_verified") == 1
+
+
+@pytest.mark.parametrize("command", ["preflight", "pack"])
+def test_the_refusal_names_the_command_and_never_echoes_host_stdout(
+    tmp_path: Path, command
+) -> None:
+    secret = b"host-said-s3cr3t-token"
+    with pytest.raises(vast.VastError) as raised:
+        if command == "preflight":
+            _preflight(_preflight_host(secret + b"\n"))
+        else:
+            (tmp_path / "attempt").mkdir()
+            journal = vast.Journal.create(tmp_path / "attempt", vast.new_attempt_id(), "k3y")
+            vast.download(_JsonHost({"pack": secret}), tmp_path / "attempt", journal, 60)
+    assert str(raised.value) == f"host: {command} printed no JSON"
+    assert secret.decode() not in str(raised.value)

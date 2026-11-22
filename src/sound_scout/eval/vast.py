@@ -1370,6 +1370,17 @@ def _checked(done: proc.RunResult, what: str) -> str:
     return done.stdout.decode("utf-8", "replace")
 
 
+def _checked_object(done: proc.RunResult, what: str) -> dict:
+    """The stdout of a host command that must print one JSON object."""
+    try:
+        printed = json.loads(_checked(done, what))
+    except (ValueError, RecursionError):
+        raise VastError(f"host: {what} printed no JSON") from None
+    if not isinstance(printed, dict):
+        raise VastError(f"host: {what} printed JSON that is not an object")
+    return printed
+
+
 def _public(version: object) -> str | None:
     return version.split("+", 1)[0] if isinstance(version, str) else None
 
@@ -1448,11 +1459,9 @@ def preflight(host, package: Mapping, models: Mapping, timeout: float, detail: d
     ).strip()
     vllm_cli = _checked(host.run(["vllm", "--version"], timeout), "vllm --version")
     detail["vllm_cli"] = vllm_cli.strip()
-    detail["found"] = found = json.loads(
-        _checked(
-            host.run(["python3", HOSTRUN, "preflight", "--workspace", WORKSPACE], timeout),
-            "preflight",
-        )
+    detail["found"] = found = _checked_object(
+        host.run(["python3", HOSTRUN, "preflight", "--workspace", WORKSPACE], timeout),
+        "preflight",
     )
     found["driver"] = _driver(gpu)
     selftest_out = host.run(
@@ -1633,15 +1642,13 @@ def verify_archive(archive: Path, target: Path) -> int:
 
 
 def download(host, attempt: Path, journal: Journal, timeout: float) -> dict:
-    printed = json.loads(
-        _checked(
-            host.run(
-                ["python3", HOSTRUN, "pack", "--root", f"{WORKSPACE}/out"]
-                + ["--out", f"{WORKSPACE}/results.tar"],
-                timeout,
-            ),
-            "pack",
-        )
+    printed = _checked_object(
+        host.run(
+            ["python3", HOSTRUN, "pack", "--root", f"{WORKSPACE}/out"]
+            + ["--out", f"{WORKSPACE}/results.tar"],
+            timeout,
+        ),
+        "pack",
     )
     local = attempt / "results.tar"
     host.get(f"{WORKSPACE}/results.tar", local)
