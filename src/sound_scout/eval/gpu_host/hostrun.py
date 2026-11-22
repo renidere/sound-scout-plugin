@@ -280,18 +280,35 @@ def serve(args) -> int:
     return 0 if reason in (None, "stopped") else 1
 
 
+def _session_survivors(stats: Path | None) -> list[int]:
+    """Live processes of the server session `serve` recorded in its `started` line."""
+    started = [r for r in _records(stats) if r.get("event") == "started"] if stats else []
+    session = started[-1].get("pid") if started else None
+    if type(session) is not int:
+        return []
+    return [pid for pid in session_pids(session) if _alive(pid)]
+
+
 def stop_command(args) -> int:
+    """SIGTERM to `serve`; 0 once it and every process of the server session are gone. A
+    survivor of a `serve` that is already gone is killed (nothing else would end it)."""
     try:
         pid = int(Path(args.pid_file).read_text())
         os.kill(pid, signal.SIGTERM)
     except (OSError, ValueError):
-        return 0
+        pid = None
     ends = time.monotonic() + args.timeout
-    while time.monotonic() < ends:
-        if not _alive(pid):
-            return 0
+    while True:
+        if pid is None or not _alive(pid):
+            survivors = _session_survivors(args.stats)
+            if not survivors:
+                return 0
+            for survivor in survivors:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(survivor, signal.SIGKILL)
+        if time.monotonic() >= ends:
+            return 1
         time.sleep(0.2)
-    return 1
 
 
 def _alive(pid: int) -> bool:
@@ -700,6 +717,7 @@ def main(argv=None) -> int:
     stop_ = commands.add_parser("stop")
     stop_.add_argument("--pid-file", required=True)
     stop_.add_argument("--timeout", type=float, default=60.0)
+    stop_.add_argument("--stats", type=Path)
     state_ = commands.add_parser("state")
     state_.add_argument("--stats", type=Path, required=True)
     state_.add_argument("--pid-file", type=Path, required=True)

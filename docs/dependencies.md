@@ -453,7 +453,8 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 `--max-num-seqs 1`, `--seed 0`, `--enforce-eager`, `--generation-config vllm`, одно аудио на
 запрос, `--no-enable-prefix-caching` и `--mm-processor-cache-gb 0` (prefix cache и кэш
 мультимодального процессора выключены, #161), `127.0.0.1:8000`, без `--trust-remote-code`
-(загружается только thinker). Имена флагов — `vllm/engine/arg_utils.py` тега `v0.34.0`
+(загружается только thinker: у Qwen3-Omni веса talker и code2wav лежат в тех же шардах,
+загрузчик vLLM их пропускает). Имена флагов — `vllm/engine/arg_utils.py` тега `v0.34.0`
 (`--enable-prefix-caching` как `BooleanOptionalAction`; `--mm-processor-cache-gb`, `0` выключает
 кэш — `vllm/config/multimodal.py`). Поле llama.cpp `cache_prompt` vLLM не читает:
 `gate0.sampling("vllm")` его не отправляет; остальные поля `SAMPLING` (`temperature`, `seed`,

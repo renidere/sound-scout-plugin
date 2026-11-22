@@ -6,6 +6,7 @@ The guard runs here in real child processes on this station; nothing reaches bey
 This proves the guard and the host commands, not the image they will run in.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -425,6 +426,56 @@ def test_a_guarded_server_starts_workers_that_stay_guarded(tmp_path, method) -> 
         if serve.poll() is None:
             serve.send_signal(signal.SIGTERM)
             serve.wait(30)
+
+
+SESSION_SERVER = """
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+time.sleep(120)
+"""
+
+
+def test_stop_ends_only_when_no_process_of_the_server_session_survives(tmp_path) -> None:
+    script = tmp_path / "server.py"
+    script.write_text(SESSION_SERVER)
+    serve = _start_serve(tmp_path, [sys.executable, str(script)])
+    server_pid = None
+    try:
+        server_pid = _wait_for(
+            lambda: next((r["pid"] for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        _wait_for(
+            lambda: len([p for p in hostrun.session_pids(server_pid) if hostrun._alive(p)]) == 2
+        )
+        serve.kill()
+        serve.wait(30)
+        assert [p for p in hostrun.session_pids(server_pid) if hostrun._alive(p)]
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "pid"), "--stats", str(tmp_path / "stats.jsonl")]
+        done = subprocess.run([*stop, "--timeout", "30"], timeout=60)
+        assert done.returncode == 0
+        assert not [p for p in hostrun.session_pids(server_pid) if hostrun._alive(p)]
+    finally:
+        if serve.poll() is None:
+            serve.kill()
+            serve.wait(30)
+        if server_pid is not None:
+            for pid in hostrun.session_pids(server_pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def test_stop_fails_while_a_process_of_the_server_session_survives(tmp_path, monkeypatch) -> None:
+    stats = tmp_path / "stats.jsonl"
+    stats.write_text(json.dumps({"event": "started", "t": 0, "pid": 4242}) + "\n")
+    monkeypatch.setattr(hostrun, "session_pids", lambda session: [4242] if session == 4242 else [])
+    monkeypatch.setattr(hostrun, "_alive", lambda pid: pid == 4242)
+    killed = []
+    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    args = ["stop", "--pid-file", str(tmp_path / "absent.pid"), "--stats", str(stats)]
+    assert hostrun.main([*args, "--timeout", "0.5"]) == 1
+    assert killed and set(killed) == {(4242, signal.SIGKILL)}
+    assert hostrun.main(["stop", "--pid-file", str(tmp_path / "absent.pid"), "--timeout", "0"]) == 0
 
 
 NATIVE_SERVER = """

@@ -8,9 +8,11 @@ external host, `API_BASE`. Recording analysis stays offline (R09).
 - `deploy --package P --approval URL` runs every step: `open` (append-only ownership journal
   under `<data_root>/gpu/<attempt>/`), `arm` (two `systemd-run --user` timers that need no agent),
   `create` (one PUT, never repeated), `ready`, `preflight`, `weights`, per model `smoke` and
-  `run` (the Gate 0 client on this station through an SSH tunnel), `download` (SHA-256 of the
-  archive and of every file) and `destroy` with a check that the instance is gone by id and by
-  label. Any failure destroys.
+  `run` (the Gate 0 client on this station through an SSH tunnel; each model on a server of its
+  own, its host evidence journaled and the server stopped before the next), `download`
+  (SHA-256 of the archive and of every file) and `destroy` with a check that the instance is
+  gone by id and by label. Any failure destroys. Before anything opens, `check_days` holds each
+  model to the rule of its local run (`GATE0_RUNS`) and to the clips its package entry pins.
 - `watch --journal J` and `cutoff --journal J` are the timers' ticks; `destroy --journal J`
   destroys by hand; `status --journal J` reads the journal only.
 - `dry-run [--out DIR]` runs the same steps against `vast_fake` on 127.0.0.1: a fake API, a fake
@@ -104,7 +106,9 @@ def _model(repo: str, revision: str, *files: tuple) -> dict:
 
 
 # bf16 weights of the candidates, revision and files from the public HF API (not computed here);
-# `spk_dict.pt` (a pickle the talker needs) is left out and never downloaded
+# `spk_dict.pt` (a pickle the talker needs) is left out and never downloaded. The talker and
+# code2wav weights of Qwen3-Omni share its shards: vLLM loads only the thinker (its weights
+# mapper drops `talker.` and `code2wav.`), as the local GGUF run of 0023 did
 MODELS = {
     "qwen25omni": _model(
         "Qwen/Qwen2.5-Omni-7B",
@@ -264,6 +268,15 @@ MODELS = {
         ("vocab.json", 2776833, None, "4783fe10ac3adce15ac8f358ef5462739852c569"),
     ),
 }
+
+
+# the rule and the memory ceiling of each model's local run: 0024 (Qwen2.5-Omni-7B, v1, 18e9)
+# and 0023 (Qwen3-Omni-30B-A3B-Instruct, v2, 26e9); a package entry keeps both
+GATE0_RUNS = {
+    "qwen25omni": {"rule": gate0.RULE_V1, "rss_ceiling_bytes": 18 * 10**9},
+    "qwen3omni": {"rule": gate0.RULE_V2, "rss_ceiling_bytes": 26 * 10**9},
+}
+DISK_STEP_GB = 10
 
 
 def expected_files(models: Mapping, name: str) -> dict:
@@ -1268,19 +1281,76 @@ def load_package(path: Path, models: Mapping) -> tuple[dict, str]:
     entries = package.get("models")
     if not isinstance(entries, list) or not entries:
         raise VastError("package needs a non-empty list of models")
+    known = sorted(set(models) & set(GATE0_RUNS))
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("name") not in models:
-            raise VastError(f"package model must be one of {sorted(models)}")
+        if not isinstance(entry, dict) or entry.get("name") not in known:
+            raise VastError(f"package model must be one of {known}")
         if not isinstance(entry.get("gate0_date"), str) or not isinstance(
             entry.get("decision"), str
         ):
             raise VastError("package model needs gate0_date and decision")
         if type(entry.get("rss_limit_bytes")) is not int or entry["rss_limit_bytes"] <= 0:
             raise VastError("package model needs a positive rss_limit_bytes")
+        ceiling = GATE0_RUNS[entry["name"]]["rss_ceiling_bytes"]
+        if entry["rss_limit_bytes"] > ceiling:
+            raise VastError(f"package rss_limit_bytes of {entry['name']} is over its {ceiling}")
+        clips = entry.get("clips")
+        if clips is not None and (
+            not isinstance(clips, dict)
+            or not clips
+            or not all(
+                isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in clips.values()
+            )
+        ):
+            raise VastError("package model clips must map clip ids to SHA-256 of their WAV")
+    names = [entry["name"] for entry in entries]
+    if len(set(names)) != len(names):
+        raise VastError("package lists a model twice")
     margin = package.setdefault("disk_margin_bytes", 10 * 10**9)
     if type(margin) is not int or margin < 0:
         raise VastError("package disk_margin_bytes must be a non-negative integer")
+    need_gb = min_disk_gb(package, models)
+    if package["disk_gb"] < need_gb:
+        raise VastError(f"package disk_gb {package['disk_gb']} is below the {need_gb} GB it needs")
     return package, hashlib.sha256(data).hexdigest()
+
+
+def min_disk_gb(package: Mapping, models: Mapping) -> int:
+    """The weights of every model plus the margin, rounded up to whole `DISK_STEP_GB`."""
+    need = package["disk_margin_bytes"] + sum(
+        entry["size"] for model in package["models"] for entry in models[model["name"]]["files"]
+    )
+    return math.ceil(need / (DISK_STEP_GB * 10**9)) * DISK_STEP_GB
+
+
+def check_days(package: Mapping, config_: config.Config) -> None:
+    """Before anything is opened: each model's Gate 0 day is prepared under the rule of its local
+    run, and a day the package pins by `clips` is exactly those clips, by id and by the SHA-256
+    of each WAV on disk (never controls only)."""
+    for entry in package["models"]:
+        name, day = entry["name"], entry["gate0_date"]
+        manifest_path = gate0.output_dir(day, config_) / gate0.MANIFEST_FILE
+        if not manifest_path.is_file():
+            raise VastError(f"Gate 0 day {day} is not prepared")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            rule = gate0.rule_sha256(Path(entry["decision"]).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, gate0.Gate0Error) as error:
+            raise VastError(f"decision of {name}: {error}") from None
+        want = GATE0_RUNS[name]["rule"]
+        if gate0.rule_name(rule) != want:
+            raise VastError(f"{name} runs under {want}, its decision holds {gate0.rule_name(rule)}")
+        if manifest.get("rule_sha256") != rule:
+            raise VastError(f"Gate 0 day {day} was prepared under another rule than {name}'s")
+        clips = entry.get("clips")
+        if clips is None:
+            continue
+        found = {
+            clip["id"]: gate0._sha256_file(manifest_path.parent / clip["file"])
+            for clip in manifest["clips"]
+        }
+        if manifest.get("controls_only") or found != clips:
+            raise VastError(f"Gate 0 day {day} is not the clip set the package pins for {name}")
 
 
 @contextlib.contextmanager
@@ -1634,7 +1704,8 @@ def fetch_server_evidence(
     host, attempt: Path, journal: Journal, name: str, out: str, timeout: float = 60.0
 ) -> None:
     """Log tails and the process list of the host into `evidence-<name>.json` and the journal,
-    while the server tree still lives; never raises, so destroy always follows."""
+    while the server tree still lives. A failure is journaled, not raised, so destroy always
+    follows; a cancellation (KeyboardInterrupt, SystemExit) is journaled and propagates."""
     try:
         found = _checked_object(
             host.run(["python3", HOSTRUN, "evidence", "--dir", out], timeout), "evidence"
@@ -1667,6 +1738,8 @@ def fetch_server_evidence(
                 model=name,
                 error=redact(f"{type(error).__name__}: {error}", journal.key),
             )
+        if not isinstance(error, Exception):
+            raise
 
 
 def _state_or_none(host, out: str, journal: Journal, detail: dict) -> dict | None:
@@ -1681,7 +1754,9 @@ def _state_or_none(host, out: str, journal: Journal, detail: dict) -> dict | Non
 
 
 def serve_and_run(host, attempt, journal, package, entry, models, receipt, iid, config_, intervals):
-    """Steps `smoke` and `run` of one model; the server stops whatever happens."""
+    """Steps `smoke` and `run` of one model on a server of its own. The host's evidence is
+    journaled and the server stops whatever happens; a server that does not stop ends the
+    attempt, so the next model never starts beside it."""
     name = entry["name"]
     out = f"{WORKSPACE}/out/{name}"
     deadline = summarize(journal.replay())["opened"]["deadline_unix"]
@@ -1690,6 +1765,7 @@ def serve_and_run(host, attempt, journal, package, entry, models, receipt, iid, 
     serve += ["--log", f"{out}/server.log", "--guard-log", f"{out}/guard.log"]
     serve += ["--pid-file", f"{out}/serve.pid", "--"]
     serve += vllm_argv(f"{WORKSPACE}/models/{name}", name, host.server_port)
+    fetched = False
     try:
         try:
             with _step(journal, "smoke", model=name) as detail:
@@ -1730,13 +1806,24 @@ def serve_and_run(host, attempt, journal, package, entry, models, receipt, iid, 
                     _judge(state, late=True)
                 except ServerExited as error:
                     detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
-                if state is None or "server_exit" in detail:
-                    fetch_server_evidence(host, attempt, journal, name, out)
+                fetched = True
+                fetch_server_evidence(host, attempt, journal, name, out)
         except BaseException:
-            fetch_server_evidence(host, attempt, journal, name, out)
+            if not fetched:
+                fetch_server_evidence(host, attempt, journal, name, out)
             raise
     finally:
-        host.run(["python3", HOSTRUN, "stop", "--pid-file", f"{out}/serve.pid"], 120)
+        stop = ["python3", HOSTRUN, "stop", "--pid-file", f"{out}/serve.pid"]
+        stopped = host.run([*stop, "--stats", f"{out}/server-stats.jsonl"], 120)
+        with contextlib.suppress(BaseException):
+            journal.append(
+                "server_stopped",
+                model=name,
+                returncode=stopped.returncode,
+                timed_out=stopped.timed_out,
+            )
+    if stopped.timed_out or stopped.returncode != 0:
+        raise VastError(f"the vLLM server of {name} did not stop; no next model starts")
 
 
 def verify_archive(archive: Path, target: Path) -> int:
@@ -1806,10 +1893,7 @@ def run_attempt(
     package, package_sha = load_package(package_path, models)
     if not dry_run and not (approval_url or "").startswith("https://github.com/"):
         raise VastError("deploy needs --approval with the link to the owner's approval")
-    for entry in package["models"]:
-        manifest = gate0.output_dir(entry["gate0_date"], config_) / gate0.MANIFEST_FILE
-        if not manifest.is_file():
-            raise VastError(f"Gate 0 day {entry['gate0_date']} is not prepared")
+    check_days(package, config_)
     gpu = gpu_root(config_)
     refuse_open_attempts(gpu)
     initial_credit = _number(api.user().get("credit"), "credit")

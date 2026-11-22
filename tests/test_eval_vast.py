@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import secrets
 import subprocess
 import tarfile
 import threading
@@ -26,6 +27,7 @@ import pytest
 
 from sound_scout import config
 from sound_scout.eval import gate0, vast, vast_fake
+from sound_scout.smoke import speech_like_control
 
 REPO = Path(__file__).resolve().parent.parent
 DRY_STEPS = ["create", "ready", "weights", "smoke", "run", "download", "destroy"]
@@ -910,6 +912,7 @@ def test_vllm_argv_is_local_thinker_only_without_remote_code() -> None:
     assert argv[argv.index("--port") + 1] == "8000"
     assert "--trust-remote-code" not in argv
     assert argv[argv.index("--limit-mm-per-prompt") + 1] == '{"audio":1,"image":0,"video":0}'
+    assert argv[argv.index("--dtype") + 1] == "bfloat16"
 
 
 def test_vllm_argv_turns_off_the_prefix_and_multimodal_processor_caches() -> None:
@@ -1110,8 +1113,21 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
     for path in out.rglob("*"):
         if path.is_file() and path.name != "fake-api-key":
             assert key.encode() not in path.read_bytes(), path
-    assert "server_evidence" not in [e["event"] for e in events]
-    assert not list((out / "gpu" / result["attempt_id"]).glob("evidence-*"))
+    per_model = [
+        f"{e['event']}:{e.get('name', '')}:{e['model']}"
+        for e in events
+        if e.get("model") and e["event"] in ("step", "server_evidence", "server_stopped")
+    ]
+    assert per_model == [
+        f"{event}:{model}"
+        for model in ("qwen25omni", "qwen3omni")
+        for event in ("step:smoke", "server_evidence:", "step:run", "server_stopped:")
+    ]
+    assert all(e["returncode"] == 0 for e in events if e["event"] == "server_stopped")
+    assert sorted(p.name for p in (out / "gpu" / result["attempt_id"]).glob("evidence-*")) == [
+        "evidence-qwen25omni.json",
+        "evidence-qwen3omni.json",
+    ]
     host = out / "gpu" / result["attempt_id"] / "host"
     assert (host / "guard-selftest.json").is_file()
     assert json.loads((host / "guard-selftest.json").read_text())["ok"] is True
@@ -1456,6 +1472,7 @@ def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monke
     assert _after_failure(events, "smoke") == [
         "step:smoke",
         "server_evidence",
+        "server_stopped",
         "destroy_requested",
         "destroy_response",
         "absence_verified",
@@ -1475,9 +1492,10 @@ def test_a_failed_smoke_journals_the_log_tail_and_the_process_list_before_destro
     attempt, events = _failed_dry_run(tmp_path, "did not answer /health in time")
     (smoke,) = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
     assert "server_exit" not in smoke["detail"]
-    assert _after_failure(events, "smoke")[:3] == [
+    assert _after_failure(events, "smoke")[:4] == [
         "step:smoke",
         "server_evidence",
+        "server_stopped",
         "destroy_requested",
     ]
     (evidence,) = [e for e in events if e["event"] == "server_evidence"]
@@ -1517,7 +1535,13 @@ def test_a_failed_run_also_journals_evidence(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(vast.gate0, "run_spike", broken)
     attempt, events = _failed_dry_run(tmp_path, "gate0 runner broke")
-    assert _after_failure(events, "run")[:3] == ["step:run", "server_evidence", "destroy_requested"]
+    assert not [e for e in events if e.get("model") == "qwen3omni"]
+    assert _after_failure(events, "run")[:4] == [
+        "step:run",
+        "server_evidence",
+        "server_stopped",
+        "destroy_requested",
+    ]
     (evidence,) = [e for e in events if e["event"] == "server_evidence"]
     assert "serving qwen25omni" in evidence["tails"]["server.log"]
     assert (attempt / "evidence-qwen25omni.json").is_file()
@@ -1547,11 +1571,35 @@ def test_a_server_that_dies_during_a_run_with_a_verdict_journals_evidence(
     assert runs["qwen25omni"]["ok"] and runs["qwen25omni"]["detail"]["verdict"] == "NOT READY"
     assert runs["qwen25omni"]["detail"]["server_exit"] == {"reason": None, "returncode": -9}
     assert "server_exit" not in runs["qwen3omni"]["detail"]
-    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    evidence, second = [e for e in events if e["event"] == "server_evidence"]
     assert evidence["model"] == "qwen25omni" and "processes" in evidence
+    assert second["model"] == "qwen3omni" and '"returncode": -9' not in str(second["tails"])
     assert '"returncode": -9' in evidence["tails"]["server-stats.jsonl"]
     assert (journal_path.parent / "evidence-qwen25omni.json").is_file()
     assert events.index(evidence) < events.index(runs["qwen25omni"])
+
+
+def test_a_cancellation_during_evidence_after_a_run_still_destroys(tmp_path, monkeypatch) -> None:
+    real_run = vast.LocalHost.run
+
+    def run(self, argv, timeout):
+        if argv[:3] == ["python3", vast.HOSTRUN, "evidence"]:
+            raise KeyboardInterrupt
+        return real_run(self, argv, timeout)
+
+    monkeypatch.setattr(vast.LocalHost, "run", run)
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(KeyboardInterrupt):
+        vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    runs = [e for e in events if e["event"] == "step" and e["name"] == "run"]
+    assert [(e["model"], e["ok"]) for e in runs] == [("qwen25omni", False)]
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert evidence["error"] == "KeyboardInterrupt: "
+    names = [e["event"] for e in events]
+    assert names.index("server_stopped") < names.index("destroy_requested")
+    assert vast.summarize(events)["closed"] is not None
 
 
 @pytest.mark.parametrize("failure", ["not-json", "raises"])
@@ -1578,8 +1626,9 @@ def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -
             "raises": "OSError: ssh dropped",
         }[failure]
     )
-    assert _after_failure(events, "smoke")[1:5] == [
+    assert _after_failure(events, "smoke")[1:6] == [
         "server_evidence",
+        "server_stopped",
         "destroy_requested",
         "destroy_response",
         "absence_verified",
@@ -1651,3 +1700,339 @@ def test_a_failing_state_call_is_counted_and_never_ends_the_wait() -> None:
         )
     assert detail["state_errors"]["count"] == 2
     assert detail["state_errors"]["last"] == "VastError: host: state printed no JSON"
+
+
+# --- the two-model package of #149 ---------------------------------------------------------
+
+DECISION_V1 = REPO / "docs/decisions/0024-gate0-qwen25-omni.md"
+DECISION_V2 = REPO / "docs/decisions/0023-gate0-qwen3-omni.md"
+
+
+def _reference_package(**changes) -> dict:
+    """The shape of the 0028 package: both models, the cap and limits the owner approved."""
+    return {
+        **_package(),
+        "ceiling_usd": 1.2,
+        "early_stop_usd": 0.9,
+        "deadline_minutes": 60,
+        "disk_gb": 110,
+        "disk_margin_bytes": 10 * 10**9,
+        "models": [
+            {
+                "name": "qwen25omni",
+                "gate0_date": "2026-11-19",
+                "decision": str(DECISION_V1),
+                "rss_limit_bytes": 18 * 10**9,
+            },
+            {
+                "name": "qwen3omni",
+                "gate0_date": "2026-11-21",
+                "decision": str(DECISION_V2),
+                "rss_limit_bytes": 26 * 10**9,
+            },
+        ],
+        "preregistration": "docs/decisions/0028-gpu-reference-gate0.md",
+        **changes,
+    }
+
+
+def _load(tmp_path: Path, package: dict, models=vast.MODELS) -> dict:
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package))
+    return vast.load_package(path, models)[0]
+
+
+def test_the_reference_package_needs_110_gb_of_disk_and_refuses_less(tmp_path: Path) -> None:
+    package = _load(tmp_path, _reference_package())
+    assert vast.min_disk_gb(package, vast.MODELS) == 110
+    with pytest.raises(vast.VastError, match="disk_gb 109 is below the 110 GB"):
+        _load(tmp_path, _reference_package(disk_gb=109))
+    single = _reference_package(disk_gb=40)
+    single["models"] = single["models"][:1]
+    assert vast.min_disk_gb(_load(tmp_path, single), vast.MODELS) == 40
+
+
+def _model_change(index: int, **fields) -> dict:
+    package = _reference_package()
+    package["models"][index] = {**package["models"][index], **fields}
+    return package
+
+
+@pytest.mark.parametrize(
+    ("package", "message"),
+    [
+        (_model_change(1, name="gemma"), "must be one of"),
+        (_model_change(1, name="qwen25omni", rss_limit_bytes=10**9), "lists a model twice"),
+        (_model_change(1, rss_limit_bytes=26 * 10**9 + 1), "over its 26000000000"),
+        (_model_change(0, rss_limit_bytes=18 * 10**9 + 1), "over its 18000000000"),
+        (_model_change(0, clips={"S0": "not a hash"}), "SHA-256 of their WAV"),
+        (_model_change(0, clips={}), "SHA-256 of their WAV"),
+    ],
+    ids=["unknown-model", "twice", "qwen3omni-rss", "qwen25omni-rss", "bad-pin", "empty-pins"],
+)
+def test_a_reference_package_with_a_bad_model_entry_is_refused(
+    tmp_path: Path, package, message
+) -> None:
+    with pytest.raises(vast.VastError, match=message):
+        _load(tmp_path, package)
+
+
+def test_a_model_missing_from_the_models_manifest_is_refused(tmp_path: Path) -> None:
+    models = {"qwen25omni": vast.MODELS["qwen25omni"]}
+    with pytest.raises(vast.VastError, match=r"must be one of \['qwen25omni'\]"):
+        _load(tmp_path, _reference_package(), models)
+
+
+def _controls_day(config_: config.Config, day: str, decision: Path) -> dict:
+    return gate0.prepare_clips(day, config_, decision=decision, controls_only=True)
+
+
+def _pins(manifest: dict) -> dict:
+    return {clip["id"]: clip["wav_sha256"] for clip in manifest["clips"]}
+
+
+@pytest.mark.parametrize(
+    ("decisions", "message"),
+    [
+        ((DECISION_V1, DECISION_V1), "qwen3omni runs under GATE0-RULE v2, its decision holds v1"),
+        ((DECISION_V2, DECISION_V2), "qwen25omni runs under GATE0-RULE v1, its decision holds v2"),
+    ],
+    ids=["v1-for-qwen3omni", "v2-for-qwen25omni"],
+)
+def test_a_model_under_another_rule_than_its_local_run_is_refused_before_any_call(
+    tmp_path: Path, key_file, fake, decisions, message
+) -> None:
+    config_ = _dry_config(tmp_path)
+    _controls_day(config_, "2026-11-19", DECISION_V1)
+    _controls_day(config_, "2026-11-21", DECISION_V2)
+    package = _reference_package()
+    for entry, decision in zip(package["models"], decisions, strict=True):
+        entry["decision"] = str(decision)
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package))
+    with pytest.raises(vast.VastError, match=message.replace("holds v", "holds GATE0-RULE v")):
+        vast.run_attempt(
+            path,
+            api=vast.Api(fake.url, key_file[1]),
+            make_host=None,
+            config_=config_,
+            runner=_no_system,
+            dry_run=True,
+            key_path=key_file[0],
+        )
+    assert fake.log == [] and not (config_.data_root / "gpu").exists()
+
+
+def test_a_day_prepared_under_another_rule_or_another_clip_set_is_refused(tmp_path: Path) -> None:
+    config_ = _dry_config(tmp_path)
+    first = _controls_day(config_, "2026-11-19", DECISION_V1)
+    _controls_day(config_, "2026-11-21", DECISION_V1)
+    package = _reference_package()
+    with pytest.raises(vast.VastError, match="2026-11-21 was prepared under another rule"):
+        vast.check_days(package, config_)
+    package["models"] = package["models"][:1]
+    vast.check_days(package, config_)
+    package["models"][0]["clips"] = _pins(first)
+    with pytest.raises(vast.VastError, match="not the clip set the package pins"):
+        vast.check_days(package, config_)
+    missing = _reference_package(models=[{**package["models"][0], "gate0_date": "2026-11-30"}])
+    with pytest.raises(vast.VastError, match="2026-11-30 is not prepared"):
+        vast.check_days(missing, config_)
+
+
+def test_a_full_day_off_its_clip_pins_is_refused(tmp_path: Path) -> None:
+    config_ = _dry_config(tmp_path)
+    v1, _ = _full_days(config_)
+    package = _reference_package()
+    package["models"] = package["models"][:1]
+    package["models"][0]["clips"] = _pins(v1)
+    vast.check_days(package, config_)
+    wrong_hash = {**_pins(v1), "V2": "0" * 64}
+    dropped = {k: v for k, v in _pins(v1).items() if k != "V2"}
+    for clips in (wrong_hash, dropped):
+        package["models"][0]["clips"] = clips
+        with pytest.raises(vast.VastError, match="not the clip set the package pins"):
+            vast.check_days(package, config_)
+    package["models"][0]["clips"] = _pins(v1)
+    wav = gate0.output_dir("2026-11-19", config_) / next(
+        clip["file"] for clip in v1["clips"] if clip["id"] == "V2"
+    )
+    data = bytearray(wav.read_bytes())
+    data[-1] ^= 1
+    wav.write_bytes(bytes(data))
+    with pytest.raises(vast.VastError, match="not the clip set the package pins"):
+        vast.check_days(package, config_)
+
+
+def _full_days(config_: config.Config) -> tuple[dict, dict]:
+    """Full Gate 0 days as the local runs had them: 2026-11-19 under v1 with B1-B3, V1-V3 and the
+    controls from synthetic voices, and 2026-11-21 under v2 as a byte copy of its clips."""
+
+    def transcribe(path, run, config_):
+        samples = np.frombuffer(gate0.wav_pcm(Path(path).read_bytes()), dtype="<i2") / 32767
+        words = [
+            {"word": " раз", "start": 0.1, "end": 0.5, "probability": 0.9},
+            {"word": " два,", "start": 1.0, "end": 1.5, "probability": 0.9},
+            {"word": " три", "start": 2.0, "end": 2.6, "probability": 0.9},
+        ]
+        return {
+            "samples": samples,
+            "sha256": "0" * 64,
+            "duration_s": len(samples) / gate0.SAMPLE_RATE,
+            "words": words,
+            "transcript": "раз два, три",
+        }
+
+    for name in gate0.SOURCE_FILES:
+        voice = speech_like_control(3.0, gate0.SAMPLE_RATE, f0=130.0)
+        (config_.allowed_roots[0] / name).write_bytes(gate0.wav_bytes(gate0.pcm16(voice)))
+    v1 = gate0.prepare_clips("2026-11-19", config_, decision=DECISION_V1, transcribe=transcribe)
+    v2 = gate0.reuse_clips("2026-11-21", config_, source="2026-11-19", decision=DECISION_V2)
+    return v1, v2
+
+
+def _stack(tmp_path: Path, config_: config.Config, package: dict) -> Path:
+    """`run_attempt` against the fakes, as the dry run drives it; the attempt directory."""
+    key_path = tmp_path / "fake-api-key"
+    key_path.write_text(secrets.token_urlsafe(32) + "\n")
+    key_path.chmod(0o600)
+    key = vast.read_api_key(key_path)
+    env = vast._fake_host_root(tmp_path / "host-root")
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package))
+    fake = vast_fake.FakeVast(key).start()
+    try:
+        journal = vast.run_attempt(
+            path,
+            api=vast.Api(fake.url, key),
+            make_host=lambda instance, attempt: vast.LocalHost(tmp_path / "host-root", env),
+            config_=config_,
+            runner=vast._refuse_system,
+            intervals=vast.DRY_INTERVALS,
+            dry_run=True,
+            key_path=key_path,
+            models=vast_fake.synthetic_models(),
+        )
+    finally:
+        fake.stop()
+    assert sum(e["method"] == "PUT" for e in fake.log) == 1
+    assert not [i for i, inst in fake.instances.items() if fake._visible(inst)]
+    return journal.dir
+
+
+def test_the_two_model_package_runs_each_full_day_under_its_rule_on_a_fresh_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(vast_fake, "OFFER", {**vast_fake.OFFER, "dph_total": 0.85})
+    config_ = _dry_config(tmp_path)
+    v1, v2 = _full_days(config_)
+    assert [clip["id"] for clip in v1["clips"]] == [
+        "B1", "V1", "B2", "V2", "B3", "V3", "S0", "N1", "T1",
+    ]  # fmt: skip
+    package = _reference_package(disk_gb=150, disk_margin_bytes=0)
+    package["models"][0]["clips"] = _pins(v1)
+    package["models"][1]["clips"] = _pins(v2)
+    attempt = _stack(tmp_path, config_, package)
+    events = vast.Journal(attempt / vast.JOURNAL_FILE).replay()
+    for day, rule, served in (
+        ("2026-11-19", "v1", "qwen25omni"),
+        ("2026-11-21", "v2", "qwen3omni"),
+    ):
+        run = json.loads((config_.data_root / day / "attempts/1/run.json").read_text())
+        assert run["rule"] == f"GATE0-RULE {rule}" and run["served_model"] == served
+        assert run["requests_planned"] == 42
+        trace = (config_.data_root / day / "attempts/1/trace.jsonl").read_text().splitlines()
+        assert sum(json.loads(line).get("sent") is True for line in trace) == 42
+    stopped = next(e for e in events if e["event"] == "server_stopped")
+    evidence = next(e for e in events if e["event"] == "server_evidence")
+    second_smoke = next(e for e in events if e["event"] == "step" and e.get("model") == "qwen3omni")
+    assert evidence["model"] == stopped["model"] == "qwen25omni" and stopped["returncode"] == 0
+    assert events.index(evidence) < events.index(stopped) < events.index(second_smoke)
+    stats = {
+        model: [
+            json.loads(line)
+            for line in (attempt / "host" / model / "server-stats.jsonl").read_text().splitlines()
+        ]
+        for model in ("qwen25omni", "qwen3omni")
+    }
+    (first_exit,) = [r for r in stats["qwen25omni"] if r["event"] == "exit"]
+    (second_start,) = [r for r in stats["qwen3omni"] if r["event"] == "started"]
+    assert first_exit["reason"] == "stopped" and first_exit["t"] <= second_start["t"]
+    assert events[-1]["event"] == "step" and events[-1]["name"] == "destroy" and events[-1]["ok"]
+
+
+def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
+    tmp_path, monkeypatch
+) -> None:
+    real_run = vast.LocalHost.run
+
+    def run(self, argv, timeout):
+        done = real_run(self, argv, timeout)
+        if argv[:3] == ["python3", vast.HOSTRUN, "stop"]:
+            return dataclasses.replace(done, returncode=1)
+        return done
+
+    monkeypatch.setattr(vast.LocalHost, "run", run)
+    attempt, events = _failed_dry_run(tmp_path, "server of qwen25omni did not stop")
+    assert not [e for e in events if e.get("model") == "qwen3omni"]
+    (stopped,) = [e for e in events if e["event"] == "server_stopped"]
+    assert stopped["returncode"] == 1
+    assert [e["event"] for e in events].count("absence_verified") == 1
+    assert events[-1]["name"] == "destroy" and events[-1]["ok"]
+
+
+@pytest.mark.parametrize(
+    ("dph", "refused"), [(1.2, True), (0.85, False)], ids=["over-cap", "within-cap"]
+)
+def test_the_estimate_covers_the_whole_package_up_to_the_deadline(
+    tmp_path: Path, key_file, fake, monkeypatch, dph, refused
+) -> None:
+    monkeypatch.setattr(vast_fake, "OFFER", {**vast_fake.OFFER, "dph_total": dph})
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    api = vast.Api(fake.url, key_file[1])
+    package = _reference_package(envelope={"dph_total": {"lte": 2.0}})
+    assert vast.estimate_usd(vast_fake.OFFER, 1.0, package["in_gb"], 1.0) == pytest.approx(
+        dph + 102.95 * 0.0026042 + 0.0039063
+    )
+    if refused:
+        with pytest.raises(vast.VastError, match=r"estimate 1\.47 USD is over the ceiling"):
+            vast.create_instance(api, journal, package, _no_system)
+        assert fake.count("PUT") == 0
+    else:
+        assert vast.create_instance(api, journal, package, _no_system)
+        assert fake.count("PUT") == 1
+
+
+def test_the_0028_package_loads_with_a_quote_and_pins_the_rules_and_clips_it_lists(
+    tmp_path: Path,
+) -> None:
+    text = (REPO / "docs/decisions/0028-gpu-reference-gate0.md").read_text(encoding="utf-8")
+    block = text.split("\n## Пакет\n", 1)[1].split("```json\n", 1)[1].split("\n```", 1)[0]
+    package = json.loads(block)
+    assert "offer_id" not in package and "dph_total" not in package["envelope"]
+    package["offer_id"] = vast_fake.OFFER_ID
+    package["envelope"]["dph_total"] = {"lte": 0.9}
+    loaded = _load(tmp_path, package)
+    assert loaded["disk_gb"] == vast.min_disk_gb(loaded, vast.MODELS) == 110
+    assert loaded["envelope"]["disk_space"] == {"gte": 110}
+    assert (loaded["ceiling_usd"], loaded["early_stop_usd"], loaded["deadline_minutes"]) == (
+        1.2,
+        0.9,
+        60,
+    )
+    assert [entry["name"] for entry in loaded["models"]] == ["qwen25omni", "qwen3omni"]
+    for entry in loaded["models"]:
+        rule = gate0.rule_sha256((REPO / entry["decision"]).read_text(encoding="utf-8"))
+        assert gate0.rule_name(rule) == vast.GATE0_RUNS[entry["name"]]["rule"]
+        assert rule in text
+        assert entry["rss_limit_bytes"] == vast.GATE0_RUNS[entry["name"]]["rss_ceiling_bytes"]
+        assert list(entry["clips"]) == ["B1", "V1", "B2", "V2", "B3", "V3", "S0", "N1", "T1"]
+        for clip_id, digest in entry["clips"].items():
+            assert re.search(rf"^\| `{clip_id}` \|.*\| `{digest}` \|", text, re.MULTILINE)
+    assert loaded["models"][0]["clips"] == loaded["models"][1]["clips"]
+    assert gate0.PROMPT_SHA256 in text and gate0.questions_sha256() in text
+    for model in vast.MODELS.values():
+        assert model["revision"] in text
+    argv = vast.vllm_argv("/m", "m")
+    assert "`--no-enable-prefix-caching`" in text and "`--mm-processor-cache-gb 0`" in text
+    assert "--no-enable-prefix-caching" in argv
