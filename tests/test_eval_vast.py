@@ -974,6 +974,28 @@ def test_timing_document_records_attempt_1_of_the_pilot() -> None:
     assert "20261122T061200Z-66c4813a" in section and "#158" in section
 
 
+def test_timing_document_records_attempt_3_of_the_pilot() -> None:
+    text = (REPO / "docs" / "gpu-timing.md").read_text(encoding="utf-8")
+    section = text.split("## Попытка 3 пилота #148", 1)[1].split("\n## ", 1)[0]
+    measured = {}
+    for line in section.splitlines():
+        if line.startswith("| `"):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            measured[cells[0].strip("`")] = (cells[2], cells[3])
+    assert {step: value for step, (value, _) in measured.items()} == {
+        "arm": "0,06",
+        "create": "2,4",
+        "ready": "45,0",
+        "preflight": "29,3",
+        "weights": "81,8",
+        "smoke": "1201,1",
+        "destroy": "2,9",
+    }
+    assert "22,38 GB" in measured["weights"][1] and "таймаут" in measured["smoke"][1]
+    assert "20261122T161658Z-24071652" in section and "62000482" in section
+    assert "1138" in section and "#160" in section and "не доказана" in section
+
+
 def test_example_package_loads_and_holds_no_secret() -> None:
     path = REPO / "docs" / "examples" / "gpu-package.example.json"
     package, digest = vast.load_package(path, vast.MODELS)
@@ -1056,6 +1078,8 @@ def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monke
     for path in out.rglob("*"):
         if path.is_file() and path.name != "fake-api-key":
             assert key.encode() not in path.read_bytes(), path
+    assert "server_evidence" not in [e["event"] for e in events]
+    assert not list((out / "gpu" / result["attempt_id"]).glob("evidence-*"))
     host = out / "gpu" / result["attempt_id"] / "host"
     assert (host / "guard-selftest.json").is_file()
     assert json.loads((host / "guard-selftest.json").read_text())["ok"] is True
@@ -1346,3 +1370,252 @@ def test_the_refusal_names_the_command_and_never_echoes_host_stdout(
             vast.download(_JsonHost({"pack": secret}), tmp_path / "attempt", journal, 60)
     assert str(raised.value) == f"host: {command} printed no JSON"
     assert secret.decode() not in str(raised.value)
+
+
+# --- a server that fails (#160) ------------------------------------------------------------
+
+
+def _with_fake_vllm_mode(monkeypatch, mode: dict) -> None:
+    real = vast._fake_host_root
+
+    def host_root(root: Path) -> dict:
+        env = real(root)
+        (root / vast_fake.FAKE_MODE_FILE).write_text(json.dumps(mode))
+        return env
+
+    monkeypatch.setattr(vast, "_fake_host_root", host_root)
+
+
+def _failed_dry_run(tmp_path: Path, match: str) -> tuple[Path, list[dict]]:
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(vast.VastError, match=match):
+        vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    return journal_path.parent, vast.Journal(journal_path).replay()
+
+
+def _after_failure(events: list[dict], step: str) -> list[str]:
+    """Event names from the failed step on, the failed step as `step:<name>`."""
+    names = [
+        f"step:{e['name']}" if e["event"] == "step" else e["event"]
+        for e in events
+        if e["event"] != "step" or not e["ok"] or e["name"] == "destroy"
+    ]
+    return names[names.index(f"step:{step}") :]
+
+
+def _no_key_anywhere(out: Path) -> None:
+    key = (out / "fake-api-key").read_text().strip()
+    for path in out.rglob("*"):
+        if path.is_file() and path.name != "fake-api-key":
+            assert key.encode() not in path.read_bytes(), path
+
+
+def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monkeypatch) -> None:
+    _with_fake_vllm_mode(monkeypatch, {"exit": 3, "line": "fake engine core died"})
+    attempt, events = _failed_dry_run(
+        tmp_path, r"exited before /health \(reason None, exit code 3\)"
+    )
+    (smoke,) = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
+    assert smoke["ok"] is False and smoke["model"] == "qwen25omni"
+    assert smoke["detail"]["server_exit"] == {"reason": None, "returncode": 3}
+    assert smoke["elapsed_s"] < vast.DRY_INTERVALS["health_timeout_s"] / 4
+    assert "state_errors" not in smoke["detail"]
+    assert _after_failure(events, "smoke") == [
+        "step:smoke",
+        "server_evidence",
+        "destroy_requested",
+        "destroy_response",
+        "absence_verified",
+        "closed",
+        "step:destroy",
+    ]
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert "fake engine core died" in evidence["tails"]["server.log"]
+    assert '"returncode": 3' in evidence["tails"]["server-stats.jsonl"]
+
+
+def test_a_failed_smoke_journals_the_log_tail_and_the_process_list_before_destroy(
+    tmp_path, monkeypatch
+) -> None:
+    _with_fake_vllm_mode(monkeypatch, {"hang": True, "child": True, "line": "fake loading forever"})
+    monkeypatch.setattr(vast, "DRY_INTERVALS", {**vast.DRY_INTERVALS, "health_timeout_s": 4.0})
+    attempt, events = _failed_dry_run(tmp_path, "did not answer /health in time")
+    (smoke,) = [e for e in events if e["event"] == "step" and e["name"] == "smoke"]
+    assert "server_exit" not in smoke["detail"]
+    assert _after_failure(events, "smoke")[:3] == [
+        "step:smoke",
+        "server_evidence",
+        "destroy_requested",
+    ]
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert evidence["model"] == "qwen25omni" and evidence["file"] == "evidence-qwen25omni.json"
+    assert "fake loading forever" in evidence["tails"]["server.log"]
+    assert all(
+        len(tail.encode()) <= vast.EVIDENCE_TAIL_BYTES for tail in evidence["tails"].values()
+    )
+    assert (
+        set(evidence["sizes"])
+        == set(evidence["tails"])
+        == {
+            "server.log",
+            "hostrun.log",
+            "guard.log",
+            "server-stats.jsonl",
+        }
+    )
+    fakes = [
+        p
+        for p in evidence["processes"]
+        if "vast_fake" in p["cmdline"] or "bin/vllm serve" in p["cmdline"]
+    ]
+    pids = {p["pid"] for p in fakes}
+    assert any(p["ppid"] in pids for p in fakes), fakes
+    path = attempt / "evidence-qwen25omni.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    saved = json.loads(path.read_text())
+    assert saved["kind"] == "server_evidence"
+    assert saved["processes"] == evidence["processes"]
+    _no_key_anywhere(tmp_path / "data" / "dry")
+
+
+def test_a_failed_run_also_journals_evidence(tmp_path, monkeypatch) -> None:
+    def broken(*args, **kwargs):
+        raise vast.VastError("gate0 runner broke")
+
+    monkeypatch.setattr(vast.gate0, "run_spike", broken)
+    attempt, events = _failed_dry_run(tmp_path, "gate0 runner broke")
+    assert _after_failure(events, "run")[:3] == ["step:run", "server_evidence", "destroy_requested"]
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert "serving qwen25omni" in evidence["tails"]["server.log"]
+    assert (attempt / "evidence-qwen25omni.json").is_file()
+
+
+def test_a_server_that_dies_during_a_run_with_a_verdict_journals_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    out = tmp_path / "data" / "dry"
+
+    def run_after_the_server_died(*args, served_model, **kwargs):
+        if served_model == "qwen25omni":
+            stats = out / "host-root" / "out" / served_model / "server-stats.jsonl"
+            lines = [json.loads(line) for line in stats.read_text().splitlines()]
+            (started,) = [line for line in lines if line["event"] == "started"]
+            os.kill(started["pid"], 9)
+            ends = time.monotonic() + 30
+            while '"event": "exit"' not in stats.read_text() and time.monotonic() < ends:
+                time.sleep(0.1)
+        return {"verdict": "NOT READY", "reason": "every request failed"}
+
+    monkeypatch.setattr(vast.gate0, "run_spike", run_after_the_server_died)
+    vast.dry_run(out, _dry_config(tmp_path))
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    runs = {e["model"]: e for e in events if e["event"] == "step" and e["name"] == "run"}
+    assert runs["qwen25omni"]["ok"] and runs["qwen25omni"]["detail"]["verdict"] == "NOT READY"
+    assert runs["qwen25omni"]["detail"]["server_exit"] == {"reason": None, "returncode": -9}
+    assert "server_exit" not in runs["qwen3omni"]["detail"]
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert evidence["model"] == "qwen25omni" and "processes" in evidence
+    assert '"returncode": -9' in evidence["tails"]["server-stats.jsonl"]
+    assert (journal_path.parent / "evidence-qwen25omni.json").is_file()
+    assert events.index(evidence) < events.index(runs["qwen25omni"])
+
+
+@pytest.mark.parametrize("failure", ["not-json", "raises"])
+def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -> None:
+    _with_fake_vllm_mode(monkeypatch, {"exit": 3})
+    real_run = vast.LocalHost.run
+
+    def run(self, argv, timeout):
+        if argv[:3] == ["python3", vast.HOSTRUN, "evidence"]:
+            if failure == "raises":
+                raise OSError("ssh dropped")
+            done = real_run(self, argv, timeout)
+            return dataclasses.replace(done, stdout=b"Traceback: not json\n")
+        return real_run(self, argv, timeout)
+
+    monkeypatch.setattr(vast.LocalHost, "run", run)
+    attempt, events = _failed_dry_run(tmp_path, "exited before /health")
+    (evidence,) = [e for e in events if e["event"] == "server_evidence"]
+    assert evidence["model"] == "qwen25omni" and "processes" not in evidence
+    assert (
+        evidence["error"]
+        == {
+            "not-json": "VastError: host: evidence printed no JSON",
+            "raises": "OSError: ssh dropped",
+        }[failure]
+    )
+    assert _after_failure(events, "smoke")[1:5] == [
+        "server_evidence",
+        "destroy_requested",
+        "destroy_response",
+        "absence_verified",
+    ]
+    assert events[-1]["event"] == "step" and events[-1]["name"] == "destroy" and events[-1]["ok"]
+    assert not (attempt / "evidence-qwen25omni.json").exists()
+
+
+class _StateHost:
+    """Answers `hostrun.py state` with the next prepared answer; an exception is raised."""
+
+    def __init__(self, answers: list) -> None:
+        self.answers = answers
+
+    def run(self, argv, timeout):
+        assert argv[:3] == ["python3", vast.HOSTRUN, "state"]
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return vast.proc.RunResult(0, answer, b"", False, False, 0.0)
+
+
+class _NeverHealthy:
+    def request(self, route, timeout):
+        return 0, b"", "refused"
+
+
+def _state(**fields) -> bytes:
+    base = {"kind": "serve_state", "started": True, "serve_alive": True, "exit": None}
+    return json.dumps({**base, **fields}).encode()
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason", "code"),
+    [
+        (_state(exit={"reason": "rss_limit", "returncode": -15, "t": 1.0}), "rss_limit", -15),
+        (_state(serve_alive=False), "hostrun_gone", None),
+        (_state(started=False, serve_alive=False), "not_started", None),
+    ],
+    ids=["exit", "hostrun-gone", "not-started"],
+)
+def test_wait_health_ends_when_the_state_shows_the_server_is_gone(answer, reason, code) -> None:
+    host, detail = _StateHost([answer]), {}
+    journal = vast.Journal(Path("unused"), "k3y")
+    started = time.monotonic()
+    with pytest.raises(vast.ServerExited) as raised:
+        vast._wait_health(
+            _NeverHealthy(),
+            60.0,
+            lambda: vast._state_or_none(host, "/workspace/out/m", journal, detail),
+            0.0,
+            0.0,
+        )
+    assert (raised.value.reason, raised.value.returncode) == (reason, code)
+    assert time.monotonic() - started < 10
+
+
+def test_a_failing_state_call_is_counted_and_never_ends_the_wait() -> None:
+    host = _StateHost([OSError("ssh k3y-secret dropped"), b"not json", _state()])
+    detail: dict = {}
+    journal = vast.Journal(Path("unused"), "k3y-secret")
+    with pytest.raises(vast.VastError, match="did not answer /health in time"):
+        vast._wait_health(
+            _NeverHealthy(),
+            2.5,
+            lambda: vast._state_or_none(host, "/workspace/out/m", journal, detail),
+            0.0,
+            100.0,
+        )
+    assert detail["state_errors"]["count"] == 2
+    assert detail["state_errors"]["last"] == "VastError: host: state printed no JSON"

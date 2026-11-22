@@ -1,10 +1,11 @@
 """Network guard of every Python process that `hostrun.py serve` starts on the GPU host (#147).
 
 `site` imports this file at start-up from `PYTHONPATH`, so the vLLM server and every child it
-starts through `spawn` get the same audit hook before any library code runs. The hook allows
-`AF_UNIX` and loopback (`127.0.0.0/8`, `::1`) and raises `PermissionError` on any other socket
-connect, bind, send or name lookup, before the system call: no packet leaves. Every denial is
-one JSON line in `$SS_GUARD_LOG`. Native sockets (C libraries) do not pass this hook;
+starts get the same audit hook before any library code runs: a `fork` child keeps it with the
+memory, a `spawn` or `forkserver` child and an exec of `sys.executable` import it again (#160).
+The hook allows `AF_UNIX` and loopback (`127.0.0.0/8`, `::1`) and raises `PermissionError` on any
+other socket connect, bind, send or name lookup, before the system call: no packet leaves. Every
+denial is one JSON line in `$SS_GUARD_LOG`. Native sockets (C libraries) do not pass this hook;
 `hostrun.py` sees them in `/proc` and kills the process group. Stdlib only, Python 3.10+, never
 imports `sound_scout`: the file goes to the host alone.
 """

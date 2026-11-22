@@ -1,15 +1,16 @@
-"""Host side of a GPU reference run (#147): `serve`, `stop`, `selftest`, `preflight`, `weights`,
-`pack`. Stdlib only (`preflight` reads the image's own torch), Python 3.10+, never imports
-`sound_scout`: the station copies this file and `guard/sitecustomize.py` to `/workspace/ss/` and
-checks their SHA-256 there before use.
+"""Host side of a GPU reference run (#147): `serve`, `stop`, `state`, `evidence`, `selftest`,
+`preflight`, `weights`, `pack`. Stdlib only (`preflight` reads the image's own torch), Python
+3.10+, never imports `sound_scout`: the station copies this file and `guard/sitecustomize.py` to
+`/workspace/ss/` and checks their SHA-256 there before use.
 
 `serve` starts the vLLM server in a new session with an allowlisted environment, offline
 variables and the audit-hook guard on `PYTHONPATH`. Every `POLL_S` it reads the socket inodes of
 every process of that session and `/proc/net/{tcp,tcp6,udp,udp6}`: an internet socket with a
 non-loopback end kills the whole session with SIGKILL and writes a `violation` line. It also
 writes the RSS of the session and the GPU memory to the stats file and stops the server at the
-deadline or over the RSS limit. This is a guard against a library that reaches out by accident,
-not a sandbox against the host's administrator.
+deadline or over the RSS limit. Native sockets of gloo and NCCL are bound to `lo` (#160): a
+listener on the bridge address would be a violation. This is a guard against a library that
+reaches out by accident, not a sandbox against the host's administrator.
 """
 
 import argparse
@@ -41,6 +42,8 @@ ENV_FIXED = {
     "VLLM_NO_USAGE_STATS": "1",
     "DO_NOT_TRACK": "1",
     "VLLM_HOST_IP": "127.0.0.1",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "NCCL_SOCKET_IFNAME": "lo",
 }
 NET_TABLES = ("tcp", "tcp6", "udp", "udp6")
 TCP_LISTEN = "0A"
@@ -49,6 +52,15 @@ STATS_S = 5.0
 GRACE_S = 10.0
 SUMS_FILE = "SHA256SUMS"
 CHUNK = 1 << 20
+RSS_FIELDS = {
+    "VmRSS:": "rss_bytes",
+    "RssAnon:": "rss_anon_bytes",
+    "RssFile:": "rss_file_bytes",
+    "RssShmem:": "rss_shmem_bytes",
+}
+EVIDENCE_FILES = ("server.log", "hostrun.log", "guard.log", "server-stats.jsonl")
+EVIDENCE_MAX_BYTES = 65536
+CMDLINE_MAX = 512
 
 
 # --- environment and process tree ----------------------------------------------------------
@@ -159,14 +171,16 @@ def read_net(root: Path = Path("/proc/net")) -> list[dict]:
     return rows
 
 
-def tree_rss(pids) -> int:
-    total = 0
+def tree_memory(pids) -> dict:
+    """Sums over the session of VmRSS (the limit) and its RssAnon, RssFile, RssShmem parts."""
+    totals = dict.fromkeys(RSS_FIELDS.values(), 0)
     for pid in pids:
         with contextlib.suppress(OSError, ValueError):
             for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    total += int(line.split()[1]) * 1024
-    return total
+                parts = line.split()
+                if parts and parts[0] in RSS_FIELDS:
+                    totals[RSS_FIELDS[parts[0]]] += int(parts[1]) * 1024
+    return totals
 
 
 def gpu_memory_mib() -> int | None:
@@ -210,10 +224,11 @@ def monitor(child, *, deadline: float, rss_limit: int, stats: Path, stop: thread
             _write_line(stats, {"event": "violation", "t": time.time(), "sockets": bad})
             child.wait()
             return "violation"
-        rss = tree_rss(pids)
+        memory = tree_memory(pids)
+        rss = memory["rss_bytes"]
         if time.monotonic() >= next_stats:
             next_stats = time.monotonic() + STATS_S
-            record = {"event": "stats", "t": time.time(), "rss_bytes": rss}
+            record = {"event": "stats", "t": time.time(), **memory}
             record["gpu_memory_used_mib"] = gpu_memory_mib()
             _write_line(stats, record)
         if rss > rss_limit:
@@ -288,6 +303,101 @@ def _alive(pid: int) -> bool:
     return text.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+def _records(path: Path) -> list[dict]:
+    """The lines of a stats file; a torn line being written is skipped."""
+    records = []
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        with contextlib.suppress(ValueError):
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
+def serve_state(stats: Path, pid_file: Path) -> dict:
+    """Whether `serve` started, is alive, and how it ended; the pid is read before the stats, so
+    a `serve` gone between the two reads has already written its `exit` line."""
+    try:
+        alive = _alive(int(Path(pid_file).read_text()))
+    except (OSError, ValueError):
+        alive = False
+    records = _records(stats)
+    exits = [r for r in records if r.get("event") == "exit"]
+    violations_ = [r for r in records if r.get("event") == "violation"]
+    return {
+        "kind": "serve_state",
+        "started": any(r.get("event") == "started" for r in records),
+        "serve_alive": alive,
+        "exit": {key: exits[-1].get(key) for key in ("reason", "returncode", "t")}
+        if exits
+        else None,
+        "violation": violations_[-1].get("sockets") if violations_ else None,
+    }
+
+
+def state_command(args) -> int:
+    print(json.dumps(serve_state(args.stats, args.pid_file), sort_keys=True))
+    return 0
+
+
+def tail(path: Path, max_bytes: int) -> dict:
+    """The last at most `max_bytes` of a file, from the start of a line."""
+    try:
+        with open(path, "rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            source.seek(max(0, size - max_bytes))
+            data = source.read(max_bytes)
+    except FileNotFoundError:
+        return {"missing": True}
+    if size > max_bytes:
+        newline = data.find(b"\n")
+        data = data[newline + 1 :] if newline >= 0 else b""
+    return {"size": size, "tail": data.decode("utf-8", errors="replace")}
+
+
+def processes(proc: Path = Path("/proc")) -> list[dict]:
+    """Every process this namespace sees, read from `/proc` without `ps`."""
+    found = []
+    for entry in sorted(os.listdir(proc), key=lambda name: (len(name), name)):
+        if not entry.isdigit():
+            continue
+        try:
+            stat_ = (proc / entry / "stat").read_text()
+            raw = (proc / entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        fields = stat_.rsplit(")", 1)[1].split()
+        found.append(
+            {
+                "pid": int(entry),
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "state": fields[0],
+                "rss_bytes": tree_memory([int(entry)])["rss_bytes"],
+                "cmdline": raw.rstrip(b"\0")
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")[:CMDLINE_MAX],
+            }
+        )
+    return found
+
+
+def evidence(args) -> int:
+    directory = Path(args.dir)
+    files = {name: tail(directory / name, args.max_bytes) for name in EVIDENCE_FILES}
+    print(
+        json.dumps(
+            {"kind": "server_evidence", "files": files, "processes": processes()}, sort_keys=True
+        )
+    )
+    return 0
+
+
 GUARDED_PRELUDE = """
 import sys
 import sitecustomize
@@ -332,7 +442,7 @@ def probe(queue):
         queue.put("allowed")
 
 if __name__ == "__main__":
-    context = multiprocessing.get_context("spawn")
+    context = multiprocessing.get_context(sys.argv[1])
     queue = context.Queue()
     process = context.Process(target=probe, args=(queue,))
     process.start(); print(queue.get(timeout=60)); process.join(30)
@@ -423,8 +533,10 @@ def selftest(args) -> int:
             "loopback_connect": _guarded_child(LOOPBACK_CHILD, env, workdir) == "allowed",
             "outside_connect_denied": _guarded_child(OUTSIDE_CHILD, env, workdir) == "denied",
             "outside_lookup_denied": _guarded_child(LOOKUP_CHILD, env, workdir) == "denied",
-            "spawn_child_denied": _guarded_child(SPAWN_CHILD, env, workdir) == "denied",
         }
+        for method in ("spawn", "fork", "forkserver"):
+            denied = _guarded_child(SPAWN_CHILD, env, workdir, method) == "denied"
+            checks[f"{method}_child_denied"] = denied
         native = _native_check(env, workdir)
         try:
             netns = subprocess.run(["unshare", "-n", "true"], capture_output=True, timeout=10)
@@ -588,6 +700,12 @@ def main(argv=None) -> int:
     stop_ = commands.add_parser("stop")
     stop_.add_argument("--pid-file", required=True)
     stop_.add_argument("--timeout", type=float, default=60.0)
+    state_ = commands.add_parser("state")
+    state_.add_argument("--stats", type=Path, required=True)
+    state_.add_argument("--pid-file", type=Path, required=True)
+    evidence_ = commands.add_parser("evidence")
+    evidence_.add_argument("--dir", required=True)
+    evidence_.add_argument("--max-bytes", type=int, default=EVIDENCE_MAX_BYTES)
     selftest_ = commands.add_parser("selftest")
     selftest_.add_argument("--out")
     selftest_.add_argument("--guard-dir", default=str(GUARD_DIR))
@@ -608,6 +726,8 @@ def main(argv=None) -> int:
     handlers = {
         "serve": serve,
         "stop": stop_command,
+        "state": state_command,
+        "evidence": evidence,
         "selftest": selftest,
         "preflight": preflight,
         "weights": weights,

@@ -336,6 +336,8 @@ INTERVALS = {
     "ready_timeout_s": 1800.0,
     "ssh_timeout_s": 600.0,
     "health_timeout_s": 1200.0,
+    "server_check_s": 15.0,
+    "server_start_s": 60.0,
     "destroy_poll_s": 10.0,
     "destroy_timeout_s": 900.0,
     "command_timeout_s": 600.0,
@@ -348,6 +350,8 @@ DRY_INTERVALS = {
     "ready_timeout_s": 30.0,
     "ssh_timeout_s": 30.0,
     "health_timeout_s": 60.0,
+    "server_check_s": 0.2,
+    "server_start_s": 10.0,
     "destroy_poll_s": 0.05,
     "destroy_timeout_s": 30.0,
     "command_timeout_s": 300.0,
@@ -381,6 +385,14 @@ class Redirected(ApiError):
 
 class CreateOutcomeUnknown(VastError):
     pass
+
+
+class ServerExited(VastError):
+    def __init__(self, reason: str | None, returncode: int | None) -> None:
+        super().__init__(
+            f"the vLLM server exited before /health (reason {reason}, exit code {returncode})"
+        )
+        self.reason, self.returncode = reason, returncode
 
 
 # --- the key -------------------------------------------------------------------------------
@@ -1564,12 +1576,105 @@ def run_pilot(client: gate0.Client) -> dict:
     return {"text_tokens": text_tokens, "lines": lines, "ok": ok}
 
 
-def _wait_health(client: gate0.Client, timeout: float) -> None:
-    ends = time.monotonic() + timeout
+EVIDENCE_TAIL_BYTES = 8192
+
+
+def server_state(host, out: str, timeout: float) -> dict:
+    argv = ["python3", HOSTRUN, "state", "--stats", f"{out}/server-stats.jsonl"]
+    return _checked_object(host.run([*argv, "--pid-file", f"{out}/serve.pid"], timeout), "state")
+
+
+def _judge(state: Mapping | None, late: bool) -> None:
+    """`ServerExited` when the state of `hostrun.py serve` shows the server will never answer."""
+    if state is None:
+        return
+    ended = state.get("exit")
+    if isinstance(ended, dict):
+        raise ServerExited(ended.get("reason"), ended.get("returncode"))
+    if state.get("started"):
+        if not state.get("serve_alive"):
+            raise ServerExited("hostrun_gone", None)
+    elif late:
+        raise ServerExited("not_started", None)
+
+
+def _wait_health(
+    client: gate0.Client,
+    timeout: float,
+    check: Callable[[], Mapping | None],
+    check_every: float,
+    start_grace: float,
+) -> None:
+    """`/health` every second until 200; every `check_every` also the server state from the
+    host, so a server that exited fails at once instead of at `timeout`."""
+    started = time.monotonic()
+    ends, next_check = started + timeout, started + check_every
     while client.request("/health", timeout=5)[0] != 200:
+        now = time.monotonic()
+        if now >= next_check:
+            next_check = now + check_every
+            _judge(check(), now - started > start_grace)
         if time.monotonic() > ends:
             raise VastError("the vLLM server did not answer /health in time")
         time.sleep(1.0)
+
+
+def _private_file(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+def fetch_server_evidence(
+    host, attempt: Path, journal: Journal, name: str, out: str, timeout: float = 60.0
+) -> None:
+    """Log tails and the process list of the host into `evidence-<name>.json` and the journal,
+    while the server tree still lives; never raises, so destroy always follows."""
+    try:
+        found = _checked_object(
+            host.run(["python3", HOSTRUN, "evidence", "--dir", out], timeout), "evidence"
+        )
+        files = found.get("files")
+        if not isinstance(files, dict) or not isinstance(found.get("processes"), list):
+            raise VastError("host: evidence printed no files or processes")
+        file_name = f"evidence-{name}.json"
+        text = json.dumps(found, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        _private_file(attempt / file_name, redact(text, journal.key))
+        tails, sizes = {}, {}
+        for path, entry in files.items():
+            entry = entry if isinstance(entry, dict) else {}
+            data = str(entry.get("tail", "")).encode()[-EVIDENCE_TAIL_BYTES:]
+            tails[path] = redact(data.decode("utf-8", "replace"), journal.key)
+            sizes[path] = entry.get("size")
+        processes = json.loads(redact(json.dumps(found["processes"]), journal.key))
+        journal.append(
+            "server_evidence",
+            model=name,
+            processes=processes,
+            tails=tails,
+            sizes=sizes,
+            file=file_name,
+        )
+    except BaseException as error:
+        with contextlib.suppress(BaseException):
+            journal.append(
+                "server_evidence",
+                model=name,
+                error=redact(f"{type(error).__name__}: {error}", journal.key),
+            )
+
+
+def _state_or_none(host, out: str, journal: Journal, detail: dict) -> dict | None:
+    """The server state, or None after a failed `state` call, counted in `state_errors`."""
+    try:
+        return server_state(host, out, 60.0)
+    except Exception as error:
+        errors = detail.setdefault("state_errors", {"count": 0, "last": None})
+        errors["count"] += 1
+        errors["last"] = redact(f"{type(error).__name__}: {error}", journal.key)
+        return None
 
 
 def serve_and_run(host, attempt, journal, package, entry, models, receipt, iid, config_, intervals):
@@ -1583,29 +1688,50 @@ def serve_and_run(host, attempt, journal, package, entry, models, receipt, iid, 
     serve += ["--pid-file", f"{out}/serve.pid", "--"]
     serve += vllm_argv(f"{WORKSPACE}/models/{name}", name, host.server_port)
     try:
-        with _step(journal, "smoke", model=name) as detail:
-            host.spawn(serve, f"{out}/hostrun.log")
-            port = host.tunnel(host.server_port)
-            client = gate0.Client(port, name)
-            _wait_health(client, intervals["health_timeout_s"])
-            pilot = run_pilot(client)
-            (attempt / f"pilot-{name}.json").write_text(json.dumps(pilot, indent=2) + "\n")
-            detail.update(pilot_ok=pilot["ok"], tunnel_port=port)
-            if not pilot["ok"]:
-                raise VastError(f"pilot of {name}: audio tokens absent or not growing")
-        with _step(journal, "run", model=name) as detail:
-            result = gate0.run_spike(
-                entry["gate0_date"],
-                config_,
-                decision=Path(entry["decision"]),
-                runtime="vllm",
-                server_port=port,
-                served_model=name,
-                weights=expected_files(models, name),
-                weights_receipt=receipt,
-                remote={"instance_id": iid, "tunnel_port": port},
-            )
-            detail.update(verdict=result["verdict"], reason=result["reason"])
+        try:
+            with _step(journal, "smoke", model=name) as detail:
+                host.spawn(serve, f"{out}/hostrun.log")
+                port = host.tunnel(host.server_port)
+                client = gate0.Client(port, name)
+                try:
+                    _wait_health(
+                        client,
+                        intervals["health_timeout_s"],
+                        lambda: _state_or_none(host, out, journal, detail),
+                        intervals["server_check_s"],
+                        intervals["server_start_s"],
+                    )
+                except ServerExited as error:
+                    detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
+                    raise
+                pilot = run_pilot(client)
+                (attempt / f"pilot-{name}.json").write_text(json.dumps(pilot, indent=2) + "\n")
+                detail.update(pilot_ok=pilot["ok"], tunnel_port=port)
+                if not pilot["ok"]:
+                    raise VastError(f"pilot of {name}: audio tokens absent or not growing")
+            with _step(journal, "run", model=name) as detail:
+                result = gate0.run_spike(
+                    entry["gate0_date"],
+                    config_,
+                    decision=Path(entry["decision"]),
+                    runtime="vllm",
+                    server_port=port,
+                    served_model=name,
+                    weights=expected_files(models, name),
+                    weights_receipt=receipt,
+                    remote={"instance_id": iid, "tunnel_port": port},
+                )
+                detail.update(verdict=result["verdict"], reason=result["reason"])
+                state = _state_or_none(host, out, journal, detail)
+                try:
+                    _judge(state, late=True)
+                except ServerExited as error:
+                    detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
+                if state is None or "server_exit" in detail:
+                    fetch_server_evidence(host, attempt, journal, name, out)
+        except BaseException:
+            fetch_server_evidence(host, attempt, journal, name, out)
+            raise
     finally:
         host.run(["python3", HOSTRUN, "stop", "--pid-file", f"{out}/serve.pid"], 120)
 

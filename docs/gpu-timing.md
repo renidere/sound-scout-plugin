@@ -4,7 +4,7 @@
 `python -m sound_scout.eval.vast deploy` на одном арендованном инстансе Vast.ai с двумя моделями
 (Qwen2.5-Omni-7B и Qwen3-Omni-30B-A3B-Instruct, bf16). Числа в разделе «Шаги» — **оценки**.
 Измеряет их только платный пилот [#148](https://github.com/renidere/sound-scout-plugin/issues/148);
-его замеры — в разделе «Попытка 1 пилота #148».
+его замеры — в разделах «Попытка 1 пилота #148» и «Попытка 3 пилота #148».
 
 ## Основания
 
@@ -54,6 +54,29 @@ preflight: `runtime differs from the pin in ['cuda']`. Дальше preflight ш
 | `ready` | 15 | 294,6 | ok: pull образа ≈ 10 GB, `running`, SSH |
 | `preflight` | 5 | 20,2 | отказ по CUDA; найденные значения в журнал не попали |
 | `destroy` | 7 | 3,1 | ok: `destroyed`, `absence_verified` |
+
+## Попытка 3 пилота #148
+
+2026-11-22 16:16:58–16:39:41 UTC, попытка `20261122T161658Z-24071652`, offer `51338026`
+(1 × A40), инстанс `62000482`. Время — `elapsed_s` шагов журнала попытки. Попытка остановилась на
+`smoke` первой модели (Qwen2.5-Omni-7B): `the vLLM server did not answer /health in time`.
+Инстанс удалён, отсутствие проверено по id и метке.
+
+| Шаг | Оценка, мин | Попытка 3, с | Итог |
+|---|---|---|---|
+| `arm` | < 0,1 | 0,06 | ok |
+| `create` | < 1 | 2,4 | ok, один PUT |
+| `ready` | 15 | 45,0 | ok, `running` |
+| `preflight` | 5 | 29,3 | ok: vllm 0.34.0, torch 2.14.0, transformers 5.22.2, CUDA 13.0; selftest `ok` |
+| `weights` | 35 | 81,8 | ok: 22,38 GB (≈ 274 MB/s вместе со сверкой хешей) |
+| `smoke` | 7 | 1201,1 | отказ по таймауту `/health` |
+| `destroy` | 7 | 2,9 | ok: `destroyed`, `absence_verified` |
+
+Туннель за ожидание получил 1138 отказов `Connection refused`: на порту сервера хоста никто не
+слушал. Лог сервера пропал вместе с инстансом. Причина не доказана; гипотезы H1–H4 и исправление
+стека (быстрый отказ smoke, улики до destroy, `GLOO_SOCKET_IFNAME=lo`) —
+[#160](https://github.com/renidere/sound-scout-plugin/issues/160),
+`docs/decisions/0026-gpu-stack.md`, подраздел «Guard и процессы vLLM (#160)».
 
 ## Меряет только платный пилот
 

@@ -98,8 +98,9 @@ preflight и пилот X1/X2 в #148.
 
 ## 5. Сетевой guard на хосте
 
-- `sitecustomize.py` ставит `sys.addaudithook` во всех Python-процессах дерева vLLM (дети через
-  `spawn` получают его по `PYTHONPATH`). Разрешены `AF_UNIX` и loopback (`127.0.0.0/8`, `::1`);
+- `sitecustomize.py` ставит `sys.addaudithook` во всех Python-процессах дерева vLLM (ребёнок
+  `fork` наследует хук с памятью, дети `spawn`, `forkserver` и exec `sys.executable` получают его
+  по `PYTHONPATH`). Разрешены `AF_UNIX` и loopback (`127.0.0.0/8`, `::1`);
   остальные connect, bind, sendto, sendmsg и поиск имён — `PermissionError` до системного вызова.
   Каждый отказ — строка в `$SS_GUARD_LOG`.
 - `hostrun.py serve`: окружение по allowlist плюс offline-переменные, новая сессия, каждые 0,5 с —
@@ -107,13 +108,86 @@ preflight и пилот X1/X2 в #148.
   не-loopback концом (и listener не на loopback) — `SIGKILL` сессии и запись `violation`. Там же
   RSS дерева и память GPU раз в 5 с; RSS сверх лимита и дедлайн — остановка.
 - `hostrun.py selftest`: loopback проходит; `192.0.2.1:9`, `getaddrinfo("huggingface.co")` и
-  ребёнок `spawn` — отказ хука; native connect через `ctypes` к своему не-loopback адресу —
+  дети `spawn`, `fork`, `forkserver` — отказ хука; native connect через `ctypes` к своему не-loopback адресу —
   детектор убивает процесс; `unshare -n true` — `netns_available`. Каждая проба сначала проверяет,
   что хук загружен, и без него ничего не отправляет.
 - **Граница.** Хук закрывает Python-код (HF hub, телеметрия, `get_ip` vLLM). Native-сокеты
   (libzmq, NCCL, gloo) детектор видит только постфактум, с шагом опроса. Это защита от случайного
   выхода в сеть, а не песочница против администратора хоста. Риск доступа хоста к данным владелец
   принимал в #149.
+
+### Guard и процессы vLLM (#160)
+
+Попытка 3 пилота #148 прошла `ready`, `preflight` и `weights`, но сервер не ответил на `/health`
+за 1201 с. Туннель 1138 раз получил `Connection refused`: на `127.0.0.1:8000` хоста никто не
+слушал. Стек удалил инстанс без лога сервера. Причина не доказана.
+
+**Guard не запрещает дочерние процессы.** Хук смотрит только события `socket.*`. Ключ
+`*_child_denied: true` в selftest значит: ребёнок под хуком, его внешний connect запрещён. Это
+успешная проверка, а не запрет ребёнка. Selftest проверяет `spawn`, `fork` и `forkserver`. Тест
+`test_a_guarded_server_starts_workers_that_stay_guarded` на станции запускает сервер под
+настоящим `hostrun.py serve`. Сервер запускает рабочий процесс `fork`, `spawn`, `forkserver` или
+exec. Рабочий под хуком: loopback и `AF_UNIX` работают, внешний connect, поиск имени и
+`bind(("", 0))` получают отказ. Нативный connect рабочего на не-loopback адрес убивает всю сессию
+(`test_a_worker_native_socket_off_loopback_kills_the_whole_session`). Exec с `-I` хук теряет; vLLM
+так не делает, такой процесс ловит только детектор `/proc`.
+
+**Как vLLM 0.34.0 запускает процессы** (тег `v0.34.0`, разбор — Decision в #160):
+
+- EngineCore — отдельный процесс `context.Process` (`vllm/v1/engine/utils.py:261`, `:287`);
+  `VLLM_ENABLE_V1_MULTIPROCESSING=1` по умолчанию (`vllm/envs.py:1527-1528`).
+- Контекст — `get_mp_context()` (`vllm/utils/system_utils.py:188-203`): `fork` по умолчанию
+  (`vllm/envs.py:989-990`), `spawn` при уже инициализированной CUDA.
+- Один GPU — executor `uni` (`vllm/config/parallel.py:1191-1192`), rendezvous `file://`
+  (`vllm/v1/executor/uniproc_executor.py:77-84`). Фронтенд и движок говорят по ZMQ `ipc://`
+  (`AF_UNIX`), guard его пропускает.
+- `get_ip()` берёт `VLLM_HOST_IP=127.0.0.1` (`vllm/utils/network_utils.py:52-70`).
+  `_get_open_port()` делает `bind(("", 0))` (`network_utils.py:233-263`), guard его запрещает.
+  На пути одного GPU функцию не вызывают; это остаточный риск.
+- Группа gloo создаётся и при `world_size == 1` (`vllm/distributed/parallel_state.py:503-512`).
+  Без `GLOO_SOCKET_IFNAME` torch 2.14.0 берёт адрес имени хоста
+  (`torch/csrc/distributed/c10d/ProcessGroupGloo.cpp:509-531`); в контейнере это обычно адрес
+  моста.
+
+**Гипотезы.** Это гипотезы, не доказанные причины. Доказать их может только лог следующей
+попытки.
+
+- H1 (самая вероятная): gloo открывает нативный listener на адресе моста. Детектор `/proc` видит
+  LISTEN не на loopback и делает `killpg(SIGKILL)` всей сессии.
+- H2: превышен `rss_limit_bytes`. VmRSS по сессии считает файловые страницы mmap и после `fork`
+  дважды считает общие страницы.
+- H3: движок не стал готов за `VLLM_ENGINE_READY_TIMEOUT_S` = 600 с.
+- H4: другая ошибка старта.
+
+**Решение.**
+
+- `ENV_FIXED` получает `GLOO_SOCKET_IFNAME=lo` и `NCCL_SOCKET_IFNAME=lo`. Хук и детектор не
+  меняются. Правка обратима: две строки. Ослабить хук, выключить мультипроцессинг vLLM или
+  добавить исключение для gloo в детектор — отклонено (Decision в #160, § 4).
+- Запись `stats` получает суммы `rss_anon_bytes`, `rss_file_bytes`, `rss_shmem_bytes`. Лимит
+  по-прежнему сравнивается с `rss_bytes` (VmRSS); лимит пакета не меняется. Так улики различают
+  H2. Смена определения или величины лимита — решение владельца о новом пакете.
+- `hostrun.py state --stats F --pid-file P` печатает `serve_state`: `started`, `serve_alive`,
+  последнюю запись `exit` и сокеты последней записи `violation`.
+- `smoke` раз в `server_check_s` = 15 с спрашивает `state` и падает сразу с `ServerExited`:
+  запись `exit` — её `reason` и `returncode`; `serve` умер без `exit` — `hostrun_gone`; нет записи
+  `started` дольше `server_start_s` = 60 с — `not_started`. Шаг пишет
+  `detail.server_exit`. Сбой самого `state` не валит smoke: он идёт в `detail.state_errors`
+  (счётчик и последний текст), ожидание идёт до `health_timeout_s`.
+- `hostrun.py evidence --dir D` печатает хвосты `server.log`, `hostrun.log`, `guard.log`,
+  `server-stats.jsonl` (≤ 64 KiB, с начала строки) и список процессов `/proc` без `ps`.
+- При провале `smoke` или `run` `fetch_server_evidence` до `stop` и destroy пишет полный ответ в
+  `<attempt>/evidence-<модель>.json` (0600, ключ вырезан) и событие `server_evidence` в журнал:
+  процессы, хвосты по 8 KiB, размеры. Ошибку сбора она пишет в то же событие (`error`) и никогда
+  не бросает: destroy идёт всегда. Порядок в журнале: `step smoke|run ok=false` →
+  `server_evidence` → `destroy_requested`. Вызовов Vast API сбор не добавляет.
+- Сервер может умереть во время `run`, а `run_spike` всё равно вернёт вердикт. Поэтому после
+  `run_spike` стек читает `state`. Если сервер ушёл, в деталях шага `run` появляется
+  `server_exit`, а улики пишутся до `stop`. Если `state` не ответил, улики тоже пишутся. Шаг
+  `run` при этом остаётся `ok=true` с вердиктом: событие `server_evidence` стоит перед ним.
+- Поддельный vLLM читает режим из `<root>/fake-vllm.json`: `exit` (строка и код выхода до
+  `/health`) и `hang` (строка, ребёнок `multiprocessing`, порт не слушается). Тесты
+  `run_attempt` с этими режимами проверяют быстрый отказ с кодом выхода и порядок улик.
 
 ## 6. Шаги deploy и dry run
 

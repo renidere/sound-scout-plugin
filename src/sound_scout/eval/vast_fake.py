@@ -8,7 +8,11 @@
 - `python -m sound_scout.eval.vast_fake vllm serve DIR …` is an OpenAI-compatible server in the
   form of vLLM (`/health`, `/version`, `/v1/models`, `/tokenize` with `messages`,
   `/v1/chat/completions` with `input_audio`): its audio tokens grow with the clip duration. On
-  start it tries an internet `bind` and prints whether the guard denied it.
+  start it tries an internet `bind` and prints whether the guard denied it. A file
+  `<root>/fake-vllm.json` of the host root (`/workspace`, outside `models/` and `out/`) sets a
+  failure mode, since `hostrun.py serve` passes no foreign variable: `{"exit": N, "line": …}`
+  prints the line and exits with N before `/health`; `{"hang": true, "child": bool, "line": …}`
+  prints the line, optionally starts a `multiprocessing` child and never listens.
 - `hf download …` writes the synthetic weights of `synthetic_models`; `nvidia-smi` prints one
   fake GPU.
 
@@ -20,6 +24,7 @@ import base64
 import hashlib
 import io
 import json
+import multiprocessing
 import socket
 import sys
 import threading
@@ -314,6 +319,30 @@ def _guard_probe() -> str:
     return "allowed"
 
 
+FAKE_MODE_FILE = "fake-vllm.json"
+
+
+def _sleep_forever() -> None:
+    while True:
+        time.sleep(60)
+
+
+def _failure_mode(model_dir: Path) -> int | None:
+    """The exit code of the `exit` mode; the `hang` mode never returns; None without a file."""
+    path = model_dir.parents[1] / FAKE_MODE_FILE
+    if not path.is_file():
+        return None
+    mode = json.loads(path.read_text())
+    print(mode.get("line", "fake vllm failure mode"), flush=True)
+    if "exit" in mode:
+        return int(mode["exit"])
+    if mode.get("child"):
+        # fork: the shim of `vllm` has no `__main__` guard, so `spawn` would run it again
+        multiprocessing.get_context("fork").Process(target=_sleep_forever).start()
+    _sleep_forever()
+    return None
+
+
 def vllm(argv: list[str]) -> int:
     if argv[:1] == ["--version"]:
         print(VLLM_VERSION)
@@ -329,6 +358,9 @@ def vllm(argv: list[str]) -> int:
         print(f"no model directory {model_dir.name}", file=sys.stderr)
         return 1
     print(f"guard_probe: {_guard_probe()}", flush=True)
+    code = _failure_mode(model_dir)
+    if code is not None:
+        return code
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:
