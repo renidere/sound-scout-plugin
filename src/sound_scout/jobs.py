@@ -80,6 +80,14 @@ A runner started after that (`jobs start`) loads the new code and runs the job.
 unit `RUNNER_UNIT` outside the gateway's cgroup (the gateway unit has `KillMode=mixed`, so its
 children die on each restart); `start_runner_unit` runs it.
 
+`bind` (decision 0025) gives an MCP job its chat once: the `sound-scout` Hermes plugin calls
+`sound-scout jobs bind` after `speech_job_submit`, with the chat of that turn read from the Hermes
+session context, never from a tool argument. It takes only a job of the submitter `mcp` whose
+`binding` has no `connection`, `profile` or `session_id` and whose `delivery` is `null`, in any
+state; anything else is `not_bindable`. It writes the three fields and `bound_at`; the
+`identity_hash` stays the one of the submit, so a repeat of the submit is still `reused`. A job
+that ended before its `bind` waits: the delivery loop takes only jobs with a `session_id`.
+
 `delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
 kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. About once a minute
 the runner deletes the staging copies that are due (`sound_scout.staging.sweep`) and marks their
@@ -171,6 +179,9 @@ NO_RESULT = "no_result"
 RUNNER_RUNNING = "runner_running"
 RUNNER_START_FAILED = "runner_start_failed"
 NOT_RETRYABLE = "not_retryable"
+NOT_BINDABLE = "not_bindable"
+SUBMITTER_MCP = "mcp"
+BINDING_FIELDS = ("connection", "profile", "session_id")
 PLAN_REFUSED = "plan_refused"
 # Set by `staging.sweep` on a job whose staging copy it removed.
 STAGING_REMOVED_AT = "staging_removed_at"
@@ -544,6 +555,38 @@ def retry(job_id: str, config: Config) -> dict:
         )
         _save(job_dir, job)
         return _view(job_dir, job, config) | {"retry": QUEUED, "next_attempt": next_attempt}
+
+
+def bind(
+    job_id: str, session_id: str, profile: str | None, connection: str | None, config: Config
+) -> dict:
+    """Bind an unbound MCP job to a chat once and answer its status; see the module docstring.
+
+    `invalid_request` for a malformed field, `job_not_found`, `not_bindable` for a job of another
+    submitter, one already bound or one whose `delivery` is set (or missing). Nothing else changes:
+    not the state, not the `identity_hash`."""
+    _check_identifier("session_id", session_id)
+    for name, value in (("profile", profile), ("connection", connection)):
+        if value is not None:
+            _check_identifier(name, value)
+    with _store(config.data_root):
+        job_dir = _job_dir(job_id, config)
+        job = _load(job_dir)
+        binding = job["binding"]
+        if binding.get("submitter") != SUBMITTER_MCP:
+            raise JobError(
+                NOT_BINDABLE,
+                f"job {job_id} came from {binding.get('submitter')!r}; only an mcp job is bound",
+            )
+        if any(binding.get(name) is not None for name in BINDING_FIELDS):
+            raise JobError(NOT_BINDABLE, f"job {job_id} is already bound")
+        if "delivery" not in job or job["delivery"] is not None:
+            raise JobError(NOT_BINDABLE, f"job {job_id} has a delivery state; it is not bound now")
+        now = _now()
+        binding.update(connection=connection, profile=profile, session_id=session_id)
+        job.update(bound_at=now, updated_at=now)
+        _save(job_dir, job)
+        return _view(job_dir, job, config)
 
 
 def run_runner(
@@ -1075,6 +1118,8 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "cancel_requested": (job_dir / CANCEL_MARKER_NAME).exists(),
         "current_stage": _current_stage(job, work_dir, finished),
         "finished_stages": finished,
+        "binding": job["binding"],
+        "bound_at": job.get("bound_at"),
         "delivery": job.get("delivery"),
         "control": job["request"].get("control"),
         "compare": job["attempts"][-1].get("compare") if job["attempts"] else None,

@@ -386,3 +386,33 @@ def test_redelivery_runs_only_on_the_users_explicit_request_and_warns_of_a_secon
     )
     assert "только по явной просьбе пользователя" in row
     assert "`delivery_not_unconfirmed`" in section(text, "## Pitfalls")
+
+
+def test_waiting_step_says_the_note_comes_to_a_local_chat_and_status_is_the_fallback() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    steps = " ".join(section(text, "## Procedure").split())
+    wait = steps.split("4. **Ожидание.**", 1)[1].split("5. **", 1)[0]
+    assert "В локальном чате Hermes плагин Sound Scout сам привязывает задание" in wait
+    assert "итоговая заметка Sound Scout придёт в этот чат одна" in wait
+    assert "Статус не опрашивать в цикле" in wait
+    assert "заметки нет (чат другой платформы" in wait and "плагин не подключён" in wait
+    assert "`speech_job_status`" in wait
+    assert "никто не пришлёт" not in text
+    quick = " ".join(section(text, "## Quick Reference").split())
+    assert "аргументов чата или сессии у инструмента нет" in quick
+
+
+def test_criterion_3_skill_gives_the_agent_no_binding_arguments_and_a_status_result_fallback() -> (
+    None
+):
+    text = SKILL.read_text(encoding="utf-8")
+    quick = " ".join(section(text, "## Quick Reference").split())
+    row = next(line for line in quick.split("| `speech_job_") if line.startswith("submit`"))
+    steps = " ".join(section(text, "## Procedure").split())
+    wait = steps.split("4. **Ожидание.**", 1)[1].split("5. **", 1)[0]
+    result = steps.split("5. **Результат.**", 1)[1]
+
+    assert not {"`connection`", "`profile`", "`session_id`"} & set(row.split())
+    assert "привязку к чату ставит плагин Sound Scout" in row
+    assert "заметки нет" in wait and "вызвать `speech_job_status` с `job_id`" in wait
+    assert "вызвать `speech_job_result` с `job_id`" in " ".join(result.split()[:20])

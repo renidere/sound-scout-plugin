@@ -826,9 +826,6 @@ def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
         "mode",
         "previous_run_id",
         "criterion",
-        "connection",
-        "profile",
-        "session_id",
     ]
     assert submit["required"] == ["path", "request_id"]
     assert submit["properties"]["layers"]["items"]["enum"] == list(jobs.LAYERS)
@@ -849,8 +846,8 @@ def test_the_job_tools_have_closed_schemas_of_the_jobs_cli_arguments() -> None:
         ("speech_job_submit", {"path": "a.wav", "request_id": "r-1", "layers": []}, "layers: "),
         (
             "speech_job_submit",
-            {"path": "a.wav", "request_id": "r-1", "session_id": ""},
-            "session_id: ",
+            {"path": "a.wav", "request_id": "r-1", "session_id": "chat-1"},
+            "Additional",
         ),
         (
             "speech_job_submit",
@@ -913,7 +910,7 @@ def test_job_tools_through_an_mcp_client_are_the_jobs_functions_and_answer_withi
 ) -> None:
     wav = make_wav("recordings/tone.wav", seconds=2.0)
     outside = make_wav("elsewhere.wav")
-    submit = {"path": str(wav), "request_id": "r-1", "layers": ["content"], "session_id": "s-1"}
+    submit = {"path": str(wav), "request_id": "r-1", "layers": ["content"]}
     calls = [
         ("speech_job_submit", submit),
         ("speech_job_submit", submit),
@@ -954,7 +951,7 @@ def test_job_tools_through_an_mcp_client_are_the_jobs_functions_and_answer_withi
         "submitter": "mcp",
         "connection": None,
         "profile": None,
-        "session_id": "s-1",
+        "session_id": None,
     }
     assert job["request"]["layers"] == ["content"]
     mismatch, outside_root, windows, queued, no_result, cancelled, ended, status = rest[:8]
@@ -1456,6 +1453,49 @@ def test_docs_mcp_describes_speech_job_redeliver_and_no_longer_calls_it_cli_only
     assert "перед любой отправкой цикл доставки плагина ищет тег задания в истории чата" in text
 
 
+# --- no chat binding from a tool argument (decision 0025, #140) ------------------------------
+
+
+@pytest.mark.parametrize("field", ["session_id", "profile", "connection"])
+def test_a_model_supplied_binding_field_is_refused_and_no_job_is_created(
+    field: str, loaded: config.Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/tone.wav")
+    arguments = {"path": str(wav), "request_id": "r-1", field: "chat-b"}
+
+    answer, is_error = mcp_server.call("speech_job_submit", arguments, loaded)
+
+    assert is_error is True
+    assert answer["error"]["code"] == "invalid_arguments"
+    assert "chat-b" not in answer["error"]["message"]
+    assert not (loaded.data_root / "jobs").exists()
+
+
+def test_an_mcp_job_is_created_unbound(loaded: config.Config, make_wav: WavFactory) -> None:
+    wav = make_wav("recordings/tone.wav")
+
+    answer, is_error = mcp_server.call(
+        "speech_job_submit", {"path": str(wav), "request_id": "r-1"}, loaded
+    )
+
+    assert is_error is False
+    status = jobs.status(answer["job_id"], loaded)
+    assert status["binding"] == {
+        "submitter": "mcp",
+        "connection": None,
+        "profile": None,
+        "session_id": None,
+    }
+    assert status["bound_at"] is None
+
+
+def test_no_mcp_tool_binds_a_job_and_the_submit_schema_has_no_binding_field() -> None:
+    assert not [tool.name for tool in mcp_server.TOOLS if "bind" in tool.name]
+    submit = next(tool for tool in mcp_server.TOOLS if tool.name == "speech_job_submit")
+    assert not {"connection", "profile", "session_id"} & submit.input_schema["properties"].keys()
+    assert "binds the job to that chat after this call" in submit.description
+
+
 # --- a control attempt through speech_job_submit (#110) --------------------------------------
 
 
@@ -1511,3 +1551,17 @@ def test_a_control_job_through_mcp_gives_the_jobs_cli_answers_and_its_comparison
         )
         assert by_cli.returncode == 0, by_cli.stderr
         assert json.loads(by_cli.stdout) == answered
+
+
+def test_criterion_3_docs_mcp_describe_the_agent_path_without_binding_arguments() -> None:
+    raw = (REPO / "docs" / "mcp.md").read_text(encoding="utf-8")
+    text = " ".join(raw.split())
+    blocks = dict(re.findall(r"### `(\w+)`\n\n```json\n(.*?)\n```", raw, flags=re.S))
+    submit = json.loads(blocks["speech_job_submit"])
+
+    assert not {"connection", "profile", "session_id"} & submit["inputSchema"]["properties"].keys()
+    assert "У `speech_job_submit` нет полей привязки" in text
+    assert "аргумент инструмента никогда не становится привязкой" in text
+    assert "Привязку к локальному чату ставит только плагин Hermes `sound-scout`" in text
+    assert "`sound-scout jobs bind`" in text and "MCP-инструмента для привязки нет" in text
+    assert "результат читается через `speech_job_status` и `speech_job_result`" in text

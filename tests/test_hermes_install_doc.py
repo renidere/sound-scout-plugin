@@ -297,3 +297,13 @@ def test_update_section_says_to_restart_the_jobs_runner_after_an_update() -> Non
     assert f"systemctl --user stop {jobs.RUNNER_UNIT}" in update
     assert "sound-scout jobs start" in update and "sound-scout jobs recover" in update
     assert "Restart=no" in update and "--collect" in update
+
+
+def test_update_section_says_an_mcp_job_note_needs_the_plugin_and_a_gateway_restart() -> None:
+    update = " ".join(section(DOC.read_text(encoding="utf-8"), "## Обновление").split())
+    assert "~/.hermes/plugins/sound-scout" in update
+    assert "~/.hermes/skills/media/speech-review" in update
+    assert "перезапустите `hermes-gateway.service`" in update
+    assert "«Проверка перед любым перезапуском»" in update
+    assert "хук `post_tool_call` плагина `sound-scout` через `sound-scout jobs bind`" in update
+    assert "`speech_job_status` и `speech_job_result`" in update

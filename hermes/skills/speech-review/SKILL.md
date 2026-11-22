@@ -1,7 +1,7 @@
 ---
 name: speech-review
 description: Разбор русской речи из аудиовложения (Sound Scout).
-version: 0.4.0
+version: 0.5.0
 author: Sound Scout
 metadata:
   hermes:
@@ -44,7 +44,7 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
 | инструмент | аргументы | ответ |
 |---|---|---|
 | `speech_capabilities` | нет | состояние `components` (`decoder`, `asr`, `acoustics`, `audio_review`: `ready`, `unvalidated`, `unavailable`, `permission_required`), флаги `validated_ru`, `diction_validated_ru`, `prosody_validated_ru` |
-| `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `previous_run_id` и `criterion` — только вместе и только для контрольной попытки (`run_id` исходной попытки — из её `speech_job_result`; критерий — тот, что выбран до записи контроля; `task` и `intent` — те же, что у исходной, иначе причина `task_differs`/`intent_differs`); `connection`, `profile`, `session_id` агент не передаёт | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
+| `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `previous_run_id` и `criterion` — только вместе и только для контрольной попытки (`run_id` исходной попытки — из её `speech_job_result`; критерий — тот, что выбран до записи контроля; `task` и `intent` — те же, что у исходной, иначе причина `task_differs`/`intent_differs`); аргументов чата или сессии у инструмента нет: привязку к чату ставит плагин Sound Scout | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
 | `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested`; у контрольной попытки — `control` (`previous_run_id`, `criterion`) и `compare` последней попытки |
 | `speech_job_result` | `job_id` | compact-ответ последней попытки с результатом: `job_id`, `job_state`, `attempt`, `run_dir`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links`; у контрольной попытки — `compare`: `state`, `verdict`, коды `reasons`, `path` |
 | `speech_job_cancel` | `job_id` | состояние задания и `cancel`: `cancelled`, `requested` или `already_ended` |
@@ -98,11 +98,15 @@ runner за `analyze.lock`.
    файлом, `task`, `intent`, `mode` и `layers` вернёт то же задание (`reused: true`), второго анализа не будет.
    Новый `request_id` для той же записи не придумывать: отказ `request_mismatch` разобран в
    «Pitfalls». Слои `layers` сужать только по просьбе пользователя. Запомнить `job_id`.
-4. **Ожидание.** Вызвать `speech_job_status` с `job_id`. `queued` — задание в очереди, `running` —
-   идёт анализ (`finished_stages` — готовые стадии). Статус не опрашивать в цикле: если задание не
-   закончилось, коротко сказать пользователю, что разбор в работе, и проверить снова в следующем
-   ходе, когда пользователь спросит. Заметку о готовности задания, поставленного агентом, в чат
-   никто не пришлёт: агент не передаёт `connection` и `session_id`, по которым доставляется заметка.
+4. **Ожидание.** В локальном чате Hermes плагин Sound Scout сам привязывает задание к этому чату
+   после `speech_job_submit`, и итоговая заметка Sound Scout придёт в этот чат одна, без вызова
+   модели. Статус не опрашивать в цикле: коротко сказать пользователю, что разбор в работе. Только
+   в локальном чате Hermes добавить, что итог придёт сюда; в чате другой платформы (например
+   Telegram) сказать, что итог можно получить по просьбе. Если пользователь спросит раньше или
+   заметки нет (чат другой платформы или плагин не подключён), вызвать `speech_job_status` с
+   `job_id`: `queued` — задание в очереди, `running` — идёт анализ (`finished_stages` — готовые
+   стадии); если задание не закончилось, проверить снова в следующем ходе, когда пользователь
+   спросит.
 5. **Результат.** Когда `state` — `finished`, `cancelled` или `failed`, вызвать
    `speech_job_result` с `job_id`. `finished` значит только, что runner закончил работу, а не что
    результат полный: полноту говорит `status` результата. Отказ `no_result` — результата нет;
@@ -295,9 +299,12 @@ runner за `analyze.lock`.
 ```
 
 `<домашний каталог>` здесь — заглушка примера: в вызове стоит путь ровно в том виде, в каком его
-показала заметка Hermes. Сервер отвечает `job_id` и `state` = `queued`; агент пишет пользователю
-одну фразу: «Поставил запись на разбор, итог посмотрю, как только спросите». Когда
-`speech_job_status` показывает `finished`, агент вызывает `speech_job_result`.
+показала заметка Hermes. Сервер отвечает `job_id` и `state` = `queued`; в локальном чате Hermes
+агент пишет пользователю одну фразу: «Поставил запись на разбор, итог придёт сюда отдельной
+заметкой». В чате другой платформы: «Поставил запись на разбор, итог пришлю, когда спросите».
+Когда пользователь
+спрашивает об итоге и `speech_job_status` показывает `finished`, агент вызывает
+`speech_job_result`.
 
 **Ответ `speech_job_result`** (compact):
 

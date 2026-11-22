@@ -5,7 +5,11 @@ The tools are the same functions the CLI calls: `speech_capabilities` is `doctor
 prints), `speech_compare` is `app.compare` answered with the comparison and its file (the document
 `compare --json` prints). The job tools (decision 0013 § 3.1) are the queue of `sound-scout jobs`:
 `speech_job_submit` is `jobs.submit` with the submitter `mcp`, its plan `mode` and, for a control
-attempt, `previous_run_id` with `criterion` (`jobs.submit` checks the pair, not the schema);
+attempt, `previous_run_id` with `criterion` (`jobs.submit` checks the pair, not the schema). It
+takes no `connection`, `profile` or `session_id`: a tool argument never becomes the job's chat
+binding, and the closed schema refuses them. The job is created unbound; the `sound-scout` Hermes
+plugin binds it to the local chat of the turn after the call (`sound-scout jobs bind`, decision
+0025). There is no MCP tool that binds a job;
 `speech_job_status`, `speech_job_result`, `speech_job_cancel` and `speech_job_retry` are
 `jobs.status`, `jobs.result`, `jobs.cancel` and `jobs.retry`; `speech_job_redeliver` is
 `delivery.request_redelivery`, the function of `jobs redeliver`. Only the job submit takes `mode`:
@@ -97,7 +101,7 @@ RELOAD_HINT = (
     "reload the MCP server (/reload-mcp in Hermes, or restart the gateway), then repeat the call "
     "with the same request_id"
 )
-SUBMITTER = "mcp"
+SUBMITTER = jobs.SUBMITTER_MCP
 HOME_PLACEHOLDER = "~"
 CONFIG_PLACEHOLDER = "<config>"
 LOGGER = logging.getLogger("sound_scout.mcp")
@@ -260,7 +264,9 @@ TOOLS = (
             "staging_full. A control attempt names previous_run_id (the run_id of the initial "
             "attempt, from its speech_job_result) and criterion, both together: after the "
             "control analysis the server compares the two attempts and puts the verdict into "
-            "the job's result (compare)."
+            "the job's result (compare). In a local Hermes chat the Sound Scout plugin binds "
+            "the job to that chat after this call, and the final note of the job arrives there "
+            "once; the call takes no chat or session argument."
         ),
         input_schema=_closed(
             {
@@ -276,9 +282,6 @@ TOOLS = (
                 },
                 "previous_run_id": _run_id("initial"),
                 "criterion": CRITERION,
-                "connection": _identifier("the connection the job came through, stored as is"),
-                "profile": _identifier("the agent profile of the chat, stored as is"),
-                "session_id": _identifier("the stored session ID of the chat, stored as is"),
             },
             ["path", "request_id"],
         ),
@@ -465,10 +468,7 @@ def _job(name: str, arguments: dict, loaded: Config) -> dict:
         }
         if "layers" in arguments:
             fields["layers"] = tuple(arguments["layers"])
-        binding = jobs.Binding(
-            submitter=SUBMITTER,
-            **{key: arguments.get(key) for key in ("connection", "profile", "session_id")},
-        )
+        binding = jobs.Binding(submitter=SUBMITTER)
         return jobs.submit(jobs.SubmitRequest(arguments["path"], **fields), binding, loaded)
     except jobs.JobError as error:
         raise Refused(error.code, error.message) from error

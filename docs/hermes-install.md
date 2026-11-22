@@ -175,6 +175,21 @@ Runner заданий — долгоживущий процесс. Он держ
 4. MCP-сервер `speech-review` тоже держит старый код. Примените обновление через `/reload-mcp`
    или перезапуск gateway (раздел «Readback», пункт 2).
 
+5. Если обновление меняет плагин `sound-scout` или скил `speech-review`, скопируйте их в профиль
+   Hermes заново: `hermes/plugin/sound-scout/` в `~/.hermes/plugins/sound-scout`,
+   `hermes/skills/speech-review/` в `~/.hermes/skills/media/speech-review`. Затем перезапустите
+   `hermes-gateway.service`: хук плагина загружается только при старте gateway. Перед перезапуском
+   выполните проверку из `docs/decisions/0017-session-authority-owner.md`, раздел «Проверка перед
+   любым перезапуском», и сохраните копии старых файлов для отката.
+
+**Заметка о задании из MCP** (решение 0025). `speech_job_submit` не принимает привязку к чату:
+задание из MCP создаётся без неё. Привязку к локальному чату хода ставит хук `post_tool_call`
+плагина `sound-scout` через `sound-scout jobs bind`. Поэтому заметке нужен включённый плагин
+`sound-scout` в процессе gateway и `SOUND_SCOUT_BIN`/`SOUND_SCOUT_CONFIG` в его окружении (их уже
+требует цикл доставки). `SOUND_SCOUT_BIN` должен указывать на тот же checkout, из которого работает
+`mcp_servers.speech-review`. Без плагина или в чате другой платформы заметки нет: агент читает
+итог через `speech_job_status` и `speech_job_result`.
+
 Защита в runner (#139): перед каждой попыткой runner сравнивает отпечаток своего кода с
 установленным (`doctor.code_fingerprint`, SHA-256 файлов пакета `sound_scout`). При расхождении он
 не начинает попытку. Задание остаётся `queued` без новой попытки, runner пишет причину в журнал

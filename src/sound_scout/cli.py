@@ -37,7 +37,10 @@ calls of the plugin's delivery loop (`sound_scout.delivery`): the next note to s
 `jobs redeliver <job_id>` is the operator's request to deliver the note of a
 `delivery_unconfirmed` job once more (`delivery.request_redelivery`); any other delivery state is
 the refusal `delivery_not_unconfirmed`. The MCP tool `speech_job_redeliver` calls the same
-function.
+function. `jobs bind --session-id=<id> [--profile=<p>] [--connection=<c>] <job_id>` binds an
+unbound MCP job to a chat once (`jobs.bind`, decision 0025): the `sound-scout` Hermes plugin
+calls it after `speech_job_submit` with the chat of that turn; any other job is `not_bindable`.
+No MCP tool binds a job.
 `doctor` prints `doctor.report` as a table or JSON and exits 0 whatever the statuses are: it is a
 diagnosis, not a check. `serve` runs the MCP stdio server (`sound_scout.mcp_server`) over the
 same functions until the client closes stdin, then exits 0.
@@ -82,7 +85,7 @@ SUBCOMMANDS = {
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
     "jobs": "queue an analysis and follow it: submit, status, result, cancel, retry; run the "
     "queue: run, start, recover; print the budgets and the staging root: limits; deliver the "
-    "final note: deliver-next, deliver-end, redeliver",
+    "final note: deliver-next, deliver-end, redeliver; bind an MCP job to its chat: bind",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -277,6 +280,17 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         "redeliver", help=redeliver_help, description=redeliver_help, parents=[common, as_json]
     )
     redeliver.add_argument("job_id", help="the job_id of a delivery_unconfirmed job")
+    bind_help = (
+        "bind an unbound job of the submitter mcp to a chat once, so its final note goes there; "
+        "the Hermes plugin calls it with the chat of the turn that submitted the job"
+    )
+    bind = actions.add_parser(
+        "bind", help=bind_help, description=bind_help, parents=[common, as_json]
+    )
+    bind.add_argument("--session-id", required=True, help="the chat the final note goes to")
+    bind.add_argument("--profile", help="the Hermes profile of the chat")
+    bind.add_argument("--connection", help="the connection the job came through")
+    bind.add_argument("job_id", help="the job_id that speech_job_submit answered")
 
 
 def _layer_list(text: str) -> tuple[str, ...]:
@@ -467,6 +481,8 @@ def run_jobs(args: argparse.Namespace) -> int:
             answer = delivery.end_delivery(args.job_id, args.outcome, args.error, loaded)
         elif args.jobs_command == "redeliver":
             answer = delivery.request_redelivery(args.job_id, loaded)
+        elif args.jobs_command == "bind":
+            answer = jobs.bind(args.job_id, args.session_id, args.profile, args.connection, loaded)
         else:
             call = {
                 "status": jobs.status,

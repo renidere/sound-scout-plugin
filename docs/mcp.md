@@ -9,7 +9,7 @@
 | `speech_capabilities` | `doctor.report` | только чтение | отчёт `doctor --json` |
 | `speech_analyze` | `app.analyze` | пишет `runs/<run_id>/` под data root | `report.compact` с `run_dir` и `reused` — тот же документ, что `analyze --json` |
 | `speech_compare` | `app.compare` | пишет `compare/<compare_id>.json` под data root | сравнение с полем `path` — тот же документ, что `compare --json` |
-| `speech_job_submit` | `jobs.submit` (submitter `mcp`, режим `mode`) | пишет задание `jobs/<job_id>/` под data root, анализ не запускает | `{job_id, request_id, state, reused}` — тот же документ, что `jobs submit --json` |
+| `speech_job_submit` | `jobs.submit` (submitter `mcp`, режим `mode`, без привязки к чату) | пишет задание `jobs/<job_id>/` под data root, анализ не запускает | `{job_id, request_id, state, reused}` — тот же документ, что `jobs submit --json` |
 | `speech_job_status` | `jobs.status` | только чтение | состояние задания — тот же документ, что `jobs status --json` |
 | `speech_job_result` | `jobs.result` | только чтение | `report.compact` run последней попытки с результатом и полями `job_id`, `job_state`, `attempt` — тот же документ, что `jobs result --json` |
 | `speech_job_cancel` | `jobs.cancel` | `queued` → `cancelled` сразу, у `running` — маркер `cancel.json` для runner | состояние задания с полем `cancel` — тот же документ, что `jobs cancel --json` |
@@ -74,15 +74,25 @@ uv run sound-scout serve
   (решение 0013 § 3.1, § 3.8): вызывают те же функции `sound_scout.jobs` и `sound_scout.delivery` и
   отвечают тем же документом, что `--json` этих подкоманд, с теми же
   кодами отказа (`job_not_found`, `no_result`, `queue_full`, `staging_full`, `invalid_request`,
-  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, коды приёма входа, коды `compare` у контрольной попытки). Lock сервера они не берут, поэтому отвечают
+  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, `not_bindable` (только `jobs bind`), коды приёма входа, коды `compare` у контрольной попытки). Lock сервера они не берут, поэтому отвечают
   и во время синхронного `speech_analyze`; хранилище заданий держит свой lock миллисекунды.
   `speech_job_submit` проверяет путь, размер и SHA-256 входа и сразу отвечает `job_id` в состоянии
   `queued`; проверка входа через ffprobe и сам анализ — дело runner. Сервер runner не запускает:
   задания исполняет runner, который оператор запустил `sound-scout jobs start` (или `jobs run`);
-  без него задание остаётся `queued`. Задание из MCP хранит `binding.submitter = "mcp"`;
-  необязательные `connection`, `profile`, `session_id` сохраняются как есть, как у
-  `jobs submit --connection/--profile/--session-id`. Состояние задания (`finished` и др.) отдельно
+  без него задание остаётся `queued`. Состояние задания (`finished` и др.) отдельно
   от `status` результата: `finished` не значит `complete`.
+- **Привязка к чату** (решение 0025, #140). У `speech_job_submit` нет полей привязки
+  `connection`, `profile`, `session_id`: аргумент инструмента никогда не становится привязкой.
+  Передать любое из них — отказ `invalid_arguments` по закрытой схеме, задание не создаётся.
+  Задание из MCP всегда создаётся без привязки: `binding.submitter = "mcp"`, остальные поля `null`.
+  Привязку к локальному чату ставит только плагин Hermes `sound-scout`. Его хук `post_tool_call`
+  после успешного вызова берёт `job_id` из ответа сервера, а id чата — из контекста сессии хода
+  Hermes (`HERMES_SESSION_PLATFORM` = `local`, `HERMES_SESSION_CHAT_ID`), и вызывает
+  `sound-scout jobs bind`. Итоговая заметка задания приходит в этот чат один раз (0013 § 3.7).
+  `jobs bind` привязывает только задание `submitter = "mcp"` без привязки и с `delivery: null`,
+  один раз; иначе отказ `not_bindable`. MCP-инструмента для привязки нет. `speech_job_status`
+  показывает `binding` и `bound_at`. Без плагина в процессе Hermes или вне локального чата привязки
+  нет, заметка не придёт: результат читается через `speech_job_status` и `speech_job_result`.
   Повторная доставка итога — `speech_job_redeliver` или `sound-scout jobs redeliver <job_id>`, одна
   функция `delivery.request_redelivery`. Она принимает только задание с доставкой
   `delivery_unconfirmed`; любое другое состояние — отказ `delivery_not_unconfirmed`, `job.json` не
@@ -275,7 +285,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_submit",
-  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full. A control attempt names previous_run_id (the run_id of the initial attempt, from its speech_job_result) and criterion, both together: after the control analysis the server compares the two attempts and puts the verdict into the job's result (compare).",
+  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full. A control attempt names previous_run_id (the run_id of the initial attempt, from its speech_job_result) and criterion, both together: after the control analysis the server compares the two attempts and puts the verdict into the job's result (compare). In a local Hermes chat the Sound Scout plugin binds the job to that chat after this call, and the final note of the job arrives there once; the call takes no chat or session argument.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -329,24 +339,6 @@ uv run sound-scout serve
         "type": "string",
         "minLength": 1,
         "description": "emphasis_on:<word>, pause_before:<word>, intelligibility_of:<word> or completeness_of_phrase"
-      },
-      "connection": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 256,
-        "description": "the connection the job came through, stored as is"
-      },
-      "profile": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 256,
-        "description": "the agent profile of the chat, stored as is"
-      },
-      "session_id": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 256,
-        "description": "the stored session ID of the chat, stored as is"
       }
     },
     "required": [
