@@ -104,6 +104,16 @@ def test_memory_ceiling_and_context_match_the_llama_runtime() -> None:
     assert "`-c 4096`" in section("## 7. План runtime")
 
 
+def test_runtime_plan_preregisters_the_clip_set_of_2026_11_19() -> None:
+    """#155: step 3 names the set of `0010` §2.1, not `0007` §2.1, as the clip source."""
+    plan = flat(section("## 7. План runtime"))
+    step = plan.split("3. Предрегистрация:", 1)[1].split("4. Проверки до запросов", 1)[0]
+    assert "клипы по `0007` §2.1" not in step
+    assert "`0007` §2.1" not in step
+    assert "клипы набора 2026-11-19 (`0010` §2.1;" in step
+    assert "`V2` и `V3` в нём — не те файлы, что в `0007`, #86)" in step
+
+
 def test_wall_time_per_clip_is_an_estimate_from_measured_runs() -> None:
     timing = flat(section("## 6. Время на клип Gate 0"))
     assert timing.startswith("Оценка, не измерение.")

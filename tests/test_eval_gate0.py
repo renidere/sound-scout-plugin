@@ -1309,6 +1309,18 @@ def test_gigachat_not_ready_packages_nothing_and_names_the_next_owner_step() -> 
     assert re.search(r"^1\. \*\*Решить судьбу GigaChat3\.1-Audio-10B-A1\.8B\*\*", owner, re.M)
 
 
+def test_gigachat_protocol_names_the_clip_set_of_its_section_2_1_not_the_clips_of_0007() -> None:
+    """#155: §2 names the 2026-11-19 set, as §2.1 does; `V2` and `V3` are not the files of 0007."""
+    flat_doc = re.sub(r"\s+", " ", (REPO / GIGACHAT_DOC).read_text(encoding="utf-8"))
+    protocol = flat_doc.split("## 2. Протокол", 1)[1].split("### 2.1. Клипы", 1)[0]
+    clips = flat_doc.split("### 2.1. Клипы", 1)[1].split("## 3.", 1)[0]
+    assert "те же клипы" not in protocol
+    assert "Клипы — набор 2026-11-19, тот же, что у 0010" in protocol
+    assert "`V2` и `V3` в нём — не те файлы, что в 0007 (0010 §2.1, #86; раздел 2.1)" in protocol
+    assert "`data/gate0/2026-11-19/`" in clips
+    assert "`V2` и `V3` — те же файлы, что в 0010, но не те, что в 0007 (0010 §2.1, #86)" in clips
+
+
 # --- GATE0-RULE v2 and the qwen3omni runtime of #144 (docs/decisions/0023-gate0-qwen3-omni.md) -
 
 QWEN3OMNI_DOC = Path("docs/decisions/0023-gate0-qwen3-omni.md")

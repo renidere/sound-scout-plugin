@@ -178,12 +178,14 @@
 
 ## 2. Протокол
 
-Протокол — без изменений, `docs/decisions/0007-gate0-result.md` раздел 2: те же клипы, те же
-варианты вопросов A, K1, K2, P и transcript-only (константы `QUESTIONS`, SHA-256
+Протокол — без изменений, `docs/decisions/0007-gate0-result.md` раздел 2: те же варианты
+вопросов A, K1, K2, P и transcript-only (константы `QUESTIONS`, SHA-256
 `34871259fa7ad301b1cd5ee24182664e79c3b1b7439bb1741204038e56cced82`), промпт A с SHA-256
 `53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca`, те же настройки запросов
 (`temperature 0`, `seed 0`, `max_tokens` 8 / 1024, `response_format` для A), лимиты запроса
-(≤ 10 клипов по ≤ 30 с, 600 с на запрос) и **42** запроса, каждый один раз. Код плана (`plan`),
+(≤ 10 клипов по ≤ 30 с, 600 с на запрос) и **42** запроса, каждый один раз. Клипы — набор
+2026-11-19, тот же, что у 0010; `V2` и `V3` в нём — не те файлы, что в 0007 (0010 §2.1, #86;
+раздел 2.1). Код плана (`plan`),
 разбора (`answer_of`, `parse_closed`), правила (`decide`, `audio_route`, `evaluate`),
 `MIN_AUDIO_TOKENS_PER_S`, `REQUEST_TIMEOUT_S`, `LOAD_TIMEOUT_S`, `MAX_CLIPS`, `MAX_CLIP_SECONDS`,
 `RSS_LIMIT_BYTES` и `MEMORY_CAP_BYTES` в `gate0.py` не менялся.
