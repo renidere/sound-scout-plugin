@@ -213,13 +213,37 @@ def _kill_session(child: subprocess.Popen, sig: int) -> None:
             os.kill(pid, sig)
 
 
+class _SignalFlag:
+    """The stop flag of `serve`, set from its signal handlers. A `threading.Event` takes a lock
+    in `set`; a signal that lands while the poll loop's `Event.wait` holds it deadlocks `serve`,
+    and `stop` then fails (#166). `wait` sleeps in slices of `SLICE_S`, so it returns within
+    `SLICE_S` of a stop."""
+
+    SLICE_S = 0.05
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def wait(self, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while not self._set and (left := end - time.monotonic()) > 0:
+            time.sleep(min(left, self.SLICE_S))
+        return self._set
+
+
 def monitor(
     child,
     *,
     deadline: float,
     rss_limit: int,
     stats: Path,
-    stop: threading.Event,
+    stop: threading.Event | _SignalFlag,
     peaks: dict | None = None,
 ):
     """Watch the session of `child` until it exits or a limit ends it; the reason or None.
@@ -266,7 +290,7 @@ def monitor(
 
 
 def serve(args) -> int:
-    stop = threading.Event()
+    stop = _SignalFlag()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     env = guarded_env(os.environ, Path(args.guard_dir), args.guard_log)

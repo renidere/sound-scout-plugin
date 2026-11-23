@@ -532,6 +532,86 @@ def test_stop_fails_while_a_process_of_the_server_session_survives(tmp_path, mon
     assert hostrun.main(["stop", "--pid-file", str(tmp_path / "absent.pid"), "--timeout", "0"]) == 0
 
 
+# `serve` whose first wait of the poll loop holds until a signal comes: in `Condition.wait` (the
+# lock of the `Event` held) or in `time.sleep`, whichever the loop waits in; the file `argv[2]`
+# says the wait holds. The SIGTERM of `stop` is the only one, so it lands inside that wait.
+SIGNAL_IN_WAIT = """
+import os, signal, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import hostrun
+
+in_wait, received = sys.argv[2], []
+install, condition_wait, sleep = signal.signal, threading.Condition.wait, time.sleep
+
+
+def recording_signal(sig, handler):
+    def record(*args):
+        received.append(sig)
+        handler(*args)
+
+    return install(sig, record)
+
+
+def hold_for_signal():
+    if not os.path.exists(in_wait):
+        open(in_wait, "w").close()
+        ends = time.monotonic() + 60
+        while not received and time.monotonic() < ends:
+            sleep(0.01)
+
+
+def held_condition_wait(self, timeout=None):
+    hold_for_signal()
+    return condition_wait(self, timeout)
+
+
+def held_sleep(seconds):
+    hold_for_signal()
+    sleep(seconds)
+
+
+signal.signal = recording_signal
+threading.Condition.wait, time.sleep = held_condition_wait, held_sleep
+hostrun.gpu_memory_mib = lambda: None  # an nvidia-smi run would hold in its own wait
+sys.exit(hostrun.main(sys.argv[3:]))
+"""
+
+
+def test_serve_stops_on_a_sigterm_that_lands_inside_its_poll_wait(tmp_path) -> None:
+    """#166: the handler set a `threading.Event`, which takes the lock the poll loop's
+    `Event.wait` holds, so a SIGTERM there deadlocked `serve` and `stop` returned 1."""
+    wrapper = tmp_path / "serve.py"
+    wrapper.write_text(SIGNAL_IN_WAIT)
+    in_wait = tmp_path / "in-wait"
+    command = [sys.executable, str(wrapper), str(HOST_DIR), str(in_wait), "serve"]
+    command += ["--guard-dir", str(HOST_DIR)]
+    command += ["--deadline", str(time.time() + 120), "--rss-limit", str(1 << 40)]
+    command += ["--stats", str(tmp_path / "stats.jsonl"), "--log", str(tmp_path / "server.log")]
+    command += ["--pid-file", str(tmp_path / "pid"), "--"]
+    serve = subprocess.Popen([*command, sys.executable, "-c", "import time; time.sleep(120)"])
+    server_pid = None
+    try:
+        server_pid = _wait_for(
+            lambda: next((r["pid"] for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        _wait_for(lambda: (tmp_path / "pid").is_file() and in_wait.is_file())
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "pid"), "--stats", str(tmp_path / "stats.jsonl")]
+        assert subprocess.run([*stop, "--timeout", "20"], timeout=60).returncode == 0
+        assert serve.wait(30) == 0
+        last = _stats(tmp_path)[-1]
+        assert last["event"] == "exit" and last["reason"] == "stopped"
+        assert not [p for p in hostrun.session_pids(server_pid) if hostrun._alive(p)]
+    finally:
+        if serve.poll() is None:
+            serve.kill()
+            serve.wait(30)
+        if server_pid is not None:
+            for pid in hostrun.session_pids(server_pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
 NATIVE_SERVER = """
 import multiprocessing, sys, time
 
