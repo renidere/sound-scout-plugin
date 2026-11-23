@@ -52,6 +52,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+# A full run writes about 2 GB to tmp_path; keep only a failed test's dirs, one session (#169).
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 markers = [
     "slow: a real model, a long synthesis, the dry stack, or 0.8 s or more on the station; deselect with -m \"not slow\"",
 ]
