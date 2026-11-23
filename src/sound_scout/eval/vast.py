@@ -675,8 +675,9 @@ class Api:
 
 class _LockWindow(threading.local):
     """The signals (`(handler, signum)`) that land while this thread opens, locks or closes a
-    journal `flock`; `None` outside that. Run there, a handler would block on the lock this
-    thread already holds, or its exception would skip the `close` and keep the lock (#170)."""
+    journal `flock`, or ends its body; `None` outside that. Run there, a handler would block on
+    the lock this thread already holds, or its exception would skip the `close` and keep the
+    lock (#170, #173)."""
 
     pending: list | None = None
 
@@ -694,6 +695,9 @@ def _outside_lock_window(handler: Callable) -> Callable:
     """The signal handler, run at once, or when the journal lock's open, flock or close ends."""
 
     def safe(signum: int, frame) -> None:
+        # the second `None` check: a signal inside `_exiting_lock` may have opened it already
+        if _LOCK_WINDOW.pending is None and _exiting_lock(frame) and _LOCK_WINDOW.pending is None:
+            _LOCK_WINDOW.pending = []
         if _LOCK_WINDOW.pending is not None:
             _LOCK_WINDOW.pending.append((handler, signum))
             return
@@ -773,8 +777,13 @@ class Journal:
                 held = True
                 self._held = 1
             _close_lock_window()
-            yield held
+            try:
+                yield held
+            finally:
+                if _LOCK_WINDOW.pending is None:
+                    _LOCK_WINDOW.pending = []
         finally:
+            # again: a handler's exception can cut the statement above short (#173)
             if _LOCK_WINDOW.pending is None:
                 _LOCK_WINDOW.pending = []
             if held:
@@ -814,6 +823,27 @@ class Journal:
                 raise VastError(f"journal {self.path.name}: line {number} is not an event")
             events.append(event)
         return events
+
+
+_LOCK_CODE = Journal.lock.__wrapped__.__code__
+_CONTEXT_EXIT = contextlib._GeneratorContextManager.__exit__.__code__
+
+
+def _exiting_lock(frame) -> bool:
+    """The signal landed in `contextlib`'s `__exit__` of a `Journal.lock()` that has its fd and
+    is not resumed yet, or in a handler that such an `__exit__` runs: an exception there would
+    skip the lock's `finally` (#173)."""
+    while frame is not None:
+        if frame.f_code is _CONTEXT_EXIT:
+            lock = getattr(frame.f_locals.get("self"), "gen", None)
+            if (
+                getattr(lock, "gi_code", None) is _LOCK_CODE
+                and lock.gi_suspended
+                and lock.gi_frame.f_locals.get("fd") is not None
+            ):
+                return True
+        frame = frame.f_back
+    return False
 
 
 def _fsync_dir(path: Path) -> None:
@@ -2343,8 +2373,9 @@ def cancel_on_signals(run: Run) -> dict:
     `SystemExit` takes the `finally` path, so the results are downloaded and the instance
     destroyed. The first signal counts; later ones are ignored, so they cannot cut that path
     short; `run.fatal` keeps the stop even where the exception is swallowed. A signal inside
-    the journal lock's open, flock or close is handled as soon as that ends. Only the main
-    thread can set handlers: elsewhere nothing changes."""
+    the journal lock's open, flock or close, or between the end of its body and the close, is
+    handled as soon as the close ends. Only the main thread can set handlers: elsewhere nothing
+    changes."""
     if threading.current_thread() is not threading.main_thread():
         return {}
 

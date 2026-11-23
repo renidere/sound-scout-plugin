@@ -5,8 +5,10 @@ Every test uses `vast_fake.FakeVast` and a key file in a temp dir. No test reach
 the real key file or arms a real timer: the fakes prove the contract of the stack only.
 """
 
+import contextlib
 import dataclasses
 import errno
+import fcntl
 import hashlib
 import io
 import itertools
@@ -2986,20 +2988,44 @@ def test_a_signal_inside_the_final_path_is_journaled_and_cuts_nothing(
     assert vast.defer_signals(run, {}) is None
 
 
+# A second process: `watch_tick` on the attempt's journal; `busy` only after 5 s of retries.
+_WATCH_PROBE = """
+import sys, time
+from sound_scout.eval import vast
+
+def no_api(_opened):
+    raise vast.VastError("the probe has no API")
+
+journal = vast.Journal.open(sys.argv[1])
+for _ in range(50):
+    outcome = vast.watch_tick(journal, no_api, runner=None)
+    if outcome != "busy":
+        break
+    time.sleep(0.1)
+print(outcome)
+"""
+
 # The child runs a dry run and, once armed, raises SIGTERM in the main thread inside a window of
-# `Journal.lock()`: right after `flock` returns (`acquire`) or right before the lock fd's `close`
-# (`release`). `cancel` arms after the first Gate 0 block (the handler of `cancel_on_signals`),
-# `defer` once the final download starts (the handler of `defer_signals`).
+# `Journal.lock()`: right after `flock` returns (`acquire`), right before the lock fd's `close`
+# (`release`), or after the lock's body ends: at the start of `contextlib`'s `__exit__` (`exit`)
+# or at the first line of the lock after its `yield` (`finally`, #173). `cancel` arms after the
+# first Gate 0 block (the handler of `cancel_on_signals`), `defer` once the final download starts
+# (the handler of `defer_signals`). Before the destroy, `_WATCH_PROBE` runs.
 _LOCK_WINDOW_CHILD = """
-import fcntl, os, signal, sys, threading
+import contextlib, fcntl, inspect, os, signal, subprocess, sys, threading
 from pathlib import Path
 
 from sound_scout import config
 from sound_scout.eval import vast
 
-out, window, when = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+out, window, when, probe_code = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 armed = []
 real_flock, real_close, real_download = fcntl.flock, os.close, vast.download
+real_destroy = vast.destroy_until_absent
+lock_code = vast.Journal.lock.__wrapped__.__code__
+exit_code = contextlib._GeneratorContextManager.__exit__.__code__
+source, first = inspect.getsourcelines(vast.Journal.lock)
+yield_line = first + next(i for i, line in enumerate(source) if "yield held" in line)
 
 
 def is_lock(fd):
@@ -3009,11 +3035,40 @@ def is_lock(fd):
         return False
 
 
-def fire():
+def fire(frame=None):
     if armed and threading.current_thread() is threading.main_thread():
         armed.clear()
-        signal.raise_signal(signal.SIGTERM)  # the handler runs inside this call
-        (out.parent / "fired").write_text(window)
+        sys.settrace(None)
+        try:
+            if frame is None:
+                signal.raise_signal(signal.SIGTERM)  # the handler runs inside this call
+            else:  # as the eval loop runs the handler at this point of `frame`
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, frame)
+        finally:
+            (out.parent / "fired").write_text(window)
+
+
+def tracer(frame, event, _arg):
+    if event != "call":
+        return None
+    if window == "exit" and frame.f_code is exit_code:
+        lock = frame.f_locals["self"].gen
+        if lock.gi_code is lock_code and lock.gi_frame.f_locals.get("fd") is not None:
+            fire(frame)
+        return None
+    return after_yield if window == "finally" and frame.f_code is lock_code else None
+
+
+def after_yield(frame, event, _arg):
+    if event == "line" and frame.f_lineno > yield_line:
+        fire(frame)
+    return after_yield
+
+
+def arm():
+    armed.append(1)
+    if window in ("exit", "finally"):
+        sys.settrace(tracer)
 
 
 def flock(fd, operation):
@@ -3031,12 +3086,25 @@ def close(fd):
 def download(*args, **kwargs):
     final = kwargs.get("name", "results") == "results"
     if when == "defer" and final and not (out.parent / "fired").exists():
-        armed.append(1)
+        arm()
     return real_download(*args, **kwargs)
 
 
+def destroy_until_absent(journal, *args, **kwargs):
+    probe = subprocess.run(
+        [sys.executable, "-c", probe_code, str(journal.path)], capture_output=True, text=True
+    )
+    (out.parent / "probe").write_text(probe.stdout.strip() or probe.stderr)
+    return real_destroy(journal, *args, **kwargs)
+
+
+def first_block(run, **_):
+    if not (out.parent / "fired").exists():
+        arm()
+
+
 fcntl.flock, os.close, vast.download = flock, close, download
-first_block = lambda run, **_: armed.append(1) if not (out.parent / "fired").exists() else None
+vast.destroy_until_absent = destroy_until_absent
 hooks = {"block_end": first_block} if when == "cancel" else {}
 (out.parent / "in").mkdir()
 config_ = config.Config(allowed_roots=((out.parent / "in").resolve(),), data_root=out.parent)
@@ -3044,10 +3112,10 @@ vast.dry_run(out, config_, scenario={"hooks": hooks})
 """
 
 
-def _signal_in_lock_window(tmp_path: Path, window: str, when: str) -> tuple[int, list]:
+def _signal_in_lock_window(tmp_path: Path, window: str, when: str) -> tuple[int, list, str]:
     out = tmp_path / "dry"
     child = subprocess.Popen(
-        [sys.executable, "-c", _LOCK_WINDOW_CHILD, str(out), window, when],
+        [sys.executable, "-c", _LOCK_WINDOW_CHILD, str(out), window, when, _WATCH_PROBE],
         cwd=REPO,
         start_new_session=True,
         stdout=subprocess.DEVNULL,
@@ -3062,7 +3130,7 @@ def _signal_in_lock_window(tmp_path: Path, window: str, when: str) -> tuple[int,
     assert code is not None, "the signal handler blocked on the journal lock"
     assert (tmp_path / "fired").read_text() == window
     (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
-    return code, vast.Journal(journal_path).replay()
+    return code, vast.Journal(journal_path).replay(), (tmp_path / "probe").read_text()
 
 
 def _download_and_destroy(events: list, tmp_path: Path) -> None:
@@ -3075,12 +3143,15 @@ def _download_and_destroy(events: list, tmp_path: Path) -> None:
     assert timeline["fake_api"]["instances_left"] == []
 
 
+LOCK_WINDOWS = ["acquire", "release", "exit", "finally"]
+
+
 @pytest.mark.slow
-@pytest.mark.parametrize("window", ["acquire", "release"])
+@pytest.mark.parametrize("window", LOCK_WINDOWS)
 def test_a_cancel_signal_inside_the_journal_lock_still_reaches_download_and_destroy(
     tmp_path: Path, window: str
 ) -> None:
-    code, events = _signal_in_lock_window(tmp_path, window, "cancel")
+    code, events, probe = _signal_in_lock_window(tmp_path, window, "cancel")
     assert code == 128 + signal.SIGTERM
     signals = [e for e in events if e["event"] == "signal"]
     assert [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", None)]
@@ -3091,17 +3162,19 @@ def test_a_cancel_signal_inside_the_journal_lock_still_reaches_download_and_dest
     models = {e["model"] for e in events if e["event"] == "step" and "model" in e}
     assert len(models) == 1  # the cancel ends the attempt: the second model never starts
     _download_and_destroy(events, tmp_path)
+    assert probe == "error"  # the second process got the lock; only its API is missing
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("window", ["acquire", "release"])
+@pytest.mark.parametrize("window", LOCK_WINDOWS)
 def test_a_signal_inside_the_journal_lock_of_the_final_path_is_journaled_and_cuts_nothing(
     tmp_path: Path, window: str
 ) -> None:
-    _, events = _signal_in_lock_window(tmp_path, window, "defer")
+    _, events, probe = _signal_in_lock_window(tmp_path, window, "defer")
     signals = [e for e in events if e["event"] == "signal"]
     assert [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", True)]
     _download_and_destroy(events, tmp_path)
+    assert probe == "error"
 
 
 def test_a_signal_inside_the_lock_window_runs_its_handler_once_the_window_ends(
@@ -3150,6 +3223,133 @@ def test_a_signal_before_a_failed_lock_open_still_runs_its_handler(tmp_path: Pat
         pass
     assert seen == [(signal.SIGTERM, None, 0)]
     assert vast._LOCK_WINDOW.pending is None
+
+
+@pytest.mark.parametrize("body_raises", [False, True])
+def test_a_raising_signal_at_any_instruction_after_the_lock_body_still_closes_the_lock(
+    tmp_path: Path, body_raises: bool
+) -> None:
+    """The handler runs as the signal machinery runs it, at each instruction in turn from the
+    start of `contextlib`'s `__exit__` to the end of the lock's `finally` (#173)."""
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    codes = (
+        contextlib._GeneratorContextManager.__exit__.__code__,
+        vast.Journal.lock.__wrapped__.__code__,
+    )
+    calls, state = [], {}
+
+    def cancel(signum, _frame):
+        calls.append(signum)
+        raise SystemExit(128 + signum)
+
+    safe = vast._outside_lock_window(cancel)
+
+    def instruction(_code, _offset):
+        if state["ended"]:
+            state["seen"] += 1
+            if state["seen"] == state["point"] + 1:
+                safe(signal.SIGTERM, sys._getframe(1))  # its exception lands on this instruction
+
+    monitoring, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+    monitoring.use_tool_id(tool, "lock-signal-test")
+    monitoring.register_callback(tool, monitoring.events.INSTRUCTION, instruction)
+    for code in codes:
+        monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+    fds = sorted(os.listdir("/proc/self/fd"))
+
+    def released(point: int) -> None:
+        assert journal._held == 0, point
+        assert vast._LOCK_WINDOW.pending is None, point
+        assert sorted(os.listdir("/proc/self/fd")) == fds, point
+        fd = os.open(journal.dir / vast.LOCK_FILE, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another open file: free, or raises
+        finally:
+            os.close(fd)
+
+    try:
+        for point in itertools.count():
+            calls.clear()
+            state.update(point=point, ended=False, seen=0)
+            exited = False
+            try:
+                with journal.lock():
+                    state["ended"] = True
+                    if body_raises:
+                        raise RuntimeError("the body")
+            except SystemExit:
+                exited = True
+                released(point)  # while the exception lives, as in the attempt's `finally`
+            except RuntimeError:
+                assert body_raises
+            if not calls:
+                break  # past the last instruction
+            assert (calls, exited) == ([signal.SIGTERM], True), point
+            released(point)
+    finally:
+        for code in codes:
+            monitoring.set_local_events(tool, code, 0)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+    assert point == state["seen"] > 30  # every instruction of `__exit__` and the lock was a point
+
+
+def test_a_second_signal_inside_the_first_handler_at_the_lock_exit_still_closes_the_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SIGTERM lands at the start of `contextlib`'s `__exit__`; SIGHUP lands in its handler
+    before that handler opens the deferral. Both wait for the lock's close (#173)."""
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    exit_code = contextlib._GeneratorContextManager.__exit__.__code__
+    calls, fired = [], []
+
+    def cancel(signum, _frame):
+        calls.append(signum)
+        raise SystemExit(128 + signum)
+
+    safe = vast._outside_lock_window(cancel)
+    real_exiting_lock = vast._exiting_lock
+
+    def exiting_lock(frame):
+        if fired == ["SIGTERM"]:
+            fired.append("SIGHUP")
+            safe(signal.SIGHUP, sys._getframe())  # it interrupts the first handler here
+            assert calls == []
+        return real_exiting_lock(frame)
+
+    monkeypatch.setattr(vast, "_exiting_lock", exiting_lock)
+
+    def instruction(_code, _offset):
+        if not fired:
+            fired.append("SIGTERM")
+            safe(signal.SIGTERM, sys._getframe(1))
+
+    monitoring, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+    monitoring.use_tool_id(tool, "lock-signal-test")
+    monitoring.register_callback(tool, monitoring.events.INSTRUCTION, instruction)
+    fds = sorted(os.listdir("/proc/self/fd"))
+    exited = False
+    try:
+        with journal.lock():
+            monitoring.set_local_events(tool, exit_code, monitoring.events.INSTRUCTION)
+    except SystemExit:
+        exited = True
+        # while the exception lives: its traceback keeps the lock's generator from `close`
+        assert journal._held == 0
+        assert vast._LOCK_WINDOW.pending is None
+        assert sorted(os.listdir("/proc/self/fd")) == fds
+        fd = os.open(journal.dir / vast.LOCK_FILE, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+    finally:
+        monitoring.set_local_events(tool, exit_code, 0)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+    assert exited
+    assert fired == ["SIGTERM", "SIGHUP"]
+    assert calls == [signal.SIGHUP]  # the first deferred handler ends the window's run
 
 
 # --- transport recovery (#149, round 2) ----------------------------------------------------------
