@@ -705,7 +705,8 @@ def test_jobs_report_through_the_cli_prints_the_markdown_or_its_json(
     path = tmp_path / "sound-scout.toml"
     path.write_text(
         f"allowed_roots = [{json.dumps(str(setup.allowed_roots[0]))}]\n"
-        f"data_root = {json.dumps(str(setup.data_root))}\n",
+        f"data_root = {json.dumps(str(setup.data_root))}\n"
+        "[network]\nallow = true\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
