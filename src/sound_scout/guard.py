@@ -4,7 +4,9 @@
 socket audit events through which a Python process reaches the network (`socket.connect`,
 name resolution, datagram sends, and `socket.bind` on an internet socket — a listener; an
 `AF_UNIX` bind stays allowed), and tells the Hugging Face libraries to stay offline. An audit
-hook cannot be removed: the ban lasts for the life of the process, which is intended.
+hook cannot be removed: the ban lasts for the life of the process, which is intended. The hook
+denies only while the module flag is on; only tests call `reset_for_tests` (#172), no code under
+`src/` does, so production stays guarded until the process exits.
 Child processes are not covered by the hook; the decoder is kept offline by its protocol
 whitelist (`proc.ffmpeg_argv` / `proc.ffprobe_argv`).
 
@@ -42,6 +44,7 @@ OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 TELEMETRY_OFF_ENV = {"ORT_DISABLE_TELEMETRY": "1"}
 
 _installed = False
+_hook_added = False
 _denied: list[str] = []
 
 
@@ -55,13 +58,14 @@ def install_network_guard(config: Config) -> bool:
     Library telemetry is switched off in either case. Returns whether the guard is active
     afterwards. Idempotent: a second call does not add a second hook.
     """
-    global _installed
+    global _installed, _hook_added
     disable_telemetry()
     if config.network.allow:
         return False
-    if not _installed:
+    if not _hook_added:
         sys.addaudithook(_deny_network_events)
-        _installed = True
+        _hook_added = True
+    _installed = True
     os.environ.update(OFFLINE_ENV)
     return True
 
@@ -80,7 +84,20 @@ def denied_events() -> tuple[str, ...]:
     return tuple(_denied)
 
 
+def reset_for_tests() -> None:
+    """Switch the guard off and forget its denials, so one test cannot leak it into the next.
+
+    Only tests call it; no code under `src/` does, so production stays guarded until the process
+    exits.
+    """
+    global _installed
+    _installed = False
+    _denied.clear()
+
+
 def _deny_network_events(event: str, args: tuple[object, ...]) -> None:
+    if not _installed:
+        return
     if event in BLOCKED_EVENTS or (event == "socket.bind" and _is_internet_socket(args[0])):
         _denied.append(event)
         raise NetworkDenied(f"network access is disabled (network.allow = false): {event}")

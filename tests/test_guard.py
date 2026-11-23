@@ -1,5 +1,7 @@
-"""The network guard is installed in a child interpreter: an audit hook cannot be removed and
-must not poison the test session; only the flag and the `allow = true` path run in-process."""
+"""An audit hook cannot be removed, so once a test installs the guard the hook stays in the pytest
+process; it denies only while the guard flag is on, and the autouse fixture
+`reset_process_globals` switches the flag off after each test. Tests of the denying hook itself
+run in a child interpreter so they see a fresh process."""
 
 import json
 import os
@@ -185,3 +187,56 @@ def test_allowed_network_installs_nothing(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_guard_flag_is_off_in_this_test_session() -> None:
     assert guard.network_guard_active() is False
+
+
+def test_after_install_the_process_stays_guarded_until_it_exits(tmp_path: Path) -> None:
+    """Production path (#172): the CLI installs the guard; later CLI calls, an allowing install
+    and the rest of the process never switch it off; a real loopback connect stays denied."""
+    recordings, data = tmp_path / "recordings", tmp_path / "data"
+    recordings.mkdir()
+    data.mkdir()
+    settings = tmp_path / "sound-scout.toml"
+    settings.write_text(
+        f"allowed_roots = [{json.dumps(str(recordings))}]\n"
+        f"data_root = {json.dumps(str(data))}\n[network]\nallow = false\n",
+        encoding="utf-8",
+    )
+    outcome = run_in_child(
+        """
+    import contextlib, io
+    from sound_scout import cli
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    address = listener.getsockname()
+
+    def connect():
+        try:
+            with socket.socket() as sock:
+                sock.settimeout(5)
+                sock.connect(address)
+        except guard.NetworkDenied:
+            return "denied"
+        return "connected"
+
+    attempts = [connect()]
+    with contextlib.redirect_stdout(io.StringIO()):
+        codes = [cli.main(["jobs", "limits", "--json"])]
+        attempts.append(connect())
+        codes.append(cli.main(["jobs", "limits", "--json"]))
+    attempts.append(connect())
+    allowing = guard.install_network_guard(config(allow=True))
+    attempts.append(connect())
+    print(json.dumps({
+        "codes": codes, "attempts": attempts, "allowing": allowing,
+        "active": guard.network_guard_active(), "denied": list(guard.denied_events()),
+    }))
+    """,
+        {"SOUND_SCOUT_CONFIG": str(settings)},
+    )
+    assert outcome["codes"] == [0, 0]
+    assert outcome["attempts"] == ["connected", "denied", "denied", "denied"]
+    assert outcome["allowing"] is False
+    assert outcome["active"] is True
+    assert outcome["denied"] == ["socket.connect"] * 3

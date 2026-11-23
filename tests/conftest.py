@@ -2,15 +2,17 @@ import functools
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from sound_scout import guard
 from sound_scout.config import root_denied_name
 
 WavFactory = Callable[..., Path]
@@ -48,6 +50,42 @@ def use_a_temp_dir_outside_denied_names() -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     use_a_temp_dir_outside_denied_names()
+
+
+GUARD_ENV = (*guard.OFFLINE_ENV, *guard.TELEMETRY_OFF_ENV)
+
+
+def signal_handlers() -> dict[signal.Signals, object]:
+    """The handler of every signal Python can read one of (`None`: set outside Python)."""
+    handlers = {}
+    for number in signal.valid_signals():
+        try:
+            handlers[number] = signal.getsignal(number)
+        except (OSError, ValueError):
+            continue
+    return handlers
+
+
+@pytest.fixture(autouse=True)
+def reset_process_globals() -> Iterator[None]:
+    """Undo the process-wide state product code changes in a test, so it cannot reach the next
+    one (#172): the network guard, its denials and its environment variables, signal handlers,
+    `tempfile.tempdir` and the current directory. The audit hook of the guard stays in the
+    process: it denies nothing while the guard is off."""
+    env = {name: os.environ.get(name) for name in GUARD_ENV}
+    handlers, temp_dir, cwd = signal_handlers(), tempfile.tempdir, os.getcwd()
+    yield
+    guard.reset_for_tests()
+    for name, value in env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    for number, before in handlers.items():
+        if before is not None and signal.getsignal(number) is not before:
+            signal.signal(number, before)
+    tempfile.tempdir = temp_dir
+    os.chdir(cwd)
 
 
 @pytest.fixture(scope="session")
