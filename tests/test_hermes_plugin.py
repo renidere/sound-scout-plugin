@@ -768,6 +768,7 @@ def recorder_wav(seconds: int, *, rate: int = 48_000) -> bytes:
     return buffer.getvalue()
 
 
+@pytest.mark.slow
 def test_criterion_4_a_180_s_recorder_wav_reaches_jobs_submit_through_the_json_body(
     api, station: Station, monkeypatch
 ) -> None:
