@@ -17,6 +17,9 @@ const same = (actual, expected) => assert.deepEqual(JSON.parse(JSON.stringify(ac
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const named = (calls, name) => calls.filter(call => call[0] === name)
 const attached = calls => Buffer.from(named(calls, 'file.attach').at(-1)[1].data_url.split(',')[1], 'base64')
+const posted = post => Buffer.from(post.opts.body.data_url.split(',')[1], 'base64')
+const IPC_FAILURE = "Error invoking remote method 'hermes:api': Error: File uploads are not supported against OAuth-gated remote backends yet."
+const DESKTOP_TEXT = 'File uploads are not supported against OAuth-gated remote backends yet.'
 const notices = calls => named(calls, 'notify').map(call => call[1])
 
 function textContent(node) {
@@ -594,8 +597,7 @@ test('no budget from GET /health means no recording', async () => {
     { ok: false, error: 'cli_failed', detail: 'x' },
     { ok: true, budgets: null, intake: { ready: false, error: 'cli_failed', detail: 'private-detail' } },
     { ok: true, budgets: { max_duration_seconds: 0, max_input_bytes: 10 }, intake: { ready: true } },
-    { ok: true, budgets: { max_duration_seconds: 1.5, max_input_bytes: 10 }, intake: { ready: true } },
-    new Error('private-network-failure')
+    { ok: true, budgets: { max_duration_seconds: 1.5, max_input_bytes: 10 }, intake: { ready: true } }
   ]
   for (const answer of answers) {
     const { recorder, capture, ctx, calls } = await setup()
@@ -628,10 +630,11 @@ test('Send and analyze posts the same WAV to POST /jobs after prompt.submit and 
   const post = ctx.rests.find(r => r.opts.method === 'POST')
   const query = new URL(`http://plugin${post.path}`).searchParams
   same(Object.fromEntries(query), { request_id: `sound-scout-desktop-${RECORDING_ID}`, session_id: 'stored-a', profile: 'default' })
-  assert.equal(post.opts.upload.filename, `sound-scout-${RECORDING_ID}.wav`)
-  assert.equal(post.opts.upload.contentType, 'audio/wav')
+  same(Object.keys(post.opts).sort(), ['body', 'method', 'timeoutMs'])
+  same(Object.keys(post.opts.body), ['data_url'])
+  assert.match(post.opts.body.data_url, /^data:audio\/wav;base64,UklGR/)
   assert.equal(post.opts.timeoutMs, 120000)
-  assert.deepEqual(Buffer.from(post.opts.upload.bytes), attached(calls))
+  assert.deepEqual(posted(post), attached(calls))
   assert.equal(recorder.state.get().phase, 'idle')
   assert.deepEqual(notices(calls)[0], { kind: 'success', message: 'Голосовое отправлено, разбор принят' })
   await recorder.polling
@@ -665,9 +668,64 @@ test('a refused POST /jobs keeps the voice in the chat and a retry posts again w
   const posts = ctx.rests.filter(r => r.opts.method === 'POST')
   assert.equal(posts.length, 2)
   assert.equal(posts[1].path, posts[0].path)
-  assert.deepEqual(Buffer.from(posts[1].opts.upload.bytes), Buffer.from(posts[0].opts.upload.bytes))
+  assert.equal(posts[1].opts.body.data_url, posts[0].opts.body.data_url)
+  assert.equal(posts[1].opts.upload, undefined)
   await recorder.polling
   same(recorder.job.get(), { jobId: JOB, text: 'Разбор не удался: input_invalid', final: true })
+})
+
+test('a failed ctx.rest of POST /jobs shows the Desktop error text without the IPC wrapper', async () => {
+  const { recorder, calls, capture, ctx } = await setup()
+  ctx.post = new Error(IPC_FAILURE)
+  await recorder.start()
+  feed(capture)
+  await assert.rejects(recorder.send({ analyze: true }), error => error.code === 'no_answer' && error.message === DESKTOP_TEXT)
+  assert.equal(recorder.state.get().phase, 'ready')
+  assert.equal(recorder.state.get().error,
+    `Голосовое в чате, но разбор не принят: no_answer — ${DESKTOP_TEXT}. Повтори «Отправить и разобрать».`)
+  assert.equal(named(calls, 'file.attach').length, 1)
+  ctx.post = { ok: true, job_id: JOB, reused: false }
+  await recorder.send({ analyze: true })
+  assert.equal(recorder.state.get().phase, 'idle')
+  assert.equal(named(calls, 'file.attach').length, 1)
+  const posts = ctx.rests.filter(r => r.opts.method === 'POST')
+  assert.equal(posts[1].opts.body.data_url, posts[0].opts.body.data_url)
+  assert.deepEqual(posted(posts[1]), attached(calls))
+})
+
+test('a failed ctx.rest of GET /health and of the last status poll show the Desktop error text', async () => {
+  {
+    const { recorder, capture, ctx } = await setup()
+    ctx.health = new Error(IPC_FAILURE)
+    await recorder.start()
+    assert.equal(capture.constraints, null)
+    assert.equal(recorder.state.get().error, `Sound Scout не сообщил лимит записи: ${DESKTOP_TEXT}.`)
+  }
+  {
+    const { recorder, capture, ctx, calls } = await setup({ options: { maxPollFailures: 2 } })
+    ctx.statuses = [{ ok: false, error: 'cli_failed' }, new Error(IPC_FAILURE)]
+    await recorder.start()
+    feed(capture)
+    await recorder.send({ analyze: true })
+    await recorder.polling
+    const text = `Статус разбора недоступен: no_answer — ${DESKTOP_TEXT}`
+    same(recorder.job.get(), { jobId: JOB, text, final: true })
+    same(notices(calls).at(-1), { kind: 'warning', message: text })
+  }
+})
+
+test('the Desktop error text is one line of at most 300 characters, and an empty one names no answer', async () => {
+  for (const [failure, expected] of [
+    [new Error(`Error invoking remote method 'hermes:api': Error: line one\n\n  line   two`), 'line one line two'],
+    [new Error(`Error: ${'x'.repeat(400)}`), 'x'.repeat(300)],
+    [new Error(''), 'нет ответа сервера'],
+    [undefined, 'нет ответа сервера']
+  ]) {
+    const { recorder, ctx } = await setup()
+    ctx.rest = async () => { throw failure }
+    await recorder.start()
+    assert.equal(recorder.state.get().error, `Sound Scout не сообщил лимит записи: ${expected}.`)
+  }
 })
 
 test('a window on another connection refuses wrong_connection without a POST, and Send then finishes', async () => {
@@ -940,7 +998,7 @@ test('record errors notify once without raw failures', async () => {
 
 test('the plugin source holds no non-stock call and only the three backend routes', async () => {
   const source = await readFile(RECORDER_PATH, 'utf8')
-  for (const banned of [/retainSession/, /composer\.submit/, /\bfetch\(/, /XMLHttpRequest/, /WebSocket/, /\beval\b/]) {
+  for (const banned of [/retainSession/, /composer\.submit/, /\bfetch\(/, /XMLHttpRequest/, /WebSocket/, /\beval\b/, /upload:/]) {
     assert.doesNotMatch(source, banned)
   }
   const imports = [...source.matchAll(/^\s*import\b.*?from\s+['"]([^'"]+)['"]/gm)].map(m => m[1])

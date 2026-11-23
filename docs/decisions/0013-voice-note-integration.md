@@ -88,10 +88,21 @@ Owner `null` перечитывается при отправке; отказ �
 
 ### 3.5. Приём на анализ
 
-«Отправить и разобрать» загружает WAV в `plugin_api` через `ctx.rest` (multipart) прямо в приватный
-staging-корень Sound Scout (0700, вне `~/.hermes`, один из `allowed_roots`). Правило корней #66 не
-меняется. Чтение файлов из `~/.hermes/attachments` по пути из `file.attach` — только по отдельному
-решению владельца (раздел 9, пункт 2), и тогда по абсолютному полю `path`, не по `ref_path`.
+«Отправить и разобрать» загружает WAV в `plugin_api` через `ctx.rest` (JSON `data_url`) прямо в
+приватный staging-корень Sound Scout (0700, вне `~/.hermes`, один из `allowed_roots`). Правило корней
+#66 не меняется. Чтение файлов из `~/.hermes/attachments` по пути из `file.attach` — только по
+отдельному решению владельца (раздел 9, пункт 2), и тогда по абсолютному полю `path`, не по
+`ref_path`.
+
+Правка 2026-11-23 (#168, [Decision](https://github.com/renidere/sound-scout-plugin/issues/168#issuecomment-7099897317)).
+Desktop 0.23.3 при входе паролем (`basic`) шлёт `ctx.rest` через cookie-ветку. Эта ветка отказывает
+любому `upload`. Поэтому WAV идёт одним JSON-телом `POST /jobs` `{"data_url":
+"data:audio/wav;base64,…"}`, той же строкой, что и `file.attach`. Приём multipart удалён: путь один.
+`plugin_api` читает тело с потолком из `max_input_bytes` (base64 плюс префикс и 1 KiB на JSON). До
+создания файла он проверяет `Content-Type`, размер, форму JSON и base64. Отказ — `bad_request`,
+`bad_base64`, `empty_upload` или `input_too_large`, на диске ничего не остаётся. Затем `<uuid4>.upload`
+с `O_EXCL|O_NOFOLLOW` и `jobs submit`, как раньше. Чанков нет. Если живая проверка упрётся в размер
+тела, чанки станут отдельной задачей.
 
 Копирование, SHA-256 и вызов CLI выполняются вне event loop gateway (`asyncio.to_thread`).
 
@@ -164,7 +175,7 @@ Hermes не дедуплицирует такие заметки. Поэтому
 | Штатный Windows-клиент без EXE и форка | рекордер Voice Note | требует `retainSession` | штатные вызовы v0.3.x (3.3) |
 | Адресат — исходный чат | stored id + owner при старте | owner может быть `null` | Spike A, перечитать при отправке |
 | Загрузка Windows → Linux | `file.attach` (до 256 MiB) | не проверена с basic-auth remote | Spike A |
-| Приём на анализ без ослабления guard | правило #66 | нет staging | multipart в staging (3.5) |
+| Приём на анализ без ослабления guard | правило #66 | нет staging | JSON `data_url` в staging (3.5, правка #168) |
 | Надёжная отправка | `composer.submit` | ложный ACK | Spike A: `prompt.submit` или проверка |
 | Быстрый приём, `job_id` | синхронный `app.analyze` | нет заданий | `jobs.py`, `submit` (3.6) |
 | Переживает закрытие UI и перезапуск | stage-файлы, идемпотентный индекс runs | нет хранилища, runner, lease | 3.6 |
@@ -196,7 +207,7 @@ Spike A, сквозной путь владельца) — отдельный э
    `systemd-run --user` из процесса gateway.
 4. Ядро заданий: `jobs submit/status/result/cancel`, хранилище, runner, режим `quick`
    (prepare + acoustics + ASR; `audio_review` честно `unavailable`); тесты на синтетике.
-5. `plugin_api`: `POST /jobs` (multipart в staging), `GET /jobs/<id>`, `GET /health`, доставка.
+5. `plugin_api`: `POST /jobs` (JSON `data_url` в staging, правка #168), `GET /jobs/<id>`, `GET /health`, доставка.
 6. Desktop: рекордер на штатных вызовах, «Отправить» и «Отправить и разобрать», прогресс текстом.
 7. Владелец на Windows: запись в чате X, переключение на чат Y и переименование X во время
    анализа, закрытие Desktop; после открытия в чате X есть голосовое и ровно одна заметка с

@@ -3,14 +3,17 @@
 Hermes mounts `router` under `/api/plugins/sound-scout/` inside the gateway process. The package
 is a client of the `sound-scout` CLI: every action is `SOUND_SCOUT_BIN jobs ...` by argv with
 `SOUND_SCOUT_CONFIG`, run in `asyncio.to_thread`, so budgets, roots and job logic live in one
-place. `POST /jobs` streams one multipart part into `<uuid4>.upload` under `jobs.staging_root`
-(created with `O_EXCL|O_NOFOLLOW` in a directory opened with `O_NOFOLLOW`; the client's file name
-is never used) and submits it. Every answer is HTTP 200: a refusal is
-`{"ok": false, "error": <code>, "detail": <text>}`, because Desktop `ctx.rest` drops the body of
-an HTTP error. Runs on the Hermes interpreter (Python >= 3.11): stdlib, FastAPI, python-multipart.
+place. `POST /jobs` takes the WAV as one JSON body `{"data_url": "data:audio/wav;base64,..."}`
+(the cookie leg of Desktop `ctx.rest` carries only JSON, #168), checks its size, shape and base64
+before any file exists, writes it into `<uuid4>.upload` under `jobs.staging_root` (created with
+`O_EXCL|O_NOFOLLOW` in a directory opened with `O_NOFOLLOW`) and submits it. Every answer is
+HTTP 200: a refusal is `{"ok": false, "error": <code>, "detail": <text>}`, because Desktop
+`ctx.rest` drops the body of an HTTP error. Runs on the Hermes interpreter (Python >= 3.11):
+stdlib, FastAPI.
 """
 
 import asyncio
+import binascii
 import contextlib
 import errno
 import hashlib
@@ -23,7 +26,6 @@ import threading
 import uuid
 
 from fastapi import APIRouter, Request
-from python_multipart.multipart import MultipartParser, parse_options_header
 
 router = APIRouter()
 
@@ -35,10 +37,11 @@ CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 CHILD_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 CLI_TIMEOUT_S = 30
 MAX_CLI_OUTPUT = 64 * 1024
-MULTIPART_OVERHEAD = 64 * 1024
+DATA_URL_PREFIX = "data:audio/wav;base64,"
+JSON_OVERHEAD = 1024
+JSON_MEDIA_TYPE = "application/json"
 SUBMITTER = "hermes-plugin"
 UPLOAD_SUFFIX = ".upload"
-FILE_FIELD = b"file"
 HERMES_DIR = ".hermes"
 JOB_ID = re.compile(r"[0-9a-f]{32}")
 CLI_REFUSAL = re.compile(r"sound-scout jobs: ([a-z_]+): (.*)")
@@ -206,101 +209,61 @@ def _create_upload(dirfd: int, name: str) -> int:
         raise Refused("staging_unavailable", detail) from None
 
 
-def _discard(sink: "_Sink", dirfd: int, name: str) -> None:
-    sink.abandon()
+def _discard(dirfd: int, name: str) -> None:
     with contextlib.suppress(OSError):
         os.unlink(name, dir_fd=dirfd)
 
 
-class _Sink:
-    """Writes the data of the one `file` part of a multipart body to `fd` and hashes it. Built
-    before the upload exists, so a boundary the parser refuses leaves no file; `fd` is set once
-    the upload is created."""
-
-    def __init__(self, boundary: bytes, cap: int) -> None:
-        self.fd = -1
-        self.cap = cap
-        self.size = 0
-        self.sha256 = hashlib.sha256()
-        self.parts = 0
-        self.ended = False
-        self.closed = False
-        self._field = b""
-        self._value = b""
-        self._headers: dict[bytes, bytes] = {}
-        self.parser = MultipartParser(
-            boundary,
-            {
-                "on_part_begin": self._part_begin,
-                "on_header_field": self._header_field,
-                "on_header_value": self._header_value,
-                "on_header_end": self._header_end,
-                "on_headers_finished": self._headers_finished,
-                "on_part_data": self._part_data,
-                "on_end": self._end,
-            },
-        )
-
-    def feed(self, chunk: bytes) -> None:
+def _write_upload(fd: int, wav: bytes) -> str:
+    """Write, fsync and close the upload; the SHA-256 of `wav`. Blocks."""
+    try:
         try:
-            self.parser.write(chunk)
-        except Refused:
-            raise
-        except OSError as error:
-            detail = f"cannot write the upload: {error.strerror}"
-            raise Refused("staging_unavailable", detail) from None
-        except Exception:  # python_multipart raises its own parse errors on a malformed body
-            raise Refused("bad_multipart", "the body is not valid multipart/form-data") from None
+            view = memoryview(wav)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        detail = f"cannot write the upload: {error.strerror}"
+        raise Refused("staging_unavailable", detail) from None
+    return hashlib.sha256(wav).hexdigest()
 
-    def close(self) -> None:
-        if not self.closed:
-            self.closed = True
-            try:
-                try:
-                    os.fsync(self.fd)
-                finally:
-                    os.close(self.fd)
-            except OSError as error:
-                detail = f"cannot write the upload: {error.strerror}"
-                raise Refused("staging_unavailable", detail) from None
 
-    def abandon(self) -> None:
-        if not self.closed:
-            self.closed = True
-            os.close(self.fd)
+def _body_cap(cap: int) -> int:
+    """The largest JSON body that carries `cap` decoded bytes: base64, prefix and JSON syntax."""
+    return 4 * -(-cap // 3) + len(DATA_URL_PREFIX) + JSON_OVERHEAD
 
-    def _part_begin(self) -> None:
-        self.parts += 1
-        if self.parts > 1:
-            raise Refused("bad_multipart", "the body must hold exactly one part")
-        self._headers = {}
 
-    def _header_field(self, data: bytes, start: int, end: int) -> None:
-        self._field += data[start:end]
-
-    def _header_value(self, data: bytes, start: int, end: int) -> None:
-        self._value += data[start:end]
-
-    def _header_end(self) -> None:
-        self._headers[self._field.lower()] = self._value
-        self._field, self._value = b"", b""
-
-    def _headers_finished(self) -> None:
-        disposition, params = parse_options_header(self._headers.get(b"content-disposition", b""))
-        if disposition != b"form-data" or params.get(b"name") != FILE_FIELD:
-            raise Refused("bad_multipart", 'the part must be form-data named "file"')
-
-    def _part_data(self, data: bytes, start: int, end: int) -> None:
-        self.size += end - start
-        if self.size > self.cap:
-            raise Refused("input_too_large", f"the file is larger than {self.cap} bytes")
-        view = memoryview(data)[start:end]
-        self.sha256.update(view)
-        while view:
-            view = view[os.write(self.fd, view) :]
-
-    def _end(self) -> None:
-        self.ended = True
+def _decode(body: bytearray, cap: int) -> bytes:
+    """The WAV of a `{"data_url": "data:audio/wav;base64,..."}` body. Empties `body` once it is
+    parsed and decodes the base64 without a sliced copy, to keep the peak memory down. Blocks."""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        raise Refused("bad_request", "the body is not JSON") from None
+    finally:
+        body.clear()
+    if not isinstance(parsed, dict) or list(parsed) != ["data_url"]:
+        raise Refused("bad_request", 'the body must be an object with the one key "data_url"')
+    data_url = parsed.pop("data_url")
+    if not isinstance(data_url, str) or not data_url.startswith(DATA_URL_PREFIX):
+        detail = f'"data_url" must be a string that starts with {DATA_URL_PREFIX}'
+        raise Refused("bad_request", detail)
+    try:
+        encoded = data_url.encode("ascii")
+    except UnicodeEncodeError:
+        raise Refused("bad_base64", "the data URL is not valid base64") from None
+    del data_url
+    try:
+        wav = binascii.a2b_base64(memoryview(encoded)[len(DATA_URL_PREFIX) :], strict_mode=True)
+    except binascii.Error:
+        raise Refused("bad_base64", "the data URL is not valid base64") from None
+    if not wav:
+        raise Refused("empty_upload", "the data URL holds no data")
+    if len(wav) > cap:
+        raise Refused("input_too_large", f"the file is larger than {cap} bytes")
+    return wav
 
 
 def _job_options(request: Request) -> dict[str, str]:
@@ -314,12 +277,10 @@ def _job_options(request: Request) -> dict[str, str]:
     return dict(items)
 
 
-def _boundary(request: Request) -> bytes:
-    content_type, params = parse_options_header(request.headers.get("content-type", ""))
-    boundary = params.get(b"boundary")
-    if content_type != b"multipart/form-data" or not boundary:
-        raise Refused("bad_multipart", "the body must be multipart/form-data with a boundary")
-    return boundary
+def _check_json(request: Request) -> None:
+    media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if media_type != JSON_MEDIA_TYPE:
+        raise Refused("bad_request", f"the body must be {JSON_MEDIA_TYPE}")
 
 
 def _content_length(request: Request) -> int | None:
@@ -327,7 +288,7 @@ def _content_length(request: Request) -> int | None:
     if value is None:
         return None
     if not value.isdigit():
-        raise Refused("bad_multipart", "Content-Length is not a number")
+        raise Refused("bad_request", "Content-Length is not a number")
     return int(value)
 
 
@@ -375,37 +336,32 @@ async def _intake(request: Request) -> dict:
     root = limits["staging_root"]
     if root is None:
         raise Refused("staging_not_configured", "jobs.staging_root is not set")
-    boundary = _boundary(request)
-    cap = limits["max_input_bytes"]
-    body_cap = cap + MULTIPART_OVERHEAD
-    length = _content_length(request)
-    if length is not None and length > body_cap:
-        raise Refused("input_too_large", f"the body is larger than {body_cap} bytes")
     try:
-        sink = _Sink(boundary, cap)
-    except Exception:  # python_multipart refuses a boundary it cannot parse with
-        raise Refused("bad_multipart", "the multipart boundary is not valid") from None
-    dirfd = await asyncio.to_thread(_open_staging, root)
-    try:
-        return await _stage_and_submit(request, dirfd, root, sink, body_cap, request_id, options)
-    finally:
-        os.close(dirfd)
+        _check_json(request)
+        cap = limits["max_input_bytes"]
+        body_cap = _body_cap(cap)
+        length = _content_length(request)
+        if length is not None and length > body_cap:
+            raise Refused("input_too_large", f"the body is larger than {body_cap} bytes")
+        body = await _receive(request, body_cap)
+        wav = await asyncio.to_thread(_decode, body, cap)
+        dirfd = await asyncio.to_thread(_open_staging, root)
+        try:
+            return await _stage_and_submit(dirfd, root, wav, request_id, options)
+        finally:
+            os.close(dirfd)
+    except Refused as refusal:
+        refusal.extra["request_id"] = request_id
+        raise
 
 
-async def _stage_and_submit(request, dirfd, root, sink, body_cap, request_id, options) -> dict:
+async def _stage_and_submit(dirfd, root, wav, request_id, options) -> dict:
     name = uuid.uuid4().hex + UPLOAD_SUFFIX
-    sink.fd = await asyncio.to_thread(_create_upload, dirfd, name)
+    fd = await asyncio.to_thread(_create_upload, dirfd, name)
     staged = os.path.join(root, name)
     keep = False
     try:
-        await _receive(request, sink, body_cap)
-        if sink.parts == 0:
-            raise Refused("bad_multipart", 'the body holds no part named "file"')
-        if not sink.ended:
-            raise Refused("bad_multipart", "the body ended before its closing boundary")
-        if sink.size == 0:
-            raise Refused("empty_upload", "the file part holds no data")
-        await asyncio.to_thread(sink.close)
+        sha256 = await asyncio.to_thread(_write_upload, fd, wav)
         args = ["submit", "--json", f"--submitter={SUBMITTER}", f"--request-id={request_id}"]
         args += [f"{JOB_OPTIONS[key]}={value}" for key, value in options.items()]
         keep = True  # from here the job may exist: a cancelled request keeps the upload
@@ -417,38 +373,34 @@ async def _stage_and_submit(request, dirfd, root, sink, body_cap, request_id, op
             keep = refusal.error in ("cli_timeout", "cli_failed")
             raise
         keep = not answer.get("reused")
-    except Refused as refusal:
-        refusal.extra["request_id"] = request_id
-        raise
     finally:
         if not keep:
-            await asyncio.to_thread(_discard, sink, dirfd, name)
+            await asyncio.to_thread(_discard, dirfd, name)
     return {
         "ok": True,
         "job_id": answer.get("job_id"),
         "request_id": answer.get("request_id"),
         "state": answer.get("state"),
         "reused": answer.get("reused"),
-        "size_bytes": sink.size,
-        "sha256": sink.sha256.hexdigest(),
+        "size_bytes": len(wav),
+        "sha256": sha256,
     }
 
 
-async def _receive(request: Request, sink: _Sink, body_cap: int) -> None:
-    """Feed the body to `sink` chunk by chunk, off the event loop; stop past `body_cap`."""
-    received = 0
+async def _receive(request: Request, body_cap: int) -> bytearray:
+    """The body, read chunk by chunk; stop past `body_cap`."""
+    body = bytearray()
     try:
         async for chunk in request.stream():
-            received += len(chunk)
-            if received > body_cap:
+            if len(body) + len(chunk) > body_cap:
                 raise Refused("input_too_large", f"the body is larger than {body_cap} bytes")
-            if chunk:
-                await asyncio.to_thread(sink.feed, chunk)
+            body += chunk
     except Refused:
         raise
     except Exception as error:  # the client went away in the middle of the body
         detail = f"the body could not be read: {type(error).__name__}"
-        raise Refused("bad_multipart", detail) from None
+        raise Refused("bad_request", detail) from None
+    return body
 
 
 @router.get("/jobs/{job_id}")

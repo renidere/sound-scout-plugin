@@ -83,6 +83,16 @@ function readDataUrl(blob) {
   })
 }
 
+// Desktop отдаёт сбой ctx.rest как ошибку IPC: снимаем обёртку и оставляем его собственный текст.
+function desktopErrorText(error) {
+  const text = String(error?.message ?? error ?? '').replace(/\s+/g, ' ').trim()
+    .replace(/^Error invoking remote method '[^']*': /, '')
+    .replace(/^Error: /, '')
+    .trim()
+    .slice(0, 300)
+  return text || 'нет ответа сервера'
+}
+
 const positive = value => Number.isInteger(value) && value > 0
 const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
 
@@ -141,8 +151,8 @@ export class Recorder {
     let answer
     try {
       answer = await this.ctx.rest('/health', { timeoutMs: HEALTH_TIMEOUT_MS })
-    } catch {
-      throw new RecorderError('no_answer', 'нет ответа сервера')
+    } catch (error) {
+      throw new RecorderError('no_answer', desktopErrorText(error))
     }
     if (answer?.ok !== true) throw new RecorderError(String(answer?.error || 'bad_answer'))
     const budgets = answer.budgets
@@ -299,7 +309,7 @@ export class Recorder {
     }
     finally { this.chunks = []; this.releaseCapture() }
     const token = Array.from(this.random(6), byte => byte.toString(16).padStart(2, '0')).join('')
-    this.pending = { blob, bytes: null, token, owner: null, attach: null, submitted: false, job: null }
+    this.pending = { blob, dataUrl: null, token, owner: null, attach: null, submitted: false, job: null }
     this.update({ phase: 'ready' })
   }
 
@@ -351,12 +361,12 @@ export class Recorder {
           if (typeof resumed?.session_id !== 'string' || !resumed.session_id) throw new Error('Чат недоступен')
           if (!pending.attach) {
             message = 'Не удалось подготовить аудио к отправке. Повтори отправку.'
-            const dataUrl = await readDataUrl(pending.blob)
+            pending.dataUrl ??= await readDataUrl(pending.blob)
             if (generation !== this.generation) return
             message = 'Не удалось загрузить аудио на сервер. Повтори отправку.'
             const name = `sound-scout-${pending.token}.wav`
             const uploaded = await this.host.requestProfile(route, 'file.attach',
-              { session_id: resumed.session_id, name, data_url: dataUrl }, ATTACH_TIMEOUT_MS)
+              { session_id: resumed.session_id, name, data_url: pending.dataUrl }, ATTACH_TIMEOUT_MS)
             if (generation !== this.generation) return
             message = 'Сервер не подтвердил получение аудио. Повтори отправку.'
             if (uploaded?.attached !== true || typeof uploaded.ref_text !== 'string' || !uploaded.ref_text.startsWith('@file:')) {
@@ -383,8 +393,10 @@ export class Recorder {
       this.host.notify({ kind: 'success', message: analyze ? 'Голосовое отправлено, разбор принят' : 'Голосовое отправлено' })
     } catch (error) {
       if (generation !== this.generation) return
+      const code = error?.code || 'no_answer'
+      const detail = code === 'no_answer' && error?.message && error.message !== code ? ` — ${error.message}` : ''
       const text = message === null
-        ? `Голосовое в чате, но разбор не принят: ${error?.code || 'no_answer'}. Повтори «Отправить и разобрать».`
+        ? `Голосовое в чате, но разбор не принят: ${code}${detail}. Повтори «Отправить и разобрать».`
         : `${message} Запись сохранена.`
       this.update({ phase: 'ready', error: text })
       throw error
@@ -395,7 +407,7 @@ export class Recorder {
     const owner = pending.owner
     if (!this.state.get().canAnalyze) throw new RecorderError('intake_not_ready')
     if (typeof owner.targetProfile !== 'string' || !owner.targetProfile) throw new RecorderError('no_target_profile')
-    pending.bytes ??= await pending.blob.arrayBuffer()
+    pending.dataUrl ??= await readDataUrl(pending.blob)
     if (generation !== this.generation) return
     // ctx.rest идёт в backend окна, поэтому окно должно стоять на маршруте чата.
     if (!this.onRoute(owner)) throw new RecorderError('wrong_connection')
@@ -406,11 +418,11 @@ export class Recorder {
     try {
       answer = await this.ctx.rest(`/jobs?${query}`, {
         method: 'POST',
-        upload: { filename: pending.attach.name, contentType: 'audio/wav', bytes: pending.bytes },
+        body: { data_url: pending.dataUrl },
         timeoutMs: UPLOAD_TIMEOUT_MS
       })
-    } catch {
-      throw new RecorderError('no_answer')
+    } catch (error) {
+      throw new RecorderError('no_answer', desktopErrorText(error))
     }
     if (generation !== this.generation) return
     if (answer?.ok !== true) throw new RecorderError(String(answer?.error || 'bad_answer'))
@@ -437,11 +449,11 @@ export class Recorder {
       if (poll !== this.pollGeneration) return
       if (!this.onRoute(owner)) continue
       let answer
-      let code = null
+      let failure = null
       try {
         answer = await this.ctx.rest(`/jobs/${jobId}`, { timeoutMs: STATUS_TIMEOUT_MS })
-      } catch {
-        code = 'no_answer'
+      } catch (error) {
+        failure = new RecorderError('no_answer', desktopErrorText(error))
       }
       if (poll !== this.pollGeneration) return
       const seen = answer?.ok === true && answer.job ? describeJob(answer.job, answer.result) : null
@@ -454,9 +466,10 @@ export class Recorder {
         }
         continue
       }
-      code ??= String(answer?.ok === false && answer.error ? answer.error : 'bad_answer')
       if (++failures >= this.maxPollFailures) {
-        const text = `Статус разбора недоступен: ${code}`
+        const text = failure
+          ? `Статус разбора недоступен: ${failure.code} — ${failure.message}`
+          : `Статус разбора недоступен: ${String(answer?.ok === false && answer.error ? answer.error : 'bad_answer')}`
         this.job.set({ jobId, text, final: true })
         this.host.notify({ kind: 'warning', message: text })
         return

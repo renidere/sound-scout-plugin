@@ -8,11 +8,13 @@ on synthesized audio; `_cli` is replaced only to observe it or to make it time o
 
 import ast
 import asyncio
+import base64
 import contextlib
 import dataclasses
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -24,8 +26,10 @@ import threading
 import types
 import urllib.parse
 import uuid
+import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 from starlette.requests import Request
 
@@ -40,7 +44,7 @@ RECORDER_SUITE = REPO / "tests" / "js" / "recorder.test.mjs"
 DECISION = REPO / "docs" / "decisions" / "0015-spike-b-backend-package.md"
 CLI = Path(sys.executable).with_name("sound-scout")
 ROUTES = {("GET", "/health"), ("POST", "/jobs"), ("GET", "/jobs/{job_id}")}
-BOUNDARY = "----SoundScoutTestBoundary7d1f"
+DATA_URL_PREFIX = "data:audio/wav;base64,"
 MAX_INPUT = 20_000
 UPLOAD_NAME = re.compile(r"[0-9a-f]{32}\.upload")
 needs_ffmpeg = pytest.mark.skipif(
@@ -104,11 +108,21 @@ class Station:
     data: Path
     config: Path
 
-    def write(self, *, staging: bool = True, max_input_bytes: int = MAX_INPUT, **jobs) -> None:
+    def write(
+        self,
+        *,
+        staging: bool = True,
+        max_input_bytes: int = MAX_INPUT,
+        max_duration_seconds: int = 30,
+        **jobs,
+    ) -> None:
+        budgets = (
+            f"max_duration_seconds = {max_duration_seconds}\nmax_input_bytes = {max_input_bytes}"
+        )
         lines = [
             f"allowed_roots = [{json.dumps(str(self.staging))}]",
             f"data_root = {json.dumps(str(self.data))}",
-            f"[budgets]\nmax_duration_seconds = 30\nmax_input_bytes = {max_input_bytes}",
+            f"[budgets]\n{budgets}",
             '[asr]\nmodel = "absent/model"',
             "[jobs]",
             *(f"{key} = {value}" for key, value in jobs.items()),
@@ -148,16 +162,9 @@ def audio(make_wav: WavFactory) -> bytes:
     return make_wav("tone.wav", seconds=0.5).read_bytes()
 
 
-def multipart(
-    data: bytes, *, filename: str = "voice.wav", name: str = "file", boundary: str = BOUNDARY
-) -> bytes:
-    """One part as Desktop `multipartBody` sends it."""
-    head = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
-        "Content-Type: audio/wav\r\n\r\n"
-    )
-    return head.encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode()
+def json_body(wav: bytes, *, prefix: str = DATA_URL_PREFIX) -> bytes:
+    """The body as the recorder sends it: `JSON.stringify({ data_url })` of `readAsDataURL`."""
+    return json.dumps({"data_url": prefix + base64.b64encode(wav).decode("ascii")}).encode()
 
 
 @dataclasses.dataclass
@@ -174,8 +181,9 @@ def post(
     query: str = "",
     chunk: int = 4096,
     length: int | None | str = "auto",
-    content_type: str | None = f"multipart/form-data; boundary={BOUNDARY}",
+    content_type: str | None = "application/json",
     drive=asyncio.run,
+    disconnect: bool = False,
 ) -> Posted:
     chunks = [body[i : i + chunk] for i in range(0, len(body), chunk)] or [b""]
     receives = []
@@ -184,7 +192,7 @@ def post(
         index = len(receives)
         receives.append(index)
         if index < len(chunks):
-            more = index < len(chunks) - 1
+            more = disconnect or index < len(chunks) - 1
             return {"type": "http.request", "body": chunks[index], "more_body": more}
         return {"type": "http.disconnect"}
 
@@ -383,7 +391,7 @@ def test_post_jobs_stages_the_upload_privately_and_submits_it_by_argv(
     calls = observe_cli(api, monkeypatch)
     query = "request_id=req-1&session_id=chat-1&profile=default&connection=desktop&layers=content"
 
-    first = post(api, multipart(audio), query=query).answer
+    first = post(api, json_body(audio), query=query).answer
 
     assert first["ok"] is True, first
     assert first["request_id"] == "req-1" and first["reused"] is False
@@ -420,7 +428,7 @@ def test_post_jobs_stages_the_upload_privately_and_submits_it_by_argv(
         str(staged),
     ]
 
-    again = post(api, multipart(audio), query=query).answer
+    again = post(api, json_body(audio), query=query).answer
 
     assert again["ok"] is True and again["reused"] is True
     assert again["job_id"] == first["job_id"]
@@ -428,7 +436,7 @@ def test_post_jobs_stages_the_upload_privately_and_submits_it_by_argv(
 
 
 def test_post_jobs_without_a_request_id_gets_a_new_one(api, station: Station, audio) -> None:
-    answer = post(api, multipart(audio)).answer
+    answer = post(api, json_body(audio)).answer
 
     assert answer["ok"] is True, answer
     assert re.fullmatch(r"[0-9a-f]{32}", answer["request_id"])
@@ -440,7 +448,7 @@ def test_an_option_like_request_id_stays_one_argv_item(
 ) -> None:
     calls = observe_cli(api, monkeypatch)
 
-    answer = post(api, multipart(audio), query="request_id=--layers%3Dx").answer
+    answer = post(api, json_body(audio), query="request_id=--layers%3Dx").answer
 
     assert answer["ok"] is True, answer
     assert "--request-id=--layers=x" in calls[-1]
@@ -454,8 +462,8 @@ def test_the_mode_query_is_one_argv_item_and_the_cli_checks_its_value(
 ) -> None:
     calls = observe_cli(api, monkeypatch)
 
-    quick = post(api, multipart(audio), query="request_id=r-quick&mode=quick").answer
-    bad = post(api, multipart(audio), query="request_id=r-bad&mode=fast%20--layers%3Dx").answer
+    quick = post(api, json_body(audio), query="request_id=r-quick&mode=quick").answer
+    bad = post(api, json_body(audio), query="request_id=r-bad&mode=fast%20--layers%3Dx").answer
 
     assert quick["ok"] is True, quick
     submits = [call for call in calls if call[0] == "submit"]
@@ -467,7 +475,7 @@ def test_the_mode_query_is_one_argv_item_and_the_cli_checks_its_value(
 
 
 def test_get_job_of_a_queued_job_has_no_result_yet(api, station: Station, audio) -> None:
-    job_id = post(api, multipart(audio)).answer["job_id"]
+    job_id = post(api, json_body(audio)).answer["job_id"]
 
     answer = get_job(api, job_id)
 
@@ -483,7 +491,7 @@ def test_get_job_answers_the_state_the_finished_stages_and_the_compact_result(
 ) -> None:
     wav = make_wav("voice.wav", seconds=1.5).read_bytes()
     station.write(max_input_bytes=len(wav) + 1)
-    job_id = post(api, multipart(wav)).answer["job_id"]
+    job_id = post(api, json_body(wav)).answer["job_id"]
     [staged] = station.staged()
     request_id = f"{job_id}-a1"
     analysis = app.analyze(app.AnalyzeRequest(str(staged), request_id=request_id), config.load())
@@ -523,7 +531,7 @@ def test_get_job_of_an_unknown_job_is_job_not_found_from_the_cli(api, station: S
 def test_a_content_length_over_the_limit_is_refused_before_reading_the_body(
     api, station: Station
 ) -> None:
-    body = multipart(b"\0" * (MAX_INPUT + 70 * 1024))
+    body = json_body(b"\0" * (MAX_INPUT + 70 * 1024))
 
     posted = post(api, body)
 
@@ -536,7 +544,7 @@ def test_a_content_length_over_the_limit_is_refused_before_reading_the_body(
 def test_an_oversize_body_without_a_true_length_is_refused_while_reading(
     api, station: Station, length: int | None
 ) -> None:
-    body = multipart(b"\1" * (MAX_INPUT * 4))
+    body = json_body(b"\1" * (MAX_INPUT * 4))
 
     posted = post(api, body, length=length, chunk=1024)
 
@@ -552,12 +560,12 @@ def test_a_file_of_exactly_max_input_bytes_is_accepted(
     wav = make_wav("voice.wav", seconds=0.5).read_bytes()
     station.write(max_input_bytes=len(wav))
 
-    answer = post(api, multipart(wav), length=None).answer
+    answer = post(api, json_body(wav), length=None).answer
 
     assert answer["ok"] is True, answer
     assert answer["size_bytes"] == len(wav)
     station.write(max_input_bytes=len(wav) - 1)
-    assert_refused(post(api, multipart(wav)).answer, "input_too_large")
+    assert_refused(post(api, json_body(wav)).answer, "input_too_large")
     assert len(station.staged()) == 1
 
 
@@ -580,7 +588,7 @@ def test_a_staging_root_swapped_for_a_symlink_after_limits_is_not_followed(
 
     monkeypatch.setattr(api, "_cli", cli)
 
-    posted = post(api, multipart(audio))
+    posted = post(api, json_body(audio))
 
     assert_refused(posted.answer, "staging_unavailable")
     assert list(elsewhere.iterdir()) == []
@@ -609,7 +617,7 @@ def test_criterion_2_post_jobs_writes_only_into_a_private_allowed_staging_root_o
         )
     before = station.outside()
 
-    answer = post(api, multipart(audio)).answer
+    answer = post(api, json_body(audio)).answer
 
     assert_refused(answer, expected)
     assert station.staged() == []
@@ -634,7 +642,7 @@ def test_an_upload_name_that_exists_is_a_conflict_and_nothing_is_written_through
     else:
         target.write_text("earlier upload", encoding="utf-8")
 
-    answer = post(api, multipart(audio), query="request_id=r").answer
+    answer = post(api, json_body(audio), query="request_id=r").answer
 
     assert_refused(answer, "staging_conflict")
     assert victim.read_text(encoding="utf-8") == "keep me"
@@ -643,90 +651,138 @@ def test_an_upload_name_that_exists_is_a_conflict_and_nothing_is_written_through
         assert target.read_text(encoding="utf-8") == "earlier upload"
 
 
-@pytest.mark.parametrize(
-    "filename", ["../../escape.wav", "/tmp/sound-scout-escape.wav", "x.wav\r\nX-Evil: 1"]
-)
-def test_the_client_file_name_is_never_used(
-    api, station: Station, audio: bytes, filename: str
+# --- the JSON body and query rules ---------------------------------------------------------------
+
+
+def data_url_body(data_url) -> bytes:
+    return json.dumps({"data_url": data_url}).encode()
+
+
+def wav_base64(audio: bytes) -> str:
+    return base64.b64encode(audio).decode("ascii")
+
+
+BAD_BODIES = {
+    "not_json": (lambda audio: b"{not json", "application/json", "bad_request"),
+    "not_utf8": (lambda audio: b'{"data_url": "\xff"}', "application/json", "bad_request"),
+    "too_deep": (lambda audio: b"[" * 20_000, "application/json", "bad_request"),
+    "not_object": (lambda audio: b'["data_url"]', "application/json", "bad_request"),
+    "extra_key": (
+        lambda audio: json.dumps(
+            {"data_url": DATA_URL_PREFIX + wav_base64(audio), "name": "x.wav"}
+        ).encode(),
+        "application/json",
+        "bad_request",
+    ),
+    "no_data_url": (lambda audio: b"{}", "application/json", "bad_request"),
+    "not_string": (lambda audio: b'{"data_url": 5}', "application/json", "bad_request"),
+    "other_prefix": (
+        lambda audio: json_body(audio, prefix="data:audio/mpeg;base64,"),
+        "application/json",
+        "bad_request",
+    ),
+    "text_plain": (lambda audio: json_body(audio), "text/plain", "bad_request"),
+    "no_content_type": (lambda audio: json_body(audio), None, "bad_request"),
+    "multipart": (lambda audio: json_body(audio), "multipart/form-data; boundary=b", "bad_request"),
+    "outside_alphabet": (
+        lambda audio: data_url_body(DATA_URL_PREFIX + "UklG*R" + wav_base64(audio)),
+        "application/json",
+        "bad_base64",
+    ),
+    "bad_padding": (
+        lambda audio: data_url_body(DATA_URL_PREFIX + wav_base64(audio) + "QQ"),
+        "application/json",
+        "bad_base64",
+    ),
+    "data_after_padding": (
+        lambda audio: data_url_body(DATA_URL_PREFIX + "QQ==" + wav_base64(audio)),
+        "application/json",
+        "bad_base64",
+    ),
+    "not_ascii": (
+        lambda audio: data_url_body(DATA_URL_PREFIX + "UklGRé"),
+        "application/json",
+        "bad_base64",
+    ),
+    "empty": (lambda audio: data_url_body(DATA_URL_PREFIX), "application/json", "empty_upload"),
+}
+
+
+@pytest.mark.parametrize("case", BAD_BODIES)
+def test_a_body_that_is_not_one_wav_data_url_is_refused_before_the_upload_exists(
+    api, station: Station, audio: bytes, monkeypatch, case: str
 ) -> None:
-    before = station.outside()
+    make, content_type, error = BAD_BODIES[case]
+    created, create = [], api._create_upload
+    monkeypatch.setattr(api, "_create_upload", lambda *args: created.append(args) or create(*args))
 
-    answer = post(api, multipart(audio, filename=filename)).answer
-
-    assert answer["ok"] is True, answer
-    [staged] = station.staged()
-    assert UPLOAD_NAME.fullmatch(staged.name)
-    assert station.outside() == before
-    assert not Path("/tmp/sound-scout-escape.wav").exists()
-    assert "escape" not in json.dumps(job_json(station, answer["job_id"]))
-
-
-# --- multipart and query rules --------------------------------------------------------------------
-
-
-def two_parts(audio: bytes) -> bytes:
-    first = multipart(audio).removesuffix(f"--{BOUNDARY}--\r\n".encode())
-    return first + multipart(audio, filename="second.wav")
-
-
-@pytest.mark.parametrize(
-    ("make", "content_type", "error"),
-    [
-        (lambda audio: two_parts(audio), None, "bad_multipart"),
-        (lambda audio: multipart(audio, name="audio"), None, "bad_multipart"),
-        (lambda audio: multipart(audio)[:-20], None, "bad_multipart"),
-        (lambda audio: f"--{BOUNDARY}--\r\n".encode(), None, "bad_multipart"),
-        (lambda audio: b"garbage without a boundary", None, "bad_multipart"),
-        (lambda audio: multipart(b""), None, "empty_upload"),
-        (lambda audio: audio, "audio/wav", "bad_multipart"),
-        (lambda audio: multipart(audio), "multipart/form-data", "bad_multipart"),
-    ],
-    ids=[
-        "two_parts",
-        "not_file",
-        "truncated",
-        "no_part",
-        "garbage",
-        "empty",
-        "not_multipart",
-        "no_boundary",
-    ],
-)
-def test_a_body_that_is_not_one_file_part_is_refused_and_leaves_nothing(
-    api, station: Station, audio: bytes, make, content_type, error: str
-) -> None:
-    kwargs = {} if content_type is None else {"content_type": content_type}
-
-    answer = post(api, make(audio), **kwargs).answer
+    answer = post(api, make(audio), content_type=content_type, query="request_id=r-bad").answer
 
     assert_refused(answer, error)
+    assert answer["request_id"] == "r-bad"
+    assert created == []
     assert station.staged() == []
     assert not (station.data / "jobs").exists() or not list(
         (station.data / "jobs").glob("*/job.json")
     )
+    assert wav_base64(audio)[:32] not in json.dumps(answer)
 
 
-@pytest.mark.parametrize(("length", "accepted"), [(256, True), (257, False)])
-def test_a_boundary_the_parser_refuses_is_bad_multipart_before_the_upload_exists(
-    api, station: Station, audio: bytes, monkeypatch, length: int, accepted: bool
+def test_the_content_type_may_carry_a_charset_and_any_case(
+    api, station: Station, audio: bytes
 ) -> None:
-    boundary = "b" * length
-    created, create = [], api._create_upload
-    monkeypatch.setattr(api, "_create_upload", lambda *args: created.append(args) or create(*args))
+    answer = post(api, json_body(audio), content_type="Application/JSON; charset=utf-8").answer
 
-    answer = post(
-        api,
-        multipart(audio, boundary=boundary),
-        content_type=f"multipart/form-data; boundary={boundary}",
-    ).answer
+    assert answer["ok"] is True, answer
+    [staged] = station.staged()
+    assert staged.read_bytes() == audio
 
-    if accepted:
-        assert answer["ok"] is True, answer
-        assert len(station.staged()) == 1
-    else:
-        assert_refused(answer, "bad_multipart")
-        assert created == []
-        assert station.staged() == []
+
+def test_a_client_that_goes_away_mid_body_is_bad_request_and_leaves_nothing(
+    api, station: Station, audio: bytes
+) -> None:
+    body = json_body(audio)
+
+    posted = post(api, body[: len(body) // 2], length=len(body), chunk=1024, disconnect=True)
+
+    assert_refused(posted.answer, "bad_request")
+    assert "could not be read" in posted.answer["detail"]
+    assert station.staged() == []
+
+
+def recorder_wav(seconds: int, *, rate: int = 48_000) -> bytes:
+    """The recorder format of `encodeWav`: 2 channels, 16 bit, the device rate; built in memory,
+    so only the staged copy takes disk space."""
+    t = np.arange(seconds * rate) / rate
+    left = (0.3 * np.sin(2 * np.pi * 220.0 * t) * np.iinfo(np.int16).max).astype(np.int16)
+    frames = np.stack([left, np.zeros_like(left)], axis=1)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(2)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(frames.tobytes())
+    return buffer.getvalue()
+
+
+def test_criterion_4_a_180_s_recorder_wav_reaches_jobs_submit_through_the_json_body(
+    api, station: Station, monkeypatch
+) -> None:
+    wav = recorder_wav(180)
+    assert len(wav) == 34_560_044
+    station.write(max_duration_seconds=180, max_input_bytes=100 * 1024 * 1024)
+    calls = observe_cli(api, monkeypatch)
+
+    answer = post(api, json_body(wav), query="request_id=r-180", chunk=64 * 1024).answer
+
+    assert answer["ok"] is True, answer
+    assert answer["state"] == "queued"
+    assert answer["size_bytes"] == len(wav)
+    assert answer["sha256"] == hashlib.sha256(wav).hexdigest()
+    [staged] = station.staged()
+    assert hashlib.sha256(staged.read_bytes()).hexdigest() == answer["sha256"]
+    assert calls[-1][0] == "submit" and calls[-1][-1] == str(staged)
+    assert job_json(station, answer["job_id"])["request"]["input"]["sha256"] == answer["sha256"]
 
 
 @pytest.mark.parametrize(
@@ -737,7 +793,7 @@ def test_a_bad_query_is_invalid_request_before_anything_runs(
     api, station: Station, audio: bytes, monkeypatch, query: str
 ) -> None:
     refuse_cli(api, monkeypatch)
-    assert_refused(post(api, multipart(audio), query=query).answer, "invalid_request")
+    assert_refused(post(api, json_body(audio), query=query).answer, "invalid_request")
     assert station.staged() == []
 
 
@@ -747,7 +803,7 @@ def test_a_second_upload_while_one_is_in_progress_is_intake_busy(
     refuse_cli(api, monkeypatch)
     assert api._intake_lock.acquire(blocking=False)
     try:
-        assert_refused(post(api, multipart(audio)).answer, "intake_busy")
+        assert_refused(post(api, json_body(audio)).answer, "intake_busy")
     finally:
         api._intake_lock.release()
 
@@ -767,16 +823,17 @@ def test_copy_hash_fsync_and_the_cli_run_off_the_event_loop(
 
         return wrapper
 
-    monkeypatch.setattr(api._Sink, "feed", recording("feed", api._Sink.feed))
+    monkeypatch.setattr(api, "_decode", recording("decode", api._decode))
+    monkeypatch.setattr(api, "_write_upload", recording("write", api._write_upload))
     monkeypatch.setattr(api.os, "fsync", recording("fsync", os.fsync))
     monkeypatch.setattr(api, "_cli", recording("cli", api._cli))
     monkeypatch.setattr(api, "_open_staging", recording("staging", api._open_staging))
     monkeypatch.setattr(api, "_create_upload", recording("create", api._create_upload))
 
-    answer = post(api, multipart(audio), chunk=1024).answer
+    answer = post(api, json_body(audio), chunk=1024).answer
 
     assert answer["ok"] is True, answer
-    assert set(threads) == {"feed", "fsync", "cli", "staging", "create"}
+    assert set(threads) == {"decode", "write", "fsync", "cli", "staging", "create"}
     loop_thread = threading.get_ident()  # asyncio.run drives the loop in this thread
     assert all(loop_thread not in idents for idents in threads.values()), threads
 
@@ -787,10 +844,10 @@ def test_a_cli_refusal_of_the_submit_removes_the_staged_copy(
     station.write(max_queued_jobs=1)
     first = make_wav("a.wav", seconds=0.5).read_bytes()
     second = make_wav("b.wav", seconds=0.5, frequency=330.0).read_bytes()
-    accepted = post(api, multipart(first)).answer
+    accepted = post(api, json_body(first)).answer
     [kept] = station.staged()
 
-    refused = post(api, multipart(second), query="request_id=r-2").answer
+    refused = post(api, json_body(second), query="request_id=r-2").answer
 
     assert_refused(refused, "queue_full")
     assert refused["request_id"] == "r-2"
@@ -817,7 +874,7 @@ def test_a_submit_that_may_have_created_the_job_keeps_the_staged_copy(
 
     monkeypatch.setattr(api, "_cli", cli)
 
-    answer = post(api, multipart(audio), query="request_id=r-9").answer
+    answer = post(api, json_body(audio), query="request_id=r-9").answer
 
     assert_refused(answer, error)
     assert answer["request_id"] == "r-9"
@@ -851,7 +908,7 @@ def test_a_request_cancelled_while_the_submit_runs_keeps_the_staged_copy(
 
     monkeypatch.setattr(api, "_cli", cli)
 
-    cancelled = post(api, multipart(audio), drive=cancel_while_submitting).answer
+    cancelled = post(api, json_body(audio), drive=cancel_while_submitting).answer
 
     assert cancelled is True
     [staged] = station.staged()
@@ -879,7 +936,7 @@ def test_a_failed_fsync_of_the_upload_is_staging_unavailable_not_an_http_error(
     monkeypatch.setattr(api.os, "fsync", fsync)
     monkeypatch.setattr(api.os, "unlink", unlink)
 
-    answer = post(api, multipart(audio), query="request_id=r-5").answer
+    answer = post(api, json_body(audio), query="request_id=r-5").answer
 
     assert_refused(answer, "staging_unavailable")
     assert answer["request_id"] == "r-5"
@@ -922,7 +979,7 @@ def test_plugin_api_never_reads_hermes_attachments_or_paths_of_the_hermes_home()
     assert not attributes & {"expanduser", "home", "listdir", "scandir", "walk", "read_text"}
 
 
-def test_plugin_api_imports_only_the_stdlib_fastapi_and_python_multipart() -> None:
+def test_plugin_api_imports_only_the_stdlib_and_fastapi() -> None:
     source = API.read_text(encoding="utf-8")
     tree = ast.parse(source, feature_version=(3, 11))
     top_level = set()
@@ -931,7 +988,7 @@ def test_plugin_api_imports_only_the_stdlib_fastapi_and_python_multipart() -> No
             top_level |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom):
             top_level.add(node.module.split(".")[0])
-    assert top_level - set(sys.stdlib_module_names) == {"fastapi", "python_multipart"}
+    assert top_level - set(sys.stdlib_module_names) == {"fastapi"}
     assert "sound_scout" not in source.replace("sound-scout", "")
     assert "/spike/" not in source
 
@@ -953,6 +1010,7 @@ def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api)
     assert imports == {"@hermes/plugin-sdk", "react/jsx-runtime"}
     assert source.count("import ") == 2
     assert "retainSession" not in source and "composer.submit" not in source
+    assert "upload:" not in source  # the cookie leg of Desktop 0.23.3 refuses ctx.rest uploads
     assert _rest_calls(source) == ROUTES
     assert _rest_calls(source) <= set(api.router.routes)
     for gone in ("/spike/", "deliver", "runner", "lastToken"):
@@ -1124,9 +1182,9 @@ def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them
     run_id = "a" * 32
     link = f"previous_run_id={run_id}&criterion={urllib.parse.quote('emphasis_on:слово')}"
 
-    refused = post(api, multipart(audio), query=f"request_id=r-c&{link}").answer
+    refused = post(api, json_body(audio), query=f"request_id=r-c&{link}").answer
     repeated = post(
-        api, multipart(audio), query=f"request_id=r-r&{link}&criterion=completeness_of_phrase"
+        api, json_body(audio), query=f"request_id=r-r&{link}&criterion=completeness_of_phrase"
     ).answer
 
     [submit] = [call for call in calls if call[0] == "submit"]
@@ -1143,17 +1201,17 @@ def test_criterion_1_post_jobs_takes_the_control_link_and_refuses_an_unsupported
 ) -> None:
     wav = make_wav("voice.wav", seconds=1.5).read_bytes()
     station.write(max_input_bytes=len(wav) + 1)
-    initial = post(api, multipart(wav), query="request_id=r-initial").answer
+    initial = post(api, json_body(wav), query="request_id=r-initial").answer
     [staged] = station.staged()
     baseline = app.analyze(app.AnalyzeRequest(str(staged), request_id="initial"), config.load())
     run_id = baseline.run.run_id
     link = f"previous_run_id={run_id}&criterion={urllib.parse.quote('emphasis_on: Слово')}"
 
-    accepted = post(api, multipart(wav), query=f"request_id=r-control&{link}").answer
+    accepted = post(api, json_body(wav), query=f"request_id=r-control&{link}").answer
     unsupported = post(
-        api, multipart(wav), query=f"request_id=r-bad&previous_run_id={run_id}&criterion=louder"
+        api, json_body(wav), query=f"request_id=r-bad&previous_run_id={run_id}&criterion=louder"
     ).answer
-    lonely = post(api, multipart(wav), query=f"request_id=r-lonely&previous_run_id={run_id}")
+    lonely = post(api, json_body(wav), query=f"request_id=r-lonely&previous_run_id={run_id}")
 
     assert accepted["ok"] is True, accepted
     control = {"previous_run_id": run_id, "criterion": "emphasis_on:Слово"}
