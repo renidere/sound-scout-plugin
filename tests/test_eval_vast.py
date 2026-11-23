@@ -3191,3 +3191,33 @@ def test_a_try_that_used_its_timeout_counts_as_silence_to_the_steps_end(
     with pytest.raises(vast.HostLost):
         vast.await_host(run, "state m", started + 1.5, "exit 255", since=started - 1.5)
     assert run.fatal == "ssh_lost" and time.time() - started < 2.5
+
+
+def test_a_long_try_that_worked_before_its_loss_is_no_ssh_lost_when_the_step_ends(
+    tmp_path: Path, key_file, fake
+) -> None:
+    """A verify that ran 500 s and noticed its loss at once: the step's end 2 s later cuts the
+    wait, and 2 s of silence is no ssh_lost of the attempt."""
+    run = _transport_run(tmp_path, fake, key_file, _SlowProbeHost(), ssh_lost_s=300)
+    started = time.time()
+    with pytest.raises(vast.TransportError) as raised:
+        vast.await_host(run, "verify m", started + 2.0, "exit 255", since=started - 500)
+    assert not isinstance(raised.value, vast.HostLost) and run.fatal is None
+    assert (
+        vast.SSH_NOTICE_S == 60
+        and "ServerAliveInterval=15" in vast.RemoteHost(tmp_path, "127.0.0.1", 22).ssh_argv()
+    )
+
+
+def test_a_retry_runs_with_what_is_left_of_a_short_step(tmp_path: Path, key_file, fake) -> None:
+    """A step shorter than `MIN_STEP_S` (the dry run's GPU check, say) still runs again after a
+    blip, with the seconds left and never past its end."""
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=1))
+    action, calls = _flaky(1)
+    until = time.time() + 4.0
+    assert vast.transport_retry(run, "gpu_free", action, until) == "done"
+    assert calls[0] == vast.MIN_STEP_S and 3.0 < calls[1] < 4.0
+    action, calls = _flaky(10**9)
+    with pytest.raises(vast.TransportError):
+        vast.transport_retry(run, "gpu_free", action, time.time() + 0.5)
+    assert len(calls) == 1

@@ -404,7 +404,13 @@ DRY_INTERVALS = {
 SSH_RETRIES = 3
 SSH_EXIT = 255
 SSH_PROBE_S = 30.0
+SSH_ALIVE_S = 15
+# the longest an ssh in flight takes to notice a lost network: OpenSSH counts four
+# ServerAliveInterval probes before it gives up (its ServerAliveCountMax 3 is compared after the
+# increment); a try with a shorter timeout notices at its timeout
+SSH_NOTICE_S = 4 * SSH_ALIVE_S
 MIN_STEP_S = 10.0
+MIN_RETRY_S = 1.0
 STATE_TIMEOUT_S = 60.0
 RECOVER_HEALTH_S = 30.0
 TUNNEL_READY_S = 15.0
@@ -1274,7 +1280,7 @@ class RemoteHost:
             "-o",
             "ExitOnForwardFailure=yes",
             "-o",
-            "ServerAliveInterval=15",
+            f"ServerAliveInterval={SSH_ALIVE_S}",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -2446,11 +2452,12 @@ def await_host(
     is a `TransportError` of this step alone. A destroy the watchdog asks for, before or during
     the wait, ends it at once. Journaled as `transport_retry`; True when the host answered the
     first `true` (no outage seen). The wait itself gets the whole window from now; the silence
-    that makes `ssh_lost` counts from `since`, the start of the failed try, because an ssh needs
-    up to its own timeout to notice a lost network and that time was silence too."""
+    that makes `ssh_lost` counts from the start of the failed try (`since`), because an ssh
+    needs up to its timeout to notice a lost network and that time was silence too, but no
+    earlier than `SSH_NOTICE_S` before now: before that a long try still had its connection."""
     _watchdog_stop(run, what, error)
     started = time.time()
-    silent_from = started if since is None else min(since, started)
+    silent_from = started if since is None else max(min(since, started), started - SSH_NOTICE_S)
     ends = min(until, started + run.intervals["ssh_lost_s"])
     tries = 0
     while True:
@@ -2494,10 +2501,10 @@ def transport_retry(
 ):
     """The one recovery path of every host step: `action(left)` (`left`: the seconds to
     `until`; the first try gets at least `MIN_STEP_S`); after a `TransportError` the host is
-    awaited (`await_host`) and the step runs again while `MIN_STEP_S` is left before `until` —
-    the step's own end (`step_until`). A step that failed `SSH_RETRIES` times while the host
-    answered at once is the step's own failure (a missing remote file, say), and its last error
-    is raised."""
+    awaited (`await_host`) and the step runs again with what is left before `until` — the
+    step's own end (`step_until`) — while that is at least `MIN_RETRY_S`. A step that failed
+    `SSH_RETRIES` times while the host answered at once is the step's own failure (a missing
+    remote file, say), and its last error is raised."""
     at_once = 0
     left = max(MIN_STEP_S, until - time.time())
     while True:
@@ -2516,7 +2523,7 @@ def transport_retry(
             if at_once >= SSH_RETRIES:
                 raise failure
         left = until - time.time()
-        if left < MIN_STEP_S:
+        if left < MIN_RETRY_S:
             raise failure
 
 
