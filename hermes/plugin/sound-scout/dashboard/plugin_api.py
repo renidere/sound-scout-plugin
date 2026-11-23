@@ -8,7 +8,10 @@ place. `POST /jobs` takes the WAV as one JSON body `{"data_url": "data:audio/wav
 before any file exists, writes it into `<uuid4>.upload` under `jobs.staging_root` (created with
 `O_EXCL|O_NOFOLLOW` in a directory opened with `O_NOFOLLOW`) and submits it. Every answer is
 HTTP 200: a refusal is `{"ok": false, "error": <code>, "detail": <text>}`, because Desktop
-`ctx.rest` drops the body of an HTTP error. Runs on the Hermes interpreter (Python >= 3.11):
+`ctx.rest` drops the body of an HTTP error. The job card of the Desktop half (#108) reads
+`GET /jobs/{job_id}/report` (`jobs report`, its larger output cap `REPORT_CLI_OUTPUT`) and acts by
+`POST /jobs/{job_id}/cancel` and `POST /jobs/{job_id}/retry` on the one job of the path; their
+bodies are not read. Runs on the Hermes interpreter (Python >= 3.11):
 stdlib, FastAPI.
 """
 
@@ -31,12 +34,12 @@ router = APIRouter()
 
 PLUGIN = "sound-scout"
 VERSION = "0.1.0"
-DIRECTIVE = "sound-scout-report"
 BIN_ENV = "SOUND_SCOUT_BIN"
 CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 CHILD_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 CLI_TIMEOUT_S = 30
 MAX_CLI_OUTPUT = 64 * 1024
+REPORT_CLI_OUTPUT = 512 * 1024  # 256 KiB of report.md, Cyrillic, in JSON escapes
 DATA_URL_PREFIX = "data:audio/wav;base64,"
 JSON_OVERHEAD = 1024
 JSON_MEDIA_TYPE = "application/json"
@@ -115,7 +118,9 @@ def _cli(args: list[str]) -> tuple[int, str, str]:
     return done.returncode, done.stdout, done.stderr
 
 
-async def _call(args: list[str], *private: tuple[str, str]) -> dict:
+async def _call(
+    args: list[str], *private: tuple[str, str], max_output: int = MAX_CLI_OUTPUT
+) -> dict:
     """The JSON answer of one CLI call, or `Refused` with the CLI's reason code; `private` pairs
     of (absolute path, placeholder) are hidden in the detail."""
     try:
@@ -124,8 +129,8 @@ async def _call(args: list[str], *private: tuple[str, str]) -> dict:
         raise Refused("cli_timeout", f"sound-scout took longer than {CLI_TIMEOUT_S} s") from None
     except OSError as error:
         raise Refused("cli_unavailable", f"cannot run sound-scout: {error.strerror}") from None
-    if len(stdout) + len(stderr) > MAX_CLI_OUTPUT:
-        raise Refused("cli_failed", "sound-scout printed more than 64 KiB")
+    if len(stdout) + len(stderr) > max_output:
+        raise Refused("cli_failed", f"sound-scout printed more than {max_output // 1024} KiB")
     if returncode == 1:
         lines = stderr.strip().splitlines()
         refusal = CLI_REFUSAL.fullmatch(lines[-1]) if lines else None
@@ -403,11 +408,15 @@ async def _receive(request: Request, body_cap: int) -> bytearray:
     return body
 
 
+def _check_job_id(job_id: str) -> None:
+    if not JOB_ID.fullmatch(job_id):
+        raise Refused("job_not_found", "a job id is 32 lowercase hex digits")
+
+
 @router.get("/jobs/{job_id}")
 async def job_status(job_id: str):
-    if not JOB_ID.fullmatch(job_id):
-        return Refused("job_not_found", "a job id is 32 lowercase hex digits").answer()
     try:
+        _check_job_id(job_id)
         job = await _call(["status", "--json", "--", job_id])
         result = None
         if job.get("state") not in UNFINISHED:
@@ -419,3 +428,32 @@ async def job_status(job_id: str):
     except Refused as refusal:
         return refusal.answer()
     return {"ok": True, "job": job, "result": result}
+
+
+@router.get("/jobs/{job_id}/report")
+async def job_report(job_id: str):
+    try:
+        _check_job_id(job_id)
+        answer = await _call(["report", "--json", "--", job_id], max_output=REPORT_CLI_OUTPUT)
+    except Refused as refusal:
+        return refusal.answer()
+    return {"ok": True, "report": answer}
+
+
+async def _act(action: str, job_id: str) -> dict:
+    try:
+        _check_job_id(job_id)
+        answer = await _call([action, "--json", "--", job_id])
+    except Refused as refusal:
+        return refusal.answer()
+    return {"ok": True, "job": answer}
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    return await _act("cancel", job_id)
+
+
+@router.post("/jobs/{job_id}/retry")
+async def retry_job(job_id: str):
+    return await _act("retry", job_id)

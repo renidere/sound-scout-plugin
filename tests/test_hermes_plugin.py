@@ -44,7 +44,14 @@ RECORDER_SUITE = REPO / "tests" / "js" / "recorder.test.mjs"
 RECORDER_DRAFTS_SUITE = REPO / "tests" / "js" / "recorder_drafts.test.mjs"
 DECISION = REPO / "docs" / "decisions" / "0015-spike-b-backend-package.md"
 CLI = Path(sys.executable).with_name("sound-scout")
-ROUTES = {("GET", "/health"), ("POST", "/jobs"), ("GET", "/jobs/{job_id}")}
+ROUTES = {
+    ("GET", "/health"),
+    ("POST", "/jobs"),
+    ("GET", "/jobs/{job_id}"),
+    ("GET", "/jobs/{job_id}/report"),
+    ("POST", "/jobs/{job_id}/cancel"),
+    ("POST", "/jobs/{job_id}/retry"),
+}
 DATA_URL_PREFIX = "data:audio/wav;base64,"
 MAX_INPUT = 20_000
 UPLOAD_NAME = re.compile(r"[0-9a-f]{32}\.upload")
@@ -218,6 +225,14 @@ def post(
 
 def get_job(api, job_id: str) -> dict:
     return asyncio.run(api.router.routes[("GET", "/jobs/{job_id}")](job_id))
+
+
+def get_report(api, job_id: str) -> dict:
+    return asyncio.run(api.router.routes[("GET", "/jobs/{job_id}/report")](job_id))
+
+
+def act(api, action: str, job_id: str) -> dict:
+    return asyncio.run(api.router.routes[("POST", f"/jobs/{{job_id}}/{action}")](job_id))
 
 
 def health(api) -> dict:
@@ -527,6 +542,96 @@ def test_get_job_of_an_unknown_job_is_job_not_found_from_the_cli(api, station: S
     answer = get_job(api, uuid.uuid4().hex)
     assert_refused(answer, "job_not_found")
     assert str(station.root) not in answer["detail"]
+
+
+# --- report, cancel, retry of the job card (#108) ------------------------------------------------
+
+
+@pytest.mark.slow
+@needs_ffmpeg
+def test_get_report_answers_report_md_of_the_run_that_result_answers_with(
+    api, station: Station, make_wav: WavFactory, monkeypatch
+) -> None:
+    wav = make_wav("voice.wav", seconds=1.5).read_bytes()
+    station.write(max_input_bytes=len(wav) + 1)
+    job_id = post(api, json_body(wav)).answer["job_id"]
+    [staged] = station.staged()
+    request_id = f"{job_id}-a1"
+    analysis = app.analyze(app.AnalyzeRequest(str(staged), request_id=request_id), config.load())
+    attempt = {"number": 1, "request_id": request_id, "run_id": analysis.run.run_id}
+    set_job(station, job_id, state="finished", attempts=[attempt])
+    calls = observe_cli(api, monkeypatch)
+
+    answer = get_report(api, job_id)
+
+    assert answer["ok"] is True, answer
+    report_md = (analysis.run.path / "report.md").read_text(encoding="utf-8")
+    assert answer["report"]["markdown"] == report_md
+    assert answer["report"]["attempt"] == 1 and answer["report"]["truncated"] is False
+    assert answer["report"]["run_dir"] == f"runs/{analysis.run.run_id}"
+    assert str(station.root) not in json.dumps(answer)
+    assert calls == [["report", "--json", "--", job_id]]
+
+
+def test_get_report_of_a_queued_job_is_no_result(api, station: Station, audio) -> None:
+    job_id = post(api, json_body(audio)).answer["job_id"]
+    assert_refused(get_report(api, job_id), "no_result")
+
+
+def test_cancel_and_retry_act_on_the_job_of_the_path_by_argv(
+    api, station: Station, audio, make_wav: WavFactory, monkeypatch
+) -> None:
+    station.write(max_input_bytes=MAX_INPUT, max_queued_jobs=4)
+    job_id = post(api, json_body(audio)).answer["job_id"]
+    other = post(api, json_body(make_wav("other.wav", seconds=0.4).read_bytes())).answer["job_id"]
+    calls = observe_cli(api, monkeypatch)
+
+    cancelled = act(api, "cancel", job_id)
+    retried = act(api, "retry", job_id)
+
+    assert cancelled["ok"] is True, cancelled
+    assert cancelled["job"]["state"] == "cancelled" and cancelled["job"]["cancel"] == "cancelled"
+    assert retried["ok"] is True, retried
+    assert retried["job"]["state"] == "queued" and retried["job"]["retry"] == "queued"
+    assert retried["job"]["job_id"] == job_id and retried["job"]["next_attempt"] == f"{job_id}-a1"
+    assert calls == [["cancel", "--json", "--", job_id], ["retry", "--json", "--", job_id]]
+    assert job_json(station, other)["state"] == "queued"
+    assert job_json(station, other).get("retries") is None
+
+
+def test_retry_of_a_finished_job_is_not_retryable(api, station: Station, audio) -> None:
+    job_id = post(api, json_body(audio)).answer["job_id"]
+    set_job(station, job_id, state="finished")
+
+    assert_refused(act(api, "retry", job_id), "not_retryable")
+    assert job_json(station, job_id)["state"] == "finished"
+
+
+@pytest.mark.parametrize("route", ["report", "cancel", "retry"])
+@pytest.mark.parametrize("job_id", ["../x", "a" * 31, "F" * 32, "--json"])
+def test_a_malformed_job_id_is_job_not_found_without_running_the_cli(
+    api, station: Station, monkeypatch, route: str, job_id: str
+) -> None:
+    refuse_cli(api, monkeypatch)
+    answer = get_report(api, job_id) if route == "report" else act(api, route, job_id)
+    assert_refused(answer, "job_not_found")
+
+
+@pytest.mark.parametrize(("size", "passes"), [(100 * 1024, True), (600 * 1024, False)])
+def test_the_report_route_takes_up_to_512_kib_of_cli_output(
+    api, station: Station, monkeypatch, size: int, passes: bool
+) -> None:
+    printed = json.dumps({"markdown": "ф" * size}, ensure_ascii=False)
+    monkeypatch.setattr(api, "_cli", lambda args: (0, printed, ""))
+
+    answer = get_report(api, uuid.uuid4().hex)
+
+    if passes:
+        assert answer["ok"] is True and len(answer["report"]["markdown"]) == size
+    else:
+        assert_refused(answer, "cli_failed")
+    status = asyncio.run(api.router.routes[("GET", "/jobs/{job_id}")](uuid.uuid4().hex))
+    assert_refused(status, "cli_failed")  # the other routes keep the 64 KiB cap
 
 
 # --- size -----------------------------------------------------------------------------------------
@@ -1009,7 +1114,7 @@ def _rest_calls(source: str) -> set[tuple[str, str]]:
     }
 
 
-def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api) -> None:
+def test_desktop_plugin_uses_stock_calls_and_only_the_job_routes(api) -> None:
     source = PLUGIN_JS.read_text(encoding="utf-8")
     assert "id: 'sound-scout'" in source and "name: 'Sound Scout'" in source
     imports = set(re.findall(r"^import .* from '([^']+)'", source, re.MULTILINE))
@@ -1019,13 +1124,9 @@ def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api)
     assert "upload:" not in source  # the cookie leg of Desktop 0.23.3 refuses ctx.rest uploads
     assert _rest_calls(source) == ROUTES
     assert _rest_calls(source) <= set(api.router.routes)
-    for gone in ("/spike/", "deliver", "runner", "lastToken"):
+    for gone in ("/spike/", "deliver", "runner", "lastToken", "sound-scout-report", "SPIKE_JOB"):
         assert gone not in source
-    assert f"const DIRECTIVE = '{api.DIRECTIVE}'" in source
-    assert "name: DIRECTIVE" in source
-    job_pattern = re.search(r"const SPIKE_JOB = /(.+)/\n", source)[1]
-    assert re.fullmatch(job_pattern, f"spike-{uuid.uuid4().hex}")
-    assert not re.fullmatch(job_pattern, "spike-../../etc")
+    assert not hasattr(api, "DIRECTIVE")
 
 
 def test_desktop_recorder_node_suite_passes(node: str) -> None:

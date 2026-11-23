@@ -480,7 +480,7 @@ def test_submit_refuses_a_bad_request_before_writing_anything(
     )
 
 
-@pytest.mark.parametrize("call", [jobs.status, jobs.result, jobs.cancel])
+@pytest.mark.parametrize("call", [jobs.status, jobs.result, jobs.report, jobs.cancel])
 def test_an_unknown_job_id_is_job_not_found(setup: Config, call) -> None:
     for job_id in ("0" * 32, "../runs", ""):
         with pytest.raises(JobError) as refused:
@@ -571,6 +571,181 @@ def test_result_answers_with_the_latest_attempt_that_has_a_result(
     assert answer["job_state"] == "running" and answer["attempt"] == 1
     assert answer["run_dir"] == f"runs/{analysis.run.run_id}"
     assert len(json.dumps(answer, ensure_ascii=False).encode("utf-8")) <= 4096
+
+
+@needs_ffmpeg
+def test_report_answers_report_md_of_the_attempt_that_result_answers_with(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    cfg = dataclasses.replace(setup, asr=config.Asr(model=ABSENT_ASR_MODEL))
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+    job_id = jobs.submit(SubmitRequest(str(wav)), Binding(), cfg)["job_id"]
+    analysis = app.analyze(app.AnalyzeRequest(str(wav), request_id=f"{job_id}-a1"), cfg)
+    first = {"number": 1, "request_id": f"{job_id}-a1", "run_id": analysis.run.run_id}
+    second = {"number": 2, "request_id": f"{job_id}-a2", "run_id": runs.new_run_id()}
+    set_job(cfg, job_id, state="failed", attempts=[first, second])
+
+    answer = jobs.report(job_id, cfg)
+
+    report_md = analysis.run.path / "report.md"
+    assert answer == {
+        "job_id": job_id,
+        "job_state": "failed",
+        "attempt": jobs.result(job_id, cfg)["attempt"],
+        "run_id": analysis.run.run_id,
+        "run_dir": f"runs/{analysis.run.run_id}",
+        "markdown": report_md.read_text(encoding="utf-8"),
+        "size_bytes": report_md.stat().st_size,
+        "truncated": False,
+    }
+    assert answer["attempt"] == 1
+    assert str(setup.allowed_roots[0]) not in json.dumps(answer)
+
+
+def fake_run(
+    cfg: Config, job_id: str, *, report_md: bytes | None, sha256: str | None = None
+) -> str:
+    """A run directory with `result.json` of the job's input and, when given, `report.md`."""
+    run_id = runs.new_run_id()
+    run_dir = cfg.data_root / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    source = sha256 or job_file(cfg, job_id)["request"]["input"]["sha256"]
+    (run_dir / "result.json").write_text(json.dumps({"source": {"sha256": source}}))
+    if report_md is not None:
+        (run_dir / "report.md").write_bytes(report_md)
+    return run_id
+
+
+def test_report_skips_an_input_changed_attempt_and_one_of_other_audio(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    good = fake_run(setup, job_id, report_md="# Отчёт 1\n".encode())
+    changed = fake_run(setup, job_id, report_md=b"# changed\n")
+    other = fake_run(setup, job_id, report_md=b"# other\n", sha256="0" * 64)
+    attempts = [
+        {"number": 1, "request_id": f"{job_id}-a1", "run_id": good},
+        {"number": 2, "request_id": f"{job_id}-a2", "run_id": changed, "input_changed": True},
+        {"number": 3, "request_id": f"{job_id}-a3", "run_id": other},
+    ]
+    set_job(setup, job_id, state="failed", attempts=attempts)
+
+    answer = jobs.report(job_id, setup)
+
+    assert answer["attempt"] == 1 and answer["markdown"] == "# Отчёт 1\n"
+    set_job(setup, job_id, attempts=attempts[1:])
+    with pytest.raises(JobError) as refused:
+        jobs.report(job_id, setup)
+    assert refused.value.code == "no_result"
+
+
+def test_report_of_a_run_without_report_md_or_of_an_unknown_job_is_refused(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    with pytest.raises(JobError) as refused:
+        jobs.report(job_id, setup)
+    assert refused.value.code == "no_result"
+    run_id = fake_run(setup, job_id, report_md=None)
+    set_job(setup, job_id, attempts=[{"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}])
+
+    with pytest.raises(JobError) as refused:
+        jobs.report(job_id, setup)
+    assert refused.value.code == "no_result"
+    for unknown in ("0" * 32, "../runs"):
+        with pytest.raises(JobError) as refused:
+            jobs.report(unknown, setup)
+        assert refused.value.code == "job_not_found"
+
+
+def test_a_report_above_the_cap_is_cut_at_a_line_break(setup: Config, make_wav: WavFactory) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    line = "Строка отчёта с кириллицей и словом «ошибка».\n".encode()
+    text = line * (300 * 1024 // len(line) + 1)
+    run_id = fake_run(setup, job_id, report_md=text)
+    set_job(setup, job_id, attempts=[{"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}])
+
+    answer = jobs.report(job_id, setup)
+
+    cut = answer["markdown"].encode("utf-8")
+    assert answer["truncated"] is True and answer["size_bytes"] == len(text)
+    assert len(cut) <= jobs.REPORT_VIEW_MAX_BYTES == 256 * 1024
+    assert cut.endswith(b"\n") and text.startswith(cut)
+    assert len(cut) > jobs.REPORT_VIEW_MAX_BYTES - len(line)
+
+
+def test_a_report_above_the_cap_without_a_line_break_is_cut_at_a_character(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    text = "ж".encode() * (jobs.REPORT_VIEW_MAX_BYTES // 2 + 10)
+    run_id = fake_run(setup, job_id, report_md=b"x" + text)
+    set_job(setup, job_id, attempts=[{"number": 1, "request_id": f"{job_id}-a1", "run_id": run_id}])
+
+    answer = jobs.report(job_id, setup)
+
+    cut = answer["markdown"].encode("utf-8")
+    assert answer["truncated"] is True and "\ufffd" not in answer["markdown"]
+    assert len(cut) == jobs.REPORT_VIEW_MAX_BYTES - 1 and (b"x" + text).startswith(cut)
+
+
+def test_jobs_report_through_the_cli_prints_the_markdown_or_its_json(
+    setup: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+) -> None:
+    from sound_scout.cli import main
+
+    path = tmp_path / "sound-scout.toml"
+    path.write_text(
+        f"allowed_roots = [{json.dumps(str(setup.allowed_roots[0]))}]\n"
+        f"data_root = {json.dumps(str(setup.data_root))}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    assert main(["jobs", "report", job_id]) == 1
+    assert capsys.readouterr().err.startswith("sound-scout jobs: no_result: ")
+    small = fake_run(setup, job_id, report_md="# Отчёт\nтекст\n".encode())
+    big = fake_run(setup, job_id, report_md=b"x\n" * (jobs.REPORT_VIEW_MAX_BYTES // 2 + 10))
+    attempt = {"number": 1, "request_id": f"{job_id}-a1", "run_id": small}
+    set_job(setup, job_id, state="finished", attempts=[attempt])
+
+    assert main(["jobs", "report", job_id]) == 0
+    printed = capsys.readouterr()
+    assert printed.out == "# Отчёт\nтекст\n" and printed.err == ""
+    assert main(["jobs", "report", job_id, "--json"]) == 0
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["markdown"] == "# Отчёт\nтекст\n" and answer["truncated"] is False
+
+    set_job(setup, job_id, attempts=[attempt | {"run_id": big}])
+    assert main(["jobs", "report", job_id]) == 0
+    printed = capsys.readouterr()
+    assert len(printed.out) == jobs.REPORT_VIEW_MAX_BYTES
+    assert printed.err.startswith("sound-scout jobs: report.md is ")
+    assert printed.err.rstrip().endswith(
+        f"the whole file is runs/{big}/report.md under the data root"
+    )
+
+
+def test_status_shows_when_the_staging_copy_was_removed(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = jobs.submit(SubmitRequest(str(make_wav("recordings/a.wav"))), Binding(), setup)[
+        "job_id"
+    ]
+    assert jobs.status(job_id, setup)["staging_removed_at"] is None
+    set_job(setup, job_id, state="failed", staging_removed_at="2026-11-23T10:00:00Z")
+
+    assert jobs.status(job_id, setup)["staging_removed_at"] == "2026-11-23T10:00:00Z"
 
 
 def test_the_stage_names_of_jobs_are_those_of_the_application_layer() -> None:

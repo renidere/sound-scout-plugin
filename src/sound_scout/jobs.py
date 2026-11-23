@@ -2,6 +2,8 @@
 
 CLI (`sound-scout jobs`) and MCP call these functions and nothing else: all job logic is here.
 `limits` answers the budgets and `jobs.staging_root` to the Hermes plugin, a client of the CLI.
+`report` answers `report.md` of the run that `result` answers with, capped at
+`REPORT_VIEW_MAX_BYTES`, for the job card of the Hermes plugin (#108).
 
 Layout: `<data_root>/jobs/<job_id>/` (0700) holds `job.json` (0600) with the request, the
 resolved plan, the binding and the job state; `cancel.json` is the cancel marker of a running
@@ -130,10 +132,10 @@ from sound_scout import (
     ingest,
     paths,
     proc,
-    report,
     runs,
     schema,
 )
+from sound_scout import report as run_report
 from sound_scout.config import CONFIG_PATH_ENV, Budgets, Config
 
 JOBS_DIR_NAME = "jobs"
@@ -185,6 +187,7 @@ BINDING_FIELDS = ("connection", "profile", "session_id")
 PLAN_REFUSED = "plan_refused"
 # Set by `staging.sweep` on a job whose staging copy it removed.
 STAGING_REMOVED_AT = "staging_removed_at"
+REPORT_VIEW_MAX_BYTES = 256 * 1024
 
 MODES = ("quick", "targeted", "full", "auto")
 DEFAULT_MODE = "auto"
@@ -462,8 +465,64 @@ def result(job_id: str, config: Config) -> dict:
     `job_state` is the queue's, `status` and `coverage` are the result's own. A job with no run
     result yet is `no_result`, whatever its state.
     """
-    job_dir = _job_dir(job_id, config)
-    job = _load(job_dir)
+    job = _load(_job_dir(job_id, config))
+    attempt, run_dir, document = _answering_attempt(job_id, job, config)
+    run_rel = run_dir.relative_to(config.data_root).as_posix()
+    head = {"job_id": job_id, "job_state": job["state"], "attempt": attempt.get("number")}
+    if job["request"].get("control"):
+        head["compare"] = attempt.get("compare")
+    return run_report.compact(document, run_dir=run_rel, head=head)
+
+
+def report(job_id: str, config: Config) -> dict:
+    """`report.md` of the run that `result` answers with, for a client to show as plain text.
+
+    At most `REPORT_VIEW_MAX_BYTES` bytes of it: a longer file is cut at its last line break
+    before the cap (at the cap without one) and answered with `truncated: true`; `size_bytes`
+    is the size of the whole file. A job whose answering run has no `report.md` is `no_result`,
+    as `result` without a run.
+    """
+    job = _load(_job_dir(job_id, config))
+    attempt, run_dir, _ = _answering_attempt(job_id, job, config)
+    path = run_dir / run_report.REPORT_FILE_NAME
+    try:
+        with path.open("rb") as file:
+            size = os.fstat(file.fileno()).st_size
+            data = file.read(REPORT_VIEW_MAX_BYTES + 1)
+    except FileNotFoundError:
+        raise JobError(
+            NO_RESULT, f"the run of attempt {attempt.get('number')} has no report.md"
+        ) from None
+    truncated = len(data) > REPORT_VIEW_MAX_BYTES
+    if truncated:
+        data = data[: _report_cut(data)]
+    return {
+        "job_id": job_id,
+        "job_state": job["state"],
+        "attempt": attempt.get("number"),
+        "run_id": run_dir.name,
+        "run_dir": run_dir.relative_to(config.data_root).as_posix(),
+        "markdown": data.decode("utf-8", errors="replace"),
+        "size_bytes": size,
+        "truncated": truncated,
+    }
+
+
+def _report_cut(data: bytes) -> int:
+    """Length of the cut: past the last line break before the cap, or, without one, the cap
+    moved back to the start of a UTF-8 character."""
+    line_end = data.rfind(b"\n", 0, REPORT_VIEW_MAX_BYTES)
+    if line_end >= 0:
+        return line_end + 1
+    cut = REPORT_VIEW_MAX_BYTES
+    while cut > 0 and data[cut] & 0xC0 == 0x80:
+        cut -= 1
+    return cut
+
+
+def _answering_attempt(job_id: str, job: dict, config: Config) -> tuple[dict, Path, dict]:
+    """The latest attempt with a `result.json` of the submitted input, its run directory and that
+    document; `no_result` without one."""
     for attempt in reversed(job["attempts"]):
         if attempt.get("input_changed"):
             continue
@@ -471,17 +530,13 @@ def result(job_id: str, config: Config) -> dict:
         if not isinstance(run_id, str) or not runs.RUN_ID_PATTERN.fullmatch(run_id):
             continue
         run_dir = config.data_root / runs.RUNS_DIR_NAME / run_id
-        result_path = run_dir / report.RESULT_FILE_NAME
+        result_path = run_dir / run_report.RESULT_FILE_NAME
         if not result_path.is_file():
             continue
         document = json.loads(result_path.read_text(encoding="utf-8"))
         if document.get("source", {}).get("sha256") != job["request"]["input"]["sha256"]:
             continue
-        run_rel = run_dir.relative_to(config.data_root).as_posix()
-        head = {"job_id": job_id, "job_state": job["state"], "attempt": attempt.get("number")}
-        if job["request"].get("control"):
-            head["compare"] = attempt.get("compare")
-        return report.compact(document, run_dir=run_rel, head=head)
+        return attempt, run_dir, document
     raise JobError(NO_RESULT, f"job {job_id} is {job['state']} and has no run result yet")
 
 
@@ -1121,6 +1176,7 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "binding": job["binding"],
         "bound_at": job.get("bound_at"),
         "delivery": job.get("delivery"),
+        STAGING_REMOVED_AT: job.get(STAGING_REMOVED_AT),
         "control": job["request"].get("control"),
         "compare": job["attempts"][-1].get("compare") if job["attempts"] else None,
     }

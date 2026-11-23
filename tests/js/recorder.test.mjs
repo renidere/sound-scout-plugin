@@ -29,9 +29,32 @@ function textContent(node) {
 }
 
 function findButton(node, label) {
-  if (node?.type === 'button' && textContent(node) === label) return node
+  if (node?.type === 'Button' && textContent(node) === label) return node
   return [].concat(node?.props?.children || []).map(child => findButton(child, label)).find(Boolean)
 }
+
+// Calls the function components of a tree, so that the result holds only SDK and DOM elements.
+function renderTree(node) {
+  if (node == null || typeof node !== 'object') return node
+  if (Array.isArray(node)) return node.map(renderTree)
+  if (typeof node.type === 'function') return renderTree(node.type(node.props))
+  if (node.props?.children === undefined) return node
+  return { type: node.type, props: { ...node.props, children: renderTree(node.props.children) } }
+}
+
+function* walk(node) {
+  if (node == null || typeof node !== 'object') return
+  if (Array.isArray(node)) {
+    for (const child of node) yield* walk(child)
+    return
+  }
+  yield node
+  yield* walk(node.props?.children)
+}
+
+const nodes = (tree, type) => [...walk(tree)].filter(node => node.type === type)
+const buttonLabels = tree => nodes(tree, 'Button').map(node => node.props['aria-label'])
+const stageTexts = tree => nodes(tree, 'li').map(textContent)
 
 function fakeHost(order) {
   const local = { connectionId: 'conn-local', mode: 'local', profile: 'default', targetProfile: 'default' }
@@ -95,13 +118,15 @@ function fakeCtx(order) {
     },
     post: { ok: true, job_id: JOB, request_id: `sound-scout-desktop-${RECORDING_ID}`, state: 'queued', reused: false },
     statuses: [],
+    actions: [],
     async rest(path, opts = {}) {
       ctx.rests.push({ path, opts })
       order.push(`rest ${opts.method || 'GET'} ${path.split('?')[0]}`)
       const answer = path === '/health' ? ctx.health
         : path.startsWith('/jobs?') ? ctx.post
-          : path.startsWith('/jobs/') ? (ctx.statuses.shift() ?? { ok: false, error: 'job_not_found' })
-            : new Error(`Unexpected rest path: ${path}`)
+          : /^\/jobs\/[^/]+\/(report|cancel|retry)$/.test(path) ? (ctx.actions.shift() ?? { ok: false, error: 'job_not_found' })
+            : path.startsWith('/jobs/') ? (ctx.statuses.shift() ?? { ok: false, error: 'job_not_found' })
+              : new Error(`Unexpected rest path: ${path}`)
       if (answer instanceof Error) throw answer
       return typeof answer === 'function' ? answer() : answer
     },
@@ -157,10 +182,17 @@ function feedFrames(capture, frames) {
 
 const random = n => Uint8Array.from({ length: n }, (_, i) => i + 1)
 
+// The composer the card renders in; its storedSessionId is the chat of the composer.
+function fakeComposer() {
+  const composer = { stored: 'stored-a' }
+  return { composer, sdk: { useComposerSession: () => ({ sessionId: 'runtime-a', storedSessionId: composer.stored }) } }
+}
+
 async function setup({ globals = {}, options = {} } = {}) {
   const order = []
   const { env, capture } = fakeAudio()
-  const plugin = await loadPlugin({ path: RECORDER_PATH, globals: { ...env, ...globals } })
+  const { composer, sdk } = fakeComposer()
+  const plugin = await loadPlugin({ path: RECORDER_PATH, sdk, globals: { ...env, ...globals } })
   const fake = fakeHost(order)
   const ctx = fakeCtx(order)
   const sleeps = []
@@ -171,21 +203,26 @@ async function setup({ globals = {}, options = {} } = {}) {
     random,
     ...options
   })
-  return { plugin, ...fake, ctx, recorder, env, capture, sleeps, order }
+  const card = () => renderTree({ type: plugin.JobCard, props: { recorder } })
+  const press = label => findButton(card(), label).props.onClick()
+  return { plugin, ...fake, ctx, recorder, env, capture, sleeps, order, composer, card, press }
 }
 
-async function setupRegistered({ globals = {}, host: patch } = {}) {
+async function setupRegistered({ globals = {}, host: patch, sdk: extra = {} } = {}) {
   const order = []
   const { env, capture } = fakeAudio()
   const fake = fakeHost(order)
   patch?.(fake.host)
-  const plugin = await loadPlugin({ path: RECORDER_PATH, sdk: { host: fake.host }, globals: { ...env, ...globals } })
+  const { composer, sdk } = fakeComposer()
+  const plugin = await loadPlugin({ path: RECORDER_PATH, sdk: { host: fake.host, ...sdk, ...extra }, globals: { ...env, ...globals } })
   const ctx = fakeCtx(order)
   plugin.default.register(ctx)
-  const element = ctx.registered[0]?.render()
-  const render = () => element.type(element.props)
+  const area = name => ctx.registered.find(item => item.area === name)
+  const element = area('composer.actions')?.render()
+  const render = () => renderTree(element)
+  const card = () => renderTree(area('composer.top').render())
   const click = label => findButton(render(), label).props.onClick()
-  return { plugin, ...fake, ctx, env, capture, element, render, click, recorder: element?.props.recorder, order }
+  return { plugin, ...fake, ctx, env, capture, element, render, card, click, composer, recorder: element?.props.recorder, order }
 }
 
 test('encodeWav writes the captured left and silent right channels as PCM16 without downmix', async () => {
@@ -671,7 +708,8 @@ test('a refused POST /jobs keeps the voice in the chat and a retry posts again w
   assert.equal(posts[1].opts.body.data_url, posts[0].opts.body.data_url)
   assert.equal(posts[1].opts.upload, undefined)
   await recorder.polling
-  same(recorder.job.get(), { jobId: JOB, text: 'Разбор не удался: input_invalid', final: true })
+  const job = recorder.job.get()
+  same([job.jobId, job.text, job.final], [JOB, 'Разбор не удался: input_invalid', true])
 })
 
 test('a failed ctx.rest of POST /jobs shows the Desktop error text without the IPC wrapper', async () => {
@@ -709,7 +747,8 @@ test('a failed ctx.rest of GET /health and of the last status poll show the Desk
     await recorder.send({ analyze: true })
     await recorder.polling
     const text = `Статус разбора недоступен: no_answer — ${DESKTOP_TEXT}`
-    same(recorder.job.get(), { jobId: JOB, text, final: true })
+    const job = recorder.job.get()
+    same([job.jobId, job.text, job.final, job.stopped], [JOB, text, false, true])
     same(notices(calls).at(-1), { kind: 'warning', message: text })
   }
 })
@@ -841,7 +880,8 @@ test('status polling pauses while the window is on another route and resumes on 
   await recorder.polling
   assert.equal(naps, 4)
   assert.equal(ctx.rests.filter(r => r.path === `/jobs/${JOB}`).length, 1)
-  same(recorder.job.get(), { jobId: JOB, text: 'Разбор готов: partial. Итог придёт в чат заметкой', final: true })
+  const job = recorder.job.get()
+  same([job.jobId, job.text, job.final], [JOB, 'Разбор готов: partial. Итог придёт в чат заметкой', true])
 })
 
 test('an intake that is not ready disables Send and analyze with its reason, and Send still works', async () => {
@@ -877,7 +917,8 @@ test('polling sends one request at a time and stops after maxPollFailures failur
   await recorder.polling
   assert.equal(most, 1)
   assert.equal(ctx.rests.filter(r => r.path === `/jobs/${JOB}`).length, 5)
-  same(recorder.job.get(), { jobId: JOB, text: 'Статус разбора недоступен: cli_timeout', final: true })
+  const job = recorder.job.get()
+  same([job.jobId, job.text, job.final, job.stopped], [JOB, 'Статус разбора недоступен: cli_timeout', false, true])
   same(notices(calls).at(-1), { kind: 'warning', message: 'Статус разбора недоступен: cli_timeout' })
 })
 
@@ -901,13 +942,13 @@ test('cancel leaves an accepted job polled, and dispose stops the polling', asyn
   assert.equal(recorder.job.get().text, 'Разбор: в очереди')
 })
 
-test('register keeps health and the directive, adds the recorder to composer actions and dispose stops it', async () => {
+test('register adds health, the recorder to composer actions and the job card above the input, and dispose stops it', async () => {
   const timers = []
-  const { ctx, click, render, capture, calls, recorder } = await setupRegistered({
+  const { ctx, click, render, card, capture, calls, recorder } = await setupRegistered({
     globals: { setTimeout: (fn, ms) => timers.push({ fn, ms }), clearTimeout: () => {} }
   })
-  same(ctx.many.map(c => [c.id, c.area]), [['health', 'palette'], ['report-directive', 'transcript.directive']])
-  same(ctx.registered.map(c => [c.id, c.area]), [['record', 'composer.actions']])
+  same(ctx.many, [])
+  same(ctx.registered.map(c => [c.id, c.area]), [['health', 'palette'], ['record', 'composer.actions'], ['job-card', 'composer.top']])
   await click('Записать')
   assert.match(textContent(render()), /00:00 \/ 03:00/)
   assert.ok(findButton(render(), 'Отправить'))
@@ -917,7 +958,8 @@ test('register keeps health and the directive, adds the recorder to composer act
   assert.match(textContent(render()), /К отправке/)
   await click('Отправить и разобрать')
   assert.equal(named(calls, 'prompt.submit').length, 1)
-  assert.match(textContent(render()), /Разбор: принят/)
+  assert.doesNotMatch(textContent(render()), /Разбор/)
+  assert.match(textContent(card()), /Разбор: принят/)
   await click('Записать')
   ctx.disposers.forEach(fn => fn())
   assert.equal(capture.tracksStopped, 2)
@@ -927,15 +969,14 @@ test('register keeps health and the directive, adds the recorder to composer act
   same(calls.filter(call => ['retainSession', 'composer.submit'].includes(call[0])), [])
 })
 
-test('an SDK without the stock route calls is refused visibly and keeps health and the directive', async () => {
+test('an SDK without the stock route calls is refused visibly and keeps health', async () => {
   for (const remove of [
     host => { delete host.requestProfile },
     host => { delete host.profileRoutes },
     host => { delete host.state.focusedSessionOwner }
   ]) {
     const { ctx, calls } = await setupRegistered({ host: remove })
-    same(ctx.registered, [])
-    assert.equal(ctx.many.length, 2)
+    same(ctx.registered.map(c => c.id), ['health'])
     assert.equal(notices(calls).filter(n => n.kind === 'error').length, 1)
   }
 })
@@ -996,13 +1037,434 @@ test('record errors notify once without raw failures', async () => {
   }
 })
 
-test('the plugin source holds no non-stock call and only the three backend routes', async () => {
+test('the plugin source holds no non-stock call, no directive, no Markdown or HTML rendering and no spinner', async () => {
   const source = await readFile(RECORDER_PATH, 'utf8')
-  for (const banned of [/retainSession/, /composer\.submit/, /\bfetch\(/, /XMLHttpRequest/, /WebSocket/, /\beval\b/, /upload:/]) {
+  for (const banned of [
+    /retainSession/, /composer\.submit/, /\bfetch\(/, /XMLHttpRequest/, /WebSocket/, /\beval\b/, /upload:/,
+    /sound-scout-report/, /SPIKE_JOB/, /TRANSCRIPT_DIRECTIVE_AREA/, /MessageTextContent/, /dangerouslySetInnerHTML/,
+    /innerHTML/, /GlyphSpinner/, /\bLoader\b/, /@keyframes/
+  ]) {
     assert.doesNotMatch(source, banned)
   }
   const imports = [...source.matchAll(/^\s*import\b.*?from\s+['"]([^'"]+)['"]/gm)].map(m => m[1])
   same(imports, ['@hermes/plugin-sdk', 'react/jsx-runtime'])
   const rpc = new Set([...source.matchAll(/'((?:session|file|prompt)\.[a-z_]+)'/g)].map(m => m[1]))
   same([...rpc].sort(), ['file.attach', 'prompt.submit', 'session.resume'])
+})
+
+// --- the job card (#108) -------------------------------------------------------------------------
+
+const SECOND = 'b'.repeat(32)
+const STAGES = ['prepare', 'acoustics', 'asr', 'audio_review']
+const view = (state, extra = {}, jobId = JOB) => ({
+  ok: true,
+  job: {
+    job_id: jobId, state, stages: STAGES, finished_stages: [], current_stage: null, state_reason: null,
+    attempts: state === 'queued' ? 0 : 1, cancel_requested: false, staging_removed_at: null, ...extra
+  },
+  result: null
+})
+const finishedView = (extra = {}) => ({ ...view('finished', extra), result: { job_id: JOB, job_state: 'finished', attempt: 1, status: 'partial' } })
+const reportAnswer = (markdown, extra = {}) => ({
+  ok: true, report: { job_id: JOB, job_state: 'finished', attempt: 1, run_id: 'r', run_dir: 'runs/r', markdown, size_bytes: markdown.length, truncated: false, ...extra }
+})
+const actionRests = ctx => ctx.rests.filter(r => /\/(report|cancel|retry)$/.test(r.path))
+const getRests = (ctx, jobId = JOB) => ctx.rests.filter(r => r.path === `/jobs/${jobId}`)
+
+// Each sleep of the poll waits until the test wakes every waiting poll at once.
+function gate() {
+  let waiting = []
+  return {
+    sleep: () => new Promise(resolve => waiting.push(resolve)),
+    async wake() {
+      const now = waiting
+      waiting = []
+      now.forEach(resolve => resolve())
+      for (let i = 0; i < 4; i++) await tick()
+    }
+  }
+}
+
+async function analyzed(context) {
+  await context.recorder.start()
+  feed(context.capture)
+  await context.recorder.send({ analyze: true })
+}
+
+test('criterion 1: the card shows the finished, current and waiting stages by polling, and no chat message per stage', async () => {
+  const context = await setup()
+  const { recorder, ctx, calls, card } = context
+  const done = [{ stage: 'prepare', status: 'completed' }]
+  ctx.statuses = [
+    view('queued', { attempts: 1, finished_stages: [{ stage: 'prepare', status: 'completed' }, { stage: 'acoustics', status: 'failed' }] }),
+    view('running', { attempts: 2, finished_stages: done, current_stage: { stage: 'acoustics', started_at: 't' } }),
+    view('running', { attempts: 2, finished_stages: [...done, { stage: 'acoustics', status: 'unavailable' }], current_stage: { stage: 'asr', started_at: 't' } }),
+    view('failed', { attempts: 2, finished_stages: [...done, { stage: 'acoustics', status: 'skipped' }, { stage: 'asr', status: 'failed' }], state_reason: 'analysis_failed' })
+  ]
+  const seen = []
+  recorder.job.subscribe(() => {
+    const tree = card()
+    if (tree) seen.push({ stages: stageTexts(tree), text: textContent(tree) })
+  })
+  await analyzed(context)
+  await recorder.polling
+  same(seen.map(item => item.stages), [
+    [],
+    ['Подготовка: ждёт', 'Измерения: ждёт', 'Распознавание речи: ждёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Измерения: идёт', 'Распознавание речи: ждёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Измерения: недоступен', 'Распознавание речи: идёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Измерения: пропущен', 'Распознавание речи: ошибка', 'Слуховой анализ: не выполнен']
+  ])
+  assert.match(seen[1].text, /Разбор: в очереди/)
+  assert.match(seen[1].text, /Попытка 2/)
+  assert.match(seen[4].text, /Разбор не удался: analysis_failed/)
+  same(calls.filter(call => ['session.resume', 'file.attach', 'prompt.submit', 'retain'].includes(call[0])).map(call => call[0]),
+    ['retain', 'session.resume', 'file.attach', 'prompt.submit'])
+  assert.equal(getRests(ctx).length, 4)
+  assert.equal(nodes(nodes(card(), 'ol')[0], 'Codicon').length, 4)
+  assert.ok(nodes(card(), 'Codicon').every(icon => icon.props['aria-hidden'] === true))
+})
+
+test('the stage rows follow the plan order and name an unknown stage by its name', async () => {
+  const plugin = await loadPlugin({ path: RECORDER_PATH })
+  same(plugin.stageRows(null), [])
+  same(plugin.stageRows({ state: 'cancelled', stages: ['prepare', 'decode'], finished_stages: [{ stage: 'decode', status: 'completed' }] }), [
+    { stage: 'prepare', label: 'Подготовка', mark: 'missing', status: 'missing' },
+    { stage: 'decode', label: 'decode', mark: 'done', status: 'completed' }
+  ])
+})
+
+test('the card renders only in the composer of the chat of the job', async () => {
+  const context = await setup()
+  const { recorder, ctx, composer, card, focus } = context
+  ctx.statuses = [finishedView()]
+  assert.equal(card(), null)
+  await analyzed(context)
+  focus.stored = 'stored-b'
+  await recorder.polling
+  assert.equal(recorder.job.get().sessionId, 'stored-a')
+  assert.match(textContent(card()), /Разбор готов: partial/)
+  composer.stored = 'stored-b'
+  assert.equal(card(), null)
+  composer.stored = null
+  assert.equal(card(), null)
+})
+
+test('criterion 2: a click opens the full report from the server as a plain string in an SDK Dialog', async () => {
+  const context = await setup()
+  const { recorder, ctx, card, press } = context
+  ctx.statuses = [finishedView()]
+  await analyzed(context)
+  await recorder.polling
+  const markdown = '# Отчёт\n::foo{x="1"} <b>жирный</b> MEDIA:/etc/passwd\n'
+  let finish
+  ctx.actions = [() => new Promise(resolve => { finish = resolve })]
+  const opening = press('Открыть отчёт')
+  await tick()
+  const loading = card()
+  assert.match(textContent(nodes(loading, 'Dialog')[0]), /Загрузка отчёта…/)
+  assert.ok(nodes(loading, 'Button').every(button => button.props.disabled === true))
+  finish(reportAnswer(markdown))
+  await opening
+  same(actionRests(ctx).map(r => [r.path, r.opts]), [[`/jobs/${JOB}/report`, { timeoutMs: 10000 }]])
+  const tree = card()
+  const [dialog] = nodes(tree, 'Dialog')
+  assert.equal(dialog.props.open, true)
+  assert.equal(textContent(nodes(tree, 'DialogTitle')[0]), 'Отчёт Sound Scout')
+  assert.equal(textContent(nodes(tree, 'DialogDescription')[0]), 'Попытка 1 · partial')
+  const [pre] = nodes(tree, 'pre')
+  assert.equal(pre.props.children, markdown)
+  assert.equal(typeof pre.props.children, 'string')
+  assert.equal(pre.props.tabIndex, 0)
+  assert.equal(pre.props['aria-label'], 'Текст отчёта')
+  assert.equal(pre.props.className, 'sound-scout-card__report')
+  assert.equal(nodes(tree, 'b').length, 0)
+  assert.doesNotMatch(textContent(tree), /256 KiB/)
+  dialog.props.onOpenChange(false)
+  assert.equal(nodes(card(), 'Dialog').length, 0)
+
+  ctx.actions = [reportAnswer('x\n', { truncated: true, size_bytes: 300 * 1024 })]
+  await press('Открыть отчёт')
+  assert.match(textContent(card()), /Показаны первые 256 KiB\. Полный отчёт: `runs\/r\/report\.md` в data root на станции/)
+  assert.doesNotMatch(textContent(card()), /jobs report/)
+  recorder.closeReport()
+
+  ctx.actions = [{ ok: false, error: 'no_result', detail: 'private-detail' }]
+  await press('Открыть отчёт')
+  const [alert] = [...walk(nodes(card(), 'Dialog')[0])].filter(node => node.props?.role === 'alert')
+  assert.equal(textContent(alert), 'Отчёт недоступен: у разбора пока нет результата.')
+  assert.doesNotMatch(textContent(card()), /private-/)
+  assert.equal(actionRests(ctx).length, 3, 'no cache: every click asks the server')
+})
+
+test('criterion 3: cancel acts on the job of the card only and polls that job at once', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, card, press } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await poll.wake()
+  ctx.post = { ok: true, job_id: SECOND, reused: false }
+  await analyzed(context)
+  ctx.statuses = [view('running', {}, SECOND)]
+  await poll.wake()
+  assert.equal(recorder.job.get().jobId, SECOND)
+  assert.ok(findButton(card(), 'Отменить разбор'))
+  const requested = view('running', { cancel_requested: true }, SECOND)
+  ctx.actions = [{ ok: true, job: { ...requested.job, cancel: 'requested' } }]
+  ctx.statuses = [requested]
+  const before = ctx.rests.length
+  await press('Отменить разбор')
+  await tick()
+  same(ctx.rests.slice(before).map(r => [r.opts.method ?? 'GET', r.path]), [['POST', `/jobs/${SECOND}/cancel`], ['GET', `/jobs/${SECOND}`]])
+  same(ctx.rests.slice(before)[0].opts, { method: 'POST', body: {}, timeoutMs: 10000 })
+  assert.equal(ctx.rests.filter(r => r.path.startsWith(`/jobs/${JOB}/`)).length, 0)
+  assert.match(textContent(card()), /отмена запрошена/)
+  assert.equal(findButton(card(), 'Отменить разбор'), undefined)
+
+  ctx.actions = [{ ok: true, job: { ...view('cancelled', {}, SECOND).job, cancel: 'cancelled' } }]
+  ctx.statuses = [view('cancelled', {}, SECOND)]
+  recorder.setJob({ view: view('queued', {}, SECOND).job })
+  await press('Отменить разбор')
+  await recorder.polling
+  assert.match(textContent(card()), /Разбор отменён/)
+  assert.ok(findButton(card(), 'Повторить разбор'))
+  assert.ok(findButton(card(), 'Скрыть'))
+})
+
+test('criterion 3: retry keeps the job_id, shows the attempt and reads the report of the new attempt', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, card, press, calls } = context
+  ctx.statuses = [view('failed', { state_reason: 'analysis_failed' })]
+  await analyzed(context)
+  await poll.wake()
+  await recorder.polling
+  assert.equal(recorder.job.get().final, true)
+  ctx.actions = [{ ok: true, job: { ...view('queued', { attempts: 1 }).job, retry: 'queued', next_attempt: `${JOB}-a2` } }]
+  ctx.statuses = [view('queued', { attempts: 1 })]
+  await press('Повторить разбор')
+  await tick()
+  same(actionRests(ctx).map(r => [r.opts.method, r.path]), [['POST', `/jobs/${JOB}/retry`]])
+  let text = textContent(card())
+  assert.match(text, /Разбор: в очереди/)
+  assert.match(text, /Попытка 2/)
+  assert.equal(recorder.job.get().final, false)
+  ctx.statuses = [view('running', { attempts: 2, current_stage: { stage: 'prepare', started_at: 't' } })]
+  await poll.wake()
+  text = textContent(card())
+  assert.match(text, /Попытка 2/)
+  assert.match(text, /Подготовка: идёт/)
+  ctx.statuses = [{ ...finishedView({ attempts: 2 }), result: { job_id: JOB, job_state: 'finished', attempt: 2, status: 'complete' } }]
+  await poll.wake()
+  await recorder.polling
+  assert.match(textContent(card()), /Разбор готов: complete/)
+  assert.ok(getRests(ctx).every(r => r.path === `/jobs/${JOB}`))
+  ctx.actions = [reportAnswer('попытка 2\n', { attempt: 2 })]
+  await press('Открыть отчёт')
+  assert.equal(nodes(card(), 'pre')[0].props.children, 'попытка 2\n')
+  assert.equal(textContent(nodes(card(), 'DialogDescription')[0]), 'Попытка 2 · complete')
+  same(actionRests(ctx).map(r => r.path), [`/jobs/${JOB}/retry`, `/jobs/${JOB}/report`])
+  assert.equal(named(calls, 'prompt.submit').length, 1)
+})
+
+test('a refused retry names why in Russian after one status request, and a removed input hides the retry button', async () => {
+  const removed = { staging_removed_at: '2026-11-23T10:00:00Z' }
+  for (const [error, after, expected, buttons] of [
+    ['not_retryable', view('failed', { state_reason: 'x', ...removed }), 'Повтор невозможен: исходная запись уже удалена. Запиши заново.', ['Скрыть']],
+    ['not_retryable', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: not_retryable', ['Повторить разбор', 'Скрыть']],
+    ['queue_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Повторить разбор', 'Скрыть']],
+    ['staging_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Повторить разбор', 'Скрыть']],
+    ['cli_timeout', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: cli_timeout', ['Повторить разбор', 'Скрыть']]
+  ]) {
+    const context = await setup()
+    context.ctx.statuses = [view('failed', { state_reason: 'x' })]
+    await analyzed(context)
+    await context.recorder.polling
+    context.ctx.actions = [{ ok: false, error, detail: 'private-detail' }]
+    context.ctx.statuses = [after]
+    await context.press('Повторить разбор')
+    const alerts = [...walk(context.card())].filter(node => node.props?.role === 'alert')
+    same(alerts.map(textContent), [expected])
+    same(buttonLabels(context.card()), buttons)
+    assert.equal(getRests(context.ctx).length, 2)
+    assert.equal(context.recorder.job.get().busy, null)
+  }
+  const context = await setup()
+  context.ctx.statuses = [view('cancelled', { staging_removed_at: '2026-11-23T10:00:00Z' })]
+  await analyzed(context)
+  await context.recorder.polling
+  same(buttonLabels(context.card()), ['Скрыть'])
+})
+
+test('a failed retry follows the state the job has now, or shows Refresh when the status request fails too', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, card, press } = context
+  ctx.statuses = [view('failed', { state_reason: 'x' })]
+  await analyzed(context)
+  await poll.wake()
+  await recorder.polling
+  ctx.actions = [new Error('socket hang up')]
+  ctx.statuses = [view('queued', { attempts: 1 })]
+  await press('Повторить разбор')
+  let text = textContent(card())
+  assert.match(text, /Разбор: в очереди/)
+  assert.match(text, /Повторить разбор не удалось: no_answer — socket hang up/)
+  assert.equal(recorder.job.get().final, false)
+  ctx.statuses = [view('failed', { attempts: 2, state_reason: 'y' })]
+  await poll.wake()
+  await recorder.polling
+  assert.match(textContent(card()), /Разбор не удался: y/)
+
+  ctx.actions = [{ ok: false, error: 'cli_timeout' }]
+  ctx.statuses = [new Error('offline')]
+  const before = getRests(ctx).length
+  await press('Повторить разбор')
+  assert.equal(getRests(ctx).length, before + 1)
+  assert.equal(recorder.job.get().stopped, true)
+  same(buttonLabels(card()), ['Повторить разбор', 'Обновить', 'Скрыть'])
+  ctx.statuses = [view('failed', { attempts: 2, state_reason: 'y' })]
+  await press('Обновить')
+  await recorder.polling
+  assert.equal(recorder.job.get().stopped, false)
+})
+
+test('a second click while an action is in flight sends one request, and another connection sends none', async () => {
+  const context = await setup()
+  const { recorder, ctx, card, press, focus } = context
+  ctx.statuses = [view('failed', { state_reason: 'x' })]
+  await analyzed(context)
+  await recorder.polling
+  let finish
+  ctx.actions = [() => new Promise(resolve => { finish = resolve })]
+  const first = press('Повторить разбор')
+  await tick()
+  assert.equal(recorder.job.get().busy, 'retry')
+  assert.ok(nodes(card(), 'Button').every(button => button.props.disabled === true))
+  await Promise.all([recorder.retryJob(), recorder.cancelJob(), recorder.openReport()])
+  finish({ ok: false, error: 'queue_full' })
+  await first
+  assert.equal(actionRests(ctx).length, 1)
+  focus.connectionId = 'conn-local'
+  const before = ctx.rests.length
+  await press('Повторить разбор')
+  assert.equal(ctx.rests.length, before)
+  const alerts = [...walk(card())].filter(node => node.props?.role === 'alert')
+  same(alerts.map(textContent), ['Окно подключено к другому серверу. Переключись на подключение этого чата.'])
+})
+
+test('a poll answer about another job is bad_answer and changes nothing', async () => {
+  const context = await setup({ options: { maxPollFailures: 1 } })
+  const { recorder, ctx, card } = context
+  ctx.statuses = [finishedView({}, SECOND), finishedView()]
+  ctx.statuses[0].job.job_id = SECOND
+  await analyzed(context)
+  await recorder.polling
+  const job = recorder.job.get()
+  same([job.view, job.result, job.final, job.stopped, job.text], [null, null, false, true, 'Статус разбора недоступен: bad_answer'])
+  same(buttonLabels(card()), ['Обновить', 'Скрыть'])
+  await context.press('Обновить')
+  await recorder.polling
+  assert.match(textContent(card()), /Разбор готов: partial/)
+  await context.press('Скрыть')
+  assert.equal(recorder.job.get(), null)
+  assert.equal(card(), null)
+})
+
+const COLOR_PROPERTY = /^(color|background(-color)?|border(-(top|right|bottom|left))?(-color)?|outline(-color)?|fill|stroke)$/
+const REDUCED_MOTION = /@media \(prefers-reduced-motion: reduce\) \{[^{}]*\{ transition: none !important; animation: none !important; \} \}/g
+
+function assertCriterion4(tree, where) {
+  for (const node of walk(tree)) {
+    assert.ok(!['button', 'dialog', 'input', 'a', 'img', 'svg'].includes(node.type), `${where}: raw <${node.type}>`)
+    assert.equal(node.props?.dangerouslySetInnerHTML, undefined, where)
+    for (const key of Object.keys(node.props?.style ?? {})) assert.doesNotMatch(key, /transition|animation/i, where)
+    if (node.type === 'Button') {
+      assert.equal(node.props.type, 'button', where)
+      assert.ok(typeof node.props['aria-label'] === 'string' && node.props['aria-label'], where)
+      assert.ok(node.props.title, where)
+    }
+  }
+  return nodes(tree, 'style').map(node => node.props.children)
+}
+
+test('criterion 4: SDK components, var(--ui-*) colors, typed and labelled buttons and reduced motion', async () => {
+  const styles = new Set()
+  {
+    const context = await setup()
+    const { recorder, ctx, card } = context
+    ctx.statuses = [finishedView()]
+    await analyzed(context)
+    await recorder.polling
+    const scenes = [
+      ['queued', { view: view('queued').job, final: false }],
+      ['running', { view: view('running', { finished_stages: [{ stage: 'prepare', status: 'completed' }], current_stage: { stage: 'asr', started_at: 't' } }).job, final: false }],
+      ['failed', { view: view('failed', { state_reason: 'x' }).job, final: true, error: 'Очередь занята, повтори позже.' }],
+      ['stopped', { stopped: true }],
+      ['finished', { view: finishedView().job, result: finishedView().result, final: true, stopped: false, error: '' }],
+      ['loading', { report: { open: true, loading: true, markdown: '', truncated: false, attempt: null, error: '' } }],
+      ['report', { report: { open: true, loading: false, markdown: 'text', truncated: true, attempt: 1, error: '' } }],
+      ['report error', { report: { open: true, loading: false, markdown: '', truncated: false, attempt: null, error: 'x' } }]
+    ]
+    for (const [name, values] of scenes) {
+      recorder.setJob(values)
+      const tree = card()
+      assert.equal(tree.type, 'section', name)
+      assert.equal(tree.props['aria-label'], 'Разбор Sound Scout', name)
+      const [status] = [...walk(tree)].filter(node => node.props?.role === 'status')
+      assert.equal(status.props['aria-live'], 'polite', name)
+      assertCriterion4(tree, name).forEach(css => styles.add(css))
+    }
+  }
+  {
+    const { recorder, render, ctx, capture } = await setupRegistered({
+      globals: { setTimeout: () => 1, clearTimeout: () => {} }
+    })
+    for (const phase of ['idle', 'starting', 'recording', 'ready', 'sending']) {
+      if (phase === 'recording') {
+        recorder.state.set({ ...recorder.state.get(), phase: 'idle' })
+        await recorder.start()
+        feed(capture)
+      } else {
+        recorder.state.set({ ...recorder.state.get(), phase, error: phase === 'ready' ? 'Запись сохранена.' : '' })
+      }
+      assertCriterion4(render(), phase).forEach(css => styles.add(css))
+    }
+    recorder.cancel()
+    ctx.disposers.forEach(fn => fn())
+  }
+  assert.equal(styles.size, 2, 'the recorder sheet and the card sheet')
+  for (const css of styles) {
+    assert.equal(css.match(REDUCED_MOTION)?.length, 1, css.slice(0, 60))
+    assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(|currentColor/i)
+    let checked = 0
+    for (const [, property, value] of css.matchAll(/([a-z-]+)\s*:\s*([^;{}]+)/g)) {
+      if (!COLOR_PROPERTY.test(property)) continue
+      checked++
+      assert.match(value, /var\(--ui-/, `${property}: ${value}`)
+    }
+    assert.ok(checked > 3)
+    assert.doesNotMatch(css.replace(REDUCED_MOTION, ''), /transition|animation|@keyframes/)
+  }
+  const card = [...styles].find(css => css.includes('.sound-scout-card {'))
+  for (const token of ['--ui-bg-elevated', '--ui-stroke-secondary', '--ui-text-primary', '--ui-text-secondary', '--ui-green', '--ui-yellow', '--ui-red']) {
+    assert.ok(card.includes(`var(${token})`), token)
+  }
+  assert.match(card, /\.sound-scout-card__report \{[^}]*white-space:pre-wrap;[^}]*\}/)
+  assert.match(card, /\.sound-scout-card__report \{[^}]*max-height:70vh;[^}]*overflow:auto;/)
+})
+
+test('register leaves the transcript directive out, and an SDK without useComposerSession keeps the recorder without the card', async () => {
+  {
+    const { ctx } = await setupRegistered()
+    assert.equal(ctx.registered.some(item => item.area === 'transcript.directive'), false)
+    ctx.disposers.forEach(fn => fn())
+  }
+  {
+    const { ctx, calls } = await setupRegistered({ sdk: { useComposerSession: undefined } })
+    same(ctx.registered.map(c => [c.id, c.area]), [['health', 'palette'], ['record', 'composer.actions']])
+    same(notices(calls), [])
+    ctx.disposers.forEach(fn => fn())
+  }
 })

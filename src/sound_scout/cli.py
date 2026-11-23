@@ -23,7 +23,10 @@ plan mode of `jobs.MODES` (default `auto`), checked by `jobs.resolved_plan`, so 
 <run_id> --criterion <criterion>` (always together) queues a control attempt: `jobs.submit`
 checks the criterion and the initial run as `compare` does, the runner compares the two attempts
 after the analysis and `status`/`result` show `control` and `compare`. `jobs retry` queues a
-failed or cancelled job again as its next attempt (`jobs.retry`). `jobs limits` prints
+failed or cancelled job again as its next attempt (`jobs.retry`). `jobs report` prints
+`report.md` of the run that `jobs result` answers with (`jobs.report`, at most
+`jobs.REPORT_VIEW_MAX_BYTES`; a cut one with a line on stderr that names the whole file,
+`<run_dir>/report.md` under the data root). `jobs limits` prints
 `jobs.limits`: the budgets, the queue limits and `jobs.staging_root`, which the Hermes plugin
 reads instead of the configuration file.
 The exit code is 0 whatever the job state or the result status is, 1 on a refusal. `jobs run`
@@ -83,9 +86,10 @@ SUBCOMMANDS = {
     "eval": "evaluate ready analyze results against the corpus labels (Gate 1)",
     "smoke": "run the real decoder and acoustics on synthetic audio (and, when named, ASR on the "
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
-    "jobs": "queue an analysis and follow it: submit, status, result, cancel, retry; run the "
-    "queue: run, start, recover; print the budgets and the staging root: limits; deliver the "
-    "final note: deliver-next, deliver-end, redeliver; bind an MCP job to its chat: bind",
+    "jobs": "queue an analysis and follow it: submit, status, result, report, cancel, retry; "
+    "run the queue: run, start, recover; print the budgets and the staging root: limits; "
+    "deliver the final note: deliver-next, deliver-end, redeliver; bind an MCP job to its chat: "
+    "bind",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -223,6 +227,7 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
     for action, help_text in (
         ("status", "print the state of a job"),
         ("result", "print the compact answer of the run of a job"),
+        ("report", "print report.md of the run that `jobs result` answers with, up to 256 KiB"),
         ("cancel", "cancel a job: a queued job at once, a running one by its cancel marker"),
         ("retry", "queue a failed or cancelled job again as its next attempt"),
     ):
@@ -487,6 +492,7 @@ def run_jobs(args: argparse.Namespace) -> int:
             call = {
                 "status": jobs.status,
                 "result": jobs.result,
+                "report": jobs.report,
                 "cancel": jobs.cancel,
                 "retry": jobs.retry,
             }
@@ -512,6 +518,15 @@ def run_jobs(args: argparse.Namespace) -> int:
         if "compare" in answer:
             print(f"compare: {_plain(answer['compare'])}")
         print(format_analysis(answer, answer["run_dir"], reused=False))
+    elif args.jobs_command == "report":
+        sys.stdout.write(answer["markdown"])
+        if answer["truncated"]:
+            print(
+                f"sound-scout jobs: report.md is {answer['size_bytes']} bytes; printed the first "
+                f"{len(answer['markdown'].encode('utf-8'))}; the whole file is "
+                f"{answer['run_dir']}/report.md under the data root",
+                file=sys.stderr,
+            )
     else:
         print("\n".join(f"{key}: {_plain(value)}" for key, value in answer.items()))
     return 0
