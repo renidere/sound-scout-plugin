@@ -93,6 +93,46 @@ function desktopErrorText(error) {
   return text || 'нет ответа сервера'
 }
 
+// Черновик записи живёт в IndexedDB рендерера от остановки до серверного receipt (0013 § 3.3, #109).
+const DRAFTS_DB = 'sound-scout-recorder'
+const DRAFTS = 'drafts'
+const DRAFT_TOKEN = /^[0-9a-f]{12}$/
+
+export function draftStore(idb) {
+  let opening = null
+  const open = () => opening ??= new Promise((resolve, reject) => {
+    const request = idb.open(DRAFTS_DB, 1)
+    request.onupgradeneeded = () => request.result.createObjectStore(DRAFTS, { keyPath: 'token' })
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  }).catch(error => { opening = null; throw error })
+  const run = async (mode, call) => {
+    const db = await open()
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(DRAFTS, mode)
+      const request = call(tx.objectStore(DRAFTS))
+      tx.oncomplete = () => resolve(request.result)
+      tx.onerror = tx.onabort = () => reject(tx.error)
+    })
+  }
+  return {
+    put: draft => run('readwrite', store => store.put(draft)),
+    remove: token => run('readwrite', store => store.delete(token)),
+    list: () => run('readonly', store => store.getAll())
+  }
+}
+
+const isText = value => typeof value === 'string' && value.length > 0
+const isOwner = owner => owner === null || (isText(owner?.connectionId) && isText(owner?.profile))
+
+function validDraft(draft) {
+  return DRAFT_TOKEN.test(draft?.token) && Number.isFinite(draft.createdAt) &&
+    draft.wav?.byteLength > WAV_HEADER_BYTES && isText(draft.target?.stored) && isOwner(draft.target.owner) &&
+    isOwner(draft.owner) && typeof draft.submitted === 'boolean' &&
+    (draft.attach === null || (isText(draft.attach?.name) && draft.attach.ref_text?.startsWith?.('@file:') === true)) &&
+    (draft.attach !== null || !draft.submitted) && (draft.attach === null || draft.owner !== null)
+}
+
 const positive = value => Number.isInteger(value) && value > 0
 const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
 
@@ -119,7 +159,8 @@ export class Recorder {
     now = () => Date.now(),
     pollEveryMs = 3000,
     maxPollFailures = 10,
-    random = n => crypto.getRandomValues(new Uint8Array(n))
+    random = n => crypto.getRandomValues(new Uint8Array(n)),
+    idb = globalThis.indexedDB
   } = {}) {
     this.host = host
     this.ctx = ctx
@@ -128,7 +169,9 @@ export class Recorder {
     this.pollEveryMs = pollEveryMs
     this.maxPollFailures = maxPollFailures
     this.random = random
-    this.state = atom({ phase: 'idle', error: '', startedAt: 0, limitSeconds: 0, canAnalyze: false, intakeError: '' })
+    this.state = atom({
+      phase: 'idle', error: '', startedAt: 0, limitSeconds: 0, canAnalyze: false, intakeError: '', restored: false, unprotected: false
+    })
     this.elapsed = atom(0)
     this.level = atom(0)
     this.job = atom(null)
@@ -140,6 +183,71 @@ export class Recorder {
     this.pending = null
     this.target = null
     this.budget = null
+    this.drafts = draftStore(idb)
+    this.draftWrites = Promise.resolve()
+    this.storedTokens = new Set()
+    this.droppedTokens = new Set()
+  }
+
+  // Записи в хранилище идут цепочкой по одной, запись и отправка их не ждут.
+  // Зависшая операция IndexedDB останавливает все следующие записи хранилища до перезагрузки окна.
+  draftWrite(step) {
+    this.draftWrites = this.draftWrites.then(step).catch(() => {})
+  }
+
+  saveDraft(pending, target) {
+    const snapshot = {
+      token: pending.token, createdAt: pending.createdAt, target, owner: pending.owner, attach: pending.attach, submitted: pending.submitted
+    }
+    const mark = unprotected => { if (this.pending === pending) this.update({ unprotected }) }
+    this.draftWrite(async () => {
+      try {
+        pending.wav ??= await pending.blob.arrayBuffer()
+        await this.drafts.put({ ...snapshot, wav: pending.wav })
+        this.storedTokens.add(pending.token)
+      } catch {
+        mark(true)
+        return
+      }
+      mark(false)
+    })
+  }
+
+  dropDraft(token) {
+    this.droppedTokens.add(token)
+    this.draftWrite(async () => {
+      const stored = this.storedTokens.delete(token)
+      try {
+        await this.drafts.remove(token)
+      } catch {
+        if (stored) {
+          this.host.notify({
+            kind: 'warning', message: 'Sound Scout: сохранённую запись не удалось удалить из хранилища окна. Она снова появится при следующей загрузке.'
+          })
+        }
+      }
+    })
+  }
+
+  // Запись предлагается сразу после чтения хранилища; ответ /health только открывает разбор.
+  async restore() {
+    let drafts
+    try { drafts = await this.drafts.list() } catch { return }
+    for (const draft of drafts) if (!validDraft(draft)) this.dropDraft(draft?.token)
+    const draft = drafts
+      .filter(draft => validDraft(draft) && !this.droppedTokens.has(draft.token))
+      .sort((a, b) => a.createdAt - b.createdAt)[0]
+    if (!draft || this.state.get().phase !== 'idle') return
+    this.storedTokens.add(draft.token)
+    this.target = { stored: draft.target.stored, owner: draft.target.owner }
+    const pending = this.pending = {
+      blob: new Blob([draft.wav], { type: 'audio/wav' }), wav: draft.wav, dataUrl: null, token: draft.token,
+      createdAt: draft.createdAt, owner: draft.owner, attach: draft.attach, submitted: draft.submitted, job: null
+    }
+    this.update({ phase: 'ready', restored: true, unprotected: false, error: '', canAnalyze: false, intakeError: 'health_pending' })
+    this.host.notify({ kind: 'info', message: 'Sound Scout: есть неотправленная запись. Отправь её в исходный чат или удали.' })
+    const health = await this.readBudget().catch(error => ({ canAnalyze: false, intakeError: error.code }))
+    if (this.pending === pending) this.update({ canAnalyze: health.canAnalyze, intakeError: health.intakeError })
   }
 
   update(values) {
@@ -178,7 +286,7 @@ export class Recorder {
       owner: owner ? { connectionId: owner.connectionId, profile: owner.profile } : null
     }
     this.pending = null
-    this.update({ phase: 'starting', error: '' })
+    this.update({ phase: 'starting', error: '', restored: false, unprotected: false })
     if (!target.stored) {
       this.update({ phase: 'idle', error: 'Открой существующий чат перед записью.' })
       return
@@ -287,16 +395,23 @@ export class Recorder {
   }
 
   cancel() {
+    const token = this.pending?.token
+    this.discard()
+    if (token) this.dropDraft(token)
+  }
+
+  // Выгрузка плагина не удаляет черновик: его предложит следующая загрузка.
+  discard() {
     this.generation++
     this.releaseCapture()
     this.chunks = []
     this.pending = null
-    this.update({ phase: 'idle', error: '' })
+    this.update({ phase: 'idle', error: '', restored: false })
   }
 
   dispose() {
     this.pollGeneration++
-    this.cancel()
+    this.discard()
   }
 
   stop() {
@@ -309,8 +424,9 @@ export class Recorder {
     }
     finally { this.chunks = []; this.releaseCapture() }
     const token = Array.from(this.random(6), byte => byte.toString(16).padStart(2, '0')).join('')
-    this.pending = { blob, dataUrl: null, token, owner: null, attach: null, submitted: false, job: null }
+    this.pending = { blob, dataUrl: null, token, createdAt: this.now(), owner: null, attach: null, submitted: false, job: null }
     this.update({ phase: 'ready' })
+    this.saveDraft(this.pending, this.target)
   }
 
   async resolveRoute(target) {
@@ -373,6 +489,7 @@ export class Recorder {
               throw new Error('Сервер не принял аудио')
             }
             pending.attach = { ref_text: uploaded.ref_text, name }
+            this.saveDraft(pending, target)
           }
           message = 'Чат не принял сообщение. Аудио уже загружено, повтори отправку.'
           const receipt = await this.host.requestProfile(route, 'prompt.submit', {
@@ -381,6 +498,7 @@ export class Recorder {
           if (generation !== this.generation) return
           if (typeof receipt?.admission_id !== 'string' || !receipt.admission_id) throw new Error('Чат не подтвердил сообщение')
           pending.submitted = true
+          if (analyze) this.saveDraft(pending, target)
         } finally { release?.() }
       }
       if (analyze && !pending.job) {
@@ -389,7 +507,8 @@ export class Recorder {
         if (generation !== this.generation) return
       }
       this.pending = null
-      this.update({ phase: 'idle' })
+      this.dropDraft(pending.token)
+      this.update({ phase: 'idle', restored: false })
       this.host.notify({ kind: 'success', message: analyze ? 'Голосовое отправлено, разбор принят' : 'Голосовое отправлено' })
     } catch (error) {
       if (generation !== this.generation) return
@@ -529,19 +648,25 @@ function RecorderControls({ recorder }) {
   const status = phase === 'recording' ? `${clock(elapsed)} / ${clock(state.limitSeconds)}`
     : phase === 'starting' ? 'Микрофон…'
     : phase === 'sending' ? 'Отправка…'
+    : state.restored ? 'Неотправленная запись'
     : 'К отправке'
   children.push(jsxs('span', { role: 'status', className: 'sound-scout-recorder__status', children: [
     phase === 'recording' && jsx('span', { className: 'sound-scout-recorder__dot', 'aria-hidden': true }),
     jsx('span', { children: status }),
     phase === 'recording' && jsx(SignalMeter, { recorder })
   ] }, 'status'))
+  if (state.unprotected) {
+    children.push(jsx('span', { role: 'note', className: 'sound-scout-recorder__job', children: 'Запись не защищена от перезагрузки окна' }, 'unprotected'))
+  }
   children.push(action({ label: 'Отправить', icon: 'send', title: 'Отправить запись в чат', disabled: busy, onClick: () => recorder.send() }))
   children.push(action({
     label: 'Отправить и разобрать', icon: 'pulse',
     title: state.canAnalyze ? 'Отправить запись в чат и поставить её на разбор' : `Разбор недоступен: ${state.intakeError}`,
     disabled: busy || !state.canAnalyze, onClick: () => recorder.send({ analyze: true })
   }))
-  children.push(action({ label: 'Отмена', icon: 'close', title: 'Отменить запись', disabled: busy, onClick: () => recorder.cancel() }))
+  children.push(state.restored
+    ? action({ label: 'Удалить', icon: 'trash', title: 'Удалить сохранённую запись', disabled: busy, onClick: () => recorder.cancel() })
+    : action({ label: 'Отмена', icon: 'close', title: 'Отменить запись', disabled: busy, onClick: () => recorder.cancel() }))
   return jsxs('div', { className: 'sound-scout-recorder', 'data-phase': phase, children })
 }
 
@@ -597,6 +722,7 @@ export default {
     }
     const recorder = new Recorder(host, ctx)
     ctx.register({ id: 'record', area: COMPOSER_AREAS.actions, render: () => jsx(RecorderControls, { recorder }) })
+    recorder.restore().catch(() => {})
     const beforeUnload = event => {
       if (recorder.state.get().phase === 'idle') return
       event.preventDefault()

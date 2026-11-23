@@ -41,6 +41,7 @@ PACKAGE = REPO / "hermes" / "plugin" / "sound-scout"
 API = PACKAGE / "dashboard" / "plugin_api.py"
 PLUGIN_JS = PACKAGE / "desktop" / "plugin.js"
 RECORDER_SUITE = REPO / "tests" / "js" / "recorder.test.mjs"
+RECORDER_DRAFTS_SUITE = REPO / "tests" / "js" / "recorder_drafts.test.mjs"
 DECISION = REPO / "docs" / "decisions" / "0015-spike-b-backend-package.md"
 CLI = Path(sys.executable).with_name("sound-scout")
 ROUTES = {("GET", "/health"), ("POST", "/jobs"), ("GET", "/jobs/{job_id}")}
@@ -1030,6 +1031,11 @@ def test_desktop_plugin_uses_stock_calls_the_three_routes_and_the_directive(api)
 def test_desktop_recorder_node_suite_passes(node: str) -> None:
     """The recorder against a fake stock SDK: its contract, not the real Windows Desktop (#105)."""
     assert assert_node_suite_passes(node, RECORDER_SUITE, REPO) >= 29
+
+
+def test_desktop_recorder_draft_node_suite_passes(node: str) -> None:
+    """The pending WAV in a fake IndexedDB until the receipt, its restore and delete (#109)."""
+    assert assert_node_suite_passes(node, RECORDER_DRAFTS_SUITE, REPO) >= 14
 
 
 def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
