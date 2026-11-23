@@ -203,7 +203,7 @@ class Scenario:
     watchdog: bool = False
     expect_error: str | None = None
     stale_s: float | None = None
-    signal_after: tuple[str, int] | None = None
+    signal_when: Callable[[Path], bool] | None = None
 
 
 def _block_end(model: str, block: str, action: Callable) -> dict:
@@ -774,6 +774,33 @@ def check_sigterm(o: Outcome, c: Checks) -> None:
     c("no process of the attempt left", not left.strip(), left.strip().splitlines()[:3])
 
 
+def _journal_has(out: Path, event: str, **fields) -> bool:
+    found = sorted((out / vast.GPU_DIR).glob(f"*/{vast.JOURNAL_FILE}"))
+    if not found:
+        return False
+    with contextlib.suppress(vast.VastError):
+        return any(
+            e["event"] == event and all(e.get(k) == v for k, v in fields.items())
+            for e in vast.Journal(found[-1]).replay()
+        )
+    return False
+
+
+def check_sigterm_late(o: Outcome, c: Checks) -> None:
+    c("deploy finished its path and exited 0", o.error == 0, o.error)
+    signals = o.kinds("signal")
+    c(
+        "the late signal is journaled as deferred",
+        [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", True)],
+        signals,
+    )
+    for model in (M1, M2):
+        model_ok(o, c, model)
+    downloaded(o, c)
+    destroyed(o, c)
+    no_secret(o, c)
+
+
 REAL_DOC = vast.REPO_ROOT / "docs/decisions/0028-gpu-reference-gate0.md"
 REAL_ENVELOPE_TOP = {"dph_total": 1.2, "inet_down_cost": 0.0043, "inet_up_cost": 0.0043}
 
@@ -1095,7 +1122,15 @@ SCENARIOS = [
         {},
         check_sigterm,
         expect_error="any",
-        signal_after=(M1, 5),
+        signal_when=lambda out: _gate0_sent(_gate0_trace_path(out, M1)) >= 5,
+    ),
+    Scenario(
+        "sigterm_in_final_path",
+        "SIGTERM после последней модели, во время download или destroy",
+        {"fake": lambda fake: setattr(fake, "destroy_lag", 40)},
+        check_sigterm_late,
+        expect_error="any",
+        signal_when=lambda out: _journal_has(out, "model_outcome", model=M2),
     ),
     Scenario(
         "truncated_gate0_day",
@@ -1202,20 +1237,18 @@ def _dry(scenario: Scenario, out: Path, holder: dict) -> dict:
 
 
 def _signalled(scenario: Scenario, out: Path) -> int | None:
-    """The dry run in a child process (`--child`), signalled once Gate 0 of the model sent
-    the given count, as `systemctl stop` would signal `deploy`; returns its exit code."""
-    model, count = scenario.signal_after
+    """The dry run in a child process (`--child`), sent SIGTERM once `signal_when(out)` holds,
+    as `systemctl stop` would signal `deploy`; returns its exit code."""
     log = open(out.parent / f"{scenario.name}.child.log", "wb")  # noqa: SIM115
     child = subprocess.Popen(
         [sys.executable, "-m", "sound_scout.eval.rehearsal", "--child", scenario.name,
          "--out", str(out)],
         stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
     )  # fmt: skip
-    trace = _gate0_trace_path(out, model)
     ends = time.monotonic() + 300
     try:
         while child.poll() is None and time.monotonic() < ends:
-            if _gate0_sent(trace) >= count:
+            if scenario.signal_when(out):
                 child.send_signal(signal.SIGTERM)
                 break
             time.sleep(0.05)
@@ -1236,7 +1269,7 @@ def run_scenario(scenario: Scenario, out: Path) -> dict:
     watchdog = Watchdog(out, holder).start() if scenario.watchdog else None
     result = None
     try:
-        if scenario.signal_after is not None:
+        if scenario.signal_when is not None:
             error = _signalled(scenario, out)
         else:
             result = _dry(scenario, out, holder)

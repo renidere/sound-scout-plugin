@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -2106,3 +2107,48 @@ def test_q_s_parses_as_a_closed_answer_and_the_gate0_questions_keep_their_pin() 
     assert gate0.questions_sha256() == (
         "34871259fa7ad301b1cd5ee24182664e79c3b1b7439bb1741204038e56cced82"
     )
+
+
+def test_a_request_cut_by_the_stacks_cap_is_no_rule_timeout_and_the_day_is_incomplete(
+    controls, monkeypatch
+) -> None:
+    hang = socket.socket()
+    hang.bind(("127.0.0.1", 0))
+    hang.listen(16)
+    kwargs = {**controls["kwargs"], "server_port": hang.getsockname()[1]}
+    monkeypatch.setattr(gate0, "_wait_ready", lambda *args: None)
+    monkeypatch.setattr(gate0, "_vllm_version", lambda client: "0.34.0")
+    monkeypatch.setattr(gate0.Client, "text_tokens", lambda self, text: None)
+    try:
+        result = gate0.run_spike(
+            "2026-11-22", controls["config"], **kwargs, timeout_cap=lambda: 0.3
+        )
+    finally:
+        hang.close()
+    lines = _trace(controls["out"] / gate0.ATTEMPTS_DIR / "1")[1:]
+    assert lines[0]["limit"] == "timeout_cap"
+    assert {line.get("not_sent") for line in lines[1:]} == {"timeout_cap"}
+    assert result["stop_reason"] == "timeout_cap"
+
+
+def test_a_cancelled_vllm_day_records_cancelled_and_still_writes_its_verdict(
+    controls,
+) -> None:
+    """The controls-only day has no verdict to lose (`not_applicable`); a full day stopped as
+    `cancelled` is `incomplete` (`test_a_vllm_day_the_stack_stopped_has_no_gate0_verdict`)."""
+    asked = []
+
+    def stop_check():
+        asked.append(1)
+        if len(asked) == 3:
+            raise KeyboardInterrupt
+        return None
+
+    with pytest.raises(KeyboardInterrupt):
+        gate0.run_spike(
+            "2026-11-22", controls["config"], **controls["kwargs"], stop_check=stop_check
+        )
+    attempt = controls["out"] / gate0.ATTEMPTS_DIR / "1"
+    assert json.loads((attempt / gate0.RUN_FILE).read_text())["stop_reason"] == "cancelled"
+    verdict = json.loads((attempt / gate0.VERDICT_FILE).read_text())
+    assert verdict["verdict"] == "not_applicable" and verdict["stop_reason"] == "cancelled"

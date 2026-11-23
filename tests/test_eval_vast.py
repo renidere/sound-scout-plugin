@@ -2847,3 +2847,55 @@ def test_launch_argv_runs_the_deploy_checks_and_prints_the_argv(
     assert f"--setenv=SOUND_SCOUT_CONFIG={toml}" in printed["argv"]
     assert printed["package_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert not (dry.data_root / "gpu" / "launches" / "x").exists()
+
+
+def test_a_request_is_cut_two_minutes_past_the_moment_the_clock_reaches_the_soft_spend(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _soft_run(tmp_path, fake, key_file, spend_soft_usd=1.9, in_gb=100.0, out_gb=0.0)
+    assert vast.spend_end_unix(run) is None and vast.timeout_cap(run) == math.inf
+    prices = {"dph_total": 1.2, "inet_down_cost": 0.004, "inet_up_cost": 0.004}
+    created = run.journal.append("create_requested", offer_id=1, prices=prices)
+    run.journal.append("create_response", instance_id=7)
+    spend_end = created["t"] + (1.9 - 0.4) / 1.2 * 3600
+    assert vast.spend_end_unix(run) == pytest.approx(spend_end)
+    cap = spend_end + vast.REQUEST_PAST_SOFT_END_S - time.time()
+    assert vast.timeout_cap(run) == pytest.approx(cap, abs=1)
+    run.soft_end = time.time() + 60
+    assert vast.timeout_cap(run) == pytest.approx(180, abs=1)
+
+
+def test_recover_past_the_soft_stop_resends_nothing_and_asks_no_host(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _RecoverHost()
+    run = _recover_run(tmp_path, fake, key_file, host)
+    run.soft_end = time.time() - 1
+    assert vast.recover(run, _NeverHealthy(), "/workspace/out/m", "m") == "soft_end"
+    assert host.calls == [] and host.reopened == []
+
+
+def test_an_rss_kill_by_hostrun_is_the_rules_limit_not_a_server_exit(
+    tmp_path: Path, key_file, fake
+) -> None:
+    killed = _state(exit={"reason": "rss_limit", "returncode": -9, "t": 1.0})
+    run = _recover_run(tmp_path, fake, key_file, _RecoverHost(states=[killed]))
+    assert vast.recover(run, _NeverHealthy(), "/workspace/out/m", "m") == "rss_limit"
+    assert "rss_limit" in gate0.RULE_STOPS
+
+
+def test_a_signal_inside_the_final_path_is_journaled_and_cuts_nothing(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _soft_run(tmp_path, fake, key_file)
+    saved = vast.cancel_on_signals(run)
+    try:
+        vast.defer_signals(run, saved)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+        signals = [e for e in run.journal.replay() if e["event"] == "signal"]
+        assert [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", True)]
+        assert run.fatal == "cancelled"
+    finally:
+        vast.restore_signals(saved)
+    assert vast.defer_signals(run, {}) is None

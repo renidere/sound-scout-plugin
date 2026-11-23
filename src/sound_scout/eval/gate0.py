@@ -1409,71 +1409,88 @@ def run_spike(
     _mkdir(attempt / REQUESTS_DIR, config_)
     _mkdir(attempt / RESPONSES_DIR, config_)
     stop_reason = None
-    with (
-        paths.open_output(attempt, TRACE_FILE, config_) as trace,
-        paths.open_output(attempt, SERVER_LOG, config_) as log,
-    ):
-        if argv is None:
-            process, copier, watch = None, None, NoWatch()
-        else:
-            process, copier = proc.start(argv, log=log, max_log_bytes=SERVER_LOG_MAX_BYTES)
-            watch = RssWatch(process, rss_limit).start()
-        try:
-            started = time.monotonic()
-            stop_reason = _wait_ready(client, process, watch, load_timeout)
-            record["model_load_s"] = round(time.monotonic() - started, 3)
-            if argv is None and stop_reason is None:
-                record["server_version"] = _vllm_version(client)
-            _trace(trace, _empty_input(client))
-            for entry in entries:
-                if stop_reason is None and stop_check is not None:
-                    stop_reason = stop_check()
-                if stop_reason is not None:
-                    _trace(trace, {**_trace_keys(entry), "sent": False, "not_sent": stop_reason})
-                    continue
+    try:
+        with (
+            paths.open_output(attempt, TRACE_FILE, config_) as trace,
+            paths.open_output(attempt, SERVER_LOG, config_) as log,
+        ):
+            if argv is None:
+                process, copier, watch = None, None, NoWatch()
+            else:
+                process, copier = proc.start(argv, log=log, max_log_bytes=SERVER_LOG_MAX_BYTES)
+                watch = RssWatch(process, rss_limit).start()
+            try:
+                started = time.monotonic()
+                stop_reason = _wait_ready(client, process, watch, load_timeout)
+                record["model_load_s"] = round(time.monotonic() - started, 3)
+                if argv is None and stop_reason is None:
+                    record["server_version"] = _vllm_version(client)
+                _trace(trace, _empty_input(client))
+                for entry in entries:
+                    if stop_reason is None and stop_check is not None:
+                        stop_reason = stop_check()
+                    if stop_reason is not None:
+                        _trace(
+                            trace, {**_trace_keys(entry), "sent": False, "not_sent": stop_reason}
+                        )
+                        continue
 
-                def send(write_request: bool = True, entry=entry) -> dict:
-                    timeout = request_timeout
-                    if timeout_cap is not None:
-                        timeout = min(timeout, timeout_cap())
-                    return _send(
-                        entry,
-                        out,
-                        manifest,
-                        client,
-                        watch,
-                        attempt,
-                        config_,
-                        timeout,
-                        sampling(runtime),
-                        write_request=write_request,
+                    def send(write_request: bool = True, entry=entry) -> dict:
+                        timeout = request_timeout
+                        if timeout_cap is not None:
+                            timeout = min(timeout, timeout_cap())
+                        line = _send(
+                            entry,
+                            out,
+                            manifest,
+                            client,
+                            watch,
+                            attempt,
+                            config_,
+                            timeout,
+                            sampling(runtime),
+                            write_request=write_request,
+                        )
+                        if line.get("limit") == "request_timeout" and timeout < request_timeout:
+                            # the stack's cap cut it, not the rule's limit: no model timeout
+                            line["limit"] = "timeout_cap"
+                        return line
+
+                    line, transport_stop = send_checked(send, transport_check)
+                    _trace(trace, line)
+                    exited = process is not None and process.poll() is not None
+                    stop_reason = (
+                        transport_stop or line.get("limit") or ("server_exited" if exited else None)
                     )
-
-                line, transport_stop = send_checked(send, transport_check)
-                _trace(trace, line)
-                exited = process is not None and process.poll() is not None
-                stop_reason = (
-                    transport_stop or line.get("limit") or ("server_exited" if exited else None)
+            except BaseException as error:
+                cancelled = isinstance(error, KeyboardInterrupt | SystemExit)
+                stop_reason = stop_reason or ("cancelled" if cancelled else "error")
+                raise
+            finally:
+                status = {} if process is None else proc_status(process.pid)
+                watch.stop()
+                if process is not None:
+                    stop_server(process)
+                    copier.join(STOP_GRACE_S)
+                record.update(
+                    {
+                        "finished_at": _now(),
+                        "stop_reason": stop_reason,
+                        "rss_exceeded_bytes": watch.exceeded,
+                        "rss_peak_bytes": watch.peak,
+                        "vm_hwm_bytes": status.get("VmHWM"),
+                        "server_returncode": None if process is None else process.returncode,
+                        "http_calls": client.calls,
+                    }
                 )
-        finally:
-            status = {} if process is None else proc_status(process.pid)
-            watch.stop()
-            if process is not None:
-                stop_server(process)
-                copier.join(STOP_GRACE_S)
-            record.update(
-                {
-                    "finished_at": _now(),
-                    "stop_reason": stop_reason,
-                    "rss_exceeded_bytes": watch.exceeded,
-                    "rss_peak_bytes": watch.peak,
-                    "vm_hwm_bytes": status.get("VmHWM"),
-                    "server_returncode": None if process is None else process.returncode,
-                    "http_calls": client.calls,
-                }
-            )
-            record["cgroup"].update(memory_usage(cgroup, cgroup_root))
-            _write_json(attempt, RUN_FILE, record, config_)
+                record["cgroup"].update(memory_usage(cgroup, cgroup_root))
+                _write_json(attempt, RUN_FILE, record, config_)
+    except BaseException:
+        if runtime == "vllm" and (attempt / RUN_FILE).is_file():
+            # a cancelled or broken vllm day is still recorded: `incomplete`, no model verdict
+            with contextlib.suppress(Exception):
+                _write_json(attempt, VERDICT_FILE, evaluate(attempt), config_)
+        raise
     result = evaluate(attempt)
     _write_json(attempt, VERDICT_FILE, result, config_)
     return result
@@ -1782,27 +1799,29 @@ RULE_STOPS = frozenset({"request_timeout", "rss_limit", "precondition_failed"})
 
 
 def _incomplete(result: dict, record: Mapping, lines: list[Mapping]) -> dict:
-    """A `vllm` day the stack stopped (soft end, spend, a lost tunnel or host, a server that
-    exited or went silent, a cancellation) has no Gate 0 verdict: its unanswered requests are
-    the server's or the stack's, not the model's answers (0028, «Правка 2026-11-23»). Only the
-    rule's own limits (`RULE_STOPS`) count unsent requests as failed, as in 0007 § 3. The
-    rule's reading of the answered part stays as `rule_verdict`, for the record only."""
+    """A `vllm` day the stack stopped (soft end, spend, a request cut by the stack's cap, a lost
+    tunnel or host, a server that exited or went silent, a cancellation, an error) has no Gate 0
+    verdict: its unanswered requests are the server's or the stack's, not the model's answers
+    (0028 Д.9). Only the rule's own limits (`RULE_STOPS`: the 600 s timeout, RSS, the
+    preconditions) count unsent requests as failed, as in 0007 § 3. The rule's reading of the
+    answered part stays as `rule_verdict`, for the record only."""
     stop = result["stop_reason"]
     if record.get("runtime") != "vllm" or stop is None or stop in RULE_STOPS:
         return result
     if result["verdict"] == "not_applicable":
         return result
-    planned = [line for line in lines if line["variant"] != "E0"]
-    unanswered = [line for line in planned if line.get("http_status") != 200]
+    sent = [line for line in lines if line["variant"] != "E0"]
+    planned = record.get("requests_planned") or len(sent)
+    unanswered = planned - sum(line.get("http_status") == 200 for line in sent)
     result.update(
         rule_verdict=result["verdict"],
         rule_reason=result["reason"],
         verdict="incomplete",
         reason=(
-            f"день не завершён ({stop}): без ответа {len(unanswered)} из {len(planned)} "
+            f"день не завершён ({stop}): без ответа {unanswered} из {planned} "
             "запросов; вердикта Gate 0 нет"
         ),
-        unanswered=len(unanswered),
+        unanswered=unanswered,
     )
     return result
 

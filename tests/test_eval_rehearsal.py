@@ -42,8 +42,8 @@ def test_every_plan_scenario_has_a_rehearsal() -> None:
         "gpu_not_free", "offer_fallback", "final_pack_blocked", "compressed_time",
         "server_not_stopping_after_failure", "extended_error",
         "network_blip_m1", "tunnel_slow_reopen", "half_alive_tunnel", "sigterm_mid_gate0",
-        "truncated_gate0_day", "spend_tail_real_numbers", "credit_below_ceiling",
-        "gpu_ext_sha_mismatch",
+        "sigterm_in_final_path", "truncated_gate0_day", "spend_tail_real_numbers",
+        "credit_below_ceiling", "gpu_ext_sha_mismatch",
         "refusals", "analysis", "pack",
     } <= names  # fmt: skip
 

@@ -2168,6 +2168,22 @@ def cancel_on_signals(run: Run) -> dict:
     return {number: signal.signal(number, cancel) for number in CANCEL_SIGNALS}
 
 
+def defer_signals(run: Run, saved: Mapping) -> None:
+    """Inside the `finally` of the attempt (download, destroy) a signal only is journaled: that
+    path is what the signal asks for, so it must not be cut short."""
+    if not saved:
+        return
+
+    def note(signum: int, _frame) -> None:
+        run.fatal = run.fatal or "cancelled"
+        with contextlib.suppress(Exception):
+            run.journal.append("signal", name=signal.Signals(signum).name, deferred=True)
+
+    for number in CANCEL_SIGNALS:
+        if signal.getsignal(number) is not signal.SIG_IGN:
+            signal.signal(number, note)
+
+
 def restore_signals(saved: Mapping) -> None:
     for number, handler in saved.items():
         signal.signal(number, handler)
@@ -2217,12 +2233,34 @@ REQUEST_PAST_SOFT_END_S = 120.0
 MIN_REQUEST_TIMEOUT_S = 10.0
 
 
+def spend_end_unix(run: Run) -> float | None:
+    """When the clock estimate (`spent_estimate`) reaches `spend_soft_usd`, by the create's
+    prices; None without a soft spend or a create."""
+    limit = run.package.get("spend_soft_usd")
+    if limit is None:
+        return None
+    requested = next((e for e in run.journal.replay() if e["event"] == "create_requested"), None)
+    if requested is None:
+        return None
+    try:
+        prices = requested.get("prices") or {}
+        dph = _number(prices.get("dph_total"), "dph_total")
+        traffic = estimate_usd(prices, 0.0, run.package["in_gb"], run.package["out_gb"])
+    except VastError:
+        return None
+    if dph <= 0:
+        return None
+    return requested["t"] + (limit - traffic) / dph * 3600
+
+
 def timeout_cap(run: Run) -> float:
-    """A request may run at most `REQUEST_PAST_SOFT_END_S` past the soft end, so the tail
-    (in-flight request, evidence, stop, download) fits between the soft end and the deadline."""
-    if run.soft_end is None:
+    """A request may run at most `REQUEST_PAST_SOFT_END_S` past the soft end or the moment the
+    clock estimate reaches the soft spend, whichever comes first, so the tail (in-flight
+    request, evidence, stop, download) fits before the deadline and before the early stop."""
+    ends = [t for t in (run.soft_end, spend_end_unix(run)) if t is not None]
+    if not ends:
         return math.inf
-    return max(MIN_REQUEST_TIMEOUT_S, run.soft_end + REQUEST_PAST_SOFT_END_S - time.time())
+    return max(MIN_REQUEST_TIMEOUT_S, min(ends) + REQUEST_PAST_SOFT_END_S - time.time())
 
 
 def check_credit(run: Run) -> None:
@@ -2277,6 +2315,12 @@ def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callab
         time.sleep(1.0)
 
 
+def _exit_outcome(error: ServerExited) -> str:
+    """`rss_limit` when `hostrun.py serve` killed vLLM for its RSS — the rule's own limit, as
+    in 0007 § 3 — and `server_exited` for any other exit."""
+    return "rss_limit" if error.reason == "rss_limit" else "server_exited"
+
+
 def recover(
     run: Run, client: gate0.Client, out: str, name: str, after_timeout: bool = False
 ) -> str:
@@ -2286,6 +2330,18 @@ def recover(
     restarted) and `/health` asked for up to `RECOVER_HEALTH_S`. `resend` only when the server
     answers again; after a timeout a tunnel that still carries `/health` means the request
     itself was slow: `timeout`, nothing is resent."""
+    stopped = soft_stop(run)
+    if stopped is not None:
+        # past the soft end or the soft spend nothing is resent, so the tail stays bounded
+        run.journal.append(
+            "transport_check",
+            model=name,
+            after_timeout=after_timeout,
+            tunnel_reopened=False,
+            health=None,
+            outcome=stopped,
+        )
+        return stopped
     if after_timeout and client.request("/health", timeout=5)[0] == 200:
         run.journal.append(
             "transport_check",
@@ -2307,8 +2363,8 @@ def recover(
     if outcome is None:
         try:
             _judge(state, late=True)
-        except ServerExited:
-            outcome = "server_exited"
+        except ServerExited as error:
+            outcome = _exit_outcome(error)
     if outcome is None and not after_timeout:
         health = client.request("/health", timeout=5)[0]
     if outcome is None and health != 200:
@@ -2320,8 +2376,8 @@ def recover(
                 RECOVER_HEALTH_S,
                 lambda: _state_or_none(run.host, out, run.journal, detail),
             )
-        except ServerExited:
-            outcome = "server_exited"
+        except ServerExited as error:
+            outcome = _exit_outcome(error)
     if outcome is None:
         outcome = "resend" if health == 200 else "server_unreachable"
     run.journal.append(
@@ -2866,6 +2922,7 @@ def run_attempt(
     except BaseException as error:
         failure = error
     finally:
+        defer_signals(run, saved_signals)
         if run.host is not None:
             state = summarize(journal.replay())
             if state["closed"] is None and not state["destroy_requested"]:
