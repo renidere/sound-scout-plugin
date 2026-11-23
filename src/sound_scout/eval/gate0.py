@@ -1096,16 +1096,23 @@ def memory_usage(cap: Mapping, cgroup_root: Path = CGROUP_ROOT) -> dict:
 
 
 class Client:
-    """HTTP to the local server only, without proxies; `calls` counts every request made."""
+    """HTTP to the local server only, without proxies; `calls` counts every request made and
+    `last_status` keeps the status of the last one (None: no HTTP answer)."""
 
     def __init__(self, port: int, model: str | None = None) -> None:
         self.base = f"http://{HOST}:{port}"
         self.model = model
         self.calls = 0
+        self.last_status: int | None = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def request(self, path: str, body: object = None, timeout: float = SERVICE_TIMEOUT_S):
         """(status, raw bytes, error); status None when no HTTP answer came."""
+        answer = self._request(path, body, timeout)
+        self.last_status = answer[0]
+        return answer
+
+    def _request(self, path: str, body: object, timeout: float):
         self.calls += 1
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
@@ -1546,29 +1553,33 @@ def transport_error(line: Mapping) -> bool:
 
 
 def send_checked(send: Callable[..., dict], transport_check) -> tuple[dict, str | None]:
-    """One request; after a transport error `transport_check` decides: `resend` sends it once
-    more without a second request file (`resent_after_tunnel`), any other answer is the reason
-    to stop. A request that ran out of time asks `transport_check(after_timeout=True)` once: a
-    tunnel that went stale while the server lives also shows as a timeout (#149); `timeout`
-    keeps the line as it is. Returns the trace line and that reason or None."""
+    """One request; after each transport error `transport_check` decides: `resend` sends it
+    again without a second request file (`resent_after_tunnel`, `resends`), any other answer is
+    the reason to stop. So a request is resent as often as the network comes back: only
+    `transport_check` ends it, by the step's own end (the soft end, the soft spend, a lost
+    host), never a count (#165). A request that ran out of time asks
+    `transport_check(after_timeout=True)`: a tunnel that went stale while the server lives also
+    shows as a timeout (#149); `timeout` keeps the line as it is. Returns the trace line and
+    that reason or None."""
     line = send()
     if transport_check is None:
         return line, None
-    if line.get("limit") == "request_timeout":
-        decision = transport_check(after_timeout=True)
-        if decision == "timeout":
+    first_error, resends = None, 0
+    while True:
+        if line.get("limit") == "request_timeout":
+            decision = transport_check(after_timeout=True)
+            if decision == "timeout":
+                return line, None
+        elif transport_error(line):
+            decision = transport_check()
+        else:
             return line, None
-    elif transport_error(line):
-        decision = transport_check()
-    else:
-        return line, None
-    if decision != "resend":
-        return line, decision
-    again = send(write_request=False)
-    again.update(resent_after_tunnel=True, first_error=line.get("error") or line.get("limit"))
-    if transport_error(again):
-        return again, "transport_errors"
-    return again, None
+        if decision != "resend":
+            return line, decision
+        first_error = first_error or line.get("error") or line.get("limit")
+        resends += 1
+        line = send(write_request=False)
+        line.update(resent_after_tunnel=True, first_error=first_error, resends=resends)
 
 
 def _send(

@@ -2011,7 +2011,7 @@ def test_a_transport_error_asks_the_check_once_and_its_reason_stops_the_day(
     assert [line["not_sent"] for line in lines[1:]] == ["server_exited"] * 8
 
 
-def test_send_checked_resends_once_after_the_tunnel_is_back_without_a_second_request_file():
+def test_send_checked_resends_after_the_tunnel_is_back_without_a_second_request_file():
     calls = []
 
     def send(write_request=True):
@@ -2023,9 +2023,30 @@ def test_send_checked_resends_once_after_the_tunnel_is_back_without_a_second_req
     line, stop = gate0.send_checked(send, lambda: "resend")
     assert calls == [True, False] and stop is None
     assert line["resent_after_tunnel"] is True and line["first_error"] == "ConnectionRefusedError"
-    again = {"n": 5, "sent": True, "http_status": None, "error": "x"}
-    line, stop = gate0.send_checked(lambda write_request=True: dict(again), lambda: "resend")
-    assert stop == "transport_errors" and line["resent_after_tunnel"] is True
+    assert line["resends"] == 1
+
+
+def test_send_checked_resends_after_every_transport_error_until_the_check_stops_it() -> None:
+    """A second (and a third) transport error of the same request is no stop of its own: the
+    request goes again while the check says `resend`, and the check's reason ends it (#165)."""
+    errors = iter(["ConnectionResetError", "IncompleteRead", "RemoteDisconnected"])
+
+    def send(write_request=True):
+        error = next(errors, None)
+        return {"n": 7, "sent": True, "http_status": None if error else 200, "error": error}
+
+    asked = []
+    line, stop = gate0.send_checked(send, lambda: asked.append(1) or "resend")
+    assert stop is None and line["http_status"] == 200 and len(asked) == 3
+    assert line["resends"] == 3 and line["first_error"] == "ConnectionResetError"
+    decisions = iter(["resend", "resend", "soft_end"])
+    lost = {"n": 8, "sent": True, "http_status": None, "error": "x"}
+    sent = []
+    line, stop = gate0.send_checked(
+        lambda write_request=True: sent.append(write_request) or dict(lost),
+        lambda: next(decisions),
+    )
+    assert stop == "soft_end" and sent == [True, False, False] and line["resends"] == 2
 
 
 def test_a_timeout_is_no_transport_error_and_asks_once_whether_the_tunnel_carried_it() -> None:
@@ -2055,8 +2076,9 @@ def test_a_timeout_is_no_transport_error_and_asks_once_whether_the_tunnel_carrie
     assert stop is None and calls == [True, False] and line["http_status"] == 200
     assert line["resent_after_tunnel"] is True and line["first_error"] == "request_timeout"
     calls.clear()
+    decisions = iter(["resend", "timeout"])  # the resent request timed out on a live tunnel
     line, stop = gate0.send_checked(
-        lambda write_request=True: calls.append(1) or dict(timeout), lambda **_: "resend"
+        lambda write_request=True: calls.append(1) or dict(timeout), lambda **_: next(decisions)
     )
     assert len(calls) == 2 and stop is None and line["limit"] == "request_timeout"
     line, stop = gate0.send_checked(lambda write_request=True: dict(timeout), None)

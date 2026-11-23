@@ -12,7 +12,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    # репетиция #149 (tests/test_eval_rehearsal.py): около 70 сценариев на поддельном стеке
+    # репетиция #149 (tests/test_eval_rehearsal.py): около 85 сценариев на поддельном стеке
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1

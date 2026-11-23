@@ -6,8 +6,10 @@ the real key file or arms a real timer: the fakes prove the contract of the stac
 """
 
 import dataclasses
+import errno
 import hashlib
 import io
+import itertools
 import json
 import math
 import os
@@ -2596,9 +2598,30 @@ def test_recover_waits_out_a_network_blip_then_reopens_the_tunnel_and_resends(
     run = _recover_run(tmp_path, fake, key_file, host)
     client = _TunnelClient(host, late=2)
     assert vast.recover(run, client, "/workspace/out/m", "m") == "resend"
-    assert host.reopened == [True] and run.fatal is None
+    # forced once, then a plain reopen after each failed /health while the server comes back
+    assert host.reopened == [True, False, False] and run.fatal is None
     (check,) = [e for e in run.journal.replay() if e["event"] == "transport_check"]
     assert (check["tunnel_reopened"], check["health"], check["outcome"]) == (True, 200, "resend")
+
+
+class _LostAgainHost(_RecoverHost):
+    """The forced reopen comes while the network is gone again: the tunnel stays dead until a
+    later plain reopen, once the network is back."""
+
+    def ensure_tunnel(self, force=False):
+        self.reopened.append(force)
+        self.tunnel_up = not force
+        return self.tunnel_up
+
+
+def test_recover_reopens_a_tunnel_a_second_loss_killed_while_it_waits_for_health(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _LostAgainHost()
+    run = _recover_run(tmp_path, fake, key_file, host)
+    client = _TunnelClient(host)
+    assert vast.recover(run, client, "/workspace/out/m", "m") == "resend"
+    assert host.reopened == [True, False]
 
 
 def test_recover_after_a_timeout_through_a_tunnel_that_answers_resends_nothing(
@@ -3221,3 +3244,196 @@ def test_a_retry_runs_with_what_is_left_of_a_short_step(tmp_path: Path, key_file
     with pytest.raises(vast.TransportError):
         vast.transport_retry(run, "gpu_free", action, time.time() + 0.5)
     assert len(calls) == 1
+
+
+# --- round 3 of the stack check (#165) -------------------------------------------------------
+
+
+def test_a_fork_the_station_refused_runs_the_step_again_after_a_growing_pause(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _RecoverHost()
+    run = _transport_run(tmp_path, fake, key_file, host, ssh_retry_s=1.2)
+    calls = []
+
+    def action(left: float) -> str:
+        calls.append(time.time())
+        if len(calls) <= 3:
+            raise OSError((errno.ENOMEM, errno.EAGAIN, errno.ENOMEM)[len(calls) - 1], "no fork")
+        return "done"
+
+    assert vast.transport_retry(run, "size m", action, time.time() + 30) == "done"
+    pauses = [round(b - a, 1) for a, b in itertools.pairwise(calls)]
+    assert pauses == [0.5, 1.0, 1.2]  # 0.5 s doubling, never longer than ssh_retry_s
+    retries = [e for e in run.journal.replay() if e["event"] == "transport_retry"]
+    assert [(e["outcome"], e["tries"]) for e in retries] == [("local_retry", n) for n in (1, 2, 3)]
+    assert retries[0]["error"] == "OSError: ENOMEM" and not host.calls  # the host is not asked
+
+
+def test_a_refused_fork_ends_the_step_at_its_end_and_any_other_os_error_at_once(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(), ssh_retry_s=0.2)
+    calls = []
+
+    def no_memory(left: float):
+        calls.append(left)
+        raise OSError(errno.ENOMEM, "no fork")
+
+    started = time.time()
+    with pytest.raises(OSError, match="no fork"):
+        vast.transport_retry(run, "pack", no_memory, time.time() + 1.0)
+    assert 0.6 < time.time() - started < 1.5 and len(calls) >= 4
+
+    def no_space(left: float):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        vast.transport_retry(run, "pack", no_space, time.time() + 30)
+    assert not [
+        e for e in run.journal.replay() if e.get("what") == "pack" and "ENOSPC" in e["error"]
+    ]
+
+
+class _Reopens:
+    def __init__(self) -> None:
+        self.forced: list[bool] = []
+
+    def __call__(self, force: bool = False) -> bool:
+        self.forced.append(force)
+        return force
+
+
+def test_the_health_wait_stops_at_once_on_the_soft_stop_and_skips_the_model() -> None:
+    stops = iter([None, None, "soft_end"])
+    started = time.monotonic()
+    with pytest.raises(vast.ModelSkipped, match="smoke: stopped while the server loads: soft_end"):
+        vast._wait_health(
+            _NeverHealthy(), 60.0, lambda: None, 0.0, 100.0, _Reopens(), lambda: next(stops)
+        )
+    assert 1.5 < time.monotonic() - started < 4
+    assert isinstance(vast.ModelSkipped("smoke", "x"), vast.ModelFailed)
+
+
+def test_the_health_wait_opens_a_live_but_stale_tunnel_anew_every_fourth_state_check() -> None:
+    reopen = _Reopens()
+    with pytest.raises(vast.VastError, match="did not answer /health in time"):
+        vast._wait_health(_NeverHealthy(), 8.5, lambda: None, 0.0, 100.0, reopen)
+    assert reopen.forced[:8] == [False, False, False, True, False, False, False, True]
+
+
+def _models_run(tmp_path, fake, key_file) -> vast.Run:
+    run = _soft_run(tmp_path, fake, key_file)
+    run.package["models"] = [{"name": "m1"}, {"name": "m2"}]
+    return run
+
+
+def test_a_cancellation_after_the_gate0_day_keeps_the_verdict(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    def serve(run, entry, receipt, after_gate0, result):
+        result.update(verdict="NOT READY", reason="C", stop_reason=None)
+        run.journal.append("step", name="evidence", model=entry["name"], ok=False)
+        raise SystemExit(143)
+
+    monkeypatch.setattr(vast, "ensure_weights", lambda run, entry, late: Path("receipt"))
+    monkeypatch.setattr(vast, "serve_model", serve)
+    run = _models_run(tmp_path, fake, key_file)
+    with pytest.raises(SystemExit):
+        vast.run_models(run)
+    outcomes = [e for e in run.journal.replay() if e["event"] == "model_outcome"]
+    assert len(outcomes) == 1 and outcomes[0]["outcome"] == "ok"
+    assert outcomes[0]["verdict"] == "NOT READY"
+    assert outcomes[0]["cancelled"] == {"reason": "cancelled: SystemExit", "step": "evidence"}
+
+
+def test_an_error_a_signal_caused_on_its_way_up_is_still_a_cancellation(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    def serve(run, entry, receipt, after_gate0, result):
+        run.fatal, run.cancel_code = "cancelled", 143  # the signal came, then an EBADF won
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(vast, "ensure_weights", lambda run, entry, late: Path("receipt"))
+    monkeypatch.setattr(vast, "serve_model", serve)
+    run = _models_run(tmp_path, fake, key_file)
+    with pytest.raises(SystemExit) as raised:
+        vast.run_models(run)
+    assert raised.value.code == 143
+    outcomes = [e for e in run.journal.replay() if e["event"] == "model_outcome"]
+    assert [(e["model"], e["outcome"], e["reason"]) for e in outcomes] == [
+        ("m1", "cancelled", "cancelled: OSError")
+    ]
+
+
+def test_a_model_the_soft_stop_cut_in_smoke_is_skipped_not_failed(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    def serve(run, entry, receipt, after_gate0, result):
+        raise vast.ModelSkipped("smoke", "stopped while the server loads: soft_end")
+
+    monkeypatch.setattr(vast, "ensure_weights", lambda run, entry, late: Path("receipt"))
+    monkeypatch.setattr(vast, "serve_model", serve)
+    monkeypatch.setattr(vast, "wait_gpu_free", lambda run: {"memory_used_mib": 0})
+    run = _models_run(tmp_path, fake, key_file)
+    vast.run_models(run)
+    outcomes = [e for e in run.journal.replay() if e["event"] == "model_outcome"]
+    assert [(e["outcome"], e["step"]) for e in outcomes] == [("skipped", "smoke")] * 2
+    assert "soft_end" in outcomes[0]["reason"]
+
+
+def test_the_probe_of_the_host_counts_a_refused_fork_as_no_answer(
+    tmp_path: Path, key_file, fake
+) -> None:
+    class Host(_RecoverHost):
+        def run(self, argv, timeout):
+            if not self.calls:
+                self.calls.append(argv[:3])
+                raise OSError(errno.EAGAIN, "no fork")
+            return super().run(argv, timeout)
+
+    host = Host()
+    run = _transport_run(tmp_path, fake, key_file, host)
+    assert vast.await_host(run, "size m", time.time() + 10, "exit 255") is False
+    assert host.calls == [["true"], ["true"]]
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost())
+    run.host.run = lambda argv, timeout: (_ for _ in ()).throw(OSError(errno.EACCES, "denied"))
+    with pytest.raises(OSError, match="denied"):
+        vast.await_host(run, "size m", time.time() + 10, "exit 255")
+
+
+def test_a_pilot_count_the_server_answered_without_is_not_asked_for_again() -> None:
+    class Client:
+        model, last_status, asked = "m", None, 0
+
+        def text_tokens(self, text):
+            self.asked += 1
+            self.last_status = None if self.asked == 1 else 500
+            return None
+
+        def request(self, path, body=None, timeout=5):
+            self.last_status = 200
+            return 200, json.dumps({"usage": {"prompt_tokens": 50}}).encode(), None
+
+    client, checks = Client(), []
+    vast.run_pilot(client, lambda after_timeout=False: checks.append(1) or "resend")
+    # lost once (no HTTP answer): asked again; the server answered 500 then: no more asks
+    assert client.asked == 2 and checks == [1]
+
+
+def test_a_signal_a_step_swallowed_still_cancels_after_the_model(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    def serve(run, entry, receipt, after_gate0, result):
+        result.update(verdict="NOT READY", reason="C", stop_reason=None)
+        run.fatal, run.cancel_code = "cancelled", 129  # SIGHUP, its exit noted as a block error
+
+    monkeypatch.setattr(vast, "ensure_weights", lambda run, entry, late: Path("receipt"))
+    monkeypatch.setattr(vast, "serve_model", serve)
+    run = _models_run(tmp_path, fake, key_file)
+    with pytest.raises(SystemExit) as raised:
+        vast.run_models(run)
+    assert raised.value.code == 129
+    outcomes = [e for e in run.journal.replay() if e["event"] == "model_outcome"]
+    assert len(outcomes) == 1 and outcomes[0]["outcome"] == "ok"
+    assert outcomes[0]["cancelled"]["reason"] == "cancelled: swallowed"

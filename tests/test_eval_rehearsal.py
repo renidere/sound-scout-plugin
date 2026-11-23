@@ -104,3 +104,38 @@ def test_the_real_numbers_scenario_reads_the_preregistered_package() -> None:
     assert package["envelope"]["dph_total"] == {"lte": 1.2}
     assert found["models"][0]["weights_timeout_s"] == 600
     assert found["models"][1]["weights_timeout_s"] == 1500
+
+
+def test_round3_faults_are_rehearsed() -> None:
+    """The faults the round-3 stack check found (#165): a second loss while the request goes
+    again, a refused fork, a soft end in the /health wait, a half-dead smoke tunnel, a loss that
+    takes most of the SSH window."""
+    names = {s.name for s in rehearsal.SCENARIOS}
+    assert {
+        "double_blip_m1_gate0", "double_blip_m1_block", "double_blip_m2_block",
+        "real_double_blip_m1_gate0", "flap_m1_gate0", "cut_gate0_twice", "cut_block_twice",
+        "enomem_size", "enomem_final_pack", "eagain_final_pack", "soft_in_m2_smoke",
+        "half_2m_m1_pilot", "half_2m_m2_health", "stall_m2_health",
+        "outage_60pct_m1_gate0", "outage_60pct_m2_block", "outage_60pct_m2_health",
+        "outage_60pct_stop", "outage_60pct_final_get",
+    } <= names  # fmt: skip
+    real = next(s for s in rehearsal.SCENARIOS if s.name == "real_double_blip_m1_gate0")
+    assert real.setup["intervals"] == {"ssh_lost_s": 300.0, "ssh_retry_s": 30.0}
+
+
+def test_the_extended_check_counts_against_the_plan(tmp_path) -> None:
+    out = tmp_path / "o"
+    attempt = out / "gpu-ext-fixture" / "attempts" / "x-m"
+    attempt.mkdir(parents=True)
+    (out / "gpu-ext-fixture" / "plan.json").write_text(json.dumps({"entries": [{}, {}, {}]}))
+    lines = [{"sent": True, "http_status": 200}] * 2
+    (attempt / "trace.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    outcome = rehearsal.Outcome("t", out, None, None)
+    checks = rehearsal.Checks()
+    rehearsal.ext_complete(outcome, checks, "m")
+    assert not checks.items[0]["passed"]  # two answered lines of three planned is no pass
+    lines = [{"sent": True, "http_status": 200}] * 3
+    (attempt / "trace.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    checks = rehearsal.Checks()
+    rehearsal.ext_complete(outcome, checks, "m")
+    assert all(item["passed"] for item in checks.items)

@@ -37,6 +37,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -413,6 +414,10 @@ MIN_STEP_S = 10.0
 MIN_RETRY_S = 1.0
 STATE_TIMEOUT_S = 60.0
 RECOVER_HEALTH_S = 30.0
+# a fork the station itself refused (no memory, too many processes): no fault of the host
+LOCAL_ERRNOS = (errno.ENOMEM, errno.EAGAIN)
+LOCAL_RETRY_S = 0.5
+REOPEN_EVERY_CHECKS = 4
 TUNNEL_READY_S = 15.0
 CREDIT_MARGIN_USD = 1.0
 SPEND_TAIL_RESERVE_S = 180.0
@@ -472,6 +477,10 @@ class ModelFailed(VastError):
     def __init__(self, step: str, reason: str) -> None:
         super().__init__(f"{step}: {reason}")
         self.step, self.reason = step, reason
+
+
+class ModelSkipped(ModelFailed):
+    """The agent stopped (`soft_stop`) before this model gave anything: `skipped`, not failed."""
 
 
 class ServerExited(VastError):
@@ -2059,20 +2068,26 @@ def pilot_clips() -> dict[str, bytes]:
     return clips
 
 
+def _no_answer(client) -> bool:
+    return hasattr(client, "last_status") and client.last_status is None
+
+
 def run_pilot(
     client: gate0.Client,
     transport_check: Callable | None = None,
     timeout: Callable[[], float] = lambda: gate0.REQUEST_TIMEOUT_S,
 ) -> dict:
     """K1 on X1 and X2: audio tokens above zero and growing with the length (PROPOSAL § 5). A
-    request without any HTTP answer goes to `transport_check` (`recover`) and, when the server
-    answers again, once more (`gate0.send_checked`); any other answer of `transport_check` (the
-    host lost, the server gone, a stop) is `ModelFailed` at `smoke` with that reason. `timeout`
+    request without any HTTP answer goes to `transport_check` (`recover`) and, each time the
+    server answers again, once more (`gate0.send_checked`); any other answer of
+    `transport_check` (the host lost, the server gone, a stop) is `ModelFailed` at `smoke` with
+    that reason. `timeout`
     is read for every request, so `timeout_cap` cuts a resend and the second clip too."""
     lines = []
     text = gate0.QUESTIONS["K1"]
     text_tokens = client.text_tokens(text)
-    if text_tokens is None and transport_check is not None:
+    # only a count lost with its HTTP answer goes again: an answered failure stays None
+    while text_tokens is None and transport_check is not None and _no_answer(client):
         decision = transport_check()
         if decision != "resend":
             raise ModelFailed("smoke", f"pilot: {decision}")
@@ -2147,20 +2162,30 @@ def _wait_health(
     check: Callable[[], Mapping | None],
     check_every: float,
     start_grace: float,
-    reopen: Callable[[], object] = lambda: None,
+    reopen: Callable[..., object] = lambda force=False: None,
+    stop: Callable[[], str | None] = lambda: None,
 ) -> None:
     """`/health` every second until 200; every `check_every` also the server state from the
     host, so a server that exited fails at once instead of at `timeout`. After each failed
     `/health`, `reopen` opens a tunnel whose `ssh` exited again (a network loss kills it while
-    the server still loads)."""
+    the server still loads); every `REOPEN_EVERY_CHECKS`-th state check it opens the tunnel
+    anew even when its `ssh` lives, since a half-dead `ssh -N` accepts and carries nothing.
+    A reason `stop` names (`soft_stop`) ends the wait at once: `ModelSkipped` (#165)."""
     started = time.monotonic()
     ends, next_check = started + timeout, started + check_every
+    checks = 0
     while client.request("/health", timeout=5)[0] != 200:
+        reason = stop()
+        if reason is not None:
+            raise ModelSkipped("smoke", f"stopped while the server loads: {reason}")
         now = time.monotonic()
+        force = False
         if now >= next_check:
             next_check = now + check_every
             _judge(check(), now - started > start_grace)
-        reopen()
+            checks += 1
+            force = checks % REOPEN_EVERY_CHECKS == 0
+        reopen(force=force)
         if time.monotonic() > ends:
             raise VastError("the vLLM server did not answer /health in time")
         time.sleep(1.0)
@@ -2253,6 +2278,7 @@ class Run:
     syncs: int = 0
     spend_seen: bool = False
     fatal: str | None = None
+    cancel_code: int | None = None
     soft_end: float | None = None
 
     @property
@@ -2284,6 +2310,7 @@ def cancel_on_signals(run: Run) -> dict:
         for number in CANCEL_SIGNALS:
             signal.signal(number, signal.SIG_IGN)
         run.fatal = "cancelled"
+        run.cancel_code = 128 + signum
         with contextlib.suppress(Exception):
             run.journal.append("signal", name=signal.Signals(signum).name)
         raise SystemExit(128 + signum)
@@ -2463,8 +2490,13 @@ def await_host(
     while True:
         tries += 1
         probe = min(SSH_PROBE_S, max(1.0, ends - time.time()))
-        done = run.host.run(["true"], timeout=probe)
-        if not _transport_failed(done) and done.returncode == 0:
+        try:
+            done = run.host.run(["true"], timeout=probe)
+        except OSError as refused:  # the station refused the fork: a probe without an answer
+            if refused.errno not in LOCAL_ERRNOS:
+                raise
+            done = None
+        if done is not None and not _transport_failed(done) and done.returncode == 0:
             break
         _watchdog_stop(run, what, error)
         if time.time() >= ends:
@@ -2483,7 +2515,13 @@ def await_host(
                 raise HostLost(f"the host does not answer over SSH ({what}, {waited:.0f} s)")
             raise TransportError(f"{what}: no SSH answer before the step's end ({waited:.0f} s)")
         time.sleep(max(0.0, min(run.intervals["ssh_retry_s"], ends - time.time())))
-    reopened = bool(run.host.ensure_tunnel(force=True)) if tunnel else False
+    reopened = False
+    if tunnel:
+        try:
+            reopened = bool(run.host.ensure_tunnel(force=True))
+        except OSError as refused:  # a refused fork: the next try finds the tunnel dead
+            if refused.errno not in LOCAL_ERRNOS:
+                raise
     run.journal.append(
         "transport_retry",
         what=what,
@@ -2504,8 +2542,10 @@ def transport_retry(
     awaited (`await_host`) and the step runs again with what is left before `until` — the
     step's own end (`step_until`) — while that is at least `MIN_RETRY_S`. A step that failed
     `SSH_RETRIES` times while the host answered at once is the step's own failure (a missing
-    remote file, say), and its last error is raised."""
-    at_once = 0
+    remote file, say), and its last error is raised. A fork the station refused
+    (`LOCAL_ERRNOS`) runs the step again after a pause that doubles from `LOCAL_RETRY_S` up to
+    `ssh_retry_s`, while the pause ends before `until`; the host is not asked (#165)."""
+    at_once = local = 0
     left = max(MIN_STEP_S, until - time.time())
     while True:
         tried = time.time()
@@ -2515,6 +2555,24 @@ def transport_retry(
             raise
         except TransportError as error:
             failure = error
+        except OSError as error:
+            if error.errno not in LOCAL_ERRNOS:
+                raise
+            local += 1
+            pause = min(run.intervals["ssh_retry_s"], LOCAL_RETRY_S * 2 ** (local - 1))
+            if time.time() + pause >= until:
+                raise
+            run.journal.append(
+                "transport_retry",
+                what=what,
+                error=f"{type(error).__name__}: {errno.errorcode.get(error.errno)}",
+                outcome="local_retry",
+                tries=local,
+                pause_s=pause,
+            )
+            time.sleep(pause)
+            left = max(MIN_RETRY_S, until - time.time())
+            continue
         if time.time() >= until:
             raise failure
         error = redact(str(failure), run.journal.key)
@@ -2530,7 +2588,8 @@ def transport_retry(
 def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callable) -> int | None:
     """`/health` every second until 200 or `seconds` (never past `timeout_cap`) have passed;
     every `server_check_s` the server state too, so a server that exited ends the wait
-    (`ServerExited`)."""
+    (`ServerExited`). After a failed `/health` a tunnel whose `ssh` exited opens again: a
+    second loss right after the reopen kills it once more (#165)."""
     started = time.monotonic()
     ends = started + min(seconds, timeout_cap(run))
     next_check = started + run.intervals["server_check_s"]
@@ -2542,6 +2601,7 @@ def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callab
         if now >= next_check:
             next_check = now + run.intervals["server_check_s"]
             _judge(state(), late=True)
+        run.host.ensure_tunnel()
         time.sleep(1.0)
 
 
@@ -2751,11 +2811,18 @@ def run_extended(run: Run, entry: Mapping, client: gate0.Client, out: str) -> di
     return summary
 
 
-def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: None) -> dict:
+def serve_model(
+    run: Run,
+    entry: Mapping,
+    receipt: Path,
+    after_gate0=lambda: None,
+    result: dict | None = None,
+) -> dict:
     """Steps `smoke`, `run` (its Gate 0 day) and `extended` of one model on a server of its
     own. The host's evidence is journaled and the server stops whatever happens; a server that
     does not stop is `AttemptFatal`, so the next model never starts beside it. A failure of
-    this model is `ModelFailed` with its step."""
+    this model is `ModelFailed` with its step. `result` (the caller's dict) holds the Gate 0
+    verdict as soon as the day is done, so a cancellation after it still keeps it."""
     host, journal, intervals = run.host, run.journal, run.intervals
     name = entry["name"]
     out = _model_out(name)
@@ -2765,7 +2832,7 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
     serve += ["--log", f"{out}/server.log", "--guard-log", f"{out}/guard.log"]
     serve += ["--pid-file", f"{out}/serve.pid", "--"]
     serve += vllm_argv(f"{WORKSPACE}/models/{name}", name, host.server_port)
-    result: dict = {}
+    result = {} if result is None else result
     fetched = False
     health_s = entry.get("health_timeout_s") or intervals["health_timeout_s"]
 
@@ -2809,10 +2876,13 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                         intervals["server_check_s"],
                         intervals["server_start_s"],
                         host.ensure_tunnel,
+                        lambda: soft_stop(run),
                     )
                 except ServerExited as error:
                     detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
                     raise ModelFailed("smoke", str(error)) from None
+                except ModelSkipped:
+                    raise
                 except VastError as error:
                     raise ModelFailed("smoke", str(error)) from None
                 run.hook("pilot", model=name)
@@ -3049,6 +3119,18 @@ def _verdict_outcome(result: Mapping) -> dict:
     return {"outcome": "ok", "step": None, "reason": None}
 
 
+def _cancelled(run: Run, name: str, result: Mapping, reason: str) -> None:
+    """A cancellation once the model's Gate 0 day is done keeps its verdict (`cancelled` names
+    the signal and the step it cut); before that the model is `cancelled` (0028 Д.9 п. 6)."""
+    step = _failed_step(run.journal, name)
+    if result.get("verdict"):
+        outcome = {"model": name, **_verdict_outcome(result), **result}
+        outcome["cancelled"] = {"reason": reason, "step": step}
+    else:
+        outcome = {"model": name, "outcome": "cancelled", "step": step, "reason": reason}
+    run.journal.append("model_outcome", **outcome)
+
+
 def run_models(run: Run) -> list[dict]:
     """Each model in turn, isolated: a failure of one is its `model_outcome` and the next still
     runs; only `AttemptFatal`, a lost host and a cancellation end the loop. The next model's
@@ -3074,6 +3156,7 @@ def run_models(run: Run) -> list[dict]:
         if reason is not None:
             outcome = {"model": name, "outcome": "skipped", "step": None, "reason": reason}
         else:
+            result: dict = {}
             try:
                 if index > 0:
                     run.journal.append("gpu_free", model=name, **wait_gpu_free(run))
@@ -3081,7 +3164,7 @@ def run_models(run: Run) -> list[dict]:
                 if index > 0 and soft is not None and late_minutes is not None:
                     late = soft - late_minutes * 60
                 receipt = ensure_weights(run, entry, late)
-                result = serve_model(run, entry, receipt, lambda index=index: start_next(index))
+                serve_model(run, entry, receipt, lambda index=index: start_next(index), result)
                 outcome = {"model": name, **_verdict_outcome(result), **result}
             except AttemptFatal as error:
                 kept = error.result
@@ -3099,20 +3182,25 @@ def run_models(run: Run) -> list[dict]:
                 run.journal.append("model_outcome", **outcome)
                 raise
             except (KeyboardInterrupt, SystemExit) as error:
-                reason = f"cancelled: {type(error).__name__}"
-                step = _failed_step(run.journal, name)
-                run.journal.append(
-                    "model_outcome", model=name, outcome="cancelled", step=step, reason=reason
-                )
+                _cancelled(run, name, result, f"cancelled: {type(error).__name__}")
                 raise
             except Exception as error:
+                if run.fatal == "cancelled":
+                    # the signal's SystemExit lost to an error it caused on its way up
+                    _cancelled(run, name, result, f"cancelled: {type(error).__name__}")
+                    raise SystemExit(run.cancel_code or 128 + signal.SIGTERM) from error
                 step = getattr(error, "step", None) or _failed_step(run.journal, name)
-                kind = "skipped" if step == "gpu_free" else "failed"
+                skipped = step == "gpu_free" or isinstance(error, ModelSkipped)
+                kind = "skipped" if skipped else "failed"
                 message = redact(getattr(error, "reason", None) or str(error), run.api.key)
                 outcome = {"model": name, "outcome": kind, "step": step, "reason": message}
                 if run.fatal == "ssh_lost":  # `await_host` gave the host its whole window
                     run.journal.append("model_outcome", **outcome)
                     raise AttemptFatal("the host does not answer over SSH") from None
+            else:
+                if run.fatal == "cancelled":  # a step swallowed the signal's exit (the blocks)
+                    _cancelled(run, name, result, "cancelled: swallowed")
+                    raise SystemExit(run.cancel_code or 128 + signal.SIGTERM)
         run.journal.append("model_outcome", **outcome)
         outcomes.append(outcome)
         if reason is None:

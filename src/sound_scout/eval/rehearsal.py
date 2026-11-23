@@ -170,15 +170,23 @@ def model_incomplete(o: Outcome, c: Checks, model: str, stop: str) -> None:
     )
 
 
+def planned_extended(o: Outcome) -> int | None:
+    path = o.out / "gpu-ext-fixture" / gpu_ext.PLAN_FILE
+    return len(json.loads(path.read_text())["entries"]) if path.is_file() else None
+
+
 def ext_complete(o: Outcome, c: Checks, model: str) -> None:
     trace = o.ext_trace(model)
+    planned = planned_extended(o)
     unsent = [line for line in trace if not line.get("sent")]
     answered = [line for line in trace if line.get("http_status") == 200]
     c(
-        f"{model}: every extended request sent and answered",
-        trace and not unsent and len(answered) == len(trace),
-        {"lines": len(trace), "not_sent": len(unsent)},
+        f"{model}: every planned extended request sent and answered",
+        planned and len(trace) == planned and not unsent and len(answered) == planned,
+        {"planned": planned, "lines": len(trace), "not_sent": len(unsent), "ok": len(answered)},
     )
+    error = o.model(model).get("extended_error")
+    c(f"{model}: no extended_error", not error, error)
 
 
 def evidence_of(o: Outcome, c: Checks, model: str) -> dict | None:
@@ -937,26 +945,71 @@ def check_both_complete(o: Outcome, c: Checks) -> None:
     no_secret(o, c)
 
 
+def _check_twice(label: str, model: str | None = None, resends: int = 0):
+    """`check_both_complete`, and the second fault fired too; with `model`, one request of it
+    went `resends` times or more, so the second fault met the resend."""
+
+    def check(o: Outcome, c: Checks) -> None:
+        fired = getattr(o.host, "fired", None) or []
+        c("the second fault fired", any(label in item for item in fired), fired)
+        if model is not None:
+            lines = o.gate0_trace(_days(model)) + o.ext_trace(model)
+            most = max((line.get("resends", 0) for line in lines), default=0)
+            c(f"{model}: a request went {resends} times again", most >= resends, most)
+        check_both_complete(o, c)
+
+    return check
+
+
+def check_cut_twice(o: Outcome, c: Checks) -> None:
+    lines = o.gate0_trace(_days(M1)) + o.ext_trace(M1)
+    cut = [x for x in lines if x.get("resends") == 2]
+    c(
+        "the cut answer and its cut resend went once more",
+        any("IncompleteRead" in str(x.get("first_error")) for x in cut),
+        [(x.get("resends"), x.get("first_error")) for x in lines if x.get("resends")],
+    )
+    check_both_complete(o, c)
+
+
 def _step_kind_scenario(kind: str) -> Scenario:
+    """A blip at the drawn call of the kind, and the same blip again as soon as the stack
+    recovered from it and tries the step (or the request) once more (#165)."""
     op, match, most = STEP_KINDS[kind]
     nth, seconds = _drawn(kind, most)
     model = (M1, M2)[(nth - 1) % 2]
 
     def blip(run, label: str = kind) -> None:
+        run.host.fired_at = time.time()
         _fire(run, label)
         _blip_for(seconds)(run)
 
+    def recovered(run, record: dict) -> bool:
+        return _fired_at(run) is not None and (
+            (record["event"] == "transport_retry" and record.get("outcome") == "retry")
+            or (record["event"] == "transport_check" and record.get("outcome") == "resend")
+        )
+
+    def again(run) -> None:
+        _fire(run, f"{kind} again")
+        _blip_for(seconds)(run)
+
+    second = _on_journal(recovered, again)
     if op == "pilot":
-        hooks = {"pilot": lambda run, **where: where["model"] == model and blip(run)}
+        hooks = {
+            "pilot": lambda run, **where: where["model"] == model and blip(run),
+            "host": second,
+        }
     elif op == "gate0":
-        hooks = _when_gate0_sent(model, 10, blip)
+        hooks = {"host": _both(_when_gate0_sent(model, 10, blip)["host"], second)}
     else:
-        hooks = {"host": _on_call(op, match, _blip_for(seconds), nth)}
+        hooks = {"host": _both(_on_call(op, match, blip, nth), second)}
     return Scenario(
         f"blip_step_{kind}",
-        f"Обрыв сети {seconds} с на шаге {kind} (вызов {nth})",
+        f"Обрыв сети {seconds} с на шаге {kind} (вызов {nth}) и ещё раз на повторе",
         {"hooks": hooks},
-        check_both_complete,
+        # the smoke tunnel's blip is mended by the /health wait itself: no retry to cut again
+        check_both_complete if kind == "smoke_tunnel" else _check_twice(f"{kind} again"),
     )
 
 
@@ -1102,7 +1155,363 @@ ROUND2_SCENARIOS = [
         expect_error="any",
     ),
 ]
+
+
+# --- round 3 of the stack check (#165): a fault that comes again while the stack recovers -----
+
+REAL_SSH = {"ssh_lost_s": 300.0, "ssh_retry_s": 30.0}
+
+
+def _outage(seconds: float, label: str = "outage") -> Callable:
+    def act(run) -> None:
+        _fire(run, f"{label} {seconds} s")
+        _blip_for(seconds)(run)
+
+    return act
+
+
+def _when(cond: Callable, action: Callable, *, within: float = 600.0) -> Callable:
+    """A host hook: `action(run)` once, from a thread, when `cond(run)` holds."""
+
+    def hook(run) -> None:
+        def loop() -> None:
+            ends = time.monotonic() + within
+            while time.monotonic() < ends:
+                with contextlib.suppress(Exception):
+                    if cond(run):
+                        action(run)
+                        return
+                time.sleep(0.01)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    return hook
+
+
+def _both(*hooks: Callable) -> Callable:
+    def hook(run) -> None:
+        for each in hooks:
+            each(run)
+
+    return hook
+
+
+def _ext_lines(run, model: str) -> int:
+    attempts = run.config_.data_root / "gpu-ext-fixture" / gpu_ext.ATTEMPTS_DIR
+    found = sorted(attempts.glob(f"*-{model}"))
+    trace = found[-1] / gpu_ext.TRACE_FILE if found else None
+    return len(trace.read_text().splitlines()) if trace and trace.is_file() else 0
+
+
+def _sent(model: str, count: int) -> Callable:
+    return lambda run: _gate0_sent(_gate0_trace_path(run.config_.data_root, model)) >= count
+
+
+def _ext_at(model: str, count: int) -> Callable:
+    return lambda run: _ext_lines(run, model) >= count
+
+
+def _on_journal(matches: Callable, action: Callable) -> Callable:
+    """A host hook: `action(run)` once, right after the agent journals the first record that
+    `matches(run, record)`, before the step that journaled it goes on."""
+
+    def hook(run) -> None:
+        journal, done = run.journal, []
+        real = journal.append
+
+        def append(event: str, **fields) -> dict:
+            record = real(event, **fields)
+            if not done and matches(run, record):
+                done.append(record)
+                action(run)
+            return record
+
+        journal.append = append
+
+    return hook
+
+
+def _fired_at(run) -> float | None:
+    return getattr(run.host, "fired_at", None)
+
+
+def _half_alive(seconds: float, per_call: float = 0.4) -> Callable:
+    """For `seconds`, new ssh connections hang `per_call` s and fail (exit 255), scp and spawn
+    the same; the tunnels stall (accept, carry nothing) and stay stalled after the window."""
+
+    def act(run) -> None:
+        _fire(run, f"half-alive {seconds} s")
+        host = run.host
+        until = time.time() + seconds
+        host.stall_tunnels()
+        real_run, real_get, real_put, real_spawn = host.run, host.get, host.put, host.spawn
+
+        def hanging() -> bool:
+            return time.time() < until
+
+        def run_(argv, timeout):
+            if hanging():
+                time.sleep(min(timeout, per_call))
+                return vast.proc.run(["sh", "-c", "exit 255"], timeout=5, max_output_bytes=64)
+            return real_run(argv, timeout)
+
+        def get_(remote, local, timeout=1800.0):
+            if hanging():
+                time.sleep(min(timeout, per_call))
+                raise vast.TransportError(f"scp from the host failed for {Path(remote).name}")
+            return real_get(remote, local, timeout)
+
+        def put_(local, remote, key):
+            if hanging():
+                time.sleep(per_call)
+                raise vast.TransportError(f"scp to the host failed for {Path(remote).name}")
+            return real_put(local, remote, key)
+
+        def spawn_(argv, log):
+            if hanging():
+                time.sleep(per_call)
+                raise vast.TransportError(f"host: start {argv[0]}: no SSH answer")
+            return real_spawn(argv, log)
+
+        host.run, host.get, host.put, host.spawn = run_, get_, put_, spawn_
+
+    return act
+
+
+def _flapping(cycles: int, down: float, up: float) -> Callable:
+    def act(run) -> None:
+        def loop() -> None:
+            for _ in range(cycles):
+                _outage(down, "flap")(run)
+                time.sleep(down + up)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    return act
+
+
+def _stall(run) -> None:
+    _fire(run, "stall")
+    run.host.stall_tunnels()
+
+
+def _fork_fails(match: Callable[..., bool], error: int = 12) -> Callable:
+    """A host hook: the first `host.run` whose argv `match`es fails to fork on the station."""
+
+    def hook(run) -> None:
+        real = run.host.run
+        seen = {"n": 0}
+
+        def wrapped(argv, timeout):
+            if match(argv) and not seen["n"]:
+                seen["n"] += 1
+                _fire(run, f"fork errno {error}")
+                raise OSError(error, os.strerror(error))
+            return real(argv, timeout)
+
+        run.host.run = wrapped
+
+    return hook
+
+
+def _new_tunnel(nth: int, action: Callable, delay: float) -> Callable:
+    """A host hook: `action(run)` `delay` s after the `nth` model tunnel opened."""
+    return _on_call(
+        "tunnel",
+        lambda remote_port, local_port=None: local_port is None,
+        lambda run: threading.Timer(delay, action, (run,)).start(),
+        nth=nth,
+    )
+
+
+def _double(first_when: Callable, model: str, seconds: float = 0.15) -> Callable:
+    """A blip, then a second one the moment the stack decided to resend the request: the
+    resend itself meets the lost network."""
+
+    def first(run) -> None:
+        run.host.fired_at = time.time()
+        _outage(seconds, "blip")(run)
+
+    def resend(run, record: dict) -> bool:
+        return (
+            _fired_at(run) is not None
+            and record["event"] == "transport_check"
+            and record.get("outcome") == "resend"
+            and record.get("model") == model
+        )
+
+    return _both(_when(first_when, first), _on_journal(resend, _outage(seconds, "second blip")))
+
+
+def _soft_end_now(run) -> None:
+    _fire(run, "soft end")
+    run.host.soft_at = time.time()
+    run.soft_end = time.time()
+
+
+def check_soft_in_smoke(o: Outcome, c: Checks) -> None:
+    model_ok(o, c, M1)
+    ext_complete(o, c, M1)
+    outcome = o.model(M2)
+    c(
+        "M2 skipped at smoke on the soft end",
+        outcome.get("outcome") == "skipped"
+        and outcome.get("step") == "smoke"
+        and "soft_end" in str(outcome.get("reason")),
+        outcome,
+    )
+    soft = getattr(o.host, "soft_at", None)
+    asked = o.kinds("destroy_requested")
+    waited = None if not asked or soft is None else round(asked[0]["t"] - soft, 2)
+    c("destroy asked within 6 s of the soft end", waited is not None and waited < 6, waited)
+    downloaded(o, c)
+    destroyed(o, c)
+    no_secret(o, c)
+
+
+def _vllm_fired(run) -> None:
+    _fire(run, "vllm")
+
+
 STEP_KIND_SCENARIOS = [_step_kind_scenario(kind) for kind in STEP_KINDS]
+
+
+ROUND3_SCENARIOS = [
+    Scenario(
+        "double_blip_m1_gate0",
+        "M1 Gate 0: обрыв 0,15 с, второй — пока запрос уходит повторно",
+        {"hooks": {"host": _double(_sent(M1, 10), M1)}},
+        _check_twice("second blip", M1, resends=2),
+    ),
+    Scenario(
+        "double_blip_m1_block",
+        "M1, блоки: обрыв 0,15 с, второй — пока запрос уходит повторно",
+        {"hooks": {"host": _double(_ext_at(M1, 60), M1)}},
+        _check_twice("second blip", M1, resends=2),
+    ),
+    Scenario(
+        "double_blip_m2_block",
+        "M2, блоки: обрыв 0,15 с, второй — пока запрос уходит повторно",
+        {"hooks": {"host": _double(_ext_at(M2, 30), M2)}},
+        _check_twice("second blip", M2, resends=2),
+    ),
+    Scenario(
+        "real_double_blip_m1_gate0",
+        "Настоящее окно SSH: обрыв 20 с в Gate 0 M1, второй 20 с — пока запрос уходит повторно",
+        {
+            "intervals": REAL_SSH,
+            "hooks": {"host": _double(_sent(M1, 10), M1, seconds=20.0)},
+        },
+        _check_twice("second blip", M1, resends=2),
+    ),
+    Scenario(
+        "flap_m1_gate0",
+        "M1 Gate 0: сеть пропадает 4 раза (0,4 с нет, 0,3 с есть)",
+        {"hooks": {"host": _when(_sent(M1, 10), _flapping(4, down=0.4, up=0.3))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "cut_gate0_twice",
+        "M1: ответ Gate 0 оборван, повтор оборван тоже",
+        {"vllm": {M1: {"truncate_at": [10, 11]}}, "hooks": {"host": _vllm_fired}},
+        check_cut_twice,
+    ),
+    Scenario(
+        "cut_block_twice",
+        "M1: ответ блока оборван, повтор оборван тоже",
+        {"vllm": {M1: {"truncate_at": [100, 101]}}, "hooks": {"host": _vllm_fired}},
+        check_cut_twice,
+    ),
+    Scenario(
+        "enomem_size",
+        "Станция: fork опроса весов M1 — ENOMEM один раз",
+        {"hooks": {"host": _fork_fails(_hostrun("size", M1))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "eagain_final_pack",
+        "Станция: fork финального pack — EAGAIN один раз",
+        {"hooks": {"host": _fork_fails(_hostrun("pack", "/results.tar"), error=11)}},
+        check_both_complete,
+    ),
+    Scenario(
+        "enomem_final_pack",
+        "Станция: fork финального pack — ENOMEM один раз",
+        {"hooks": {"host": _fork_fails(_hostrun("pack", "/results.tar"))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "soft_in_m2_smoke",
+        "Мягкий конец, пока сервер M2 грузится (15 с): ожидание /health прерывается",
+        {
+            "vllm": {M2: {"slow_start_s": 15}},
+            "models": [{}, {"health_timeout_s": 60}],
+            "hooks": {"host": _new_tunnel(2, _soft_end_now, 0.2)},
+        },
+        check_soft_in_smoke,
+    ),
+    Scenario(
+        "half_2m_m1_pilot",
+        "Полуживая сеть 2 с сразу после туннеля M1; туннель так и остаётся полуживым",
+        {"hooks": {"host": _new_tunnel(1, _half_alive(2.0), 0.05)}},
+        check_both_complete,
+    ),
+    Scenario(
+        "half_2m_m2_health",
+        "Полуживая сеть 2 с, пока сервер M2 грузится; туннель остаётся полуживым",
+        {
+            "vllm": {M2: {"slow_start_s": 2}},
+            "models": [{}, {"health_timeout_s": 30}],
+            "hooks": {"host": _new_tunnel(2, _half_alive(2.0), 0.3)},
+        },
+        check_both_complete,
+    ),
+    Scenario(
+        "stall_m2_health",
+        "Туннель M2 зависает через 0,3 с, сервер M2 грузится 2 с",
+        {
+            "vllm": {M2: {"slow_start_s": 2}},
+            "models": [{}, {"health_timeout_s": 30}],
+            "hooks": {"host": _new_tunnel(2, _stall, 0.3)},
+        },
+        check_both_complete,
+    ),
+    # a loss that takes 3 s of the 5 s SSH window of the dry run, as 3 of the 5 real minutes
+    Scenario(
+        "outage_60pct_m1_gate0",
+        "Сеть пропала на 60 % окна SSH внутри Gate 0 M1",
+        {"hooks": {"host": _when(_sent(M1, 10), _outage(3.0))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "outage_60pct_m2_block",
+        "Сеть пропала на 60 % окна SSH в блоках M2",
+        {"hooks": {"host": _when(_ext_at(M2, 30), _outage(3.0))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "outage_60pct_m2_health",
+        "Сеть пропала на 60 % окна SSH, пока сервер M2 грузится",
+        {
+            "vllm": {M2: {"slow_start_s": 2}},
+            "models": [{}, {"health_timeout_s": 30}],
+            "hooks": {"host": _new_tunnel(2, _outage(3.0), 0.3)},
+        },
+        check_both_complete,
+    ),
+    Scenario(
+        "outage_60pct_stop",
+        "Сеть пропала на 60 % окна SSH на остановке сервера M1",
+        {"hooks": {"host": _on_call("run", _hostrun("stop", M1), _outage(3.0))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "outage_60pct_final_get",
+        "Сеть пропала на 60 % окна SSH на финальном scp results.tar",
+        {"hooks": {"host": _on_call("get", _remote("/results.tar"), _outage(3.0))}},
+        check_both_complete,
+    ),
+]
 
 
 REAL_DOC = vast.REPO_ROOT / "docs/decisions/0028-gpu-reference-gate0.md"
@@ -1472,6 +1881,7 @@ SCENARIOS = [
     ),
     *ROUND2_SCENARIOS,
     *STEP_KIND_SCENARIOS,
+    *ROUND3_SCENARIOS,
 ]
 
 
