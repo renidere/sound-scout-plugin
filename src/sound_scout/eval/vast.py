@@ -404,9 +404,6 @@ DRY_INTERVALS = {
 SSH_RETRIES = 3
 SSH_EXIT = 255
 SSH_PROBE_S = 30.0
-# the longest a lost network can go unseen by an ssh in flight: ServerAliveInterval 15 s times
-# the default ServerAliveCountMax 3 (a new connection gives up sooner, at ConnectTimeout 10 s)
-SSH_SILENT_S = 45.0
 MIN_STEP_S = 10.0
 STATE_TIMEOUT_S = 60.0
 RECOVER_HEALTH_S = 30.0
@@ -2448,14 +2445,13 @@ def await_host(
     `ssh_lost_s` window is `ssh_lost` for the attempt (`HostLost`); a window `until` cut short
     is a `TransportError` of this step alone. A destroy the watchdog asks for, before or during
     the wait, ends it at once. Journaled as `transport_retry`; True when the host answered the
-    first `true` (no outage seen). The window counts from when the silence began: the start of
-    the failed try (`since`), but no earlier than `SSH_SILENT_S` before now, since an ssh in
-    flight notices a lost network that late at most and a long try worked before it."""
+    first `true` (no outage seen). The wait itself gets the whole window from now; the silence
+    that makes `ssh_lost` counts from `since`, the start of the failed try, because an ssh needs
+    up to its own timeout to notice a lost network and that time was silence too."""
     _watchdog_stop(run, what, error)
     started = time.time()
-    silent = started if since is None else max(since, started - SSH_SILENT_S)
-    window = silent + run.intervals["ssh_lost_s"]
-    ends = min(until, window)
+    silent_from = started if since is None else min(since, started)
+    ends = min(until, started + run.intervals["ssh_lost_s"])
     tries = 0
     while True:
         tries += 1
@@ -2466,7 +2462,7 @@ def await_host(
         _watchdog_stop(run, what, error)
         if time.time() >= ends:
             waited = round(time.time() - started, 3)
-            lost = until >= window - 1.0
+            lost = time.time() - silent_from >= run.intervals["ssh_lost_s"] - 1.0
             if lost:
                 run.fatal = run.fatal or "ssh_lost"
             run.journal.append(

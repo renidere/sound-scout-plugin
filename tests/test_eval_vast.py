@@ -3169,17 +3169,25 @@ def test_a_pilot_reads_its_timeout_for_every_request_and_a_resend() -> None:
     assert [line["resent_after_tunnel"] for line in pilot["lines"]] == [True, False]
 
 
-def test_a_long_try_that_lost_its_ssh_late_still_gets_most_of_the_window(
+def test_a_long_try_that_lost_its_ssh_late_still_gets_the_whole_window(
     tmp_path: Path, key_file, fake
 ) -> None:
     host = _SlowProbeHost()
-    run = _transport_run(tmp_path, fake, key_file, host, ssh_lost_s=vast.SSH_SILENT_S + 2.0)
+    run = _transport_run(tmp_path, fake, key_file, host, ssh_lost_s=2.0)
     started = time.time()
-    with pytest.raises(vast.TransportError) as raised:
-        # the try began an hour ago and worked; its ssh noticed the loss only now
-        vast.await_host(run, "verify m", started + 1.0, "exit 255", since=started - 3600)
-    assert not isinstance(raised.value, vast.HostLost)
-    assert max(host.timeouts) <= 1.0 + 0.1
     with pytest.raises(vast.HostLost):
-        vast.await_host(run, "verify m", time.time() + 3600, "exit 255", since=started - 3600)
-    assert time.time() - started >= 1.5
+        # the try began an hour ago and worked; its ssh noticed the loss only now
+        vast.await_host(run, "verify m", started + 3600, "exit 255", since=started - 3600)
+    assert time.time() - started >= 1.9 and min(host.timeouts) >= 1.0
+
+
+def test_a_try_that_used_its_timeout_counts_as_silence_to_the_steps_end(
+    tmp_path: Path, key_file, fake
+) -> None:
+    """An ssh blackholed right after it connected takes the try's whole timeout to fail: the
+    step's end then cuts the wait, and the silence since the try began is the window."""
+    run = _transport_run(tmp_path, fake, key_file, _SlowProbeHost(), ssh_lost_s=3.0)
+    started = time.time()
+    with pytest.raises(vast.HostLost):
+        vast.await_host(run, "state m", started + 1.5, "exit 255", since=started - 1.5)
+    assert run.fatal == "ssh_lost" and time.time() - started < 2.5
