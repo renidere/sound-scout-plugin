@@ -15,7 +15,8 @@
   prints the line, optionally starts a `multiprocessing` child and never listens.
   The file may instead map a served model name to its own mode (`{"qwen3omni": {...}}`), and a
   mode may also slow the start (`slow_start_s`), crash the server after N completions
-  (`crash_after`), never answer given completions (`hang_at`), delay answers
+  (`crash_after`), never answer given completions (`hang_at`), cut the body of given completions
+  in half and close the connection (`truncate_at`), delay answers
   (`latency_s: {closed, review}`), set the completion tokens of a review (`review_tokens`), the
   audio token rate (`audio_tokens_per_s`, 12.5 for `qwen3omni` and 25 otherwise by default) and
   the answers (`answers: {closed, review}`).
@@ -462,6 +463,18 @@ def vllm(argv: list[str]) -> int:
             self.end_headers()
             self.wfile.write(data)
 
+        def _cut_reply(self, status: int, body: object) -> None:
+            """The headers and half the body, then the connection closes: `IncompleteRead`."""
+            data = json.dumps(body, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data[: len(data) // 2])
+            self.wfile.flush()
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+
         def do_GET(self) -> None:
             if self.path == "/health":
                 return self._reply(200)
@@ -502,7 +515,8 @@ def vllm(argv: list[str]) -> int:
                 content, tokens = answers.get("closed", "тон"), 1
             tokens = min(tokens, int(body.get("max_tokens") or tokens))
             time.sleep(float(latency.get("review" if json_answer else "closed", 0)))
-            self._reply(
+            reply = self._cut_reply if number in mode.get("truncate_at", ()) else self._reply
+            reply(
                 200,
                 {
                     "id": "fake",

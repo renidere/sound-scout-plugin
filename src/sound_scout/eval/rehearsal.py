@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -817,6 +818,259 @@ def check_sigterm_late(o: Outcome, c: Checks) -> None:
     no_secret(o, c)
 
 
+# --- transport blips at every step (#149, round 2 of the stack check) --------------------------
+
+
+def _fire(run, label: str) -> None:
+    """Notes on the host that a scenario's hook fired, for its checks."""
+    run.host.__dict__.setdefault("fired", []).append(label)
+
+
+def _blip_for(seconds: float) -> Callable:
+    def blip(run) -> None:
+        run.host.lose()
+        threading.Timer(seconds, lambda: setattr(run.host, "lost", False)).start()
+
+    return blip
+
+
+def _on_call(op: str, match: Callable[..., bool], action: Callable, nth: int = 1) -> Callable:
+    """A host hook: `action(run)` right before the `nth` call of `host.<op>` whose arguments
+    `match`; for `tunnel`, right after the tunnel opened."""
+
+    def hook(run) -> None:
+        real = getattr(run.host, op)
+        seen = {"n": 0}
+
+        def wrapped(*args, **kwargs):
+            hit = match(*args, **kwargs)
+            if hit:
+                seen["n"] += 1
+                hit = seen["n"] == nth
+            if hit and op != "tunnel":
+                _fire(run, f"{op} #{nth}")
+                action(run)
+            answer = real(*args, **kwargs)
+            if hit and op == "tunnel":
+                _fire(run, f"{op} #{nth}")
+                action(run)
+            return answer
+
+        setattr(run.host, op, wrapped)
+
+    return hook
+
+
+def _hostrun(command: str, *needles: str) -> Callable[..., bool]:
+    def match(argv, *_args, **_kwargs) -> bool:
+        return argv[:3] == ["python3", vast.HOSTRUN, command] and all(
+            any(needle in arg for arg in argv) for needle in needles
+        )
+
+    return match
+
+
+def _argv0(*head: str, needle: str = "") -> Callable[..., bool]:
+    def match(argv, *_args, **_kwargs) -> bool:
+        return argv[: len(head)] == list(head) and any(needle in arg for arg in argv)
+
+    return match
+
+
+def _remote(suffix: str) -> Callable[..., bool]:
+    return lambda remote, *_args, **_kwargs: suffix in remote
+
+
+# every kind of host step of an attempt: (operation of the host, argument match, the most calls
+# of this kind any attempt makes for sure, so the drawn call always comes)
+STEP_KINDS = {
+    "upload_mkdir": ("run", _argv0("mkdir", "-p", needle="/ss/guard"), 1),
+    "upload_put": ("put", lambda *_a, **_k: True, 3),
+    "upload_sha256sum": ("run", _argv0("sha256sum"), 1),
+    "preflight_nvidia_smi": ("run", _argv0("nvidia-smi", needle="name,memory.total"), 1),
+    "preflight_vllm_version": ("run", _argv0("vllm", "--version"), 1),
+    "preflight_hostrun": ("run", _hostrun("preflight"), 1),
+    "preflight_selftest": ("run", _hostrun("selftest"), 1),
+    "fetch_mkdir": ("run", _argv0("mkdir", "-p", needle="/out/qwen"), 2),
+    "fetch_spawn": ("spawn", lambda argv, log: log.endswith("download-wrapper.log"), 2),
+    "weights_size": ("run", _hostrun("size"), 2),
+    "weights_verify": ("run", _hostrun("weights"), 2),
+    "weights_receipt": ("get", _remote("weights-receipt.json"), 2),
+    "gpu_free": ("run", _argv0("nvidia-smi", needle="memory.used"), 1),
+    "serve_spawn": ("spawn", lambda argv, log: log.endswith("/hostrun.log"), 2),
+    "smoke_tunnel": ("tunnel", lambda remote_port, local_port=None: local_port is None, 2),
+    "server_state": ("run", _hostrun("state"), 4),
+    "sync_pack": ("run", _hostrun("pack", "/sync-"), 10),
+    "sync_get": ("get", _remote("/sync-"), 10),
+    "evidence": ("run", _hostrun("evidence"), 2),
+    "stop": ("run", _hostrun("stop"), 2),
+    "final_pack": ("run", _hostrun("pack", "/results.tar"), 1),
+    "final_get": ("get", _remote("/results.tar"), 1),
+}
+
+
+def _drawn(kind: str, most: int) -> tuple[int, float]:
+    """The call and the blip length of a kind, drawn once with the kind as the seed."""
+    rng = random.Random(f"149:{kind}")
+    return rng.randint(1, most), round(rng.uniform(0.05, 1.0), 2)
+
+
+def check_both_complete(o: Outcome, c: Checks) -> None:
+    fired = getattr(o.host, "fired", None)
+    c("the scenario's fault fired", bool(fired), fired)
+    for model in (M1, M2):
+        model_ok(o, c, model)
+        ext_complete(o, c, model)
+    downloaded(o, c)
+    destroyed(o, c)
+    no_secret(o, c)
+
+
+def _step_kind_scenario(kind: str) -> Scenario:
+    op, match, most = STEP_KINDS[kind]
+    nth, seconds = _drawn(kind, most)
+    return Scenario(
+        f"blip_step_{kind}",
+        f"Обрыв сети {seconds} с на шаге {kind} (вызов {nth})",
+        {"hooks": {"host": _on_call(op, match, _blip_for(seconds), nth)}},
+        check_both_complete,
+    )
+
+
+def _incomplete_read_extra(o: Outcome, c: Checks) -> None:
+    lines = o.gate0_trace(_days(M1))
+    resent = [x for x in lines if x.get("resent_after_tunnel")]
+    c(
+        "the cut answer was sent once more",
+        any("IncompleteRead" in str(x.get("first_error")) for x in resent),
+        [x.get("first_error") for x in resent],
+    )
+
+
+def check_incomplete_read(o: Outcome, c: Checks) -> None:
+    _incomplete_read_extra(o, c)
+    for model in (M1, M2):
+        model_ok(o, c, model)
+        ext_complete(o, c, model)
+    downloaded(o, c)
+    destroyed(o, c)
+    no_secret(o, c)
+
+
+def _watchdog_at_final_pack(run) -> None:
+    """3 USD gone just before the final `pack`; the agent busy for a second, so the watchdog
+    destroys and the host is gone for the download."""
+
+    def act(run) -> None:
+        run.api.call("POST", "/fake/credit", {"spend": 3.0})
+        time.sleep(1.0)
+
+    _on_call("run", _hostrun("pack", "/results.tar"), act)(run)
+
+
+def check_watchdog_in_download(o: Outcome, c: Checks) -> None:
+    for model in (M1, M2):
+        model_ok(o, c, model)
+    first = next((e for e in o.kinds("destroy_requested")), {})
+    c("the first destroy is the watchdog's early stop", "early_stop" in str(first.get("reason")))
+    text = "" if o.error is None else str(o.error)
+    c(
+        "the error names the watchdog's early stop, not the pack",
+        "early_stop" in text and "watchdog" in text and "pack" not in text,
+        text[:300],
+    )
+    c("earlier syncs are on the station", any(s["ok"] for s in o.kinds("sync")))
+    destroyed(o, c)
+    no_secret(o, c)
+
+
+def check_sigterm_create(o: Outcome, c: Checks) -> None:
+    c("deploy exited 128 + SIGTERM", o.error == 128 + signal.SIGTERM, o.error)
+    c("the signal is journaled", [e["name"] for e in o.kinds("signal")] == ["SIGTERM"])
+    c("create was requested", bool(o.kinds("create_requested")))
+    c("create outcome unknown journaled", bool(o.kinds("create_outcome_unknown")))
+    c("the instance was adopted by label", bool(o.kinds("adopted_by_label")))
+    destroyed(o, c)
+    c("absence verified", bool(o.kinds("absence_verified")))
+    no_secret(o, c)
+    left = subprocess.run(["pgrep", "-f", str(o.out)], capture_output=True, text=True).stdout
+    c("no process of the attempt left", not left.strip(), left.strip().splitlines()[:3])
+
+
+ROUND2_SCENARIOS = [
+    Scenario(
+        "blip_m1_weights_poll",
+        "Обрыв 0,15 с на первом опросе весов M1",
+        {"hooks": {"host": _on_call("run", _hostrun("size", M1), _blip_for(0.15))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "blip_m2_weights_poll",
+        "Обрыв 0,15 с на первом опросе весов M2",
+        {"hooks": {"host": _on_call("run", _hostrun("size", M2), _blip_for(0.15))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "blip_m2_smoke_tunnel",
+        "Обрыв 0,15 с через 0,5 с после туннеля M2, сервер M2 стартует 2 с",
+        {
+            "vllm": {M2: {"slow_start_s": 2}},
+            "models": [{}, {"health_timeout_s": 20}],
+            "hooks": {
+                "host": _on_call(
+                    "tunnel",
+                    lambda remote_port, local_port=None: local_port is None,
+                    lambda run: threading.Timer(0.5, _blip_for(0.15), (run,)).start(),
+                    nth=2,
+                )
+            },
+        },
+        check_both_complete,
+    ),
+    Scenario(
+        "blip_gpu_free",
+        "Обрыв 0,15 с на первом nvidia-smi (preflight)",
+        {"hooks": {"host": _on_call("run", _argv0("nvidia-smi"), _blip_for(0.15))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "blip_final_download",
+        "Обрыв 0,15 с на финальном scp results.tar",
+        {"hooks": {"host": _on_call("get", _remote("/results.tar"), _blip_for(0.15))}},
+        check_both_complete,
+    ),
+    Scenario(
+        "outage_1s_gate0",
+        "Сеть пропала на 1 с внутри Gate 0 M1",
+        {"hooks": _when_gate0_sent(M1, 10, lambda run: (_fire(run, "gate0"), _blip_for(1.0)(run)))},
+        check_both_complete,
+    ),
+    Scenario(
+        "incomplete_read_mid_body",
+        "M1: ответ Gate 0 оборван посреди тела (IncompleteRead)",
+        {"vllm": {M1: {"truncate_at": [10]}}, "hooks": {"host": lambda run: _fire(run, "vllm")}},
+        check_incomplete_read,
+    ),
+    Scenario(
+        "sigterm_during_create_put",
+        "SIGTERM, пока PUT create в полёте",
+        {"create_mode": "timeout", "fake": lambda fake: setattr(fake, "timeout_s", 3.0)},
+        check_sigterm_create,
+        expect_error="any",
+        signal_when=lambda out: _journal_has(out, "create_requested"),
+    ),
+    Scenario(
+        "watchdog_destroy_in_download",
+        "Скачок расхода перед финальным pack: удаляет сторож",
+        {"hooks": {"host": _watchdog_at_final_pack}},
+        check_watchdog_in_download,
+        watchdog=True,
+        expect_error="any",
+    ),
+]
+STEP_KIND_SCENARIOS = [_step_kind_scenario(kind) for kind in STEP_KINDS]
+
+
 REAL_DOC = vast.REPO_ROOT / "docs/decisions/0028-gpu-reference-gate0.md"
 REAL_ENVELOPE_TOP = {"dph_total": 1.2, "inet_down_cost": 0.0043, "inet_up_cost": 0.0043}
 
@@ -1182,6 +1436,8 @@ SCENARIOS = [
         check_code_refused,
         expect_error="VastError",
     ),
+    *ROUND2_SCENARIOS,
+    *STEP_KIND_SCENARIOS,
 ]
 
 
