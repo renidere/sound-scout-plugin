@@ -1395,6 +1395,7 @@ class LocalHost(RemoteHost):
         self.lost = False
         self.failing: list[list[str]] = []
         self.reopen_delay_s = 0.0
+        self._binding = threading.Event()  # a slow reopen in flight: its `ssh -N` still lives
 
     def _map(self, text: str) -> str:
         return text.replace(WORKSPACE, str(self.root))
@@ -1437,8 +1438,12 @@ class LocalHost(RemoteHost):
 
             def later() -> None:
                 time.sleep(delay)
-                self._forwarders.append(vast_fake.Forwarder(remote_port, local_port))
+                try:
+                    self._forwarders.append(vast_fake.Forwarder(remote_port, local_port))
+                finally:
+                    self._binding.clear()
 
+            self._binding.set()
             threading.Thread(target=later, daemon=True).start()
             return local_port
         forwarder = vast_fake.Forwarder(remote_port, local_port or 0)
@@ -1446,7 +1451,7 @@ class LocalHost(RemoteHost):
         return forwarder.port
 
     def ensure_tunnel(self, force: bool = False) -> bool:
-        if self.lost or not self._forwarders:
+        if self.lost or not self._forwarders or self._binding.is_set():
             return False
         last = self._forwarders[-1]
         if last.alive():

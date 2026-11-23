@@ -3437,3 +3437,22 @@ def test_a_signal_a_step_swallowed_still_cancels_after_the_model(
     outcomes = [e for e in run.journal.replay() if e["event"] == "model_outcome"]
     assert len(outcomes) == 1 and outcomes[0]["outcome"] == "ok"
     assert outcomes[0]["cancelled"]["reason"] == "cancelled: swallowed"
+
+
+def test_a_slow_reopen_of_the_dry_tunnel_counts_as_a_live_ssh_until_it_binds(tmp_path) -> None:
+    """A plain `ensure_tunnel` while a slow reopen is in flight opens no second forwarder on
+    its port (that bind failed with EADDRINUSE in a thread, CI run 45141440965)."""
+    host = vast.LocalHost(tmp_path / "root", {})
+    target = vast_fake.Forwarder(vast._free_port())
+    port = host.tunnel(target.port)
+    host.reopen_delay_s = 0.5
+    host.kill_tunnels()
+    assert host.ensure_tunnel(force=True) is True  # the slow reopen starts
+    assert host.ensure_tunnel() is False and host.ensure_tunnel(force=True) is False
+    deadline = time.monotonic() + 5
+    while len(host._forwarders) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert [f.port for f in host._forwarders][-1] == port and host._forwarders[-1].alive()
+    assert host.ensure_tunnel() is False
+    host.close()
+    target.stop()
