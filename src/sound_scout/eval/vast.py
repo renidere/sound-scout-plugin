@@ -2330,18 +2330,6 @@ def recover(
     restarted) and `/health` asked for up to `RECOVER_HEALTH_S`. `resend` only when the server
     answers again; after a timeout a tunnel that still carries `/health` means the request
     itself was slow: `timeout`, nothing is resent."""
-    stopped = soft_stop(run)
-    if stopped is not None:
-        # past the soft end or the soft spend nothing is resent, so the tail stays bounded
-        run.journal.append(
-            "transport_check",
-            model=name,
-            after_timeout=after_timeout,
-            tunnel_reopened=False,
-            health=None,
-            outcome=stopped,
-        )
-        return stopped
     if after_timeout and client.request("/health", timeout=5)[0] == 200:
         run.journal.append(
             "transport_check",
@@ -2354,8 +2342,11 @@ def recover(
         return "timeout"
     detail: dict = {}
     state = _state_or_none(run.host, out, run.journal, detail)
+    # past the soft end or the soft spend nothing is resent, so the tail stays bounded; a
+    # rule limit (the timeout above, an RSS kill here) still keeps its own name
+    stopped = soft_stop(run)
     outcome, reopened, health = None, False, None
-    if state is None:
+    if state is None and stopped is None:
         if host_reachable(run):
             state = _state_or_none(run.host, out, run.journal, detail)
         else:
@@ -2365,6 +2356,8 @@ def recover(
             _judge(state, late=True)
         except ServerExited as error:
             outcome = _exit_outcome(error)
+    if outcome is None and stopped is not None:
+        outcome = stopped
     if outcome is None and not after_timeout:
         health = client.request("/health", timeout=5)[0]
     if outcome is None and health != 200:
@@ -2926,13 +2919,23 @@ def run_attempt(
         if run.host is not None:
             state = summarize(journal.replay())
             if state["closed"] is None and not state["destroy_requested"]:
-                try:
-                    with _step(journal, "download") as detail:
-                        detail.update(
-                            download(run.host, attempt, journal, intervals["download_timeout_s"])
-                        )
-                except BaseException as error:
-                    failure = failure or error
+                # `systemctl stop` (KillMode=control-group) also kills an ssh or scp in flight,
+                # so after a signal a failed download gets one more try
+                for number in (1, 2):
+                    if number == 2 and (attempt / HOST_DIR).exists():
+                        os.rename(attempt / HOST_DIR, attempt / f"{HOST_DIR}-failed-1")
+                    try:
+                        with _step(journal, "download") as detail:
+                            detail.update(
+                                download(
+                                    run.host, attempt, journal, intervals["download_timeout_s"]
+                                )
+                            )
+                        break
+                    except BaseException as error:
+                        if number == 2 or run.fatal != "cancelled":
+                            failure = failure or error
+                            break
             else:
                 journal.append("download_skipped", reason="the watchdog is destroying the instance")
                 failure = failure or VastError(

@@ -2865,14 +2865,22 @@ def test_a_request_is_cut_two_minutes_past_the_moment_the_clock_reaches_the_soft
     assert vast.timeout_cap(run) == pytest.approx(180, abs=1)
 
 
-def test_recover_past_the_soft_stop_resends_nothing_and_asks_no_host(
+def test_recover_past_the_soft_stop_resends_nothing_but_keeps_the_rules_own_limits(
     tmp_path: Path, key_file, fake
 ) -> None:
-    host = _RecoverHost()
+    host = _RecoverHost(down=10**9)
     run = _recover_run(tmp_path, fake, key_file, host)
     run.soft_end = time.time() - 1
     assert vast.recover(run, _NeverHealthy(), "/workspace/out/m", "m") == "soft_end"
-    assert host.calls == [] and host.reopened == []
+    assert host.calls == [["python3", vast.HOSTRUN, "state"]] and host.reopened == []
+    assert run.fatal is None
+    healthy = _TunnelClient(host, healthy=True)
+    assert vast.recover(run, healthy, "/workspace/out/m", "m", after_timeout=True) == "timeout"
+    killed = _state(exit={"reason": "rss_limit", "returncode": -9, "t": 1.0})
+    (tmp_path / "late").mkdir()
+    late = _recover_run(tmp_path / "late", fake, key_file, _RecoverHost(states=[killed]))
+    late.soft_end = time.time() - 1
+    assert vast.recover(late, _NeverHealthy(), "/workspace/out/m", "m") == "rss_limit"
 
 
 def test_an_rss_kill_by_hostrun_is_the_rules_limit_not_a_server_exit(

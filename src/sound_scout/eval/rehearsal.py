@@ -204,6 +204,7 @@ class Scenario:
     expect_error: str | None = None
     stale_s: float | None = None
     signal_when: Callable[[Path], bool] | None = None
+    signal_group: bool = False
 
 
 def _block_end(model: str, block: str, action: Callable) -> dict:
@@ -786,13 +787,28 @@ def _journal_has(out: Path, event: str, **fields) -> bool:
     return False
 
 
+def _slow_final_pack(run) -> None:
+    """The final `pack` runs 2 s in a subprocess, so the signal to the whole group kills it in
+    flight, as `systemctl stop` kills an ssh or scp of the download."""
+    real = run.host.run
+
+    def slow(argv, timeout):
+        if argv[:3] == ["python3", vast.HOSTRUN, "pack"] and argv[-1].endswith("/results.tar"):
+            argv = ["sh", "-c", 'sleep 2; exec "$0" "$@"', *argv]
+        return real(argv, timeout)
+
+    run.host.run = slow
+
+
 def check_sigterm_late(o: Outcome, c: Checks) -> None:
-    c("deploy finished its path and exited 0", o.error == 0, o.error)
+    c("deploy ended by the signal or after its path", o.error in (0, 143), o.error)
     signals = o.kinds("signal")
+    c("one SIGTERM journaled", [e["name"] for e in signals] == ["SIGTERM"], signals)
+    downloads = o.steps("download")
     c(
-        "the late signal is journaled as deferred",
-        [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", True)],
-        signals,
+        "the download killed in flight was tried once more and verified",
+        [d["ok"] for d in downloads] == [False, True],
+        [(d["ok"], (d.get("detail") or {}).get("error")) for d in downloads],
     )
     for model in (M1, M2):
         model_ok(o, c, model)
@@ -1126,11 +1142,12 @@ SCENARIOS = [
     ),
     Scenario(
         "sigterm_in_final_path",
-        "SIGTERM после последней модели, во время download или destroy",
-        {"fake": lambda fake: setattr(fake, "destroy_lag", 40)},
+        "SIGTERM всей группе процессов (как systemctl stop) во время финального download",
+        {"hooks": {"host": _slow_final_pack}},
         check_sigterm_late,
         expect_error="any",
         signal_when=lambda out: _journal_has(out, "model_outcome", model=M2),
+        signal_group=True,
     ),
     Scenario(
         "truncated_gate0_day",
@@ -1236,6 +1253,21 @@ def _dry(scenario: Scenario, out: Path, holder: dict) -> dict:
         vast.HEARTBEAT_STALE_S = saved_stale
 
 
+def _descendants(pid: int) -> list[int]:
+    """Every process below `pid` by `/proc/<n>/stat` parent links, whatever its session."""
+    parents = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            parents[int(stat.parent.name)] = int(fields[1])
+    found, frontier = [], [pid]
+    while frontier:
+        below = [child for child, parent in parents.items() if parent in frontier]
+        found += below
+        frontier = below
+    return found
+
+
 def _signalled(scenario: Scenario, out: Path) -> int | None:
     """The dry run in a child process (`--child`), sent SIGTERM once `signal_when(out)` holds,
     as `systemctl stop` would signal `deploy`; returns its exit code."""
@@ -1249,7 +1281,12 @@ def _signalled(scenario: Scenario, out: Path) -> int | None:
     try:
         while child.poll() is None and time.monotonic() < ends:
             if scenario.signal_when(out):
-                child.send_signal(signal.SIGTERM)
+                if scenario.signal_group:  # as systemd's KillMode=control-group: every process
+                    for pid in [child.pid, *_descendants(child.pid)]:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGTERM)
+                else:
+                    child.send_signal(signal.SIGTERM)
                 break
             time.sleep(0.05)
         return child.wait(300)
