@@ -790,14 +790,19 @@ def _journal_has(out: Path, event: str, **fields) -> bool:
     return False
 
 
+FINAL_PACK_MARK = "final-pack-started"
+
+
 def _slow_final_pack(run) -> None:
-    """The final `pack` runs 2 s in a subprocess, so the signal to the whole group kills it in
-    flight, as `systemctl stop` kills an ssh or scp of the download."""
+    """The final `pack` runs 2 s in a subprocess and marks its start on the host, so the signal
+    to the whole group (sent once the mark is there) kills it in flight, as `systemctl stop`
+    kills an ssh or scp of the download."""
     real = run.host.run
+    mark = f"{vast.WORKSPACE}/{FINAL_PACK_MARK}"
 
     def slow(argv, timeout):
         if argv[:3] == ["python3", vast.HOSTRUN, "pack"] and argv[-1].endswith("/results.tar"):
-            argv = ["sh", "-c", 'sleep 2; exec "$0" "$@"', *argv]
+            argv = ["sh", "-c", f'touch {mark}; sleep 2; exec "$0" "$@"', *argv]
         return real(argv, timeout)
 
     run.host.run = slow
@@ -1418,7 +1423,7 @@ SCENARIOS = [
         {"hooks": {"host": _slow_final_pack}},
         check_sigterm_late,
         expect_error="any",
-        signal_when=lambda out: _journal_has(out, "model_outcome", model=M2),
+        signal_when=lambda out: (out / "host-root" / FINAL_PACK_MARK).exists(),
         signal_group=True,
     ),
     Scenario(

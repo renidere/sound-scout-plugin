@@ -78,7 +78,8 @@ jobs:
 
   clean-install:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # тот же набор тестов, что у checks, с репетицией #149
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
 
