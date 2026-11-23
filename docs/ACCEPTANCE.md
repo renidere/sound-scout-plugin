@@ -84,9 +84,13 @@ CLAUDE.md). Статусы `проверено` в матрице опирают
   `tests/test_jobs.py`, `tests/test_jobs_runner.py`, `tests/test_staging.py`,
   `tests/test_delivery.py`, `tests/test_hermes_plugin.py` и `tests/test_hermes_delivery.py`; моки не доказывают пользовательский путь.
 - **A01–A14 — новые пункты приёмки**, не часть T01–T10: сценарии из поручения владельца на
-  настоящем Windows-клиенте (0013 § 8), задача [#112](https://github.com/renidere/sound-scout-plugin/issues/112). Состояние на 2026-11-20: ни один
-  сценарий не выполнялся, значит ни один не пройден. Им нужны пакет на хосте Hermes ([#104](https://github.com/renidere/sound-scout-plugin/issues/104)),
-  рекордер Desktop ([#103](https://github.com/renidere/sound-scout-plugin/issues/103)) и сквозной путь Windows ([#105](https://github.com/renidere/sound-scout-plugin/issues/105)).
+  настоящем Windows-клиенте (0013 § 8), задача [#112](https://github.com/renidere/sound-scout-plugin/issues/112). Таблица «критерий → действие →
+  evidence → результат», стенды и шаги владельца O1–O9 — `docs/acceptance/A01-A14.md`. Состояние
+  на 2026-11-23 (проверка агента только чтением, 23:12–23:40 MSK, `plugin.js` `0d247e4b…`):
+  пройдено 0, частично 10, не проверено 1, ждёт владельца 3. Пройденные части опираются на
+  прогоны владельца в [#105](https://github.com/renidere/sound-scout-plugin/issues/105) и задания
+  [#114](https://github.com/renidere/sound-scout-plugin/issues/114); клиентский путь после #108 и
+  #109 владелец повторяет шагами O1–O9.
 
 ## Evaluation note
 

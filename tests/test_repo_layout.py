@@ -478,13 +478,14 @@ def test_hermes_install_keeps_connection_an_owner_step_and_counts_the_tools() ->
 
 
 def test_acceptance_limits_t09b_to_the_sync_call_and_lists_a01_a14_as_not_passed() -> None:
-    """#111 criterion 3: T09b is the synchronous MCP call; A01–A14 are new and not run."""
+    """#111 criterion 3: T09b is the synchronous MCP call; A01–A14 are new and live in their own
+    table (#112), which is not all passed."""
     text = read("docs/ACCEPTANCE.md")
     section = flat(text.split("## Приёмка единого плагина (A01–A14)", 1)[1].split("\n## ", 1)[0])
     for fragment in (
         "**T09b покрывает только синхронный native вызов MCP.**",
         "**A01–A14 — новые пункты приёмки**, не часть T01–T10",
-        "ни один сценарий не выполнялся, значит ни один не пройден",
+        "`docs/acceptance/A01-A14.md`",
         f"[#112]({ISSUE.format(112)})",
         f"[#114]({ISSUE.format(114)})",
         f"[#115]({ISSUE.format(115)})",
