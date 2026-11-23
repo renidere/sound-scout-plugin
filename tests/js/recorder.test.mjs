@@ -629,22 +629,94 @@ test('the byte budget of GET /health stops the capture before the WAV grows past
   assert.equal(named(calls, 'file.attach').length, 0)
 })
 
-test('no budget from GET /health means no recording', async () => {
-  const answers = [
-    { ok: false, error: 'cli_failed', detail: 'x' },
-    { ok: true, budgets: null, intake: { ready: false, error: 'cli_failed', detail: 'private-detail' } },
-    { ok: true, budgets: { max_duration_seconds: 0, max_input_bytes: 10 }, intake: { ready: true } },
-    { ok: true, budgets: { max_duration_seconds: 1.5, max_input_bytes: 10 }, intake: { ready: true } }
-  ]
-  for (const answer of answers) {
-    const { recorder, capture, ctx, calls } = await setup()
-    ctx.health = answer
-    await recorder.start()
-    assert.equal(capture.constraints, null)
+const R02 = { max_duration_seconds: 180, max_input_bytes: 104857600 }
+const noBudgetWarning = text => `Sound Scout не сообщил лимит записи: ${text}. Запись идёт с лимитом 180 с, разбор недоступен.`
+
+// Without budgets from GET /health the capture starts with the R02 limit and only Send is open (#174).
+async function startWithoutBudget(health, patch = () => {}) {
+  let timeout
+  const context = await setup({ globals: { setTimeout: (fn, ms) => { timeout = { fn, ms }; return 1 }, clearTimeout: () => {} } })
+  context.ctx.health = health
+  patch(context.ctx)
+  await context.recorder.start()
+  const { recorder, capture, calls } = context
+  assert.notEqual(capture.constraints, null)
+  assert.equal(recorder.state.get().phase, 'recording')
+  assert.equal(timeout.ms, 180000)
+  assert.equal(recorder.state.get().limitSeconds, 180)
+  same(recorder.budget, R02)
+  assert.equal(recorder.state.get().canAnalyze, false)
+  assert.equal(recorder.state.get().error, '')
+  const warnings = notices(calls)
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].kind, 'warning')
+  return { ...context, warning: warnings[0].message }
+}
+
+test('a GET /health exception starts the recording with the R02 limit and disables Send and analyze', async () => {
+  const { recorder, warning } = await startWithoutBudget(new Error(IPC_FAILURE))
+  assert.equal(recorder.state.get().intakeError, 'no_answer')
+  assert.ok(warning.startsWith(`Sound Scout не сообщил лимит записи: ${DESKTOP_TEXT}.`))
+  assert.equal(warning, noBudgetWarning(DESKTOP_TEXT))
+})
+
+// ctx.rest of the Desktop SDK rejects when its timeoutMs runs out; the fake rejects the same way.
+test('a GET /health timeout of ctx.rest starts the recording with the R02 limit and disables Send and analyze', async () => {
+  const timedOut = 'Request timed out after 10000 ms'
+  const { recorder, ctx, warning } = await startWithoutBudget(null, ctx => {
+    ctx.rest = async (path, opts = {}) => {
+      ctx.rests.push({ path, opts })
+      if (path === '/health' && opts.timeoutMs === 10000) throw new Error(timedOut)
+      throw new Error(`Unexpected rest: ${path} ${JSON.stringify(opts)}`)
+    }
+  })
+  same(ctx.rests, [{ path: '/health', opts: { timeoutMs: 10000 } }])
+  assert.equal(recorder.state.get().intakeError, 'no_answer')
+  assert.equal(warning, noBudgetWarning(timedOut))
+})
+
+test('a GET /health with ok: false starts the recording with the R02 limit and disables Send and analyze', async () => {
+  const { recorder, warning } = await startWithoutBudget({ ok: false, error: 'cli_failed', detail: 'private-detail' })
+  assert.equal(recorder.state.get().intakeError, 'cli_failed')
+  assert.equal(warning, noBudgetWarning('cli_failed'))
+  assert.doesNotMatch(warning, /private-/)
+})
+
+test('a GET /health with null or invalid budgets starts the recording with the R02 limit and disables Send and analyze', async () => {
+  for (const [health, code] of [
+    [{ ok: true, budgets: null, intake: { ready: false, error: 'cli_failed', detail: 'private-detail' } }, 'cli_failed'],
+    [{ ok: true, budgets: { max_duration_seconds: 0, max_input_bytes: 10 }, intake: { ready: true } }, 'no_budgets'],
+    [{ ok: true, budgets: { max_duration_seconds: 1.5, max_input_bytes: 10 }, intake: { ready: true } }, 'no_budgets']
+  ]) {
+    const { recorder, warning } = await startWithoutBudget(health)
+    assert.equal(recorder.state.get().intakeError, code)
+    assert.equal(warning, noBudgetWarning(code))
+    assert.doesNotMatch(warning, /private-/)
+  }
+})
+
+test('without budgets Send goes to the chat captured at start by the stock path and Send and analyze stays disabled', async () => {
+  const { ctx, click, render, calls, capture, recorder, focus, remote } = await setupRegistered()
+  ctx.health = new Error(IPC_FAILURE)
+  try {
+    await click('Записать')
+    assert.equal(recorder.state.get().phase, 'recording')
+    feed(capture)
+    const analyze = findButton(render(), 'Отправить и разобрать')
+    assert.equal(analyze.props.disabled, true)
+    assert.match(analyze.props.title, /no_answer/)
+    focus.stored = 'stored-b'
+    focus.owner = { connectionId: 'conn-local', profile: 'default' }
+    await click('Отправить')
+    same(calls.map(call => call[0]).filter(name => name !== 'notify'),
+      ['profileRoutes', 'retain', 'session.resume', 'file.attach', 'prompt.submit', 'release'])
+    same(named(calls, 'session.resume')[0][1], { session_id: 'stored-a', omit_messages: true })
+    assert.equal(named(calls, 'prompt.submit')[0][2], remote)
+    assert.equal(ctx.rests.filter(r => r.opts.method === 'POST').length, 0)
+    same(ctx.rests.map(r => r.path), ['/health'])
     assert.equal(recorder.state.get().phase, 'idle')
-    assert.match(recorder.state.get().error, /Sound Scout не сообщил лимит записи/)
-    assert.doesNotMatch(recorder.state.get().error, /private-/)
-    assert.equal(notices(calls).length, 1)
+  } finally {
+    ctx.disposers.forEach(fn => fn())
   }
 })
 
@@ -733,11 +805,13 @@ test('a failed ctx.rest of POST /jobs shows the Desktop error text without the I
 
 test('a failed ctx.rest of GET /health and of the last status poll show the Desktop error text', async () => {
   {
-    const { recorder, capture, ctx } = await setup()
+    const { recorder, capture, ctx, calls } = await setup()
     ctx.health = new Error(IPC_FAILURE)
     await recorder.start()
-    assert.equal(capture.constraints, null)
-    assert.equal(recorder.state.get().error, `Sound Scout не сообщил лимит записи: ${DESKTOP_TEXT}.`)
+    assert.notEqual(capture.constraints, null)
+    assert.equal(recorder.state.get().phase, 'recording')
+    assert.equal(recorder.state.get().error, '')
+    same(notices(calls), [{ kind: 'warning', message: noBudgetWarning(DESKTOP_TEXT) }])
   }
   {
     const { recorder, capture, ctx, calls } = await setup({ options: { maxPollFailures: 2 } })
@@ -760,10 +834,11 @@ test('the Desktop error text is one line of at most 300 characters, and an empty
     [new Error(''), 'нет ответа сервера'],
     [undefined, 'нет ответа сервера']
   ]) {
-    const { recorder, ctx } = await setup()
+    const { recorder, ctx, calls } = await setup()
     ctx.rest = async () => { throw failure }
     await recorder.start()
-    assert.equal(recorder.state.get().error, `Sound Scout не сообщил лимит записи: ${expected}.`)
+    assert.equal(recorder.state.get().phase, 'recording')
+    same(notices(calls), [{ kind: 'warning', message: noBudgetWarning(expected) }])
   }
 })
 

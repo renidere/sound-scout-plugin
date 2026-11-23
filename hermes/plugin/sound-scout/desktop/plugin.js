@@ -12,6 +12,8 @@ const ATTACH_TIMEOUT_MS = 120000
 const UPLOAD_TIMEOUT_MS = 120000
 const STATUS_TIMEOUT_MS = 10000
 const HEALTH_TIMEOUT_MS = 10000
+// Границы версии R02: лимит записи, когда `GET /health` не дал бюджетов (#174).
+const R02_BUDGET = { max_duration_seconds: 180, max_input_bytes: 104857600 }
 const WAV_HEADER_BYTES = 44
 
 function describeHealth(answer) {
@@ -347,8 +349,11 @@ export class Recorder {
       health = await this.readBudget()
     } catch (error) {
       if (generation !== this.generation) return
-      this.update({ phase: 'idle', error: `Sound Scout не сообщил лимит записи: ${error.message}.` })
-      return
+      health = { budget: R02_BUDGET, canAnalyze: false, intakeError: error.code }
+      this.host.notify({
+        kind: 'warning',
+        message: `Sound Scout не сообщил лимит записи: ${error.message}. Запись идёт с лимитом 180 с, разбор недоступен.`
+      })
     }
     if (generation !== this.generation) return
     this.target = target
