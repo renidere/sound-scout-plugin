@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from sound_scout.eval import rehearsal
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -213,8 +215,8 @@ def test_clean_install_job_reuses_the_ffmpeg_step_of_checks_and_runs_the_script(
     uses = [step["uses"] for step in job["steps"] if "uses" in step]
     checks_uses = [step["uses"] for step in jobs["checks"]["steps"] if "uses" in step]
     assert uses == checks_uses
-    assert job["steps"][-1]["run"] == "bash scripts/clean-install-check.sh"
-    # the same suite as checks, with the #149 rehearsal: the same job limit
+    # the suite of checks, without the #149 rehearsal (the job rehearsal has it, #167)
+    assert job["steps"][-1]["run"] == 'bash scripts/clean-install-check.sh -m "not rehearsal"'
     assert job["timeout-minutes"] == jobs["checks"]["timeout-minutes"] == 45
 
 
@@ -227,10 +229,35 @@ def test_history_scan_job_checks_out_the_whole_history_and_runs_the_scanner() ->
     assert all("continue-on-error" not in step for step in job["steps"])
 
 
-def test_criterion_4_ci_test_step_runs_the_full_suite_without_a_marker_filter() -> None:
-    """#164: the fast set is `-m "not slow"` on the station; CI still runs every test."""
-    step = named_step(workflow_jobs()["checks"], "Test")
-    assert step["run"] == "uv run pytest"
+def test_criterion_4_ci_runs_the_full_suite_split_between_checks_and_rehearsal() -> None:
+    """#164: the fast set is `-m "not slow"` on the station; CI still runs every test.
+    #167: checks runs all but the rehearsal, the job rehearsal runs the rest (the shards are
+    checked in tests/test_eval_rehearsal.py)."""
+    jobs = workflow_jobs()
+    assert named_step(jobs["checks"], "Test")["run"] == 'uv run pytest -m "not rehearsal"'
+    assert named_step(jobs["rehearsal"], "Test")["run"] == "uv run pytest -m rehearsal"
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     addopts = re.search(r'^addopts\s*=\s*"([^"]*)"', pyproject, re.MULTILINE)
     assert addopts and "-m" not in addopts.group(1).split()
+
+
+def test_the_rehearsal_job_names_the_scenario_count_and_stays_within_its_limit() -> None:
+    """#167: the job comment gives the scenario count of the code; checks keeps its 45 min."""
+    text = CI.read_text(encoding="utf-8")
+    job = text[text.index("\n  rehearsal:\n") :]
+    comment = job[: job.index("\n    timeout-minutes:")]
+    assert f"сценариев: {len(rehearsal.SCENARIOS)}, unit: {len(rehearsal.UNITS)}." in comment
+    assert "Предел 20 мин" in comment
+    jobs = workflow_jobs()
+    assert jobs["rehearsal"]["timeout-minutes"] == 20
+    assert jobs["checks"]["timeout-minutes"] == 45
+    steps = jobs["rehearsal"]["steps"]
+    assert [s.get("uses", "").split("@")[0] for s in steps if "uses" in s] == [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+    ]
+    assert [s["name"] for s in steps if "name" in s] == ["Sync", "Test"]
+    # the rehearsal never calls ffmpeg: no ffmpeg step, the same locked environment as checks
+    assert named_step(jobs["rehearsal"], "Sync")["run"] == named_step(jobs["checks"], "Sync")["run"]
+    test = named_step(jobs["rehearsal"], "Test")
+    assert test["env"]["HF_HUB_OFFLINE"] == test["env"]["SOUND_SCOUT_NO_NETWORK"] == "1"

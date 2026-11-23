@@ -4,6 +4,9 @@ Each scenario runs the whole stack (`vast.dry_run`: the fake Vast API, a host di
 the real `hostrun.py serve` and guard, the fake vLLM, the real Gate 0 and extended clients) and
 its own checks (`rehearsal.SCENARIOS`); a failing check names itself in the assertion. The
 fakes prove the order and the contract of the stack, never the image, vLLM, a model or Vast.ai.
+
+CI runs the scenarios and the units in the `rehearsal` job, one shard per runner (#167):
+`REHEARSAL_SHARD=k/n` keeps every n-th name from the k-th; without it all of them run.
 """
 
 import json
@@ -11,10 +14,28 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from sound_scout.eval import rehearsal
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REHEARSED = [s.name for s in rehearsal.SCENARIOS] + sorted(rehearsal.UNITS)
+
+
+def shard(names: list[str], spec: str) -> list[str]:
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", spec)
+    if not match or int(match[1]) > int(match[2]):
+        raise ValueError(f"REHEARSAL_SHARD must be k/n with 1 <= k <= n, got {spec!r}")
+    return names[int(match[1]) - 1 :: int(match[2])]
+
+
+SELECTED = (
+    set(shard(REHEARSED, os.environ["REHEARSAL_SHARD"]))
+    if os.environ.get("REHEARSAL_SHARD")
+    else set(REHEARSED)
+)
 
 
 def _failed(result: dict) -> list:
@@ -22,7 +43,10 @@ def _failed(result: dict) -> list:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("scenario", rehearsal.SCENARIOS, ids=lambda s: s.name)
+@pytest.mark.rehearsal
+@pytest.mark.parametrize(
+    "scenario", [s for s in rehearsal.SCENARIOS if s.name in SELECTED], ids=lambda s: s.name
+)
 def test_scenario(tmp_path, scenario) -> None:
     result = rehearsal.run_scenario(scenario, tmp_path / scenario.name)
     assert result["checks"], "a scenario without checks proves nothing"
@@ -30,7 +54,8 @@ def test_scenario(tmp_path, scenario) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("name", sorted(rehearsal.UNITS))
+@pytest.mark.rehearsal
+@pytest.mark.parametrize("name", sorted(set(rehearsal.UNITS) & SELECTED))
 def test_unit(tmp_path, name) -> None:
     result = rehearsal.UNITS[name](tmp_path / name)
     assert result["checks"] and not _failed(result), _failed(result)
@@ -141,3 +166,58 @@ def test_the_extended_check_counts_against_the_plan(tmp_path) -> None:
     checks = rehearsal.Checks()
     rehearsal.ext_complete(outcome, checks, "m")
     assert all(item["passed"] for item in checks.items)
+
+
+def ci_shards() -> list[str]:
+    yaml = pytest.importorskip("yaml")
+    jobs = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())["jobs"]
+    job = jobs["rehearsal"]
+    test = next(step for step in job["steps"] if step.get("name") == "Test")
+    assert test["run"] == "uv run pytest -m rehearsal"
+    assert test["env"]["REHEARSAL_SHARD"] == "${{ matrix.shard }}"
+    assert job["strategy"]["fail-fast"] is False
+    return job["strategy"]["matrix"]["shard"]
+
+
+def test_the_ci_shards_run_every_scenario_and_unit_exactly_once() -> None:
+    """#167: a scenario added later lands in a shard by itself; a shard missing from the CI
+    matrix, or one counted twice, fails here."""
+    shards = ci_shards()
+    assert len(shards) >= 2 and all(spec.endswith(f"/{len(shards)}") for spec in shards)
+    picked = [name for spec in shards for name in shard(REHEARSED, spec)]
+    assert sorted(picked) == sorted(REHEARSED) and len(picked) == len(set(picked))
+    assert len(REHEARSED) == len(set(REHEARSED)) == len(rehearsal.SCENARIOS) + len(rehearsal.UNITS)
+
+
+def test_a_shard_picks_every_nth_name_and_refuses_a_bad_spec() -> None:
+    names = [f"s{i}" for i in range(7)]
+    assert shard(names, "1/3") == ["s0", "s3", "s6"]
+    assert shard(names, "3/3") == ["s2", "s5"]
+    assert shard(names, "1/1") == names
+    for spec in ("0/3", "4/3", "3", "1/0", "a/b", " 1/3", "1/3 "):
+        with pytest.raises(ValueError, match="REHEARSAL_SHARD"):
+            shard(names, spec)
+
+
+@pytest.mark.slow
+def test_the_shard_env_selects_the_collected_scenarios(tmp_path) -> None:
+    def collected(spec: str | None) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if k != "REHEARSAL_SHARD"}
+        if spec is not None:
+            env["REHEARSAL_SHARD"] = spec
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "rehearsal",
+             "-p", "no:cacheprovider", str(Path(__file__))],
+            capture_output=True, text=True, env=env, cwd=tmp_path, timeout=120,
+        )  # fmt: skip
+
+    def names(done: subprocess.CompletedProcess) -> list[str]:
+        assert done.returncode == 0, done.stdout + done.stderr
+        return re.findall(r"::test_(?:scenario|unit)\[([^\]]+)\]$", done.stdout, re.MULTILINE)
+
+    assert sorted(names(collected(None))) == sorted(REHEARSED)
+    assert names(collected("2/3")) == shard(REHEARSED, "2/3")
+    refused = collected("4/3")
+    assert refused.returncode != 0 and "REHEARSAL_SHARD must be k/n" in refused.stdout + (
+        refused.stderr
+    )

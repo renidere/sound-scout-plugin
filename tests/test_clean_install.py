@@ -109,7 +109,7 @@ hf=${HF_HUB_OFFLINE-unset} net=${SOUND_SCOUT_NO_NETWORK-unset}" >> "$CALLS"
 case "$1 $2 $3" in
   "--version  ") echo "uv 0.0.0" ;;
   "sync --locked --all-groups") ;;
-  "run pytest ")
+  "run pytest "*)
     if [ -n "$FAIL_PYTEST" ]; then echo "collected in $(pwd)"; echo "== 1 failed =="; exit 1; fi
     echo "======= 3 passed, 1 skipped in 0.10s =======" ;;
   "run sound-scout doctor") cat "$FAKE_DOCTOR" ;;
@@ -138,7 +138,7 @@ def checkout(tmp_path: Path) -> Path:
 
 
 def run_check(
-    checkout: Path, tmp_path: Path, analyze: dict, **env: str
+    checkout: Path, tmp_path: Path, analyze: dict, *args: str, **env: str
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg is not installed")
@@ -150,7 +150,7 @@ def run_check(
     (tmp_path / "analyze.json").write_text(json.dumps(analyze))
     calls = tmp_path / "calls"
     done = subprocess.run(
-        ["bash", str(checkout / "scripts" / CHECK.name)],
+        ["bash", str(checkout / "scripts" / CHECK.name), *args],
         env={
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -198,7 +198,7 @@ def test_check_prints_a_summary_and_passes_on_the_expected_statuses(
     assert lines[6].endswith("| ok")
     assert lines[-1] == "result: ok"
     pytest_call = next(call for call in calls if call.startswith("run pytest"))
-    assert pytest_call.endswith("cfg=unset dev=unset hf=1 net=1")
+    assert pytest_call == "run pytest | cfg=unset dev=unset hf=1 net=1"
     for name in ("doctor", "analyze"):
         call = next(call for call in calls if call.startswith(f"run sound-scout {name}"))
         assert "dev=unset hf=1 net=1" in call
@@ -225,3 +225,14 @@ def test_check_stops_at_the_first_failed_step_and_hides_the_temp_dir(
     assert not any(call.startswith("run sound-scout") for call in calls)
     assert "collected in <tmp>/repo" in done.stderr
     assert "/tmp" not in done.stderr.replace("<tmp>", "")
+
+
+def test_check_passes_its_args_to_the_pytest_step_only(checkout: Path, tmp_path: Path) -> None:
+    """#167: CI runs the clean install without the rehearsal, which has a job of its own."""
+    done, calls = run_check(
+        checkout, tmp_path, analyze_answer("unavailable"), "-m", "not rehearsal"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    pytest_call = next(call for call in calls if call.startswith("run pytest"))
+    assert pytest_call == "run pytest -m not rehearsal | cfg=unset dev=unset hf=1 net=1"
+    assert sum("rehearsal" in call for call in calls) == 1

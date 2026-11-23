@@ -57,6 +57,7 @@ tmp_path_retention_policy = "failed"
 tmp_path_retention_count = 1
 markers = [
     "slow: a real model, a long synthesis, the dry stack, or 0.8 s or more on the station; deselect with -m \"not slow\"",
+    "rehearsal: a scenario or a unit of the #149 rehearsal; CI runs them in the job rehearsal, sharded by REHEARSAL_SHARD=k/n",
 ]
 
 [tool.uv]

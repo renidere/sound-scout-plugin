@@ -62,7 +62,9 @@ bash scripts/clean-install-check.sh
 сетевой guard активен; `analyze` возвращает `partial` с кодом 3, `prepare` и `acoustics` —
 `completed`, `audio_review` — `unavailable` (`backend = none`). `asr` допускается `completed` или
 `unavailable`: в CI модели нет, и там ожидается `unavailable`; на станции с моделью в кэше —
-`completed`. `failed` — всегда ошибка. В CI это job `clean-install`.
+`completed`. `failed` — всегда ошибка. В CI это job `clean-install`: он вызывает скрипт с
+аргументами `-m "not rehearsal"`, и скрипт передаёт их шагу `pytest`. Репетицию #149 на том же
+коммите проверяет job `rehearsal` по шардам (#167).
 
 ## 4. Нет приватного в git
 

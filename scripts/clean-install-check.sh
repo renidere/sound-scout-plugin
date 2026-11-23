@@ -7,7 +7,7 @@
 # cached here or not: `asr` is accepted as `completed` or `unavailable`, `audio_review` must be
 # `unavailable` (scripts/clean_install_expect.py has the rules).
 #
-# usage: clean-install-check.sh
+# usage: clean-install-check.sh [pytest args…] — the args go to the pytest step as they are
 # output: `clean-install-check: <commit>`, one `<step> | ok|fail | <seconds> | <detail>` line per
 # step, then `result: ok` (exit 0) or `result: fail (<step>)` (exit 1). The full output of a
 # failed step goes to stderr, with the temp dir shown as `<tmp>`.
@@ -44,7 +44,7 @@ step clone "git -C '$repo' log -1 --format=%cs" -- git clone --quiet "$root" "$r
 cd "$repo"
 step "uv sync" "uv --version" -- uv sync --locked --all-groups
 step pytest "grep -E '[0-9]+ (passed|failed|error)' '$tmp/pytest.log' | tail -1 | sed -E 's/^=+ *| *=+\$//g'" -- \
-  "${offline[@]}" uv run pytest
+  "${offline[@]}" uv run pytest "$@"
 
 mkdir "$tmp/in" "$tmp/data"
 cat >"$tmp/sound-scout.toml" <<EOF
