@@ -49,6 +49,7 @@ from pathlib import Path
 HOST = "127.0.0.1"
 OFFER_ID = 4242
 FIRST_INSTANCE_ID = 900001
+SHUTDOWN_POLL_S = 0.05  # serve_forever polls for `stop` this often; the default 0.5 s waits
 PAGE_SIZE = 1
 AUDIO_TOKENS_PER_S = 25
 QWEN3_AUDIO_TOKENS_PER_S = 12.5
@@ -99,7 +100,9 @@ class FakeVast:
         self._lock = threading.Lock()
         self._server = ThreadingHTTPServer((HOST, 0), self._handler())
         self._server.daemon_threads = True
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, args=(SHUTDOWN_POLL_S,), daemon=True
+        )
 
     @property
     def url(self) -> str:

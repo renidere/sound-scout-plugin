@@ -356,7 +356,7 @@ def test_streamed_decoder_equals_the_checkpoint_in_bf16_with_nothing_left_on_met
 def server():
     """The real handler on 127.0.0.1 with a fake engine, without the process network guard."""
     httpd = gigachat.GigaServer((gigachat.HOST, 0), borealis.Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread = threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True)
     thread.start()
     yield httpd
     httpd.shutdown()

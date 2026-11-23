@@ -142,6 +142,7 @@ def test_an_unknown_job_is_job_not_found(setup: Config) -> None:  # noqa: F811
     assert refused.value.code == "job_not_found"
 
 
+@pytest.mark.slow
 def test_jobs_bind_through_the_console(config_file: Path, make_wav: WavFactory) -> None:  # noqa: F811
     wav = make_wav("recordings/a.wav")
     data = config_file.parent / "data"

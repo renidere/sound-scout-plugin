@@ -31,6 +31,7 @@ def built(tmp_path_factory) -> dict:
     return {"dir": out, "pins": pins, "manifest": manifest, "entries": entries}
 
 
+@pytest.mark.slow
 def test_every_clip_id_is_neutral_and_the_roles_stay_in_the_manifest(built) -> None:
     clips = built["manifest"]["clips"]
     assert all(gpu_ext.ID_PATTERN.fullmatch(clip["id"]) for clip in clips)
@@ -371,6 +372,7 @@ def test_the_real_set_is_built_from_rinco_without_pilot_1_and_piper_twice(tmp_pa
     assert [c["wav_sha256"] for c in left] == [c["wav_sha256"] for c in right]
 
 
+@pytest.mark.slow
 def test_the_cli_writes_the_analysis_once(built, tmp_path) -> None:
     attempt = _attempt(tmp_path, built, _right)
     argv = [sys.executable, "-m", "sound_scout.eval.gpu_ext", "analyze"]

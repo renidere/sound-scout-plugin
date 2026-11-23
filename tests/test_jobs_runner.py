@@ -134,6 +134,7 @@ def test_a_second_runner_is_refused_by_runner_lock_not_analyze_lock(cfg: Config)
     jobs.run_runner(cfg, exit_when_idle=True)
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_busy_puts_the_job_back_in_its_place_in_the_queue(
     cfg: Config, make_wav: WavFactory
@@ -269,6 +270,7 @@ def test_a_cancel_marker_stops_a_running_real_analyze_through_the_cancel_token(
     assert manifest["complete"] is False
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_jobs_status_merges_state_current_stage_and_finished_stages_of_a_real_running_job(
     cfg: Config, make_wav: WavFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -457,6 +459,7 @@ def test_an_unchanged_input_ends_the_job_finished_with_its_result(
     assert result["source"]["sha256"] == job["request"]["input"]["sha256"]
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_an_input_changed_attempt_does_not_hide_the_result_of_an_earlier_attempt(
     cfg: Config, make_wav: WavFactory
@@ -687,6 +690,7 @@ def run_jobs_cli(config_path: Path, *args: str, path: str | None = None):
     )
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_jobs_run_through_the_console_runs_a_queued_job_with_the_real_analyze(
     tmp_path: Path, make_wav: WavFactory
@@ -865,6 +869,7 @@ def test_an_input_outside_the_roots_narrowed_after_submit_fails_the_job_path_den
     assert job["state"] == "failed" and job["state_reason"].startswith("path_denied: ")
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_full_with_backend_none_marks_audio_review_unavailable_and_quick_skips_it(
     cfg: Config, make_wav: WavFactory
@@ -1182,6 +1187,7 @@ def control_job(cfg: Config, make_wav: WavFactory, **fields: object) -> tuple[st
     return queue(cfg, wav, request_id="r-control", **link | fields), initial
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_a_control_job_without_a_backend_ends_finished_with_an_inconclusive_comparison(
     cfg: Config, make_wav: WavFactory
@@ -1215,6 +1221,7 @@ def test_a_control_job_without_a_backend_ends_finished_with_an_inconclusive_comp
     assert len(json.dumps(answer, ensure_ascii=False).encode("utf-8")) <= 4096
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_the_comparison_runs_before_the_job_is_finished_and_lands_in_the_same_write(
     cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
@@ -1238,6 +1245,7 @@ def test_the_comparison_runs_before_the_job_is_finished_and_lands_in_the_same_wr
     assert job["state"] == "finished" and job["attempts"][-1]["compare"]["state"] == "completed"
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_an_initial_run_removed_after_submit_is_a_refused_comparison_of_a_finished_job(
     cfg: Config, make_wav: WavFactory
@@ -1254,6 +1262,7 @@ def test_an_initial_run_removed_after_submit_is_a_refused_comparison_of_a_finish
     assert not (cfg.data_root / "compare").exists()
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_an_unexpected_comparison_error_is_failed_by_its_type_and_the_job_stays_finished(
     cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
@@ -1320,6 +1329,7 @@ def test_an_ordinary_job_is_never_compared(
     assert jobs.status(job_id, cfg)["control"] is None
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_each_attempt_of_a_retried_control_job_has_its_own_comparison(
     cfg: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
@@ -1513,6 +1523,7 @@ def _log(line: str) -> None:
 """
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_criterion_3_a_new_jobs_run_process_runs_the_waiting_job_on_the_updated_code(
     tmp_path: Path, make_wav: WavFactory
@@ -1665,6 +1676,7 @@ def _start_worker(*args, **kwargs):
 """
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_criteria_3_4_an_update_between_the_claim_and_the_worker_start_leaves_the_job_queued(
     tmp_path: Path, make_wav: WavFactory

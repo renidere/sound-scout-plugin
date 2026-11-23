@@ -33,6 +33,7 @@ def _config(tmp_path: Path) -> config.Config:
     )
 
 
+@pytest.mark.slow
 def test_criterion_2_a_canary_key_reaches_no_output_argv_environment_payload_or_file(
     tmp_path: Path, monkeypatch, capfd
 ) -> None:
@@ -122,6 +123,7 @@ def _watchdog(journal: Path, command: str) -> subprocess.CompletedProcess:
     return subprocess.run(argv[argv.index("--") + 1 :], capture_output=True, timeout=120)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("create_mode", ["ok", "drop"], ids=["create-answered", "create-lost"])
 def test_criterion_3_watchdog_in_its_own_process_destroys_by_id_after_the_agent_is_killed(
     tmp_path: Path, create_mode

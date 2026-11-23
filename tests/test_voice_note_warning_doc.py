@@ -367,6 +367,7 @@ def sh_blocks(title: str) -> list[str]:
     return re.findall(r"^```sh\n(.*?)^```$", section(title), re.S | re.M)
 
 
+@pytest.mark.slow
 def test_criterion2_publish_and_revert_commands_run_as_written_and_restore_byte_for_byte(
     tmp_path: Path,
 ) -> None:

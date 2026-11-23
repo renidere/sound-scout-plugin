@@ -46,6 +46,7 @@ def tail(text: str) -> str:
     return "\n".join(text.splitlines()[-40:])
 
 
+@pytest.mark.slow
 def test_probe_node_suite_passes(node: str) -> None:
     assert assert_node_suite_passes(node, NODE_SUITE, REPO_ROOT) >= 43
 
@@ -99,6 +100,7 @@ def test_an_uncounted_test_call_fails_closed(source: str) -> None:
         declared_node_tests(source)
 
 
+@pytest.mark.slow
 def test_probe_wav_is_byte_identical_to_the_backend_generator(node: str, reference: bytes) -> None:
     program = (
         "import { createHash } from 'node:crypto';"

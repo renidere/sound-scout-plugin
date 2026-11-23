@@ -182,6 +182,7 @@ def test_speech_like_signal_gives_one_span_within_the_declared_tolerance_on_the_
     assert values["rms_dbfs"]["value"]["p10"] <= values["rms_dbfs"]["value"]["p50"] <= 0.0
 
 
+@pytest.mark.slow
 def test_onset_sweep_keeps_the_start_within_50_ms_and_the_end_within_two_windows() -> None:
     """The declared tolerance holds at every onset, not at placements picked to pass.
 

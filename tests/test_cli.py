@@ -720,6 +720,7 @@ def test_analyze_compare_and_serve_without_configuration_are_one_line_config_err
     one_line_error(captured.err, command, "config_error")
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_compare_prints_the_verdict_and_the_file_and_json_is_the_written_comparison(
     analyze_config: Path, make_wav: WavFactory, capsys: pytest.CaptureFixture[str]
@@ -814,6 +815,7 @@ def test_the_layers_of_the_parser_are_those_of_the_application_layer() -> None:
     assert cli.ANALYZE_LAYERS == app.LAYERS
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_analyze_through_the_console_entry_with_backend_none_exits_3_with_result_json(
     tmp_path: Path, make_wav: WavFactory

@@ -347,6 +347,7 @@ def config_file(setup: Config) -> Path:
     return path
 
 
+@pytest.mark.slow
 def test_deliver_next_and_end_through_the_console_entry(
     setup: Config, config_file: Path, make_wav: WavFactory
 ) -> None:
@@ -509,6 +510,7 @@ def test_two_redelivery_requests_are_recorded_each_with_its_time(
     assert "redelivery" not in first["previous"] and second["previous"]["redelivery"] is True
 
 
+@pytest.mark.slow
 def test_jobs_redeliver_through_the_console_entry(
     setup: Config, config_file: Path, make_wav: WavFactory
 ) -> None:
@@ -605,6 +607,7 @@ def control_job(cfg: Config, initial_wav: Path, wav: Path) -> str:
     return job_id
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_note_of_a_control_job_without_a_backend_says_inconclusive_and_why(
     setup: Config,
@@ -685,6 +688,7 @@ def analyzed_alone(cfg: Config, wavs: list[Path]) -> dict:
     return {name: level_of(item) for name, item in json.loads(out).items()}
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 @pytest.mark.parametrize("recording", ["tone", "speech_like"])
 def test_the_level_of_each_attempt_is_the_same_in_the_suite_and_alone(

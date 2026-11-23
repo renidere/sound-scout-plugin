@@ -99,6 +99,7 @@ def text() -> str:
     return ACCEPTANCE.read_text(encoding="utf-8")
 
 
+@pytest.mark.slow
 def test_acceptance_matrix_lists_each_item_once_with_collected_tests(text: str) -> None:
     assert matrix_problems(text, collected_ids()) == []
 

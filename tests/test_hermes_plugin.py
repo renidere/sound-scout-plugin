@@ -385,6 +385,7 @@ def test_health_names_why_the_intake_is_not_ready(
 # --- POST /jobs: the upload and the submit --------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_post_jobs_stages_the_upload_privately_and_submits_it_by_argv(
     api, station: Station, audio: bytes, monkeypatch
 ) -> None:
@@ -457,6 +458,7 @@ def test_an_option_like_request_id_stays_one_argv_item(
     assert job["request"]["layers"] == sorted(app.LAYERS)
 
 
+@pytest.mark.slow
 def test_the_mode_query_is_one_argv_item_and_the_cli_checks_its_value(
     api, station: Station, audio: bytes, monkeypatch
 ) -> None:
@@ -485,6 +487,7 @@ def test_get_job_of_a_queued_job_has_no_result_yet(api, station: Station, audio)
     assert answer["result"] is None
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_get_job_answers_the_state_the_finished_stages_and_the_compact_result(
     api, station: Station, make_wav: WavFactory
@@ -838,6 +841,7 @@ def test_copy_hash_fsync_and_the_cli_run_off_the_event_loop(
     assert all(loop_thread not in idents for idents in threads.values()), threads
 
 
+@pytest.mark.slow
 def test_a_cli_refusal_of_the_submit_removes_the_staged_copy(
     api, station: Station, make_wav: WavFactory
 ) -> None:
@@ -1195,6 +1199,7 @@ def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them
     assert station.staged() == []
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_criterion_1_post_jobs_takes_the_control_link_and_refuses_an_unsupported_criterion(
     api, station: Station, make_wav: WavFactory

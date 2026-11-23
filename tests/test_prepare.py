@@ -457,6 +457,7 @@ def test_a_zero_duration_budget_is_an_explicit_error_and_leaves_work_as_it_was(
     assert (run.path / "work" / "decoded.f32").read_bytes() == b"\0" * 16
 
 
+@pytest.mark.slow
 def test_a_timeout_is_reported_with_the_budget_and_the_child_is_gone(
     run: Run, config: Config, fake_ffmpeg: Callable[[str], Path], tmp_path: Path
 ) -> None:
@@ -472,6 +473,7 @@ def test_a_timeout_is_reported_with_the_budget_and_the_child_is_gone(
     assert work_entries(run) == []
 
 
+@pytest.mark.slow
 def test_a_version_probe_that_hangs_is_a_timeout(
     run: Run, config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -236,7 +236,7 @@ def test_bad_requests_are_refused_before_the_model(body) -> None:
 def server():
     """The real handler on 127.0.0.1 with a fake engine, without the process network guard."""
     httpd = borealis.Server((borealis.HOST, 0), borealis.Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread = threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True)
     thread.start()
     yield httpd
     httpd.shutdown()

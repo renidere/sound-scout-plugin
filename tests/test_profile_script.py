@@ -157,6 +157,7 @@ def run_profile(tmp_path: Path, dev_audio: Path | None) -> tuple[subprocess.Comp
     return done, output.read_text(encoding="utf-8") if output.exists() else ""
 
 
+@pytest.mark.slow
 def test_profile_measures_cold_and_warm_runs_without_private_data(tmp_path: Path) -> None:
     private = tmp_path / "private-recordings"
     private.mkdir()
@@ -219,6 +220,7 @@ def test_profile_measures_cold_and_warm_runs_without_private_data(tmp_path: Path
     assert "synthetic 3 s: measured" in done.stdout
 
 
+@pytest.mark.slow
 def test_profile_without_the_development_recording_records_it_as_skipped(
     tmp_path: Path,
 ) -> None:

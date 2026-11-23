@@ -151,6 +151,7 @@ def run_install_step(
     return done, calls.read_text().splitlines()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("modes", [["hang"], ["fail"], ["hang", "fail"], ["fail", "hang"]])
 def test_install_ffmpeg_step_survives_one_or_two_slow_or_failing_downloads(
     tmp_path: Path, modes: list[str]
@@ -171,6 +172,7 @@ def test_install_ffmpeg_step_survives_one_or_two_slow_or_failing_downloads(
     assert sum("install -y --no-download ffmpeg" in c for c in calls) == 1
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("modes", [["hang", "hang", "hang"], ["fail", "hang", "fail"]])
 def test_install_ffmpeg_step_fails_with_a_reason_after_three_bad_downloads(
     tmp_path: Path, modes: list[str]
@@ -223,3 +225,12 @@ def test_history_scan_job_checks_out_the_whole_history_and_runs_the_scanner() ->
     assert checkout["with"]["fetch-depth"] == 0
     assert job["steps"][-1]["run"] == "bash scripts/scan-history.sh"
     assert all("continue-on-error" not in step for step in job["steps"])
+
+
+def test_criterion_4_ci_test_step_runs_the_full_suite_without_a_marker_filter() -> None:
+    """#164: the fast set is `-m "not slow"` on the station; CI still runs every test."""
+    step = named_step(workflow_jobs()["checks"], "Test")
+    assert step["run"] == "uv run pytest"
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    addopts = re.search(r'^addopts\s*=\s*"([^"]*)"', pyproject, re.MULTILINE)
+    assert addopts and "-m" not in addopts.group(1).split()

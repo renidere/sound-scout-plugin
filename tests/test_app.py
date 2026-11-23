@@ -142,6 +142,7 @@ def sha256_of(path: Path) -> str:
 # --- stages ----------------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_stages_run_in_order_and_an_unavailable_one_does_not_stop_the_rest(
     config: Config, wav: Path
 ) -> None:
@@ -418,6 +419,7 @@ def test_an_unexpected_stage_error_logs_one_line_without_its_message(
 # --- deadline and cancel ---------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_deadline_stops_the_worker_and_its_child_and_keeps_what_is_ready(
     config: Config, wav: Path, pid_dir: Path
 ) -> None:

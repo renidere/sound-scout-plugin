@@ -641,6 +641,7 @@ def test_prepare_after_one_that_stopped_midway_asks_to_delete_the_day(spike) -> 
         gate0.prepare_clips("2026-11-18", spike["config"], decision=spike["decision"])
 
 
+@pytest.mark.slow
 def test_prepare_refuses_a_clip_over_30_s_before_writing_any_clip(spike) -> None:
     config_, inputs = spike["config"], spike["config"].allowed_roots[0]
     long_voice = speech_like_control(31.0, gate0.SAMPLE_RATE, f0=130.0)
@@ -667,6 +668,7 @@ def test_plan_of_the_synthetic_run_is_the_42_fixed_requests(spike) -> None:
     assert all(e["json_response"] == (e["variant"] in ("A", "A-text")) for e in entries)
 
 
+@pytest.mark.slow
 def test_run_sends_each_request_once_traces_the_pcm_sent_and_refuses_e0(spike) -> None:
     result = gate0.run_spike("2026-11-18", spike["config"], **spike["kwargs"])
     attempt = spike["out"] / gate0.ATTEMPTS_DIR / "1"
@@ -760,6 +762,7 @@ def test_cli_verdict_without_an_attempt_or_a_date_exits_2(
     assert message in capsys.readouterr().err
 
 
+@pytest.mark.slow
 def test_rss_over_the_limit_stops_the_server_and_marks_every_request_not_sent(spike) -> None:
     result = gate0.run_spike("2026-11-18", spike["config"], rss_limit=1, **spike["kwargs"])
     attempt = spike["out"] / gate0.ATTEMPTS_DIR / "1"
@@ -771,6 +774,7 @@ def test_rss_over_the_limit_stops_the_server_and_marks_every_request_not_sent(sp
     assert result["verdict"] == "NOT READY"
 
 
+@pytest.mark.slow
 def test_natural_prepare_builds_six_takes_and_a_51_request_plan(tmp_path: Path) -> None:
     pairs_dir = tmp_path / "in" / "pairs"
     data = tmp_path / "data"
@@ -879,6 +883,7 @@ def test_criterion_a_document_preregisters_backend_audio_prompt_settings_and_cos
     assert gate0.rule_sha256(document) == DECISION_RULE_SHA256
 
 
+@pytest.mark.slow
 def test_criterion_b_pairs_controls_and_transcript_only_requests_go_out_as_the_protocol_says(
     spike, tmp_path: Path, monkeypatch
 ) -> None:
@@ -1014,6 +1019,7 @@ def test_borealis_weight_mismatch_stops_before_the_server_start(spike, tmp_path)
     assert record["cgroup"]["memory_max"] == "19999997952"
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
 def test_borealis_run_under_the_cap_records_the_cgroup_peak_and_the_same_plan(
     spike, tmp_path, monkeypatch
@@ -1178,6 +1184,7 @@ def test_gigachat_one_wrong_weight_hash_of_fourteen_stops_before_the_server_star
     assert len(record["preconditions"]["weights_sha256"]) == 14
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
 def test_gigachat_run_under_the_cap_records_its_limits_host_memory_and_the_same_plan(
     spike, tmp_path, monkeypatch
@@ -1198,6 +1205,7 @@ def test_gigachat_run_under_the_cap_records_its_limits_host_memory_and_the_same_
     assert len(lines) == 43 and result["preconditions"] == {"P1": True, "P2": True, "P3": True}
 
 
+@pytest.mark.slow
 def test_llama_run_keeps_the_18e9_rss_limit_and_records_the_host_memory(spike) -> None:
     gate0.run_spike("2026-11-18", spike["config"], **spike["kwargs"])
     record = json.loads((spike["out"] / gate0.ATTEMPTS_DIR / "1" / gate0.RUN_FILE).read_text())
@@ -1446,6 +1454,7 @@ def _qwen_run(qwen_spike, tmp_path, memory_max=GIGACHAT_CAP, swap_max="0", **kw)
     )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
 def test_qwen3omni_run_under_the_cap_uses_its_files_rule_v2_and_the_same_plan(
     qwen_spike, tmp_path
@@ -1549,6 +1558,7 @@ def test_prepare_cli_refuses_reuse_with_sources(spike, tmp_path, monkeypatch, ca
     assert manifest["rule_sha256"] == gate0.RULE_V2_SHA256
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
 def test_a_reused_prepare_runs_under_v2_with_the_clip_hashes_of_the_source(
     qwen_spike, tmp_path
@@ -1693,6 +1703,7 @@ def _qwen25_run(spike, tmp_path, memory_max=QWEN25OMNI_CAP, swap_max="0", availa
     )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
 def test_qwen25omni_run_under_the_18e9_cap_uses_its_files_rule_v1_and_the_same_plan(
     spike, tmp_path

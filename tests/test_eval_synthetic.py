@@ -268,6 +268,7 @@ def test_the_draft_with_synthetic_clips_has_no_structural_error(
     assert report.heldout_coverage["pronunciation"] == 10
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_a_second_add_and_a_fixed_manifest_are_refused_unchanged(
     tmp_path: Path, draft: Path

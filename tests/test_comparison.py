@@ -314,6 +314,7 @@ def test_pause_before_uses_the_gap_before_the_word_and_shows_spans_as_measuremen
     ]
 
 
+@pytest.mark.slow
 def test_completeness_counts_an_unlocalized_observation_with_a_correction(
     config: Config, make_attempt
 ) -> None:

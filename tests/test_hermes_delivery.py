@@ -121,6 +121,7 @@ def test_without_the_owner_a_tick_calls_neither_the_cli_nor_send(
     assert delivery_of(setup, job_id) is None
 
 
+@pytest.mark.slow
 def test_with_the_owner_one_job_gets_exactly_one_note_in_its_chat(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -134,6 +135,7 @@ def test_with_the_owner_one_job_gets_exactly_one_note_in_its_chat(
     assert delivery_of(setup, job_id)["confirmed_by"] == "send"
 
 
+@pytest.mark.slow
 def test_two_jobs_of_two_chats_get_one_note_each_in_their_own_chat(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -165,6 +167,7 @@ def test_the_marker_is_in_job_json_while_send_runs(
     assert marker["state"] == "sending" and marker["loop_id"] == "loop-1"
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("failure", [TIMEOUT, RuntimeError("gateway gone")])
 def test_an_unknown_send_without_the_tag_in_history_is_unconfirmed_and_never_resent(
     loop, setup: Config, make_wav: WavFactory, failure
@@ -181,6 +184,7 @@ def test_an_unknown_send_without_the_tag_in_history_is_unconfirmed_and_never_res
     assert "tag not found in chat history" in recorded["error"]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("failure", [TIMEOUT, RuntimeError("gateway gone")])
 def test_an_unknown_send_with_the_tag_in_history_is_delivered_by_history(
     loop, setup: Config, make_wav: WavFactory, failure
@@ -207,6 +211,7 @@ def test_a_failing_history_check_counts_as_tag_not_found(
     assert delivery_of(setup, job_id)["state"] == "delivery_unconfirmed"
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("history", "state"), [(True, "delivered"), (False, "delivery_unconfirmed")]
 )
@@ -302,6 +307,7 @@ def test_run_cli_with_a_nul_in_its_arguments_did_not_answer(loop, setup: Config)
 # --- criterion 3: the note lists each requested layer with its status ------------------------
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_the_sent_note_lists_the_layers_and_does_not_read_as_all_done(
     loop, setup: Config, make_wav: WavFactory
@@ -329,6 +335,7 @@ def test_the_sent_note_lists_the_layers_and_does_not_read_as_all_done(
     assert "готово" not in text.lower() and "всё выполнено" not in text.lower()
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_criterion_3_note_names_completed_unavailable_and_skipped_layers_never_all_done(
     loop, setup: Config, make_wav: WavFactory
@@ -357,6 +364,7 @@ def test_criterion_3_note_names_completed_unavailable_and_skipped_layers_never_a
 # --- criterion 4: a deleted or unavailable chat is a delivery error, never another chat -------
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "said",
     [
@@ -383,6 +391,7 @@ def test_a_chat_error_is_delivery_failed_in_the_job_and_nothing_else_is_sent(
     assert chats.checked == []
 
 
+@pytest.mark.slow
 def test_no_owner_in_the_send_releases_the_job_and_the_next_tick_delivers_once(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -673,6 +682,7 @@ def requested(cfg: Config, wav: Path, **kwargs) -> str:
     return job_id
 
 
+@pytest.mark.slow
 def test_a_redelivery_with_the_tag_in_history_sends_nothing(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -688,6 +698,7 @@ def test_a_redelivery_with_the_tag_in_history_sends_nothing(
     assert recorded["redelivery"] is True
 
 
+@pytest.mark.slow
 def test_a_redelivery_without_the_tag_sends_exactly_one_note_to_the_bound_chat(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -725,6 +736,7 @@ def test_an_unreadable_history_sends_nothing_and_a_new_request_is_taken(
     assert len(job_file(setup, job_id)["redeliveries"]) == 2
 
 
+@pytest.mark.slow
 def test_a_timed_out_redelivery_without_the_tag_is_unconfirmed_after_one_send(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -738,6 +750,7 @@ def test_a_timed_out_redelivery_without_the_tag_is_unconfirmed_after_one_send(
     assert recorded["state"] == "delivery_unconfirmed" and recorded["redelivery"] is True
 
 
+@pytest.mark.slow
 def test_no_owner_in_a_redelivery_send_waits_and_checks_the_history_again(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -785,6 +798,7 @@ def jobs_redeliver(job_id: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.slow
 def test_criterion_1_jobs_redeliver_makes_the_loop_send_one_more_note_to_the_same_chat(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -810,6 +824,7 @@ def test_criterion_1_jobs_redeliver_makes_the_loop_send_one_more_note_to_the_sam
     assert len(chats.sent) == 2
 
 
+@pytest.mark.slow
 def test_criterion_1_jobs_redeliver_takes_no_job_but_a_delivery_unconfirmed_one(
     loop, setup: Config, make_wav: WavFactory
 ) -> None:

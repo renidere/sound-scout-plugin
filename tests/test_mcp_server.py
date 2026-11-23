@@ -356,6 +356,7 @@ def test_a_path_outside_the_allowed_roots_is_refused(
     assert answer["error"]["message"].startswith("outside allowed roots: ")
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_compare_answers_with_the_written_comparison_and_its_path(
     loaded: config.Config, make_wav: WavFactory
@@ -389,6 +390,7 @@ def read_run_file(loaded: config.Config, answer: dict, name: str) -> dict:
     return json.loads((loaded.data_root / answer["run_dir"] / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_the_intent_argument_reaches_the_application_layer_and_request_json(
     loaded: config.Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
@@ -469,6 +471,7 @@ def test_an_instruction_in_the_intent_argument_is_suspicious_content(
     assert "ignore all" not in json.dumps(result, ensure_ascii=False)
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 @pytest.mark.parametrize(
     ("intents", "differs"),
@@ -683,6 +686,7 @@ def stdio_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_stdout_is_only_json_rpc_and_logs_go_to_stderr_with_user_paths_masked(
     stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
@@ -718,6 +722,7 @@ def test_stdout_is_only_json_rpc_and_logs_go_to_stderr_with_user_paths_masked(
     assert str(tmp_path) not in stderr
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_cli_and_mcp_give_the_same_result_and_the_same_compact_answer(
     stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
@@ -759,6 +764,7 @@ def test_cli_and_mcp_give_the_same_result_and_the_same_compact_answer(
     assert str(tmp_path) not in text
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_criteria_1_2_4_speech_analyze_on_code_updated_after_the_server_started_is_code_changed(
     stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
@@ -1043,6 +1049,7 @@ def test_job_tools_answer_while_a_synchronous_analysis_holds_the_lock(
     assert json.loads(text_of_result(analysis))["error"]["code"] == "busy"
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_job_tools_over_stdio_give_the_jobs_cli_answers_and_the_runner_s_result(
     stdio_env: dict[str, str], tmp_path: Path, make_wav: WavFactory
@@ -1510,6 +1517,7 @@ def test_speech_job_submit_takes_the_control_link_with_the_schemas_of_speech_com
     assert "criterion" not in schemas["speech_job_submit"]["required"]
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_a_control_job_through_mcp_gives_the_jobs_cli_answers_and_its_comparison(
     loaded: config.Config, make_wav: WavFactory

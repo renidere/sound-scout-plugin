@@ -29,6 +29,7 @@ def test_scenario(tmp_path, scenario) -> None:
     assert not _failed(result), json.dumps(_failed(result), ensure_ascii=False)[:2000]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("name", sorted(rehearsal.UNITS))
 def test_unit(tmp_path, name) -> None:
     result = rehearsal.UNITS[name](tmp_path / name)
@@ -83,6 +84,7 @@ def test_a_blip_is_rehearsed_at_every_kind_of_host_step() -> None:
     }
 
 
+@pytest.mark.slow
 def test_the_report_lists_every_scenario_and_what_it_cannot_prove(tmp_path) -> None:
     report = rehearsal.run(tmp_path / "r", only=["refusals"])
     assert report["passed"] and [r["scenario"] for r in report["scenarios"]] == ["refusals"]

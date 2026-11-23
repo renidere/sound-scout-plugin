@@ -797,6 +797,7 @@ def config_file(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.slow
 def test_jobs_through_the_console_entry(config_file: Path, make_wav: WavFactory) -> None:
     wav = make_wav("recordings/voice.wav", seconds=2.0)
     other = make_wav("recordings/other.wav", frequency=330.0)
@@ -935,6 +936,7 @@ def test_jobs_submit_outside_the_roots_is_one_line_path_denied(
     assert not list((config_file.parent / "data").glob("jobs/*/job.json"))
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_jobs_result_prints_the_job_state_next_to_the_result_summary(
     tmp_path: Path, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, capsys
@@ -971,6 +973,7 @@ def test_jobs_result_prints_the_job_state_next_to_the_result_summary(
     assert f"run_dir: runs/{analysis.run.run_id}" in lines
 
 
+@pytest.mark.slow
 def test_jobs_submit_mode_and_retry_through_the_console(
     config_file: Path, make_wav: WavFactory
 ) -> None:
@@ -1114,6 +1117,7 @@ def test_a_control_job_compare_would_refuse_is_refused_at_submit_and_writes_noth
     assert [path.name for path in jobs._job_dirs(cfg.data_root / "jobs")] == [accepted["job_id"]]
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_jobs_submit_of_a_control_attempt_through_the_console(
     config_file: Path, make_wav: WavFactory

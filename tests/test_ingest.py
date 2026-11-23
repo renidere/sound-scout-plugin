@@ -814,6 +814,7 @@ def test_a_failed_write_keeps_a_work_dir_it_did_not_create(
 # the budgets of #14 bound the decoder
 
 
+@pytest.mark.slow
 def test_decoder_timeout_is_reported_with_the_budget(
     tone: Path, run: Run, config: Config, fake_ffmpeg: Callable[[str], Path], tmp_path: Path
 ) -> None:
@@ -825,6 +826,7 @@ def test_decoder_timeout_is_reported_with_the_budget(
     assert process_gone(int(pid_file.read_text()))
 
 
+@pytest.mark.slow
 def test_an_oversized_slow_decode_is_refused_for_its_samples_not_its_time(
     tone: Path, run: Run, config: Config, fake_ffmpeg: Callable[[str], Path], tmp_path: Path
 ) -> None:

@@ -160,7 +160,7 @@ class _Echo(BaseHTTPRequestHandler):
 
 def _serve(handler) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     return server
 
 
@@ -204,6 +204,7 @@ def test_the_key_goes_only_in_an_unredirected_header(monkeypatch, key_file, fake
     assert fake.log == [{"method": "GET", "path": "/api/v0/users/current/", "auth": True}]
 
 
+@pytest.mark.slow
 def test_a_redirect_is_an_error_and_the_second_server_gets_nothing(key_file) -> None:
     second = vast_fake.FakeVast(key_file[1]).start()
     first = vast_fake.FakeVast(key_file[1], redirect_to=second.url).start()
@@ -301,7 +302,7 @@ def test_offer_sends_post_bundles_with_ask_contract_id_and_returns_that_offer(ke
             self.wfile.write(data)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     try:
         api = vast.Api(f"http://127.0.0.1:{server.server_port}", key_file[1])
         assert api.offer(vast_fake.OFFER_ID, 60) == vast_fake.OFFER
@@ -346,6 +347,7 @@ def test_payload_has_no_environment_the_fixed_onstart_and_no_key(key_file) -> No
             vast.check_no_secret({**payload, "env": {name: "x"}}, key_file[1])
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(("until_in", "slept"), [(-100, False), (2, True)], ids=["past", "future"])
 def test_onstart_sleeps_until_the_absolute_time_and_not_from_container_start(
     until_in, slept
@@ -1119,6 +1121,7 @@ def test_a_malformed_package_is_refused(tmp_path: Path, change) -> None:
 # --- the dry run ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_dry_run_gives_the_full_timeline_against_the_fakes(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("CUDA_VERSION", raising=False)
     sentinel = tmp_path / "real-key-must-not-be-read"
@@ -1304,6 +1307,7 @@ def _dry_config(tmp_path: Path) -> config.Config:
     )
 
 
+@pytest.mark.slow
 def test_a_step_failing_after_create_still_destroys_and_closes_the_attempt(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1334,6 +1338,7 @@ def _no_secret_fields(event: dict, key: str) -> None:
     assert not any(name.lower() in text.lower() for name in (*vast.SECRET_NAMES, "key", "token"))
 
 
+@pytest.mark.slow
 def test_a_failed_credit_read_after_close_is_journaled_and_changes_nothing(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -1393,6 +1398,7 @@ def test_deploy_reads_the_credit_once_after_a_watchdog_close_and_the_watchdog_ne
     assert status["closed"]["reason"] == "deadline"
 
 
+@pytest.mark.slow
 def test_deploy_reads_the_credit_one_time_when_the_watchdog_closed_the_attempt_mid_run(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1419,6 +1425,7 @@ def test_deploy_reads_the_credit_one_time_when_the_watchdog_closed_the_attempt_m
     assert sum(e["path"] == "/api/v0/users/current/" for e in log) == 2
 
 
+@pytest.mark.slow
 def test_a_credit_journal_failure_after_close_keeps_the_original_failure_and_destroy(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1444,6 +1451,7 @@ def test_a_credit_journal_failure_after_close_keeps_the_original_failure_and_des
     assert vast.summarize(events)["closed"] is not None
 
 
+@pytest.mark.slow
 def test_a_failed_credit_read_through_the_fake_api_redacts_the_echoed_key_and_keeps_the_outcome(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -1483,6 +1491,7 @@ def _runtime_found(detail: dict) -> dict:
     return {key: detail["found"][key] for key in keys}
 
 
+@pytest.mark.slow
 def test_a_torch_built_for_another_cuda_fails_preflight_with_every_found_value_journaled(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1508,6 +1517,7 @@ def test_a_torch_built_for_another_cuda_fails_preflight_with_every_found_value_j
     assert [e["event"] for e in events].count("absence_verified") == 1
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("session_cuda", ["12.4", "13.0.3", None])
 def test_preflight_reads_cuda_from_torch_so_a_wrong_or_missing_ssh_cuda_version_passes(
     tmp_path: Path, monkeypatch, session_cuda
@@ -1530,6 +1540,7 @@ def test_driver_is_the_last_field_of_the_first_nvidia_smi_line() -> None:
     assert vast._driver("garbage") is None
 
 
+@pytest.mark.slow
 def test_a_failed_arm_closes_the_attempt_without_any_create(tmp_path: Path, monkeypatch) -> None:
     def broken_arm(*args, **kwargs):
         raise vast.VastError("arm refused: Linger is not on")
@@ -1622,6 +1633,7 @@ def test_download_refuses_pack_stdout_that_is_not_a_json_object(tmp_path: Path, 
     assert host.got == []
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("stdout", [b"Traceback: not json\n", b"[1, 2]\n"], ids=["text", "list"])
 def test_a_preflight_without_a_json_object_is_one_vast_line_exit_2_and_still_destroys(
     tmp_path: Path, monkeypatch, capsys, stdout
@@ -1706,6 +1718,7 @@ def _no_key_anywhere(out: Path) -> None:
             assert key.encode() not in path.read_bytes(), path
 
 
+@pytest.mark.slow
 def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monkeypatch) -> None:
     _with_fake_vllm_mode(monkeypatch, {"exit": 3, "line": "fake engine core died"})
     attempt, events = _failed_dry_run(
@@ -1743,6 +1756,7 @@ def test_a_server_that_exits_fails_smoke_fast_with_its_exit_code(tmp_path, monke
     assert '"returncode": 3' in evidence["tails"]["server-stats.jsonl"]
 
 
+@pytest.mark.slow
 def test_a_failed_smoke_journals_the_log_tail_and_the_process_list_before_destroy(
     tmp_path, monkeypatch
 ) -> None:
@@ -1788,6 +1802,7 @@ def test_a_failed_smoke_journals_the_log_tail_and_the_process_list_before_destro
     _no_key_anywhere(tmp_path / "data" / "dry")
 
 
+@pytest.mark.slow
 def test_a_failed_run_also_journals_evidence(tmp_path, monkeypatch) -> None:
     def broken(*args, **kwargs):
         raise vast.VastError("gate0 runner broke")
@@ -1809,6 +1824,7 @@ def test_a_failed_run_also_journals_evidence(tmp_path, monkeypatch) -> None:
     assert (attempt / "evidence-qwen25omni.json").is_file()
 
 
+@pytest.mark.slow
 def test_a_server_that_dies_during_a_run_with_a_verdict_journals_evidence(
     tmp_path, monkeypatch
 ) -> None:
@@ -1846,6 +1862,7 @@ def test_a_server_that_dies_during_a_run_with_a_verdict_journals_evidence(
     assert all(b["sent"] == 0 for b in extended["detail"]["blocks"].values())
 
 
+@pytest.mark.slow
 def test_a_cancellation_during_evidence_after_a_run_still_destroys(tmp_path, monkeypatch) -> None:
     real_run = vast.LocalHost.run
 
@@ -1871,6 +1888,7 @@ def test_a_cancellation_during_evidence_after_a_run_still_destroys(tmp_path, mon
     assert vast.summarize(events)["closed"] is not None
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("failure", ["not-json", "raises"])
 def test_evidence_failure_never_blocks_destroy(tmp_path, monkeypatch, failure) -> None:
     _with_fake_vllm_mode(monkeypatch, {"exit": 3})
@@ -1960,6 +1978,7 @@ def test_wait_health_ends_when_the_state_shows_the_server_is_gone(answer, reason
     assert time.monotonic() - started < 10
 
 
+@pytest.mark.slow
 def test_a_failing_state_call_is_counted_and_never_ends_the_wait() -> None:
     host = _StateHost([OSError("ssh k3y-secret dropped"), b"not json", _state()])
     detail: dict = {}
@@ -2224,6 +2243,7 @@ def _stack(tmp_path: Path, config_: config.Config, package: dict) -> Path:
     return journal.dir
 
 
+@pytest.mark.slow
 def test_the_two_model_package_runs_each_full_day_under_its_rule_on_a_fresh_server(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2266,6 +2286,7 @@ def test_the_two_model_package_runs_each_full_day_under_its_rule_on_a_fresh_serv
     assert events[-1]["event"] == "credit_after_close"
 
 
+@pytest.mark.slow
 def test_a_server_that_does_not_stop_ends_the_attempt_before_the_second_model(
     tmp_path, monkeypatch
 ) -> None:
@@ -2413,6 +2434,7 @@ def test_no_approved_offer_means_no_put_and_names_every_reason(
     assert fake.count("PUT") == 0
 
 
+@pytest.mark.slow
 def test_the_extended_set_must_match_its_pins_and_hold_no_gate0_clip(tmp_path: Path) -> None:
     config_ = _dry_config(tmp_path)
     found = gpu_ext.fixture(config_.data_root / "gpu-ext-x")
@@ -2591,6 +2613,7 @@ def _recover_run(tmp_path, fake, key_file, host) -> vast.Run:
     return run
 
 
+@pytest.mark.slow
 def test_recover_waits_out_a_network_blip_then_reopens_the_tunnel_and_resends(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -2614,6 +2637,7 @@ class _LostAgainHost(_RecoverHost):
         return self.tunnel_up
 
 
+@pytest.mark.slow
 def test_recover_reopens_a_tunnel_a_second_loss_killed_while_it_waits_for_health(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -2646,6 +2670,7 @@ def test_recover_after_a_timeout_restarts_a_stale_tunnel_and_resends(
     assert check["after_timeout"] is True and check["tunnel_reopened"] is True
 
 
+@pytest.mark.slow
 def test_recover_ends_the_wait_when_the_server_exits_and_a_dead_host_is_ssh_lost(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -2673,6 +2698,7 @@ time.sleep(60)
 """
 
 
+@pytest.mark.slow
 def test_the_ssh_tunnel_returns_once_its_port_accepts_and_force_restarts_a_live_one(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2738,6 +2764,7 @@ def test_sigterm_and_sighup_cancel_the_attempt_once_and_later_signals_are_ignore
         vast.restore_signals(saved)
 
 
+@pytest.mark.slow
 def test_create_is_refused_when_the_credit_is_below_the_ceiling_plus_the_margin(
     tmp_path: Path,
 ) -> None:
@@ -2757,6 +2784,7 @@ def test_create_is_refused_when_the_credit_is_below_the_ceiling_plus_the_margin(
     assert closed["reason"] == "no_instance_created"
 
 
+@pytest.mark.slow
 def test_an_extended_set_built_by_another_gpu_ext_is_refused_before_anything_opens(
     tmp_path: Path,
 ) -> None:
@@ -3017,6 +3045,7 @@ class _SlowProbeHost(_RecoverHost):
         return vast.proc.RunResult(-9, b"", b"", True, False, timeout)
 
 
+@pytest.mark.slow
 def test_the_ssh_window_never_runs_past_the_steps_own_end(tmp_path: Path, key_file, fake) -> None:
     host = _SlowProbeHost()
     run = _transport_run(tmp_path, fake, key_file, host, ssh_lost_s=300)
@@ -3149,6 +3178,7 @@ def test_term_stop_covers_the_final_path_up_to_the_delete() -> None:
     assert vast.stop_path_s() == 600 and minutes * 60 >= vast.stop_path_s()
 
 
+@pytest.mark.slow
 def test_the_ssh_window_counts_the_failed_try_itself(tmp_path: Path, key_file, fake) -> None:
     """A real ssh needs its ConnectTimeout to fail: that time is silence of the host too, so a
     host silent from the try on for the whole window is ssh_lost, though the wait was shorter."""
@@ -3192,6 +3222,7 @@ def test_a_pilot_reads_its_timeout_for_every_request_and_a_resend() -> None:
     assert [line["resent_after_tunnel"] for line in pilot["lines"]] == [True, False]
 
 
+@pytest.mark.slow
 def test_a_long_try_that_lost_its_ssh_late_still_gets_the_whole_window(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -3204,6 +3235,7 @@ def test_a_long_try_that_lost_its_ssh_late_still_gets_the_whole_window(
     assert time.time() - started >= 1.9 and min(host.timeouts) >= 1.0
 
 
+@pytest.mark.slow
 def test_a_try_that_used_its_timeout_counts_as_silence_to_the_steps_end(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -3216,6 +3248,7 @@ def test_a_try_that_used_its_timeout_counts_as_silence_to_the_steps_end(
     assert run.fatal == "ssh_lost" and time.time() - started < 2.5
 
 
+@pytest.mark.slow
 def test_a_long_try_that_worked_before_its_loss_is_no_ssh_lost_when_the_step_ends(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -3249,6 +3282,7 @@ def test_a_retry_runs_with_what_is_left_of_a_short_step(tmp_path: Path, key_file
 # --- round 3 of the stack check (#165) -------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_a_fork_the_station_refused_runs_the_step_again_after_a_growing_pause(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -3270,6 +3304,7 @@ def test_a_fork_the_station_refused_runs_the_step_again_after_a_growing_pause(
     assert retries[0]["error"] == "OSError: ENOMEM" and not host.calls  # the host is not asked
 
 
+@pytest.mark.slow
 def test_a_refused_fork_ends_the_step_at_its_end_and_any_other_os_error_at_once(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -3304,6 +3339,7 @@ class _Reopens:
         return force
 
 
+@pytest.mark.slow
 def test_the_health_wait_stops_at_once_on_the_soft_stop_and_skips_the_model() -> None:
     stops = iter([None, None, "soft_end"])
     started = time.monotonic()
@@ -3315,6 +3351,7 @@ def test_the_health_wait_stops_at_once_on_the_soft_stop_and_skips_the_model() ->
     assert isinstance(vast.ModelSkipped("smoke", "x"), vast.ModelFailed)
 
 
+@pytest.mark.slow
 def test_the_health_wait_opens_a_live_but_stale_tunnel_anew_every_fourth_state_check() -> None:
     reopen = _Reopens()
     with pytest.raises(vast.VastError, match="did not answer /health in time"):

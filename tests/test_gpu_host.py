@@ -267,6 +267,7 @@ def test_serve_kills_the_server_at_the_rss_limit(tmp_path) -> None:
     assert peak["rss_bytes"] > 1000 and set(peak) == set(hostrun.RSS_FIELDS.values())
 
 
+@pytest.mark.slow
 def test_serve_kills_the_server_at_the_deadline(tmp_path) -> None:
     code, lines = _serve(
         tmp_path,
@@ -647,6 +648,7 @@ def test_evidence_tails_are_bounded_line_cut_and_list_processes(tmp_path, capsys
     assert all(len(p["cmdline"]) <= hostrun.CMDLINE_MAX for p in found["processes"])
 
 
+@pytest.mark.slow
 def test_stats_record_the_rss_breakdown_and_the_limit_still_uses_vmrss(
     tmp_path, monkeypatch
 ) -> None:

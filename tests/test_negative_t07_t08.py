@@ -104,6 +104,7 @@ def read_json(path: Path) -> dict:
 # --- T08: deadline and cancel ----------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_speech_analyze_past_its_deadline_is_partial_and_the_server_answers_next(
     loaded: Config, make_wav: WavFactory, pid_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -189,6 +190,7 @@ def test_a_cancelled_speech_analyze_frees_the_worker_and_leaves_an_incomplete_ma
     assert ("audio_review", app.CANCELLED) in codes(result)
 
 
+@pytest.mark.slow
 def test_closing_stdin_frees_the_worker_and_leaves_an_incomplete_manifest(
     tmp_path: Path, make_wav: WavFactory, pid_dir: Path
 ) -> None:
@@ -234,6 +236,7 @@ def local(tmp_path: Path) -> Config:
     return Config(allowed_roots=(root,), data_root=data_root, asr=Asr(model=ABSENT_ASR_MODEL))
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("text", "why"),
     [
@@ -317,6 +320,7 @@ def fake_asr(tmp_path: Path, text: str) -> Path:
     return package.parent
 
 
+@pytest.mark.slow
 def test_instructions_in_the_transcript_and_the_model_output_are_marked_and_never_acted_on(
     tmp_path: Path, make_wav: WavFactory
 ) -> None:
@@ -480,6 +484,7 @@ class ConnectingBackend(FakeBackend):
         return super().review(request)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("swallow", [False, True], ids=["raised", "swallowed"])
 def test_a_backend_network_attempt_is_network_denied_in_errors_not_a_success(
     local: Config, make_wav: WavFactory, swallow: bool

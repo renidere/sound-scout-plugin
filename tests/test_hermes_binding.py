@@ -162,6 +162,7 @@ def sent_to(chats: Chats) -> list[tuple[str, str]]:
 # --- criterion 2: one note to the chat of the turn, none to another ---------------------------
 
 
+@pytest.mark.slow
 def test_criterion_2_an_mcp_job_from_chat_a_delivers_one_note_to_a_and_none_to_b(
     plugin, setup: Config, make_wav: WavFactory, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -207,6 +208,7 @@ def test_a_turn_outside_a_local_chat_leaves_the_job_unbound_and_sends_nothing(
     assert chats.sent == [] and jobs.status(job_id, setup)["binding"]["session_id"] is None
 
 
+@pytest.mark.slow
 def test_a_job_that_ends_before_its_bind_waits_and_then_gets_one_note(
     plugin, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -232,6 +234,7 @@ def test_a_job_that_ends_before_its_bind_waits_and_then_gets_one_note(
     assert sent_to(chats) == [("chat-a", f"sound-scout-job:{answer['job_id']}")]
 
 
+@pytest.mark.slow
 def test_without_the_hook_an_mcp_job_is_never_delivered(
     plugin, setup: Config, make_wav: WavFactory
 ) -> None:
@@ -246,6 +249,7 @@ def test_without_the_hook_an_mcp_job_is_never_delivered(
     assert jobs.status(answer["job_id"], setup)["binding"]["session_id"] is None
 
 
+@pytest.mark.slow
 def test_a_second_hook_call_from_chat_b_is_not_bindable_and_the_note_goes_to_a_only(
     plugin, setup: Config, make_wav: WavFactory, caplog: pytest.LogCaptureFixture
 ) -> None:

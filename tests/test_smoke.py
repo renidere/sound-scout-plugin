@@ -160,6 +160,7 @@ def test_acoustics_smoke_writes_the_receipt_and_doctor_reports_ready(
     assert_only_receipts_in_data_root(config)
 
 
+@pytest.mark.slow
 @needs_ffmpeg
 def test_decoder_smoke_timeout_keeps_the_old_receipt(
     config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

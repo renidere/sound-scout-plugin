@@ -315,6 +315,7 @@ def test_material_leaves_out_the_pilot_files_and_counts_the_rest(tmp_path: Path)
 # --- precondition Q1 and the scope ---------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_q1_fails_with_an_open_network_and_a_wrong_rinco_archive(tmp_path: Path) -> None:
     settings = make_config(tmp_path)
     settings = config.Config(

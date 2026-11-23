@@ -53,7 +53,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
-    "slow: tests that run a real model or a long synthesis; deselect with -m \"not slow\"",
+    "slow: a real model, a long synthesis, the dry stack, or 0.8 s or more on the station; deselect with -m \"not slow\"",
 ]
 
 [tool.uv]

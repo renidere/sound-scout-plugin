@@ -29,9 +29,9 @@ Skill scripts: <absolute skill dir>/scripts.
 Platform: <uname -s>
 revmux profile: <profile>
 Check commands: CLAUDE.md names them — `uv run ruff check .`, `uv run ruff format --check .`,
-`uv run pytest` (the whole suite: it is small; when a run takes longer than five minutes, the
-tests of what you changed and `-m "not slow"`), run from the tree's root. Run them as you work
-and once more on the finished tree at the end of your work. A check that fails: fix, then rerun.
+`uv run pytest`, run from the tree's root. While you work, run `uv run pytest -m "not slow"`
+(about 3 min) plus the touched test files whole. Run the full suite (about 30 min) once, detached
+with a completion marker, on the finished tree. A check that fails: fix, then rerun.
 Every later fix before a commit — a review finding, a red CI fixed forward — gets the same.
 
 Hard limits — the spec's permission boundaries hold for you (docs/spec/REQUIREMENTS.md § R09,

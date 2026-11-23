@@ -138,6 +138,7 @@ def read_wav(path: Path) -> np.ndarray:
     return np.frombuffer(frames, "<i2") / 32767
 
 
+@pytest.mark.slow
 def test_prepare_writes_22_clips_and_lists_19_without_the_speech_backgrounds(built) -> None:
     corpus_dir, result, _ = built
     out = corpus_dir / "pilot-t"
