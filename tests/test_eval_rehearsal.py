@@ -7,7 +7,10 @@ fakes prove the order and the contract of the stack, never the image, vLLM, a mo
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -62,8 +65,22 @@ def test_a_blip_is_rehearsed_at_every_kind_of_host_step() -> None:
     }  # fmt: skip
     assert set(rehearsal.STEP_KINDS) == kinds
     assert {f"blip_step_{kind}" for kind in kinds} <= names
-    # the draw is seeded by the kind: the same call and length every run
-    assert [rehearsal._drawn(k, 3) for k in kinds] == [rehearsal._drawn(k, 3) for k in kinds]
+    # the draw is seeded by the kind alone: the same call and length in every process
+    code = (
+        "from sound_scout.eval import rehearsal as r; "
+        "print([r._drawn(k, m) for k, (_, _, m) in sorted(r.STEP_KINDS.items())])"
+    )
+    drawn = {
+        subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, check=True, env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout
+        for seed in ("1", "2")
+    }  # fmt: skip
+    assert len(drawn) == 1
+    assert drawn == {
+        f"{[rehearsal._drawn(k, m) for k, (_, _, m) in sorted(rehearsal.STEP_KINDS.items())]}\n"
+    }
 
 
 def test_the_report_lists_every_scenario_and_what_it_cannot_prove(tmp_path) -> None:

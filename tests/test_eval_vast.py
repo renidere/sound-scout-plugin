@@ -1052,7 +1052,7 @@ def test_timing_document_records_attempt_3_of_the_pilot() -> None:
 
 def test_example_package_loads_and_holds_no_secret() -> None:
     path = REPO / "docs" / "examples" / "gpu-package.example.json"
-    package, digest = vast.load_package(path, vast.MODELS)
+    package, digest = vast.load_package(path, vast.MODELS, real=True)
     assert len(digest) == 64 and package["ceiling_usd"] == 3.0
     assert vast.offer_ids(package) == [34475479, 34475480]
     vast.check_no_secret(path.read_bytes(), None)
@@ -2979,13 +2979,65 @@ def test_a_host_silent_for_the_whole_window_is_ssh_lost(tmp_path: Path, key_file
     assert retry["outcome"] == "ssh_lost" and retry["waited_s"] >= 0.3
 
 
+class _SlowProbeHost(_RecoverHost):
+    """Every probe uses its whole timeout, as an ssh that connects and then stalls."""
+
+    def __init__(self, journal_on_probe=None) -> None:
+        super().__init__(down=10**9)
+        self.timeouts, self.on_probe = [], journal_on_probe
+
+    def run(self, argv, timeout):
+        self.timeouts.append(timeout)
+        if self.on_probe is not None:
+            self.on_probe()
+        time.sleep(min(timeout, 0.2))
+        return vast.proc.RunResult(-9, b"", b"", True, False, timeout)
+
+
 def test_the_ssh_window_never_runs_past_the_steps_own_end(tmp_path: Path, key_file, fake) -> None:
-    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=10**9), ssh_lost_s=300)
-    action, _ = _flaky(10**9)
+    host = _SlowProbeHost()
+    run = _transport_run(tmp_path, fake, key_file, host, ssh_lost_s=300)
+    action, calls = _flaky(10**9)
     started = time.monotonic()
-    with pytest.raises(vast.HostLost):
-        vast.transport_retry(run, "evidence m", action, time.time() + 0.5)
-    assert time.monotonic() - started < 3
+    with pytest.raises(vast.TransportError) as raised:
+        vast.transport_retry(run, "evidence m", action, time.time() + 1.5)
+    # a window the step's end cut short is no ssh_lost of the attempt
+    assert not isinstance(raised.value, vast.HostLost) and run.fatal is None
+    assert time.monotonic() - started < 3 and len(calls) == 1
+    assert max(host.timeouts) <= 1.5 and min(host.timeouts) >= 1.0
+    (retry,) = [e for e in run.journal.replay() if e["event"] == "transport_retry"]
+    assert retry["outcome"] == "step_end"
+
+
+def test_a_watchdog_destroy_during_the_wait_ends_it_and_names_the_watchdog(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _transport_run(tmp_path, fake, key_file, None, ssh_lost_s=300)
+    host = _SlowProbeHost(
+        lambda: run.journal.append("destroy_requested", instance_id=7, reason="early_stop")
+    )
+    run.host = host
+    action, _ = _flaky(10**9)
+    with pytest.raises(vast.VastError, match="watchdog destroyed the instance") as raised:
+        vast.transport_retry(run, "stop m", action, time.time() + 60)
+    assert not isinstance(raised.value, vast.TransportError) and len(host.timeouts) == 1
+    assert run.fatal is None
+
+
+@pytest.mark.parametrize("stop", ["spend_seen", "cancelled", "ssh_lost"])
+def test_once_stopped_for_any_reason_a_tail_step_gets_only_its_own_limit(
+    tmp_path: Path, key_file, fake, stop
+) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(), ssh_lost_s=300)
+    run.soft_end = time.time() + 3600
+    if stop == "spend_seen":
+        run.package["spend_soft_usd"] = 1.0
+        run.spend_seen = True
+    else:
+        run.fatal = stop
+    now = time.time()
+    assert vast.step_until(run, 60, tail=True) == pytest.approx(now + 60, abs=1)
+    assert vast.step_until(run, 60) <= now + 1
 
 
 def test_a_step_failing_while_the_host_answers_is_its_own_failure(
@@ -3019,7 +3071,7 @@ def test_a_step_before_the_stop_gets_the_ssh_window_and_a_tail_step_its_own_limi
     assert vast.step_until(run, 60) == pytest.approx(now + 100, abs=1)
     assert vast.step_until(run, 120, tail=True) == pytest.approx(now + 120, abs=1)
     run.soft_end = now - 10
-    assert vast.step_until(run, 60) <= now
+    assert vast.step_until(run, 60) <= now + 1
     assert vast.step_until(run, 300, tail=True) == pytest.approx(now + 300, abs=1)
 
 

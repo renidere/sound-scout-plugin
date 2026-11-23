@@ -1118,7 +1118,10 @@ class Client:
             with self._opener.open(request, timeout=timeout) as response:
                 return response.status, response.read(), None
         except urllib.error.HTTPError as error:
-            return error.code, error.read(), f"HTTP {error.code}"
+            try:
+                return error.code, error.read(), f"HTTP {error.code}"
+            except (OSError, http.client.HTTPException) as cut:
+                return None, None, f"{type(cut).__name__}: {cut}"
         except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
             # IncompleteRead, BadStatusLine, RemoteDisconnected: no whole answer came either
             reason = getattr(error, "reason", error)

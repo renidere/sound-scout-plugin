@@ -2402,40 +2402,60 @@ def stop_at(run: Run) -> float:
 
 
 def step_until(run: Run, own_s: float, *, tail: bool = False) -> float:
-    """Until when a step may retry after transport errors. Before `stop_at`: its own limit, but
+    """Until when a step may retry after transport errors. Before the stop: its own limit, but
     at least the SSH window `ssh_lost_s`, since a lost network is not the step's fault, and
-    never past `stop_at`. A `tail` step (sync, evidence, server stop, final download) also gets
-    its own limit after `stop_at`: `spend_tail_s` counts it."""
+    never past `stop_at`. Once the agent has stopped for any reason `soft_stop` names (also a
+    credit-seen spend, a signal, `ssh_lost`, the watchdog), a `tail` step (sync, evidence,
+    server stop, final download) gets only its own limit — what `spend_tail_s` and
+    `stop_path_s` count — and any other step nothing more."""
     now = time.time()
-    until = min(stop_at(run), now + max(own_s, run.intervals["ssh_lost_s"]))
+    stop = now if soft_stop(run) is not None else stop_at(run)
+    until = min(stop, now + max(own_s, run.intervals["ssh_lost_s"]))
     return max(until, now + own_s) if tail else until
 
 
-def await_host(run: Run, what: str, until: float, error: str, *, tunnel: bool = False) -> bool:
-    """After a transport error: `true` on the host every `ssh_retry_s` until it answers, for at
-    most `ssh_lost_s` and never past `until`; then, with `tunnel`, the tunnel opened again (a live
-    but stale `ssh` restarted). A host silent for the whole window is `ssh_lost` for the attempt
-    (`HostLost`); a destroy the watchdog asked for ends the wait at once. Journaled as
-    `transport_retry`; True when the host answered the first `true` (no outage seen)."""
+def _watchdog_stop(run: Run, what: str, error: str) -> None:
     destroyed = watchdog_destroy(run.journal)
     if destroyed is not None:
         run.journal.append("transport_retry", what=what, error=error, outcome="watchdog")
         raise VastError(f"{what}: the watchdog destroyed the instance ({destroyed})")
+
+
+def await_host(run: Run, what: str, until: float, error: str, *, tunnel: bool = False) -> bool:
+    """After a transport error: `true` on the host every `ssh_retry_s` until it answers, for at
+    most `ssh_lost_s` and never past `until` (no probe outlives it); then, with `tunnel`, the
+    tunnel opened again (a live but stale `ssh` restarted). Only a host silent for the whole
+    `ssh_lost_s` window is `ssh_lost` for the attempt (`HostLost`); a window `until` cut short
+    is a `TransportError` of this step alone. A destroy the watchdog asks for, before or during
+    the wait, ends it at once. Journaled as `transport_retry`; True when the host answered the
+    first `true` (no outage seen)."""
+    _watchdog_stop(run, what, error)
     started = time.time()
-    ends = min(until, started + run.intervals["ssh_lost_s"])
+    window = started + run.intervals["ssh_lost_s"]
+    ends = min(until, window)
     tries = 0
     while True:
         tries += 1
-        done = run.host.run(["true"], timeout=SSH_PROBE_S)
+        probe = min(SSH_PROBE_S, max(1.0, ends - time.time()))
+        done = run.host.run(["true"], timeout=probe)
         if not _transport_failed(done) and done.returncode == 0:
             break
+        _watchdog_stop(run, what, error)
         if time.time() >= ends:
-            run.fatal = run.fatal or "ssh_lost"
             waited = round(time.time() - started, 3)
+            lost = until >= window - 1.0  # `until` from `step_until` is the same window
+            if lost:
+                run.fatal = run.fatal or "ssh_lost"
             run.journal.append(
-                "transport_retry", what=what, error=error, outcome="ssh_lost", waited_s=waited
+                "transport_retry",
+                what=what,
+                error=error,
+                outcome="ssh_lost" if lost else "step_end",
+                waited_s=waited,
             )
-            raise HostLost(f"the host does not answer over SSH ({what}, {waited:.0f} s)")
+            if lost:
+                raise HostLost(f"the host does not answer over SSH ({what}, {waited:.0f} s)")
+            raise TransportError(f"{what}: no SSH answer before the step's end ({waited:.0f} s)")
         time.sleep(max(0.0, min(run.intervals["ssh_retry_s"], ends - time.time())))
     reopened = bool(run.host.ensure_tunnel(force=True)) if tunnel else False
     run.journal.append(
@@ -2454,14 +2474,16 @@ def transport_retry(
     run: Run, what: str, action: Callable[[float], object], until: float, *, tunnel: bool = False
 ):
     """The one recovery path of every host step: `action(left)` (`left`: the seconds to
-    `until`, at least `MIN_STEP_S`); after a `TransportError` the host is awaited
-    (`await_host`) and the step runs again, until `until` — the step's own end
-    (`step_until`). A step that failed `SSH_RETRIES` times while the host answered at once is
-    the step's own failure (a missing remote file, say), and its last error is raised."""
+    `until`; the first try gets at least `MIN_STEP_S`); after a `TransportError` the host is
+    awaited (`await_host`) and the step runs again while `MIN_STEP_S` is left before `until` —
+    the step's own end (`step_until`). A step that failed `SSH_RETRIES` times while the host
+    answered at once is the step's own failure (a missing remote file, say), and its last error
+    is raised."""
     at_once = 0
+    left = max(MIN_STEP_S, until - time.time())
     while True:
         try:
-            return action(max(MIN_STEP_S, until - time.time()))
+            return action(left)
         except HostLost:
             raise
         except TransportError as error:
@@ -2472,6 +2494,9 @@ def transport_retry(
             at_once += 1
             if at_once >= SSH_RETRIES:
                 raise failure
+        left = until - time.time()
+        if left < MIN_STEP_S:
+            raise failure
 
 
 def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callable) -> int | None:
@@ -2526,12 +2551,13 @@ def recover(
     outcome, reopened, health = None, False, None
     if state is None and stopped is None:
         try:
-            await_host(run, f"request {name}", stop_at(run), "no server state")
+            await_host(run, f"request {name}", step_until(run, 0.0), "no server state")
             state = _state_or_none(run.host, out, run.journal, detail)
         except HostLost:
             outcome = "ssh_lost"
         except VastError:
-            outcome = "watchdog"
+            outcome = soft_stop(run) or "server_unreachable"
+        stopped = soft_stop(run)  # the wait may have run into the soft end
     if outcome is None:
         try:
             _judge(state, late=True)
@@ -2729,6 +2755,8 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
         except HostLost:
             raise
         except VastError as error:
+            if watchdog_destroy(journal) is not None:
+                raise
             errors = detail.setdefault("state_errors", {"count": 0, "last": None})
             errors["count"] += 1
             errors["last"] = redact(f"{type(error).__name__}: {error}", journal.key)
@@ -2853,7 +2881,9 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
         cancelled = isinstance(sys.exc_info()[1], KeyboardInterrupt | SystemExit)
         if failed is not None and not cancelled:
             destroyed = watchdog_destroy(journal)
-            if run.fatal == "ssh_lost":
+            if destroyed is None and (
+                run.fatal == "ssh_lost" or isinstance(failed, TransportError)
+            ):
                 raise AttemptFatal(
                     f"the host does not answer over SSH; the server of {name} could not be "
                     "stopped from here",
