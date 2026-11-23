@@ -11,6 +11,12 @@ writes the RSS of the session and the GPU memory to the stats file and stops the
 deadline or over the RSS limit. Native sockets of gloo and NCCL are bound to `lo` (#160): a
 listener on the bridge address would be a violation. This is a guard against a library that
 reaches out by accident, not a sandbox against the host's administrator.
+
+`stop` signals a process only while it is the one `serve` recorded: `serve.pid` holds the pid and
+the start time of `serve`, the `started` line the pid and the start time of the session leader,
+and every stats line a moment the leader was alive. A pid the kernel gave to a new process after
+the recorded one ended is left alone (#171). With the leader gone, a survivor of the session
+that `serve` cannot prove recorded gets no signal either, and `stop` does not report success.
 """
 
 import argparse
@@ -82,17 +88,34 @@ def guarded_env(environ, guard_dir: Path, guard_log: Path | None) -> dict:
     return env
 
 
+def _stat(pid: int | str) -> list[str] | None:
+    """The fields of `/proc/<pid>/stat` from field 3 (the state) on, or None."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return text.rsplit(")", 1)[1].split()
+
+
+def start_ticks(pid: int) -> int | None:
+    """Field 22 of `/proc/<pid>/stat`: when the process started, in clock ticks since boot."""
+    fields = _stat(pid)
+    return int(fields[19]) if fields else None
+
+
+def boot_ticks() -> int:
+    """Now on the clock of `start_ticks`, rounded down the way the kernel rounds it."""
+    now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    return now * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+
+
 def session_pids(session: int) -> list[int]:
     pids = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
-        try:
-            text = Path(f"/proc/{entry}/stat").read_text()
-        except OSError:
-            continue
-        fields = text.rsplit(")", 1)[1].split()
-        if int(fields[3]) == session:
+        fields = _stat(entry)
+        if fields and int(fields[3]) == session:
             pids.append(int(entry))
     return pids
 
@@ -245,19 +268,31 @@ def monitor(
     stats: Path,
     stop: threading.Event | _SignalFlag,
     peaks: dict | None = None,
+    held: dict | None = None,
 ):
     """Watch the session of `child` until it exits or a limit ends it; the reason or None.
-    `peaks` gets the maximum of every memory field over all polls, not only the stats lines."""
+    `peaks` gets the maximum of every memory field over all polls, not only the stats lines.
+    `ticks` of a stats line and `held["ticks"]` are read before a call that can reap `child`, so
+    its pid, the session id, was still taken after that moment."""
     next_stats = 0.0
     peaks = {} if peaks is None else peaks
-    while child.poll() is None:
+    held = {} if held is None else held
+
+    def reap(timeout: float | None = None) -> None:
+        held["ticks"] = boot_ticks()
+        child.wait(timeout)
+
+    while True:
+        seen = held["ticks"] = boot_ticks()
+        if child.poll() is not None:
+            return None
         pids = session_pids(child.pid)
         reason = None
         bad = violations(read_net(), socket_inodes(pids))
         if bad:
             _kill_session(child, signal.SIGKILL)
             _write_line(stats, {"event": "violation", "t": time.time(), "sockets": bad})
-            child.wait()
+            reap()
             return "violation"
         memory = tree_memory(pids)
         for name, value in memory.items():
@@ -265,7 +300,7 @@ def monitor(
         rss = memory["rss_bytes"]
         if time.monotonic() >= next_stats:
             next_stats = time.monotonic() + STATS_S
-            record = {"event": "stats", "t": time.time(), **memory}
+            record = {"event": "stats", "t": time.time(), "ticks": seen, **memory}
             record["gpu_memory_used_mib"] = gpu_memory_mib()
             _write_line(stats, record)
         if rss > rss_limit:
@@ -277,13 +312,12 @@ def monitor(
         if reason is not None:
             _kill_session(child, signal.SIGTERM)
             try:
-                child.wait(GRACE_S)
+                reap(GRACE_S)
             except subprocess.TimeoutExpired:
                 _kill_session(child, signal.SIGKILL)
-                child.wait()
+                reap()
             return reason
         stop.wait(POLL_S)
-    return None
 
 
 # --- commands ------------------------------------------------------------------------------
@@ -303,10 +337,14 @@ def serve(args) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+    # The leader is not reaped before the first poll: its pid stays taken after `ticks`.
+    started = {"event": "started", "t": time.time(), "pid": child.pid}
+    started |= {"start": start_ticks(child.pid), "ticks": boot_ticks()}
     if args.pid_file:
-        Path(args.pid_file).write_text(str(os.getpid()))
-    _write_line(args.stats, {"event": "started", "t": time.time(), "pid": child.pid})
+        Path(args.pid_file).write_text(f"{os.getpid()} {start_ticks(os.getpid())}")
+    _write_line(args.stats, started)
     peaks: dict = {}
+    held: dict = {}
     reason = monitor(
         child,
         deadline=args.deadline,
@@ -314,6 +352,7 @@ def serve(args) -> int:
         stats=args.stats,
         stop=stop,
         peaks=peaks,
+        held=held,
     )
     _kill_session(child, signal.SIGKILL)
     _write_line(
@@ -323,38 +362,92 @@ def serve(args) -> int:
             "t": time.time(),
             "reason": reason,
             "returncode": child.returncode,
+            "ticks": held.get("ticks"),
             "peak": peaks,
         },
     )
     return 0 if reason in (None, "stopped") else 1
 
 
-def _session_survivors(stats: Path | None) -> list[int]:
-    """Live processes of the server session `serve` recorded in its `started` line."""
-    started = [r for r in _records(stats) if r.get("event") == "started"] if stats else []
-    session = started[-1].get("pid") if started else None
+def _session_survivors(
+    stats: Path | None, accepted: set[tuple[int, int]]
+) -> list[tuple[int, int]] | None:
+    """Live processes of the server session `serve` recorded in its `started` line, as (pid,
+    start ticks); None when live processes hold the recorded session id but nothing proves them
+    of the recorded session or of a new one. The kernel gives the session id to a new process
+    only after every process of the recorded session ended, so the live ones are all of one
+    session. They are of the recorded one if the process with that pid is the recorded leader,
+    or, with the leader gone, if one of them is in `accepted` (an earlier answer) or started
+    before a moment `serve` saw the leader not yet reaped. They are of a new one if the process
+    with that pid is another leader."""
+    records = _records(stats) if stats else []
+    starts = [i for i, record in enumerate(records) if record.get("event") == "started"]
+    if not starts:
+        return []
+    started = records[starts[-1]]
+    session, leader_start = started.get("pid"), started.get("start")
     if type(session) is not int:
         return []
-    return [pid for pid in session_pids(session) if _alive(pid)]
+    members = [(pid, start_ticks(pid)) for pid in session_pids(session) if _alive(pid)]
+    members = [(pid, start) for pid, start in members if start is not None]
+    if not members:
+        return []
+    if type(leader_start) is not int:
+        return None
+    leader = start_ticks(session)
+    if leader is not None:
+        return members if leader == leader_start else []
+    seen = [record.get("ticks") for record in records[starts[-1] :]]
+    bound = max((ticks for ticks in seen if type(ticks) is int), default=None)
+    if accepted.intersection(members):
+        return members
+    if bound is not None and any(start < bound for _, start in members):
+        return members
+    return None
+
+
+def _serve_identity(pid_file) -> tuple[int, int] | None:
+    """The pid and the start ticks of `serve` from its pid file; None without both."""
+    try:
+        pid, start = (int(part) for part in Path(pid_file).read_text().split())
+    except (OSError, ValueError):
+        return None
+    return pid, start
+
+
+def _signal(pid: int, start: int, sig: int) -> bool:
+    """`sig` to `pid` only while it is the process that started at `start` ticks."""
+    if start_ticks(pid) != start:
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def _is_running(pid: int, start: int) -> bool:
+    return start_ticks(pid) == start and _alive(pid)
 
 
 def stop_command(args) -> int:
     """SIGTERM to `serve`; 0 once it and every process of the server session are gone. A
-    survivor of a `serve` that is already gone is killed (nothing else would end it)."""
-    try:
-        pid = int(Path(args.pid_file).read_text())
-        os.kill(pid, signal.SIGTERM)
-    except (OSError, ValueError):
-        pid = None
+    survivor of a `serve` that is already gone is killed (nothing else would end it). A pid of
+    `serve` or of the session the kernel gave to a new process gets no signal. A survivor that
+    is of neither session for sure gets no signal either, and `stop` fails at the timeout."""
+    serve_ = _serve_identity(args.pid_file)
+    if serve_ is not None and not _signal(*serve_, signal.SIGTERM):
+        serve_ = None
+    accepted: set[tuple[int, int]] = set()
     ends = time.monotonic() + args.timeout
     while True:
-        if pid is None or not _alive(pid):
-            survivors = _session_survivors(args.stats)
-            if not survivors:
+        if serve_ is None or not _is_running(*serve_):
+            survivors = _session_survivors(args.stats, accepted)
+            if survivors == []:
                 return 0
-            for survivor in survivors:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(survivor, signal.SIGKILL)
+            for pid, start in survivors or []:
+                accepted.add((pid, start))
+                _signal(pid, start, signal.SIGKILL)
         if time.monotonic() >= ends:
             return 1
         time.sleep(0.2)
@@ -362,11 +455,8 @@ def stop_command(args) -> int:
 
 def _alive(pid: int) -> bool:
     """A process that exited is gone even while its parent has not reaped it (a zombie)."""
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    return text.rsplit(")", 1)[1].split()[0] != "Z"
+    fields = _stat(pid)
+    return fields is not None and fields[0] != "Z"
 
 
 def _records(path: Path) -> list[dict]:
@@ -388,8 +478,8 @@ def serve_state(stats: Path, pid_file: Path) -> dict:
     """Whether `serve` started, is alive, and how it ended; the pid is read before the stats, so
     a `serve` gone between the two reads has already written its `exit` line."""
     try:
-        alive = _alive(int(Path(pid_file).read_text()))
-    except (OSError, ValueError):
+        alive = _alive(int(Path(pid_file).read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
         alive = False
     records = _records(stats)
     exits = [r for r in records if r.get("event") == "exit"]

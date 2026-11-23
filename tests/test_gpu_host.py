@@ -521,15 +521,301 @@ def test_stop_ends_only_when_no_process_of_the_server_session_survives(tmp_path)
 
 def test_stop_fails_while_a_process_of_the_server_session_survives(tmp_path, monkeypatch) -> None:
     stats = tmp_path / "stats.jsonl"
-    stats.write_text(json.dumps({"event": "started", "t": 0, "pid": 4242}) + "\n")
+    started = {"event": "started", "t": 0, "pid": 4242, "start": 7, "ticks": 8}
+    stats.write_text(json.dumps(started) + "\n")
     monkeypatch.setattr(hostrun, "session_pids", lambda session: [4242] if session == 4242 else [])
     monkeypatch.setattr(hostrun, "_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(hostrun, "start_ticks", lambda pid: 7 if pid == 4242 else None)
     killed = []
     monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     args = ["stop", "--pid-file", str(tmp_path / "absent.pid"), "--stats", str(stats)]
     assert hostrun.main([*args, "--timeout", "0.5"]) == 1
     assert killed and set(killed) == {(4242, signal.SIGKILL)}
     assert hostrun.main(["stop", "--pid-file", str(tmp_path / "absent.pid"), "--timeout", "0"]) == 0
+
+
+def _fake_gone_leader(monkeypatch, members) -> list:
+    """A recorded session 4242 whose leader is gone; `members()` gives its live (pid, start) at
+    each pass of `stop`. The SIGKILLs `stop` sends are recorded and land nowhere."""
+    monkeypatch.setattr(hostrun, "session_pids", lambda session: [p for p, _ in members()])
+    monkeypatch.setattr(hostrun, "_alive", lambda pid: True)
+    monkeypatch.setattr(hostrun, "start_ticks", lambda pid: dict(members()).get(pid))
+    killed = []
+    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    return killed
+
+
+@pytest.mark.parametrize(
+    ("lines", "start", "proved"),
+    [
+        ([{"event": "stats", "ticks": 9}], 8, True),
+        ([{"event": "stats", "ticks": 9}, {"event": "exit", "ticks": 20}], 15, True),
+        ([{"event": "stats", "ticks": 9}], 9, False),
+        ([{"event": "stats", "ticks": 9}], 15, False),
+    ],
+    ids=["before a stats tick", "before the exit tick", "at the last tick", "after the last tick"],
+)
+def test_stop_kills_a_survivor_of_a_gone_leader_only_with_proof_and_never_reports_success(
+    tmp_path, monkeypatch, lines, start, proved
+) -> None:
+    stats = tmp_path / "stats.jsonl"
+    started = {"event": "started", "t": 0, "pid": 4242, "start": 7, "ticks": 8}
+    stats.write_text("".join(json.dumps(line) + "\n" for line in [started, *lines]))
+    killed = _fake_gone_leader(monkeypatch, lambda: [(5000, start)])
+    args = ["stop", "--pid-file", str(tmp_path / "absent.pid"), "--stats", str(stats)]
+    assert hostrun.main([*args, "--timeout", "0.3"]) == 1
+    assert set(killed) == ({(5000, signal.SIGKILL)} if proved else set())
+
+
+def test_stop_keeps_killing_a_survivor_it_proved_once_after_the_proof_is_gone(
+    tmp_path, monkeypatch
+) -> None:
+    stats = tmp_path / "stats.jsonl"
+    started = {"event": "started", "t": 0, "pid": 4242, "start": 7, "ticks": 8}
+    stats.write_text(json.dumps(started) + "\n")
+    passes = iter([[(5000, 7), (5001, 15)], [(5001, 15)], [(5001, 15)], []])
+    current: list = []
+
+    def members():
+        return current
+
+    killed = _fake_gone_leader(monkeypatch, members)
+    real_survivors = hostrun._session_survivors
+
+    def next_pass(stats_path, accepted):
+        current[:] = next(passes)
+        return real_survivors(stats_path, accepted)
+
+    monkeypatch.setattr(hostrun, "_session_survivors", next_pass)
+    args = ["stop", "--pid-file", str(tmp_path / "absent.pid"), "--stats", str(stats)]
+    assert hostrun.main([*args, "--timeout", "30"]) == 0
+    assert killed == [(5000, signal.SIGKILL), *[(5001, signal.SIGKILL)] * 3]
+
+
+LEADER_THAT_LEAVES = """
+import os, subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+while not os.path.exists(sys.argv[1]):
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.slow
+def test_stop_kills_the_survivors_of_a_server_session_whose_leader_is_gone(tmp_path) -> None:
+    script, leave = tmp_path / "server.py", tmp_path / "leave"
+    script.write_text(LEADER_THAT_LEAVES)
+    serve = _start_serve(tmp_path, [sys.executable, str(script), str(leave)])
+    server_pid = None
+    try:
+        server_pid = _wait_for(
+            lambda: next((r["pid"] for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        (worker,) = _wait_for(
+            lambda: [p for p in hostrun.session_pids(server_pid) if p != server_pid]
+        )
+        worker_start = hostrun.start_ticks(worker)
+        _wait_for(
+            lambda: any(r.get("ticks", 0) > worker_start for r in _stats(tmp_path)), seconds=30
+        )
+        serve.kill()
+        serve.wait(30)
+        leave.touch()
+        _wait_for(lambda: hostrun.start_ticks(server_pid) is None, seconds=30)
+        assert hostrun._alive(worker)
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "pid"), "--stats", str(tmp_path / "stats.jsonl")]
+        assert subprocess.run([*stop, "--timeout", "30"], timeout=60).returncode == 0
+        assert not hostrun._alive(worker)
+    finally:
+        leave.touch()
+        if serve.poll() is None:
+            serve.kill()
+            serve.wait(30)
+        if server_pid is not None:
+            for pid in hostrun.session_pids(server_pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+# A leader that starts a worker and leaves once `serve` is gone: no line of `serve` comes after
+# the worker started, so nothing proves the worker is of the recorded session.
+LEADER_THAT_FORKS_AFTER_SERVE = """
+import os, subprocess, sys, time
+go, ready = sys.argv[1], sys.argv[2]
+while not os.path.exists(go):
+    time.sleep(0.05)
+worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+with open(ready, "w") as out:
+    out.write(str(worker.pid))
+"""
+
+
+@pytest.mark.slow
+def test_stop_fails_without_a_signal_on_a_survivor_it_cannot_prove_of_the_recorded_session(
+    tmp_path,
+) -> None:
+    script, go, ready = tmp_path / "server.py", tmp_path / "go", tmp_path / "ready"
+    script.write_text(LEADER_THAT_FORKS_AFTER_SERVE)
+    serve = _start_serve(tmp_path, [sys.executable, str(script), str(go), str(ready)])
+    server_pid = None
+    try:
+        server_pid = _wait_for(
+            lambda: next((r["pid"] for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        _wait_for(lambda: [r for r in _stats(tmp_path) if r["event"] == "stats"])
+        serve.kill()
+        serve.wait(30)
+        go.touch()
+        worker = int(_wait_for(lambda: ready.is_file() and ready.read_text()))
+        _wait_for(lambda: hostrun.start_ticks(server_pid) is None, seconds=30)
+        worker_start = hostrun.start_ticks(worker)
+        assert worker_start > max(r["ticks"] for r in _stats(tmp_path))
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "pid"), "--stats", str(tmp_path / "stats.jsonl")]
+        assert subprocess.run([*stop, "--timeout", "1"], timeout=60).returncode == 1
+        assert hostrun._alive(worker) and hostrun.start_ticks(worker) == worker_start
+    finally:
+        go.touch()
+        if serve.poll() is None:
+            serve.kill()
+            serve.wait(30)
+        if server_pid is not None:
+            for pid in hostrun.session_pids(server_pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+# A vLLM-like leader that dies first on SIGTERM, with two workers started after a stats line:
+# one in the leader's process group, one in a process group of its own that ignores SIGTERM.
+LEADER_WITH_LATE_WORKERS = """
+import os, subprocess, sys, time
+go, ready = sys.argv[1], sys.argv[2]
+while not os.path.exists(go):
+    time.sleep(0.05)
+deaf = "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+deaf += "open(sys.argv[1], 'w').close(); time.sleep(120)"
+own_group = subprocess.Popen([sys.executable, "-c", deaf, ready + ".deaf"], process_group=0)
+same_group = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+while not os.path.exists(ready + ".deaf"):
+    time.sleep(0.05)
+with open(ready, "w") as out:
+    out.write(f"{own_group.pid} {same_group.pid}")
+time.sleep(120)
+"""
+
+
+def test_stop_still_kills_every_live_process_of_the_recorded_server_session(tmp_path) -> None:
+    script, go, ready = tmp_path / "server.py", tmp_path / "go", tmp_path / "ready"
+    script.write_text(LEADER_WITH_LATE_WORKERS)
+    serve = _start_serve(tmp_path, [sys.executable, str(script), str(go), str(ready)])
+    server_pid = None
+    try:
+        server_pid = _wait_for(
+            lambda: next((r["pid"] for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        _wait_for(lambda: [r for r in _stats(tmp_path) if r["event"] == "stats"])
+        go.touch()
+        workers = [int(p) for p in _wait_for(lambda: ready.is_file() and ready.read_text()).split()]
+        assert all(pid in hostrun.session_pids(server_pid) for pid in workers)
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "pid"), "--stats", str(tmp_path / "stats.jsonl")]
+        assert subprocess.run([*stop, "--timeout", "30"], timeout=60).returncode == 0
+        assert serve.wait(30) == 0
+        assert not [p for p in hostrun.session_pids(server_pid) if hostrun._alive(p)]
+        assert not any(hostrun._alive(pid) for pid in workers)
+    finally:
+        if serve.poll() is None:
+            serve.kill()
+            serve.wait(30)
+        if server_pid is not None:
+            for pid in hostrun.session_pids(server_pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def _start_ticks(pid: int) -> int | None:
+    """Field 22 of `/proc/<pid>/stat`, read here and not by `hostrun`."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except OSError:
+        return None
+
+
+# A new session that took the recorded session id: its leader stays, or it forks and leaves the
+# way a daemon does. The recorded leader started a tick before it; `serve` last saw that leader
+# no later than the new session started. With the leader gone nothing proves the survivor is of
+# the new session either: it gets no signal, and `stop` fails.
+DAEMON = """
+import os, time
+if os.fork() == 0:
+    time.sleep(60)
+os._exit(0)
+"""
+
+
+@pytest.mark.parametrize("leader", ["alive", pytest.param("gone", marks=pytest.mark.slow)])
+def test_stop_leaves_a_new_session_that_took_the_recorded_session_id(tmp_path, leader) -> None:
+    code = "import time; time.sleep(60)" if leader == "alive" else DAEMON
+    first = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    session = first.pid
+    try:
+        if leader == "gone":
+            first.wait(30)
+        (stranger,) = _wait_for(
+            lambda: [p for p in hostrun.session_pids(session) if hostrun._alive(p)]
+        )
+        start = _start_ticks(stranger)
+        stats = tmp_path / "stats.jsonl"
+        started = {"event": "started", "t": 0, "pid": session, "start": start - 1}
+        stats.write_text(json.dumps({**started, "ticks": start}) + "\n")
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        stop += [str(tmp_path / "absent.pid"), "--stats", str(stats), "--timeout", "1"]
+        assert subprocess.run(stop, timeout=60).returncode == (0 if leader == "alive" else 1)
+        assert hostrun._alive(stranger) and _start_ticks(stranger) == start
+    finally:
+        for pid in hostrun.session_pids(session):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        if first.poll() is None:
+            first.wait(30)
+
+
+@pytest.mark.parametrize("recorded", ["pid", "pid and an earlier start"])
+def test_stop_sends_no_sigterm_to_a_process_that_took_the_pid_of_serve(tmp_path, recorded) -> None:
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        start = _wait_for(lambda: _start_ticks(stranger.pid))
+        pid_file = tmp_path / "serve.pid"
+        pid_file.write_text(f"{stranger.pid} {start - 1}" if " " in recorded else str(stranger.pid))
+        stop = [sys.executable, str(HOST_DIR / "hostrun.py"), "stop", "--pid-file"]
+        assert subprocess.run([*stop, str(pid_file), "--timeout", "5"], timeout=60).returncode == 0
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait(30)
+
+
+def test_serve_records_its_own_and_the_leader_start_for_stop(tmp_path) -> None:
+    serve = _start_serve(tmp_path, [sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        started = _wait_for(
+            lambda: next((r for r in _stats(tmp_path) if r["event"] == "started"), None)
+        )
+        assert started["start"] == hostrun.start_ticks(started["pid"]) <= started["ticks"]
+        pid_file = tmp_path / "pid"
+        _wait_for(lambda: pid_file.is_file() and pid_file.read_text())
+        assert pid_file.read_text() == f"{serve.pid} {hostrun.start_ticks(serve.pid)}"
+        stats = _wait_for(lambda: [r for r in _stats(tmp_path) if r["event"] == "stats"])
+        assert stats[0]["ticks"] >= started["ticks"]
+        serve.send_signal(signal.SIGTERM)
+        assert serve.wait(30) == 0
+        records = _stats(tmp_path)
+        assert records[-1]["event"] == "exit"
+        assert records[-1]["ticks"] >= max(r["ticks"] for r in records[:-1])
+    finally:
+        if serve.poll() is None:
+            serve.send_signal(signal.SIGTERM)
+            serve.wait(30)
 
 
 # `serve` whose first wait of the poll loop holds until a signal comes: in `Condition.wait` (the
