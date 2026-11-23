@@ -2986,6 +2986,172 @@ def test_a_signal_inside_the_final_path_is_journaled_and_cuts_nothing(
     assert vast.defer_signals(run, {}) is None
 
 
+# The child runs a dry run and, once armed, raises SIGTERM in the main thread inside a window of
+# `Journal.lock()`: right after `flock` returns (`acquire`) or right before the lock fd's `close`
+# (`release`). `cancel` arms after the first Gate 0 block (the handler of `cancel_on_signals`),
+# `defer` once the final download starts (the handler of `defer_signals`).
+_LOCK_WINDOW_CHILD = """
+import fcntl, os, signal, sys, threading
+from pathlib import Path
+
+from sound_scout import config
+from sound_scout.eval import vast
+
+out, window, when = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+armed = []
+real_flock, real_close, real_download = fcntl.flock, os.close, vast.download
+
+
+def is_lock(fd):
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}").endswith("/" + vast.LOCK_FILE)
+    except OSError:
+        return False
+
+
+def fire():
+    if armed and threading.current_thread() is threading.main_thread():
+        armed.clear()
+        signal.raise_signal(signal.SIGTERM)  # the handler runs inside this call
+        (out.parent / "fired").write_text(window)
+
+
+def flock(fd, operation):
+    real_flock(fd, operation)
+    if window == "acquire" and operation & fcntl.LOCK_EX and is_lock(fd):
+        fire()
+
+
+def close(fd):
+    if window == "release" and is_lock(fd):
+        fire()
+    real_close(fd)
+
+
+def download(*args, **kwargs):
+    final = kwargs.get("name", "results") == "results"
+    if when == "defer" and final and not (out.parent / "fired").exists():
+        armed.append(1)
+    return real_download(*args, **kwargs)
+
+
+fcntl.flock, os.close, vast.download = flock, close, download
+first_block = lambda run, **_: armed.append(1) if not (out.parent / "fired").exists() else None
+hooks = {"block_end": first_block} if when == "cancel" else {}
+(out.parent / "in").mkdir()
+config_ = config.Config(allowed_roots=((out.parent / "in").resolve(),), data_root=out.parent)
+vast.dry_run(out, config_, scenario={"hooks": hooks})
+"""
+
+
+def _signal_in_lock_window(tmp_path: Path, window: str, when: str) -> tuple[int, list]:
+    out = tmp_path / "dry"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_WINDOW_CHILD, str(out), window, when],
+        cwd=REPO,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        code = child.wait(240)
+    except subprocess.TimeoutExpired:  # the handler blocked on the lock this thread holds
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        code = None
+    assert code is not None, "the signal handler blocked on the journal lock"
+    assert (tmp_path / "fired").read_text() == window
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    return code, vast.Journal(journal_path).replay()
+
+
+def _download_and_destroy(events: list, tmp_path: Path) -> None:
+    downloads = [e for e in events if e["event"] == "step" and e["name"] == "download"]
+    assert [d["ok"] for d in downloads] == [True]
+    assert any(e["event"] == "download_verified" for e in events)
+    assert any(e["event"] == "absence_verified" for e in events)
+    assert any(e["event"] == "closed" for e in events)
+    timeline = json.loads((tmp_path / "dry" / "timeline.json").read_text())
+    assert timeline["fake_api"]["instances_left"] == []
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("window", ["acquire", "release"])
+def test_a_cancel_signal_inside_the_journal_lock_still_reaches_download_and_destroy(
+    tmp_path: Path, window: str
+) -> None:
+    code, events = _signal_in_lock_window(tmp_path, window, "cancel")
+    assert code == 128 + signal.SIGTERM
+    signals = [e for e in events if e["event"] == "signal"]
+    assert [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", None)]
+    first_download = next(
+        i for i, e in enumerate(events) if e["event"] == "step" and e["name"] == "download"
+    )
+    assert events.index(signals[0]) < first_download
+    models = {e["model"] for e in events if e["event"] == "step" and "model" in e}
+    assert len(models) == 1  # the cancel ends the attempt: the second model never starts
+    _download_and_destroy(events, tmp_path)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("window", ["acquire", "release"])
+def test_a_signal_inside_the_journal_lock_of_the_final_path_is_journaled_and_cuts_nothing(
+    tmp_path: Path, window: str
+) -> None:
+    _, events = _signal_in_lock_window(tmp_path, window, "defer")
+    signals = [e for e in events if e["event"] == "signal"]
+    assert [(e["name"], e.get("deferred")) for e in signals] == [("SIGTERM", True)]
+    _download_and_destroy(events, tmp_path)
+
+
+def test_a_signal_inside_the_lock_window_runs_its_handler_once_the_window_ends(
+    tmp_path: Path, monkeypatch
+) -> None:
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    seen = []
+
+    def handler(signum, _frame):
+        seen.append((signum, vast._LOCK_WINDOW.pending, journal._held))
+        journal.append("signal", name=signal.Signals(signum).name)
+
+    safe = vast._outside_lock_window(handler)
+    real_flock = vast.fcntl.flock
+
+    def flock(fd, operation):
+        real_flock(fd, operation)
+        if operation & vast.fcntl.LOCK_EX and not seen:
+            safe(signal.SIGHUP, None)  # as the signal machinery calls it inside the window
+            assert seen == []
+
+    monkeypatch.setattr(vast.fcntl, "flock", flock)
+    journal.append("one")
+    assert seen == [(signal.SIGHUP, None, 1)]
+    assert [e["event"] for e in journal.replay()] == ["signal", "one"]
+    assert vast._LOCK_WINDOW.pending is None
+    safe(signal.SIGTERM, None)  # outside the window: at once
+    assert seen[-1] == (signal.SIGTERM, None, 0)
+
+
+def test_a_signal_before_a_failed_lock_open_still_runs_its_handler(tmp_path: Path) -> None:
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    seen = []
+    safe = vast._outside_lock_window(
+        lambda signum, _frame: seen.append((signum, vast._LOCK_WINDOW.pending, journal._held))
+    )
+
+    class Missing:
+        def __truediv__(self, name):
+            safe(signal.SIGTERM, None)
+            assert seen == []
+            return tmp_path / "missing" / name
+
+    journal.dir = Missing()
+    with pytest.raises(FileNotFoundError), journal.lock():
+        pass
+    assert seen == [(signal.SIGTERM, None, 0)]
+    assert vast._LOCK_WINDOW.pending is None
+
+
 # --- transport recovery (#149, round 2) ----------------------------------------------------------
 
 

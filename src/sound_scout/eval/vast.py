@@ -673,6 +673,35 @@ class Api:
 # --- the ownership journal -----------------------------------------------------------------
 
 
+class _LockWindow(threading.local):
+    """The signals (`(handler, signum)`) that land while this thread opens, locks or closes a
+    journal `flock`; `None` outside that. Run there, a handler would block on the lock this
+    thread already holds, or its exception would skip the `close` and keep the lock (#170)."""
+
+    pending: list | None = None
+
+
+_LOCK_WINDOW = _LockWindow()
+
+
+def _close_lock_window() -> None:
+    pending, _LOCK_WINDOW.pending = _LOCK_WINDOW.pending, None
+    for handler, signum in pending or ():
+        handler(signum, None)
+
+
+def _outside_lock_window(handler: Callable) -> Callable:
+    """The signal handler, run at once, or when the journal lock's open, flock or close ends."""
+
+    def safe(signum: int, frame) -> None:
+        if _LOCK_WINDOW.pending is not None:
+            _LOCK_WINDOW.pending.append((handler, signum))
+            return
+        handler(signum, frame)
+
+    return safe
+
+
 class Journal:
     """`<attempt>/journal.jsonl`: one `os.write` of one line per event, then `fsync`."""
 
@@ -730,22 +759,29 @@ class Journal:
             finally:
                 self._held -= 1
             return
-        fd = os.open(
-            self.dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
-        )
+        _LOCK_WINDOW.pending = []
+        fd, held = None, False
         try:
+            fd = os.open(
+                self.dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+            )
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             except BlockingIOError:
-                yield False
-                return
-            self._held = 1
-            try:
-                yield True
-            finally:
-                self._held = 0
+                pass
+            else:
+                held = True
+                self._held = 1
+            _close_lock_window()
+            yield held
         finally:
-            os.close(fd)
+            if _LOCK_WINDOW.pending is None:
+                _LOCK_WINDOW.pending = []
+            if held:
+                self._held = 0
+            if fd is not None:
+                os.close(fd)
+            _close_lock_window()
 
     def append(self, event: str, **fields) -> dict:
         record = {"event": event, "t": round(time.time(), 3), **fields}
@@ -2306,7 +2342,8 @@ def cancel_on_signals(run: Run) -> dict:
     """SIGTERM and SIGHUP (a `systemctl stop`, a closed terminal) end the attempt like Ctrl-C:
     `SystemExit` takes the `finally` path, so the results are downloaded and the instance
     destroyed. The first signal counts; later ones are ignored, so they cannot cut that path
-    short; `run.fatal` keeps the stop even where the exception is swallowed. Only the main
+    short; `run.fatal` keeps the stop even where the exception is swallowed. A signal inside
+    the journal lock's open, flock or close is handled as soon as that ends. Only the main
     thread can set handlers: elsewhere nothing changes."""
     if threading.current_thread() is not threading.main_thread():
         return {}
@@ -2320,7 +2357,8 @@ def cancel_on_signals(run: Run) -> dict:
             run.journal.append("signal", name=signal.Signals(signum).name)
         raise SystemExit(128 + signum)
 
-    return {number: signal.signal(number, cancel) for number in CANCEL_SIGNALS}
+    safe = _outside_lock_window(cancel)
+    return {number: signal.signal(number, safe) for number in CANCEL_SIGNALS}
 
 
 def defer_signals(run: Run, saved: Mapping) -> None:
@@ -2334,9 +2372,10 @@ def defer_signals(run: Run, saved: Mapping) -> None:
         with contextlib.suppress(Exception):
             run.journal.append("signal", name=signal.Signals(signum).name, deferred=True)
 
+    safe = _outside_lock_window(note)
     for number in CANCEL_SIGNALS:
         if signal.getsignal(number) is not signal.SIG_IGN:
-            signal.signal(number, note)
+            signal.signal(number, safe)
 
 
 def restore_signals(saved: Mapping) -> None:
