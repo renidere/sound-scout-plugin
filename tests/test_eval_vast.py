@@ -3124,3 +3124,26 @@ def test_term_stop_covers_the_final_path_up_to_the_delete() -> None:
     minutes = int(vast.LAUNCH_TIMEOUT_STOP.removesuffix("min"))
     # evidence 1 min, stop 2 min, download 5 min, listing and DELETE 1 min each
     assert vast.stop_path_s() == 600 and minutes * 60 >= vast.stop_path_s()
+
+
+def test_the_ssh_window_counts_the_failed_try_itself(tmp_path: Path, key_file, fake) -> None:
+    """A real ssh needs its ConnectTimeout to fail: that time is silence of the host too, so a
+    host silent from the try on for the whole window is ssh_lost, though the wait was shorter."""
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=10**9), ssh_lost_s=3.0)
+
+    def slow_failure(left: float) -> None:
+        time.sleep(1.5)
+        raise vast.TransportError("host: state: no SSH answer (exit 255)")
+
+    until = vast.step_until(run, 1.0)
+    assert until == pytest.approx(time.time() + 3.0, abs=0.5)
+    with pytest.raises(vast.HostLost):
+        vast.transport_retry(run, "state m", slow_failure, until)
+    assert run.fatal == "ssh_lost"
+
+
+def test_a_pilot_whose_recovery_stops_fails_the_smoke_with_that_reason() -> None:
+    dead = gate0.Client(vast._free_port(), "m")  # nothing listens: no HTTP answer
+    with pytest.raises(vast.ModelFailed, match="pilot: ssh_lost") as raised:
+        vast.run_pilot(dead, lambda after_timeout=False: "ssh_lost", timeout=1.0)
+    assert raised.value.step == "smoke"

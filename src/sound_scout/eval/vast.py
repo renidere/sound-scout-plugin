@@ -2053,14 +2053,22 @@ def pilot_clips() -> dict[str, bytes]:
     return clips
 
 
-def run_pilot(client: gate0.Client, transport_check: Callable | None = None) -> dict:
+def run_pilot(
+    client: gate0.Client,
+    transport_check: Callable | None = None,
+    timeout: float = gate0.REQUEST_TIMEOUT_S,
+) -> dict:
     """K1 on X1 and X2: audio tokens above zero and growing with the length (PROPOSAL § 5). A
     request without any HTTP answer goes to `transport_check` (`recover`) and, when the server
-    answers again, once more (`gate0.send_checked`)."""
+    answers again, once more (`gate0.send_checked`); any other answer of `transport_check` (the
+    host lost, the server gone, a stop) is `ModelFailed` at `smoke` with that reason."""
     lines = []
     text = gate0.QUESTIONS["K1"]
     text_tokens = client.text_tokens(text)
-    if text_tokens is None and transport_check is not None and transport_check() == "resend":
+    if text_tokens is None and transport_check is not None:
+        decision = transport_check()
+        if decision != "resend":
+            raise ModelFailed("smoke", f"pilot: {decision}")
         text_tokens = client.text_tokens(text)
     for clip_id, wav in pilot_clips().items():
         audio = {
@@ -2075,12 +2083,12 @@ def run_pilot(client: gate0.Client, transport_check: Callable | None = None) -> 
         }
 
         def send(write_request: bool = True, body=body) -> dict:
-            status, raw, error = client.request(
-                gate0.CHAT_ROUTE, body, timeout=gate0.REQUEST_TIMEOUT_S
-            )
+            status, raw, error = client.request(gate0.CHAT_ROUTE, body, timeout=timeout)
             return {"sent": True, "http_status": status, "raw": raw, "error": error}
 
-        answer, _ = gate0.send_checked(send, transport_check)
+        answer, decision = gate0.send_checked(send, transport_check)
+        if decision is not None:
+            raise ModelFailed("smoke", f"pilot: {decision}")
         status, raw = answer["http_status"], answer["raw"]
         try:
             prompt = json.loads(raw)["usage"]["prompt_tokens"] if status == 200 else None
@@ -2421,17 +2429,26 @@ def _watchdog_stop(run: Run, what: str, error: str) -> None:
         raise VastError(f"{what}: the watchdog destroyed the instance ({destroyed})")
 
 
-def await_host(run: Run, what: str, until: float, error: str, *, tunnel: bool = False) -> bool:
+def await_host(
+    run: Run,
+    what: str,
+    until: float,
+    error: str,
+    *,
+    tunnel: bool = False,
+    since: float | None = None,
+) -> bool:
     """After a transport error: `true` on the host every `ssh_retry_s` until it answers, for at
     most `ssh_lost_s` and never past `until` (no probe outlives it); then, with `tunnel`, the
     tunnel opened again (a live but stale `ssh` restarted). Only a host silent for the whole
     `ssh_lost_s` window is `ssh_lost` for the attempt (`HostLost`); a window `until` cut short
     is a `TransportError` of this step alone. A destroy the watchdog asks for, before or during
     the wait, ends it at once. Journaled as `transport_retry`; True when the host answered the
-    first `true` (no outage seen)."""
+    first `true` (no outage seen). The window counts from `since`, when the failed try began:
+    an ssh needs its own timeout to fail, and that time was silence too."""
     _watchdog_stop(run, what, error)
     started = time.time()
-    window = started + run.intervals["ssh_lost_s"]
+    window = (started if since is None else since) + run.intervals["ssh_lost_s"]
     ends = min(until, window)
     tries = 0
     while True:
@@ -2443,7 +2460,7 @@ def await_host(run: Run, what: str, until: float, error: str, *, tunnel: bool = 
         _watchdog_stop(run, what, error)
         if time.time() >= ends:
             waited = round(time.time() - started, 3)
-            lost = until >= window - 1.0  # `until` from `step_until` is the same window
+            lost = until >= window - 1.0
             if lost:
                 run.fatal = run.fatal or "ssh_lost"
             run.journal.append(
@@ -2482,6 +2499,7 @@ def transport_retry(
     at_once = 0
     left = max(MIN_STEP_S, until - time.time())
     while True:
+        tried = time.time()
         try:
             return action(left)
         except HostLost:
@@ -2490,7 +2508,8 @@ def transport_retry(
             failure = error
         if time.time() >= until:
             raise failure
-        if await_host(run, what, until, redact(str(failure), run.journal.key), tunnel=tunnel):
+        error = redact(str(failure), run.journal.key)
+        if await_host(run, what, until, error, tunnel=tunnel, since=tried):
             at_once += 1
             if at_once >= SSH_RETRIES:
                 raise failure
@@ -2791,6 +2810,7 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                 pilot = run_pilot(
                     client,
                     lambda after_timeout=False: recover(run, client, out, name, after_timeout),
+                    min(gate0.REQUEST_TIMEOUT_S, timeout_cap(run)),
                 )
                 (run.attempt / f"pilot-{name}.json").write_text(json.dumps(pilot, indent=2) + "\n")
                 detail.update(pilot_ok=pilot["ok"], tunnel_port=port)
