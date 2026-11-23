@@ -16,6 +16,8 @@ models, a real host or Vast.ai.
 import argparse
 import contextlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import tarfile
@@ -144,6 +146,27 @@ def model_failed(o: Outcome, c: Checks, model: str, step: str, *, kind: str = "f
     )
 
 
+def model_incomplete(o: Outcome, c: Checks, model: str, stop: str) -> None:
+    """A day the stack stopped is `incomplete`, never a NOT READY of the model (0028)."""
+    outcome = o.model(model)
+    c(
+        f"{model}: outcome incomplete ({stop}), no Gate 0 verdict",
+        outcome.get("outcome") == "incomplete"
+        and outcome.get("verdict") == "incomplete"
+        and outcome.get("stop_reason") == stop,
+        outcome,
+    )
+    path = o.out / _days(model) / gate0.ATTEMPTS_DIR / "1" / gate0.VERDICT_FILE
+    verdict = json.loads(path.read_text()) if path.is_file() else {}
+    c(
+        f"{model}: verdict.json says incomplete and keeps the rule's reading apart",
+        verdict.get("verdict") == "incomplete"
+        and verdict.get("stop_reason") == stop
+        and "rule_verdict" in verdict,
+        {k: verdict.get(k) for k in ("verdict", "stop_reason", "rule_verdict", "unanswered")},
+    )
+
+
 def ext_complete(o: Outcome, c: Checks, model: str) -> None:
     trace = o.ext_trace(model)
     unsent = [line for line in trace if not line.get("sent")]
@@ -175,11 +198,12 @@ def in_archive(o: Outcome, c: Checks, relative: str) -> None:
 class Scenario:
     name: str
     title: str
-    setup: dict | Callable[[dict], dict]
+    setup: dict | Callable[[], dict]
     check: Callable[[Outcome, Checks], None]
     watchdog: bool = False
     expect_error: str | None = None
     stale_s: float | None = None
+    signal_after: tuple[str, int] | None = None
 
 
 def _block_end(model: str, block: str, action: Callable) -> dict:
@@ -188,6 +212,39 @@ def _block_end(model: str, block: str, action: Callable) -> dict:
             action(run)
 
     return {"block_end": hook}
+
+
+def _gate0_sent(trace: Path) -> int:
+    if not trace.is_file():
+        return 0
+    sent = 0
+    for text in trace.read_text(encoding="utf-8").splitlines():
+        with contextlib.suppress(ValueError):
+            sent += json.loads(text).get("sent") is True
+    return sent
+
+
+def _gate0_trace_path(data_root: Path, model: str) -> Path:
+    return data_root / _days(model) / gate0.ATTEMPTS_DIR / "1" / gate0.TRACE_FILE
+
+
+def _when_gate0_sent(model: str, count: int, action: Callable) -> dict:
+    """A host hook: `action(run)` once, from a thread, when Gate 0 of `model` sent `count`."""
+
+    def hook(run) -> None:
+        trace = _gate0_trace_path(run.config_.data_root, model)
+
+        def loop() -> None:
+            ends = time.monotonic() + 600
+            while time.monotonic() < ends:
+                if _gate0_sent(trace) >= count:
+                    action(run)
+                    return
+                time.sleep(0.02)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    return {"host": hook}
 
 
 def check_success(o: Outcome, c: Checks) -> None:
@@ -307,6 +364,7 @@ def check_crash(o: Outcome, c: Checks) -> None:
         "M1 extended blocks not sent after the crash",
         ext and all(not line.get("sent") for line in ext),
     )
+    model_incomplete(o, c, M1, "server_exited")
     model_ok(o, c, M2)
     ext_complete(o, c, M2)
     downloaded(o, c)
@@ -375,6 +433,11 @@ def check_watchdog(reason: str):
         c(
             "the attempt ends in an error (deploy exits 2)",
             o.error is not None,
+            None if o.error is None else str(o.error)[:200],
+        )
+        c(
+            "the error names the watchdog's destroy, not a server that did not stop",
+            o.error is not None and "did not stop" not in str(o.error),
             None if o.error is None else str(o.error)[:200],
         )
         closed = o.kinds("closed")
@@ -611,6 +674,219 @@ def _fallback_offer(fake) -> None:
     }
 
 
+def check_resent(after_timeout: bool = False):
+    """The tunnel came back (reopened, and with `after_timeout` the stale one restarted) and
+    the request went once more; nothing of M1 was lost."""
+
+    def check(o: Outcome, c: Checks) -> None:
+        checks = o.kinds("transport_check")
+        c(
+            "the tunnel was reopened and the request resent",
+            any(
+                e["tunnel_reopened"]
+                and e["outcome"] == "resend"
+                and e.get("after_timeout", False) == after_timeout
+                for e in checks
+            ),
+            [(e.get("after_timeout"), e["tunnel_reopened"], e["outcome"]) for e in checks],
+        )
+        lines = o.ext_trace(M1) + o.gate0_trace(_days(M1))
+        c("a line carries resent_after_tunnel", any(x.get("resent_after_tunnel") for x in lines))
+        model_ok(o, c, M1)
+        ext_complete(o, c, M1)
+        model_ok(o, c, M2)
+        ext_complete(o, c, M2)
+        downloaded(o, c)
+        destroyed(o, c)
+        no_secret(o, c)
+
+    return check
+
+
+def _blip(run) -> None:
+    """The network gone for 0.15 s: the tunnel dies with it, SSH answers again after."""
+    run.host.lose()
+    threading.Timer(0.15, lambda: setattr(run.host, "lost", False)).start()
+
+
+def _slow_reopen(run) -> None:
+    run.host.reopen_delay_s = 1.5
+    run.host.kill_tunnels()
+
+
+def _move_soft_end_now(run) -> None:
+    run.soft_end = time.time()
+
+
+def check_truncated(o: Outcome, c: Checks) -> None:
+    c(
+        "deploy ends in an error: no model gave a Gate 0 verdict",
+        o.error is not None and "no model gave a Gate 0 verdict" in str(o.error),
+        None if o.error is None else str(o.error)[:300],
+    )
+    model_incomplete(o, c, M1, "soft_end")
+    trace = o.gate0_trace(_days(M1))
+    c(
+        "the rest of M1 Gate 0 is not_sent: soft_end",
+        any(line.get("not_sent") == "soft_end" for line in trace),
+    )
+    c("M2 skipped on the soft end", o.model(M2).get("reason") == "soft_end", o.model(M2))
+    downloaded(o, c)
+    destroyed(o, c)
+
+
+def check_credit_refused(o: Outcome, c: Checks) -> None:
+    refused = o.kinds("credit_refused")
+    c("the low credit is journaled before create", bool(refused), refused)
+    c("no create asked", not o.kinds("create_requested"))
+    fake = (o.result or {}).get("fake_api") or _timeline(o).get("fake_api") or {}
+    c("no PUT on the fake account", fake.get("put") == 0, fake)
+    closed = o.kinds("closed")
+    c("attempt closed without an instance", bool(closed), closed[-1]["reason"] if closed else None)
+    c("the error names the credit", o.error is not None and "credit" in str(o.error))
+
+
+def check_code_refused(o: Outcome, c: Checks) -> None:
+    c(
+        "refused for the gpu_ext.py SHA-256 before anything opens",
+        o.error is not None and "code_sha256" in str(o.error),
+        None if o.error is None else str(o.error)[:300],
+    )
+    c("no journal opened", not o.events)
+    fake = _timeline(o).get("fake_api") or {}
+    c("no PUT and no API call on the fake account", fake.get("put") == 0, fake)
+
+
+def check_sigterm(o: Outcome, c: Checks) -> None:
+    c("deploy exited 128 + SIGTERM", o.error == 128 + signal.SIGTERM, o.error)
+    c("the signal is journaled", [e["name"] for e in o.kinds("signal")] == ["SIGTERM"])
+    outcome = o.model(M1)
+    c("M1 outcome cancelled", outcome.get("outcome") == "cancelled", outcome)
+    responses = o.out / _days(M1) / gate0.ATTEMPTS_DIR / "1" / gate0.RESPONSES_DIR
+    kept = len(list(responses.glob("*.json"))) if responses.is_dir() else 0
+    c("M1 Gate 0 answers before the signal are on the station", kept >= 5, kept)
+    evidence_of(o, c, M1)
+    c("M2 never started", not o.steps("weights", M2) and not o.steps("smoke", M2))
+    downloaded(o, c)
+    destroyed(o, c)
+    no_secret(o, c)
+    left = subprocess.run(["pgrep", "-f", str(o.out)], capture_output=True, text=True).stdout
+    c("no process of the attempt left", not left.strip(), left.strip().splitlines()[:3])
+
+
+REAL_DOC = vast.REPO_ROOT / "docs/decisions/0028-gpu-reference-gate0.md"
+REAL_ENVELOPE_TOP = {"dph_total": 1.2, "inet_down_cost": 0.0043, "inet_up_cost": 0.0043}
+
+
+def real_package() -> dict:
+    """The money, time and request limits of the preregistered $3 package (0028, Д.2) with
+    the envelope's price tops (Д.1); the models, days and set stay the dry run's."""
+    text = REAL_DOC.read_text(encoding="utf-8")
+    addendum = text.split("\n## Дополнение 2026-11-23: пакет $3 и расширенный набор\n", 1)[1]
+    package = json.loads(addendum.split("```json\n", 1)[1].split("\n```", 1)[0])
+    keep = {
+        k: package[k]
+        for k in (
+            "ceiling_usd", "early_stop_usd", "spend_soft_usd", "deadline_minutes",
+            "soft_end_minutes", "weights_late_minutes", "disk_gb", "in_gb", "out_gb",
+            "gate0_request_timeout_s", "closed_timeout_s", "review_timeout_s",
+        )
+    }  # fmt: skip
+    envelope = dict(package["envelope"])
+    envelope.update({name: {"lte": top} for name, top in REAL_ENVELOPE_TOP.items()})
+    fields = ("slot_minutes", "health_timeout_s", "weights_timeout_s")
+    limits = [{k: v for k, v in entry.items() if k in fields} for entry in package["models"]]
+    return {"package": {**keep, "envelope": envelope}, "models": limits}
+
+
+def _real_offer(fake) -> None:
+    """The worst offer the envelope admits: its top prices, the floors of the host."""
+    fake.offers = {
+        vast_fake.OFFER_ID: {
+            **vast_fake.OFFER,
+            **REAL_ENVELOPE_TOP,
+            "cpu_ram": 128000,
+            "disk_space": 200,
+            "verification": "verified",
+            "reliability2": 0.995,
+        }
+    }
+    fake.spend_per_s = REAL_ENVELOPE_TOP["dph_total"] / 3600
+
+
+def _spend_reaches_soft(run) -> None:
+    """The credit seen at this block's end has gone down by the soft spend exactly."""
+    initial = run.opened["initial_credit"]
+    current = run.api.user()["credit"]
+    run.api.call(
+        "POST", "/fake/credit", {"spend": run.package["spend_soft_usd"] - (initial - current)}
+    )
+
+
+def check_spend_tail(o: Outcome, c: Checks) -> None:
+    package = json.loads((o.out / "package.json").read_text())
+    c(
+        "the package carries the preregistered numbers",
+        (package["ceiling_usd"], package["early_stop_usd"], package["spend_soft_usd"])
+        == (3.0, 2.25, 1.9)
+        and package["envelope"]["dph_total"] == {"lte": 1.2},
+        {k: package.get(k) for k in ("ceiling_usd", "early_stop_usd", "spend_soft_usd")},
+    )
+    margin_min = (package["early_stop_usd"] - package["spend_soft_usd"]) / 1.2 * 60
+    tail_min = (vast.spend_tail_s() + vast.SPEND_TAIL_RESERVE_S) / 60
+    c(
+        "the spend margin at 1.20 USD/h covers the worst tail with its reserve",
+        margin_min >= tail_min,
+        {"margin_min": round(margin_min, 2), "tail_and_reserve_min": tail_min},
+    )
+    old = {**package, "spend_soft_usd": 2.1}
+    (o.out / "package-old.json").write_text(json.dumps(old))
+    try:
+        vast.load_package(o.out / "package-old.json", vast_fake.synthetic_models())
+    except vast.VastError as error:
+        c("the old spend_soft_usd 2.10 is refused", True, str(error)[:200])
+    else:
+        c("the old spend_soft_usd 2.10 is refused", False)
+    for model in (M1, M2):
+        model_ok(o, c, model)
+    ext_complete(o, c, M1)
+    c("M1 ran the 717-request plan", len(o.ext_trace(M1)) == 717, len(o.ext_trace(M1)))
+    ext = o.ext_trace(M2)
+    c(
+        "M2 stopped itself on the soft spend after E-P",
+        all(
+            line.get("not_sent") == "spend"
+            for line in ext
+            if line["block"] in ("E-R", "E-A", "E-D")
+        )
+        and all(line.get("sent") for line in ext if line["block"] in ("E-C", "E-P")),
+    )
+    first = next((e for e in o.kinds("destroy_requested")), {})
+    early = [e for e in o.kinds("destroy_requested") if "early_stop" in str(e.get("reason"))]
+    c(
+        "the watchdog ran, never stopped early, and the first destroy was the agent's own",
+        bool(o.watchdog) and first.get("reason") == "agent" and not early,
+        {"watchdog": o.watchdog, "first_destroy": first.get("reason")},
+    )
+    stopped = next(
+        (e["t"] for e in o.kinds("block_done") if e["model"] == M2 and e["block"] == "E-P"), None
+    )
+    done = next((e["t"] for e in o.kinds("download_verified")), None)
+    c(
+        "the tail from the soft spend to the verified download ran here",
+        stopped is not None and done is not None,
+        None if stopped is None or done is None else {"tail_s_here": round(done - stopped, 2)},
+    )
+    downloaded(o, c)
+    destroyed(o, c)
+    closed = o.kinds("closed")
+    c(
+        "closed by the agent's destroy",
+        bool(closed) and closed[-1]["reason"] == "destroy_requested",
+        closed[-1]["reason"] if closed else None,
+    )
+
+
 SCENARIOS = [
     Scenario("success", "Обе модели, все блоки", {}, check_success),
     Scenario(
@@ -792,6 +1068,68 @@ SCENARIOS = [
         },
         check_compressed,
     ),
+    Scenario(
+        "network_blip_m1",
+        "M1: сеть пропала на 0,15 с, туннель умер",
+        {"hooks": _block_end(M1, "E-C", _blip)},
+        check_resent(),
+    ),
+    Scenario(
+        "tunnel_slow_reopen",
+        "M1: туннель умер, новый слушает порт через 1,5 с",
+        {"hooks": _block_end(M1, "E-C", _slow_reopen)},
+        check_resent(),
+    ),
+    Scenario(
+        "half_alive_tunnel",
+        "M1: полуживой туннель в Gate 0 — принимает, но не возит; таймаут запроса",
+        {
+            "hooks": _when_gate0_sent(M1, 10, lambda run: run.host.stall_tunnels()),
+            "package": {"gate0_request_timeout_s": 8.0},
+        },
+        check_resent(after_timeout=True),
+    ),
+    Scenario(
+        "sigterm_mid_gate0",
+        "SIGTERM процессу deploy внутри Gate 0 M1",
+        {},
+        check_sigterm,
+        expect_error="any",
+        signal_after=(M1, 5),
+    ),
+    Scenario(
+        "truncated_gate0_day",
+        "Мягкий конец внутри Gate 0 M1: день не завершён, вердикта нет",
+        {"hooks": _when_gate0_sent(M1, 10, _move_soft_end_now)},
+        check_truncated,
+        expect_error="VastError",
+    ),
+    Scenario(
+        "spend_tail_real_numbers",
+        "Числа пакета $3 (3,00/2,25/1,90, 1,20 $/ч), план 717: мягкий порог, хвост до сторожа",
+        lambda: {
+            **real_package(),
+            "fake": _real_offer,
+            "fixture": {"utterances": 96, "pairs": 20},
+            "hooks": _block_end(M2, "E-P", _spend_reaches_soft),
+        },
+        check_spend_tail,
+        watchdog=True,
+    ),
+    Scenario(
+        "credit_below_ceiling",
+        "Кредит ниже потолка + $1,00: отказ до create",
+        {"fake": lambda fake: setattr(fake, "credit", 4.99)},
+        check_credit_refused,
+        expect_error="VastError",
+    ),
+    Scenario(
+        "gpu_ext_sha_mismatch",
+        "Набор построен другим gpu_ext.py: отказ до журнала",
+        {"manifest_code_sha256": "0" * 64},
+        check_code_refused,
+        expect_error="VastError",
+    ),
 ]
 
 
@@ -839,11 +1177,10 @@ class Watchdog:
         self._thread.join(5)
 
 
-def run_scenario(scenario: Scenario, out: Path) -> dict:
-    """One scenario as a dry run, then its checks; never raises."""
-    setup = dict(scenario.setup)
+def _dry(scenario: Scenario, out: Path, holder: dict) -> dict:
+    """The scenario's dry run; raises what the attempt raised."""
+    setup = dict(scenario.setup() if callable(scenario.setup) else scenario.setup)
     setup.setdefault("full_days", True)
-    holder: dict = {}
     hooks = dict(setup.get("hooks") or {})
     own_host = hooks.get("host")
 
@@ -855,19 +1192,57 @@ def run_scenario(scenario: Scenario, out: Path) -> dict:
     hooks["host"] = host_hook
     setup["hooks"] = hooks
     config_ = config.Config(allowed_roots=(out.parent.resolve(),), data_root=out.parent.resolve())
-    started = time.monotonic()
-    error: BaseException | None = None
-    watchdog = Watchdog(out, holder).start() if scenario.watchdog else None
     saved_stale = vast.HEARTBEAT_STALE_S
     if scenario.stale_s is not None:
         vast.HEARTBEAT_STALE_S = scenario.stale_s
+    try:
+        return vast.dry_run(out, config_, scenario=setup)
+    finally:
+        vast.HEARTBEAT_STALE_S = saved_stale
+
+
+def _signalled(scenario: Scenario, out: Path) -> int | None:
+    """The dry run in a child process (`--child`), signalled once Gate 0 of the model sent
+    the given count, as `systemctl stop` would signal `deploy`; returns its exit code."""
+    model, count = scenario.signal_after
+    log = open(out.parent / f"{scenario.name}.child.log", "wb")  # noqa: SIM115
+    child = subprocess.Popen(
+        [sys.executable, "-m", "sound_scout.eval.rehearsal", "--child", scenario.name,
+         "--out", str(out)],
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+    )  # fmt: skip
+    trace = _gate0_trace_path(out, model)
+    ends = time.monotonic() + 300
+    try:
+        while child.poll() is None and time.monotonic() < ends:
+            if _gate0_sent(trace) >= count:
+                child.send_signal(signal.SIGTERM)
+                break
+            time.sleep(0.05)
+        return child.wait(300)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        return None
+    finally:
+        log.close()
+
+
+def run_scenario(scenario: Scenario, out: Path) -> dict:
+    """One scenario as a dry run, then its checks; never raises."""
+    holder: dict = {}
+    started = time.monotonic()
+    error: BaseException | int | None = None
+    watchdog = Watchdog(out, holder).start() if scenario.watchdog else None
     result = None
     try:
-        result = vast.dry_run(out, config_, scenario=setup)
+        if scenario.signal_after is not None:
+            error = _signalled(scenario, out)
+        else:
+            result = _dry(scenario, out, holder)
     except BaseException as caught:
         error = caught
     finally:
-        vast.HEARTBEAT_STALE_S = saved_stale
         if watchdog is not None:
             time.sleep(0.5)
             watchdog.stop()
@@ -893,12 +1268,20 @@ def run_scenario(scenario: Scenario, out: Path) -> dict:
         "title": scenario.title,
         "passed": all(item["passed"] for item in checks.items),
         "elapsed_s": round(time.monotonic() - started, 3),
-        "error": None if error is None else f"{type(error).__name__}: {error}"[:500],
+        "error": _error_text(error),
         "watchdog": None if watchdog is None else watchdog.outcomes,
         "models": _timeline(outcome).get("models"),
         "checks": checks.items,
         "dir": str(out),
     }
+
+
+def _error_text(error: BaseException | int | None) -> str | None:
+    if error is None:
+        return None
+    if isinstance(error, int):
+        return f"exit code {error}"
+    return f"{type(error).__name__}: {error}"[:500]
 
 
 # --- unit checks ------------------------------------------------------------------------------
@@ -1092,6 +1475,7 @@ def run(out: Path, only: list[str] | None = None) -> dict:
     report = {
         "kind": "gpu_rehearsal",
         "issue": "https://github.com/renidere/sound-scout-plugin/issues/149",
+        "code": code_identity(),
         "passed": all(r["passed"] for r in results) and bool(results),
         "scenarios": results,
         "cannot_prove": CANNOT_PROVE,
@@ -1099,6 +1483,19 @@ def run(out: Path, only: list[str] | None = None) -> dict:
     (out / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     (out / "report.md").write_text(markdown(report))
     return report
+
+
+def code_identity() -> dict:
+    """The commit the rehearsal ran on and whether the tree differed from it."""
+
+    def git(*args: str) -> str | None:
+        done = subprocess.run(
+            ["git", "-C", str(vast.REPO_ROOT), *args], capture_output=True, text=True, check=False
+        )
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"commit": git("rev-parse", "HEAD"), "dirty": None if status is None else bool(status)}
 
 
 CANNOT_PROVE = [
@@ -1118,6 +1515,10 @@ def markdown(report: dict) -> str:
         "# Репетиция пакета #149",
         "",
         f"Итог: **{'пройдена' if report['passed'] else 'НЕ пройдена'}**.",
+        "",
+        f"Коммит: `{report['code']['commit']}`"
+        + (" (дерево с изменениями)" if report["code"]["dirty"] else "")
+        + ".",
         "",
         "| Сценарий | Что | Итог | Проверок | Время, с |",
         "|---|---|---|---|---|",
@@ -1147,7 +1548,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m sound_scout.eval.rehearsal")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--only", nargs="*")
+    parser.add_argument("--child", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.child:
+        _dry(next(s for s in SCENARIOS if s.name == args.child), args.out.absolute(), {})
+        return 0
     report = run(args.out, args.only)
     for r in report["scenarios"]:
         print(f"{'ok  ' if r['passed'] else 'FAIL'} {r['scenario']}")

@@ -14,7 +14,7 @@
   },
   "ceiling_usd": 3.0,
   "early_stop_usd": 2.25,
-  "spend_soft_usd": 2.15,
+  "spend_soft_usd": 1.9,
   "deadline_minutes": 105,
   "soft_end_minutes": 90,
   "weights_late_minutes": 25,

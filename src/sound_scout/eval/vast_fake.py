@@ -535,7 +535,8 @@ def nvidia_smi(argv: list[str]) -> int:
 
 class Forwarder:
     """127.0.0.1:`port` → 127.0.0.1:`target`, one thread per connection; `stop` closes the
-    listener and every open connection, as a dead SSH tunnel would."""
+    listener and every open connection, as a dead SSH tunnel would; `stall` keeps accepting and
+    holding connections but carries no byte, as a half-dead one."""
 
     def __init__(self, target: int, port: int = 0) -> None:
         self.target = target
@@ -547,6 +548,7 @@ class Forwarder:
         self._open: list[socket.socket] = []
         self._lock = threading.Lock()
         self._stopped = threading.Event()
+        self._stalled = threading.Event()
         self._thread = threading.Thread(target=self._accept, daemon=True)
         self._thread.start()
 
@@ -559,6 +561,10 @@ class Forwarder:
                 client, _ = self._listener.accept()
             except OSError:
                 return
+            if self._stalled.is_set():
+                with self._lock:
+                    self._open.append(client)
+                continue
             try:
                 upstream = socket.create_connection((HOST, self.target), timeout=5)
             except OSError:
@@ -570,22 +576,29 @@ class Forwarder:
             for source, sink in ((client, upstream), (upstream, client)):
                 threading.Thread(target=self._copy, args=(source, sink), daemon=True).start()
 
-    @staticmethod
-    def _copy(source: socket.socket, sink: socket.socket) -> None:
+    def _copy(self, source: socket.socket, sink: socket.socket) -> None:
         try:
             while data := source.recv(1 << 16):
-                sink.sendall(data)
+                if not self._stalled.is_set():
+                    sink.sendall(data)
         except OSError:
             pass
         finally:
-            for sock in (source, sink):
-                with contextlib.suppress(OSError):
-                    sock.shutdown(socket.SHUT_RDWR)
+            if not self._stalled.is_set():  # a stalled tunnel holds the client's end open
+                for sock in (source, sink):
+                    with contextlib.suppress(OSError):
+                        sock.shutdown(socket.SHUT_RDWR)
+
+    def stall(self) -> None:
+        self._stalled.set()
 
     def stop(self) -> None:
         self._stopped.set()
         with contextlib.suppress(OSError):
+            self._listener.shutdown(socket.SHUT_RDWR)  # wakes the accept, frees the port
+        with contextlib.suppress(OSError):
             self._listener.close()
+        self._thread.join(5)
         with self._lock:
             for sock in self._open:
                 with contextlib.suppress(OSError):

@@ -2027,13 +2027,76 @@ def test_send_checked_resends_once_after_the_tunnel_is_back_without_a_second_req
     assert stop == "transport_errors" and line["resent_after_tunnel"] is True
 
 
-def test_a_timeout_is_no_transport_error_and_needs_no_check() -> None:
+def test_a_timeout_is_no_transport_error_and_asks_once_whether_the_tunnel_carried_it() -> None:
     timeout = {"sent": True, "http_status": None, "limit": "request_timeout"}
     assert gate0.transport_error(timeout) is False
     assert gate0.transport_error({"sent": True, "http_status": None}) is True
     assert gate0.transport_error({"sent": True, "http_status": 500}) is False
-    line, stop = gate0.send_checked(lambda write_request=True: dict(timeout), lambda: 1 / 0)
+    asked = []
+
+    def check(after_timeout=False):
+        asked.append(after_timeout)
+        return "timeout"
+
+    line, stop = gate0.send_checked(lambda write_request=True: dict(timeout), check)
+    assert stop is None and line == timeout and asked == [True]
+    line, stop = gate0.send_checked(
+        lambda write_request=True: dict(timeout), lambda **_: "ssh_lost"
+    )
+    assert stop == "ssh_lost" and line == timeout
+    calls = []
+
+    def send(write_request=True):
+        calls.append(write_request)
+        return dict(timeout) if len(calls) == 1 else {"sent": True, "http_status": 200}
+
+    line, stop = gate0.send_checked(send, lambda **_: "resend")
+    assert stop is None and calls == [True, False] and line["http_status"] == 200
+    assert line["resent_after_tunnel"] is True and line["first_error"] == "request_timeout"
+    calls.clear()
+    line, stop = gate0.send_checked(
+        lambda write_request=True: calls.append(1) or dict(timeout), lambda **_: "resend"
+    )
+    assert len(calls) == 2 and stop is None and line["limit"] == "request_timeout"
+    line, stop = gate0.send_checked(lambda write_request=True: dict(timeout), None)
     assert stop is None and line == timeout
+
+
+VLLM = {**RECORD, "runtime": "vllm"}
+
+
+def _cut(lines: list[dict], keep: int, reason: str) -> list[dict]:
+    """The day as the stack left it: the first `keep` requests answered, the rest not sent."""
+    cut = [dict(line) for line in lines]
+    for line in [line for line in cut if line["variant"] != "E0"][keep:]:
+        line.clear()
+        line.update(variant="K1", clip="S0", sent=False, not_sent=reason)
+    return cut
+
+
+@pytest.mark.parametrize("stop", ["server_exited", "soft_end", "spend", "ssh_lost", "cancelled"])
+def test_a_vllm_day_the_stack_stopped_has_no_gate0_verdict(stop) -> None:
+    lines = [{**line, "http_status": 200} for line in _held_lines()]
+    result = gate0.decide(
+        _synthetic_manifest(), {**VLLM, "stop_reason": stop}, _cut(lines, 5, stop)
+    )
+    assert result["verdict"] == "incomplete" and result["stop_reason"] == stop
+    assert result["rule_verdict"] == "NOT READY" and "C:" in result["rule_reason"]
+    assert result["unanswered"] == len(lines) - 1 - 5
+    assert result["reason"].startswith(f"день не завершён ({stop})")
+
+
+@pytest.mark.parametrize("stop", [None, "request_timeout", "rss_limit"])
+def test_a_rule_limit_or_a_full_vllm_day_keeps_the_rule_verdict(stop) -> None:
+    lines = [{**line, "http_status": 200} for line in _held_lines()]
+    result = gate0.decide(_synthetic_manifest(), {**VLLM, "stop_reason": stop}, _cut(lines, 5, "x"))
+    assert result["verdict"] == "NOT READY" and "rule_verdict" not in result
+
+
+def test_a_local_runtime_day_keeps_its_verdict_even_when_the_server_exited() -> None:
+    record = {**RECORD, "runtime": "llama", "stop_reason": "server_exited"}
+    result = gate0.decide(_synthetic_manifest(), record, _cut(_held_lines(), 5, "server_exited"))
+    assert result["verdict"] == "NOT READY" and "rule_verdict" not in result
 
 
 def test_q_s_parses_as_a_closed_answer_and_the_gate0_questions_keep_their_pin() -> None:

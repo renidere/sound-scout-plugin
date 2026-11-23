@@ -13,7 +13,10 @@ import math
 import os
 import re
 import secrets
+import signal
+import socket
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -2517,3 +2520,330 @@ def test_a_request_may_run_only_two_minutes_past_the_soft_end(tmp_path: Path, ke
     assert 715 <= vast.timeout_cap(run) <= 720
     run.soft_end = time.time() - 3600
     assert vast.timeout_cap(run) == vast.MIN_REQUEST_TIMEOUT_S
+
+
+# --- the fixes of the verifier's round on #149 ---------------------------------------------
+
+
+class _RecoverHost:
+    """`state` and `true` fail while the network is gone (`down` calls), then answer;
+    `ensure_tunnel` records whether it was forced and brings the tunnel back."""
+
+    def __init__(self, down: int = 0, states: list | None = None) -> None:
+        self.down, self.states, self.calls, self.reopened = down, states, [], []
+        self.tunnel_up = False
+
+    def run(self, argv, timeout):
+        self.calls.append(argv[:3])
+        if self.down > 0:
+            self.down -= 1
+            return vast.proc.RunResult(255, b"", b"", False, False, 0.0)
+        if argv[:3] == ["python3", vast.HOSTRUN, "state"]:
+            states = self.states or [_state()]
+            answer = states.pop(0) if len(states) > 1 else states[0]
+            return vast.proc.RunResult(0, answer, b"", False, False, 0.0)
+        return vast.proc.RunResult(0, b"", b"", False, False, 0.0)
+
+    def ensure_tunnel(self, force=False):
+        self.reopened.append(force)
+        self.tunnel_up = True
+        return True
+
+
+class _TunnelClient:
+    """`/health` answers 200 only once the host's tunnel is back, after `late` more asks."""
+
+    def __init__(self, host, late: int = 0, healthy: bool = False) -> None:
+        self.host, self.late, self.healthy, self.asked = host, late, healthy, 0
+
+    def request(self, route, timeout=5):
+        self.asked += 1
+        if self.healthy:
+            return 200, b"", None
+        if self.host.tunnel_up:
+            if self.late <= 0:
+                return 200, b"", None
+            self.late -= 1
+        return None, None, "ConnectionRefusedError"
+
+
+def _recover_run(tmp_path, fake, key_file, host) -> vast.Run:
+    run = _soft_run(tmp_path, fake, key_file)
+    run.host = host
+    return run
+
+
+def test_recover_waits_out_a_network_blip_then_reopens_the_tunnel_and_resends(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _RecoverHost(down=2)
+    run = _recover_run(tmp_path, fake, key_file, host)
+    client = _TunnelClient(host, late=2)
+    assert vast.recover(run, client, "/workspace/out/m", "m") == "resend"
+    assert host.reopened == [True] and run.fatal is None
+    (check,) = [e for e in run.journal.replay() if e["event"] == "transport_check"]
+    assert (check["tunnel_reopened"], check["health"], check["outcome"]) == (True, 200, "resend")
+
+
+def test_recover_after_a_timeout_through_a_tunnel_that_answers_resends_nothing(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _RecoverHost()
+    run = _recover_run(tmp_path, fake, key_file, host)
+    client = _TunnelClient(host, healthy=True)
+    assert vast.recover(run, client, "/workspace/out/m", "m", after_timeout=True) == "timeout"
+    assert host.reopened == [] and host.calls == []
+
+
+def test_recover_after_a_timeout_restarts_a_stale_tunnel_and_resends(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _RecoverHost()
+    run = _recover_run(tmp_path, fake, key_file, host)
+    client = _TunnelClient(host)
+    assert vast.recover(run, client, "/workspace/out/m", "m", after_timeout=True) == "resend"
+    assert host.reopened == [True]
+    (check,) = [e for e in run.journal.replay() if e["event"] == "transport_check"]
+    assert check["after_timeout"] is True and check["tunnel_reopened"] is True
+
+
+def test_recover_ends_the_wait_when_the_server_exits_and_a_dead_host_is_ssh_lost(
+    tmp_path: Path, key_file, fake
+) -> None:
+    exited = _state(exit={"reason": "exit", "returncode": 1, "t": 1.0})
+    host = _RecoverHost(states=[_state(), _state(), exited])
+    run = _recover_run(tmp_path, fake, key_file, host)
+    started = time.monotonic()
+    outcome = vast.recover(run, _NeverHealthy(), "/workspace/out/m", "m")
+    assert outcome == "server_exited" and time.monotonic() - started < vast.RECOVER_HEALTH_S
+    (tmp_path / "lost").mkdir()
+    lost = _recover_run(tmp_path / "lost", fake, key_file, _RecoverHost(down=10**9))
+    assert vast.recover(lost, _NeverHealthy(), "/workspace/out/m", "m") == "ssh_lost"
+    assert lost.fatal == "ssh_lost"
+
+
+_SLOW_SSH = """
+import socket, sys, time
+port = int(sys.argv[sys.argv.index("-L") + 1].split(":")[1])
+time.sleep(0.7)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(4)
+time.sleep(60)
+"""
+
+
+def test_the_ssh_tunnel_returns_once_its_port_accepts_and_force_restarts_a_live_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    host = vast.RemoteHost(tmp_path, "203.0.113.7", 22)
+    monkeypatch.setattr(host, "ssh_argv", lambda *extra: [sys.executable, "-c", _SLOW_SSH, *extra])
+    started = time.monotonic()
+    port = host.tunnel(8000)
+    assert time.monotonic() - started >= 0.6
+    socket.create_connection(("127.0.0.1", port), 1).close()
+    first = host._tunnels[-1][0]
+    assert host.ensure_tunnel() is False
+    assert host.ensure_tunnel(force=True) is True
+    assert first.poll() is not None and host._forward == (8000, port)
+    socket.create_connection(("127.0.0.1", port), 1).close()
+    host.close()
+
+
+def test_a_stalled_fake_tunnel_accepts_but_carries_nothing_and_its_stop_frees_the_port() -> None:
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)
+    forwarder = vast_fake.Forwarder(server.getsockname()[1])
+    forwarder.stall()
+    client = socket.create_connection(("127.0.0.1", forwarder.port), 2)
+    client.settimeout(0.5)
+    client.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    with pytest.raises(TimeoutError):
+        client.recv(1)
+    forwarder.stop()
+    again = vast_fake.Forwarder(server.getsockname()[1], forwarder.port)
+    assert again.port == forwarder.port and again.alive()
+    again.stop()
+    client.close()
+    server.close()
+
+
+def test_sigterm_and_sighup_cancel_the_attempt_once_and_later_signals_are_ignored(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _soft_run(tmp_path, fake, key_file)
+    saved = vast.cancel_on_signals(run)
+    try:
+        with pytest.raises(SystemExit) as raised:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)
+        assert raised.value.code == 128 + signal.SIGTERM
+        assert run.fatal == "cancelled" and vast.soft_stop(run) == "cancelled"
+        os.kill(os.getpid(), signal.SIGHUP)  # ignored now: the download and destroy go on
+        time.sleep(0.05)
+        assert [e["name"] for e in run.journal.replay() if e["event"] == "signal"] == ["SIGTERM"]
+    finally:
+        vast.restore_signals(saved)
+    assert signal.getsignal(signal.SIGTERM) == saved[signal.SIGTERM]
+    (tmp_path / "hup").mkdir()
+    run2 = _soft_run(tmp_path / "hup", fake, key_file)
+    saved = vast.cancel_on_signals(run2)
+    try:
+        with pytest.raises(SystemExit) as raised:
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(1)
+        assert raised.value.code == 128 + signal.SIGHUP
+    finally:
+        vast.restore_signals(saved)
+
+
+def test_create_is_refused_when_the_credit_is_below_the_ceiling_plus_the_margin(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "data" / "dry"
+    need = vast.DRY_PACKAGE["ceiling_usd"] + vast.CREDIT_MARGIN_USD
+    scenario = {"fake": lambda fake: setattr(fake, "credit", need - 0.01)}
+    with pytest.raises(vast.VastError, match="credit 4.99 USD is below the ceiling plus 1.00"):
+        vast.dry_run(out, _dry_config(tmp_path), scenario=scenario)
+    log = [json.loads(line) for line in (out / "fake-api.jsonl").read_text().splitlines()]
+    assert not any(e["method"] in ("PUT", "DELETE") for e in log)
+    (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
+    events = vast.Journal(journal_path).replay()
+    (refused,) = [e for e in events if e["event"] == "credit_refused"]
+    assert (refused["credit"], refused["need_usd"]) == (4.99, need)
+    assert not any(e["event"] == "create_requested" for e in events)
+    (closed,) = [e for e in events if e["event"] == "closed"]
+    assert closed["reason"] == "no_instance_created"
+
+
+def test_an_extended_set_built_by_another_gpu_ext_is_refused_before_anything_opens(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(vast.VastError, match="code_sha256"):
+        vast.dry_run(out, _dry_config(tmp_path), scenario={"manifest_code_sha256": "0" * 64})
+    assert not list((out / "gpu").glob("*/journal.jsonl"))
+    assert (out / "fake-api.jsonl").read_text() == ""
+
+
+def _spend_package(**changes) -> dict:
+    package = json.loads((REPO / "docs/examples/gpu-package.example.json").read_text())
+    package["extended"] = None
+    return {k: v for k, v in {**package, **changes}.items() if v is not None}
+
+
+def test_the_soft_spend_leaves_the_worst_tail_and_its_reserve_before_the_early_stop(
+    tmp_path: Path,
+) -> None:
+    assert vast.spend_tail_s() == 12 * 60 and vast.SPEND_TAIL_RESERVE_S == 3 * 60
+    loaded = _load(tmp_path, _spend_package(spend_soft_usd=1.9))
+    assert loaded["spend_soft_usd"] == 1.9
+    _load(tmp_path, _spend_package(spend_soft_usd=1.95))
+    with pytest.raises(vast.VastError, match="leaves 0.150 USD before the early stop"):
+        _load(tmp_path, _spend_package(spend_soft_usd=2.1))
+    envelope = {**_spend_package()["envelope"], "dph_total": {"gte": 0.5}}
+    with pytest.raises(vast.VastError, match="needs an envelope dph_total lte bound"):
+        _load(tmp_path, _spend_package(spend_soft_usd=1.9, envelope=envelope))
+    _load(tmp_path, _spend_package(spend_soft_usd=None, envelope=envelope))
+
+
+def test_the_approved_package_bounds_every_wait_of_its_models_and_the_soft_spend() -> None:
+    text = (REPO / "docs/decisions/0028-gpu-reference-gate0.md").read_text(encoding="utf-8")
+    addendum = text.split("\n## Дополнение 2026-11-23: пакет $3 и расширенный набор\n", 1)[1]
+    package = json.loads(addendum.split("```json\n", 1)[1].split("\n```", 1)[0])
+    m1, m2 = package["models"]
+    assert (m1["weights_timeout_s"], m1["health_timeout_s"], m1["slot_minutes"]) == (600, 300, 25)
+    assert (m2["weights_timeout_s"], m2["health_timeout_s"]) == (1500, 600)
+    assert package["spend_soft_usd"] == 1.9
+    margin_s = (package["early_stop_usd"] - package["spend_soft_usd"]) / 1.2 * 3600
+    assert margin_s >= vast.spend_tail_s() + vast.SPEND_TAIL_RESERVE_S
+    assert "### Д.9. Правка 2026-11-23 (до аренды" in addendum
+    assert "launch-argv --package data/gate0/gpu/packages/gpu-ref-149.json" in addendum
+
+
+def test_a_truncated_day_is_its_model_outcome_incomplete_never_ok() -> None:
+    assert vast._verdict_outcome({"verdict": "NOT READY"}) == {
+        "outcome": "ok",
+        "step": None,
+        "reason": None,
+    }
+    assert vast._verdict_outcome({"verdict": "incomplete", "reason": "день не завершён"}) == {
+        "outcome": "incomplete",
+        "step": "run",
+        "reason": "день не завершён",
+    }
+
+
+def test_the_watchdog_destroy_is_named_and_the_agents_own_is_not(
+    tmp_path: Path, key_file, fake
+) -> None:
+    journal, _ = _journal(tmp_path, fake, key_file)
+    journal.append("destroy_requested", instance_id=7, reason="agent")
+    assert vast.watchdog_destroy(journal) is None
+    journal.append("destroy_requested", instance_id=7, reason="early_stop")
+    assert vast.watchdog_destroy(journal) == "early_stop"
+
+
+def test_the_launch_argv_starts_deploy_from_the_checkout_with_its_config_and_python(
+    tmp_path: Path,
+) -> None:
+    root, logs = tmp_path / "checkout", tmp_path / "logs"
+    package, config_path = root / "data/p.json", root / "local/gate0.toml"
+    argv = vast.launch_argv(
+        package, "https://github.com/x/y/issues/1#c", config_path, logs, "T", root
+    )
+    assert argv[:4] == ["systemd-run", "--user", f"--unit={vast.LABEL_PREFIX}deploy-T", "--collect"]
+    assert f"--working-directory={root}" in argv
+    assert f"--setenv=SOUND_SCOUT_CONFIG={config_path}" in argv
+    assert "--property=TimeoutStopSec=25min" in argv
+    assert f"--property=StandardOutput=append:{logs / 'deploy.out'}" in argv
+    assert f"--property=StandardError=append:{logs / 'deploy.err'}" in argv
+    inhibit = argv.index("--") + 1
+    assert argv[inhibit].endswith("systemd-inhibit") and "--mode=block" in argv[inhibit:]
+    python = argv.index(str(root / ".venv" / "bin" / "python"))
+    assert argv[python + 1 :] == [
+        "-m", "sound_scout.eval.vast", "deploy", "--package", str(package),
+        "--approval", "https://github.com/x/y/issues/1#c",
+    ]  # fmt: skip
+
+
+def test_launch_argv_refuses_without_an_approval_or_a_config_and_starts_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    package = tmp_path / "p.json"
+    package.write_text("{}")
+    monkeypatch.delenv("SOUND_SCOUT_CONFIG", raising=False)
+    approval = "https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-1"
+    argv = ["launch-argv", "--package", str(package), "--approval", approval]
+    assert vast.main(argv) == 2
+    assert "needs SOUND_SCOUT_CONFIG" in capsys.readouterr().err
+    assert vast.main([*argv[:3], "--approval", "yes"]) == 2
+    assert "--approval" in capsys.readouterr().err
+
+
+def test_launch_argv_runs_the_deploy_checks_and_prints_the_argv(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    dry = _dry_config(tmp_path)
+    entries = vast._dry_days(dry, False)
+    package = {**vast.DRY_PACKAGE, "models": entries}
+    path = tmp_path / "package.json"
+    path.write_text(json.dumps(package))
+    toml = tmp_path / "gate0.toml"
+    toml.write_text(
+        f'allowed_roots = ["{dry.allowed_roots[0]}"]\ndata_root = "{dry.data_root}"\n'
+        'backend = "none"\n\n[network]\nallow = false\n'
+    )
+    monkeypatch.setenv("SOUND_SCOUT_CONFIG", str(toml))
+    monkeypatch.setattr(vast, "MODELS", vast_fake.synthetic_models())
+    approval = "https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-1"
+    assert vast.main(["launch-argv", "--package", str(path), "--approval", approval]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    logs = Path(printed["logs"])
+    assert logs.is_dir() and logs.parent == dry.data_root / "gpu" / "launches"
+    assert oct(logs.stat().st_mode & 0o777) == "0o700" and not list(logs.iterdir())
+    assert f"--setenv=SOUND_SCOUT_CONFIG={toml}" in printed["argv"]
+    assert printed["package_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert not (dry.data_root / "gpu" / "launches" / "x").exists()

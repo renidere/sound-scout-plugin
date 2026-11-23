@@ -20,6 +20,10 @@ external host, `API_BASE`. Recording analysis stays offline (R09).
   `check_extended` holds the extended set to its pins.
 - `watch --journal J` and `cutoff --journal J` are the timers' ticks; `destroy --journal J`
   destroys by hand; `status --journal J` reads the journal only.
+- `launch-argv --package P --approval URL` runs the checks `deploy` runs before any API call
+  and prints the `systemd-run --user` argv that starts `deploy` outside the tool session
+  (`launch_argv`); it starts nothing. SIGTERM and SIGHUP of `deploy` cancel the attempt through
+  download and destroy (`cancel_on_signals`).
 - `dry-run [--out DIR]` runs the same steps against `vast_fake` on 127.0.0.1: a fake API, a fake
   host directory instead of SSH, a fake vLLM under the real `hostrun.py serve` and guard, the
   real Gate 0 client. It proves the order and the contract of the stack, not the image, vLLM, the
@@ -44,6 +48,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import sys
@@ -395,6 +400,10 @@ DRY_INTERVALS = {
     "ssh_retry_s": 0.1,
 }
 SSH_RETRIES = 3
+RECOVER_HEALTH_S = 30.0
+TUNNEL_READY_S = 15.0
+CREDIT_MARGIN_USD = 1.0
+SPEND_TAIL_RESERVE_S = 180.0
 GPU_FREE_MIB = 1024
 MAX_DEADLINE_MINUTES = 120
 MAX_OFFERS = 3
@@ -1293,6 +1302,8 @@ class RemoteHost:
             raise VastError(f"scp from the host failed for {Path(remote).name}")
 
     def tunnel(self, remote_port: int, local_port: int | None = None) -> int:
+        """`ssh -N -L` to the server port; returns once the local port accepts (or the ssh
+        exited, or `TUNNEL_READY_S` passed: the caller's `/health` then decides)."""
         local_port = _free_port() if local_port is None else local_port
         forward = f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"
         log = open(self.attempt / f"tunnel-{local_port}.log", "ab")  # noqa: SIM115
@@ -1301,13 +1312,28 @@ class RemoteHost:
         )
         self._tunnels.append((child, copier, log))
         self._forward = (remote_port, local_port)
+        ends = time.monotonic() + TUNNEL_READY_S
+        while child.poll() is None and time.monotonic() < ends:
+            with (
+                contextlib.suppress(OSError),
+                socket.create_connection(("127.0.0.1", local_port), 1),
+            ):
+                break
+            time.sleep(0.2)
         return local_port
 
-    def ensure_tunnel(self) -> bool:
-        """A dead tunnel (the `ssh -N` exited) opens again on the same local port, so the
-        client keeps its port; True when it was reopened."""
-        if not self._tunnels or self._tunnels[-1][0].poll() is None:
+    def ensure_tunnel(self, force: bool = False) -> bool:
+        """A dead tunnel (the `ssh -N` exited), or with `force` a live one that no longer
+        carries requests (a half-dead ssh), opens again on the same local port, so the client
+        keeps its port; True when it was reopened."""
+        if not self._tunnels:
             return False
+        child, copier, _ = self._tunnels[-1]
+        if child.poll() is None:
+            if not force:
+                return False
+            gate0.stop_server(child)
+            copier.join(5)
         remote_port, local_port = self._forward
         self.tunnel(remote_port, local_port)
         return True
@@ -1332,6 +1358,7 @@ class LocalHost(RemoteHost):
         self._forwarders: list[vast_fake.Forwarder] = []
         self.lost = False
         self.failing: list[list[str]] = []
+        self.reopen_delay_s = 0.0
 
     def _map(self, text: str) -> str:
         return text.replace(WORKSPACE, str(self.root))
@@ -1361,21 +1388,40 @@ class LocalHost(RemoteHost):
         shutil.copyfile(self._map(remote), local)
 
     def tunnel(self, remote_port: int, local_port: int | None = None) -> int:
-        """A loopback forwarder stands in for `ssh -L`, so a rehearsal can kill it."""
+        """A loopback forwarder stands in for `ssh -L`, so a rehearsal can kill it; with
+        `reopen_delay_s` a reopened one binds only that much later, as a slow `ssh -N`."""
+        if local_port and self.reopen_delay_s:
+            delay, self.reopen_delay_s = self.reopen_delay_s, 0.0
+
+            def later() -> None:
+                time.sleep(delay)
+                self._forwarders.append(vast_fake.Forwarder(remote_port, local_port))
+
+            threading.Thread(target=later, daemon=True).start()
+            return local_port
         forwarder = vast_fake.Forwarder(remote_port, local_port or 0)
         self._forwarders.append(forwarder)
         return forwarder.port
 
-    def ensure_tunnel(self) -> bool:
-        if self.lost or not self._forwarders or self._forwarders[-1].alive():
+    def ensure_tunnel(self, force: bool = False) -> bool:
+        if self.lost or not self._forwarders:
             return False
         last = self._forwarders[-1]
+        if last.alive():
+            if not force:
+                return False
+            last.stop()
         self.tunnel(last.target, last.port)
         return True
 
     def kill_tunnels(self) -> None:
         for forwarder in self._forwarders:
             forwarder.stop()
+
+    def stall_tunnels(self) -> None:
+        """The tunnel stays up and accepts but carries nothing, as a half-dead `ssh -N`."""
+        for forwarder in self._forwarders:
+            forwarder.stall()
 
     def lose(self) -> None:
         """The host is gone for the station, as after a network loss or a destroy."""
@@ -1429,6 +1475,7 @@ def load_package(path: Path, models: Mapping) -> tuple[dict, str]:
     envelope = package.get("envelope")
     if not isinstance(envelope, dict) or "dph_total" not in envelope:
         raise VastError("package envelope must bound at least dph_total")
+    _check_spend_margin(package)
     if not isinstance(package.get("preregistration"), str):
         raise VastError("package needs the preregistration decision document")
     entries = package.get("models")
@@ -1503,6 +1550,34 @@ def _check_limits(package: Mapping) -> None:
         )
 
 
+def spend_tail_s(intervals: Mapping = INTERVALS) -> float:
+    """The longest the agent runs after it stops itself (soft end or soft spend) until destroy:
+    the request in flight, the block's sync, the evidence, the server stop, the download."""
+    return REQUEST_PAST_SOFT_END_S + sum(
+        intervals[name]
+        for name in ("sync_timeout_s", "evidence_timeout_s", "stop_timeout_s", "download_timeout_s")
+    )
+
+
+def _check_spend_margin(package: Mapping) -> None:
+    """Between the soft spend and the watchdog's early stop the worst tail plus
+    `SPEND_TAIL_RESERVE_S` must fit at the envelope's top `dph_total`; otherwise the watchdog
+    could destroy the instance during the final download (#149)."""
+    spend = package.get("spend_soft_usd")
+    if spend is None:
+        return
+    top = package["envelope"]["dph_total"]
+    top = top.get("lte") if isinstance(top, dict) else None
+    if top is None:
+        raise VastError("package spend_soft_usd needs an envelope dph_total lte bound")
+    need = _number(top, "dph_total lte") * (spend_tail_s() + SPEND_TAIL_RESERVE_S) / 3600
+    if package["early_stop_usd"] - spend < need - 1e-9:
+        raise VastError(
+            f"package spend_soft_usd {spend} leaves {package['early_stop_usd'] - spend:.3f} USD "
+            f"before the early stop; the tail needs {need:.3f} USD at {top} USD/h"
+        )
+
+
 def min_disk_gb(package: Mapping, models: Mapping) -> int:
     """The weights of every model plus the margin, rounded up to whole `DISK_STEP_GB`."""
     need = package["disk_margin_bytes"] + sum(
@@ -1564,6 +1639,11 @@ def check_extended(package: Mapping, config_: config.Config) -> tuple[Path, dict
         )
     except (gpu_ext.ExtError, OSError, ValueError) as error:
         raise VastError(f"extended set {extended['dir']}: {error}") from None
+    if manifest.get("code_sha256") != gpu_ext.code_sha256():
+        raise VastError(
+            f"extended set {extended['dir']}: gpu_ext.py differs from the code the set was "
+            "built and preregistered with (code_sha256)"
+        )
     return directory, manifest, entries
 
 
@@ -2065,6 +2145,34 @@ class Run:
             self.hooks[name](self, **fields)
 
 
+CANCEL_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+def cancel_on_signals(run: Run) -> dict:
+    """SIGTERM and SIGHUP (a `systemctl stop`, a closed terminal) end the attempt like Ctrl-C:
+    `SystemExit` takes the `finally` path, so the results are downloaded and the instance
+    destroyed. The first signal counts; later ones are ignored, so they cannot cut that path
+    short; `run.fatal` keeps the stop even where the exception is swallowed. Only the main
+    thread can set handlers: elsewhere nothing changes."""
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+
+    def cancel(signum: int, _frame) -> None:
+        for number in CANCEL_SIGNALS:
+            signal.signal(number, signal.SIG_IGN)
+        run.fatal = "cancelled"
+        with contextlib.suppress(Exception):
+            run.journal.append("signal", name=signal.Signals(signum).name)
+        raise SystemExit(128 + signum)
+
+    return {number: signal.signal(number, cancel) for number in CANCEL_SIGNALS}
+
+
+def restore_signals(saved: Mapping) -> None:
+    for number, handler in saved.items():
+        signal.signal(number, handler)
+
+
 def soft_end_unix(opened: Mapping) -> float | None:
     return opened.get("soft_end_unix")
 
@@ -2151,26 +2259,78 @@ def host_reachable(run: Run) -> bool:
     return False
 
 
-def recover(run: Run, client: gate0.Client, out: str, name: str) -> str:
-    """After a request without any HTTP answer: reopen a dead tunnel, ask the host whether the
-    server lives, then `/health`. `resend` only when the server answers again."""
-    reopened = run.host.ensure_tunnel()
+def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callable) -> int | None:
+    """`/health` every second until 200 or `seconds` (never past `timeout_cap`) have passed;
+    every `server_check_s` the server state too, so a server that exited ends the wait
+    (`ServerExited`)."""
+    started = time.monotonic()
+    ends = started + min(seconds, timeout_cap(run))
+    next_check = started + run.intervals["server_check_s"]
+    while True:
+        health = client.request("/health", timeout=5)[0]
+        now = time.monotonic()
+        if health == 200 or now >= ends:
+            return health
+        if now >= next_check:
+            next_check = now + run.intervals["server_check_s"]
+            _judge(state(), late=True)
+        time.sleep(1.0)
+
+
+def recover(
+    run: Run, client: gate0.Client, out: str, name: str, after_timeout: bool = False
+) -> str:
+    """After a request without any HTTP answer (or, `after_timeout`, one that ran out of time):
+    first the host (a brief network loss gets `SSH_RETRIES`), then the server's state, then the
+    tunnel — `/health` through the one in hand, else it is opened again (a live but stale `ssh`
+    restarted) and `/health` asked for up to `RECOVER_HEALTH_S`. `resend` only when the server
+    answers again; after a timeout a tunnel that still carries `/health` means the request
+    itself was slow: `timeout`, nothing is resent."""
+    if after_timeout and client.request("/health", timeout=5)[0] == 200:
+        run.journal.append(
+            "transport_check",
+            model=name,
+            after_timeout=True,
+            tunnel_reopened=False,
+            health=200,
+            outcome="timeout",
+        )
+        return "timeout"
     detail: dict = {}
     state = _state_or_none(run.host, out, run.journal, detail)
-    outcome = None
-    if state is None and not host_reachable(run):
-        run.fatal = outcome = "ssh_lost"
-    else:
+    outcome, reopened, health = None, False, None
+    if state is None:
+        if host_reachable(run):
+            state = _state_or_none(run.host, out, run.journal, detail)
+        else:
+            run.fatal = outcome = "ssh_lost"
+    if outcome is None:
         try:
             _judge(state, late=True)
         except ServerExited:
             outcome = "server_exited"
-    health = None
-    if outcome is None:
+    if outcome is None and not after_timeout:
         health = client.request("/health", timeout=5)[0]
+    if outcome is None and health != 200:
+        reopened = run.host.ensure_tunnel(force=True)
+        try:
+            health = _health_within(
+                run,
+                client,
+                RECOVER_HEALTH_S,
+                lambda: _state_or_none(run.host, out, run.journal, detail),
+            )
+        except ServerExited:
+            outcome = "server_exited"
+    if outcome is None:
         outcome = "resend" if health == 200 else "server_unreachable"
     run.journal.append(
-        "transport_check", model=name, tunnel_reopened=reopened, health=health, outcome=outcome
+        "transport_check",
+        model=name,
+        after_timeout=after_timeout,
+        tunnel_reopened=reopened,
+        health=health,
+        outcome=outcome,
     )
     return outcome
 
@@ -2266,7 +2426,9 @@ def run_extended(run: Run, entry: Mapping, client: gate0.Client, out: str) -> di
             client,
             run.config_,
             stop_check=stop,
-            transport_check=lambda: recover(run, client, out, name),
+            transport_check=lambda after_timeout=False: recover(
+                run, client, out, name, after_timeout
+            ),
             on_block_end=block_end,
             timeout_cap=lambda: timeout_cap(run),
             timeouts={
@@ -2353,7 +2515,9 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                         "gate0_request_timeout_s", gate0.REQUEST_TIMEOUT_S
                     ),
                     stop_check=lambda: soft_stop(run),
-                    transport_check=lambda: recover(run, client, out, name),
+                    transport_check=lambda after_timeout=False: recover(
+                        run, client, out, name, after_timeout
+                    ),
                     timeout_cap=lambda: timeout_cap(run),
                 )
                 detail.update(
@@ -2361,7 +2525,11 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                     reason=verdict["reason"],
                     stop_reason=verdict.get("stop_reason"),
                 )
-                result.update(verdict=verdict["verdict"], reason=verdict["reason"])
+                result.update(
+                    verdict=verdict["verdict"],
+                    reason=verdict["reason"],
+                    stop_reason=verdict.get("stop_reason"),
+                )
                 try:
                     _judge(_state_or_none(host, out, journal, detail), late=True)
                 except ServerExited as error:
@@ -2402,10 +2570,33 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
         # cancellation in flight keeps its own exception
         cancelled = isinstance(sys.exc_info()[1], KeyboardInterrupt | SystemExit)
         if (stopped.timed_out or stopped.returncode != 0) and not cancelled:
+            destroyed = watchdog_destroy(journal)
+            if run.fatal == "ssh_lost":
+                raise AttemptFatal(
+                    f"the host does not answer over SSH; the server of {name} could not be "
+                    "stopped from here",
+                    result,
+                )
+            if destroyed is not None:
+                raise AttemptFatal(
+                    f"the watchdog destroyed the instance ({destroyed}); the server of {name} "
+                    "ended with it",
+                    result,
+                )
             raise AttemptFatal(
                 f"the vLLM server of {name} did not stop; no next model starts", result
             )
     return result
+
+
+def watchdog_destroy(journal: Journal) -> str | None:
+    """The reason of a destroy the watchdog asked for, if any (the agent's own is `agent`)."""
+    reasons = [
+        e.get("reason")
+        for e in journal.replay()
+        if e["event"] == "destroy_requested" and e.get("reason") != "agent"
+    ]
+    return reasons[0] if reasons else None
 
 
 def verify_archive(archive: Path, target: Path) -> int:
@@ -2499,6 +2690,13 @@ def _failed_step(journal: Journal, name: str) -> str | None:
     return failed[-1] if failed else None
 
 
+def _verdict_outcome(result: Mapping) -> dict:
+    """`ok` for a Gate 0 verdict; `incomplete` for a day the stack stopped (no verdict, 0028)."""
+    if result.get("verdict") == "incomplete":
+        return {"outcome": "incomplete", "step": "run", "reason": result.get("reason")}
+    return {"outcome": "ok", "step": None, "reason": None}
+
+
 def run_models(run: Run) -> list[dict]:
     """Each model in turn, isolated: a failure of one is its `model_outcome` and the next still
     runs; only `AttemptFatal`, a lost host and a cancellation end the loop. The next model's
@@ -2532,18 +2730,28 @@ def run_models(run: Run) -> list[dict]:
                     late = soft - late_minutes * 60
                 receipt = ensure_weights(run, entry, late)
                 result = serve_model(run, entry, receipt, lambda index=index: start_next(index))
-                outcome = {"model": name, "outcome": "ok", "step": None, "reason": None, **result}
+                outcome = {"model": name, **_verdict_outcome(result), **result}
             except AttemptFatal as error:
                 kept = error.result
-                outcome = {
-                    "model": name,
-                    "outcome": "ok" if kept.get("verdict") else "failed",
-                    "step": None if kept.get("verdict") else _failed_step(run.journal, name),
-                    "reason": None if kept.get("verdict") else str(error),
-                    **kept,
-                    "fatal": str(error),
-                }
+                if kept.get("verdict"):
+                    outcome = {"model": name, **_verdict_outcome(kept), **kept}
+                else:
+                    step = _failed_step(run.journal, name)
+                    outcome = {
+                        "model": name,
+                        "outcome": "failed",
+                        "step": step,
+                        "reason": str(error),
+                    }
+                outcome["fatal"] = str(error)
                 run.journal.append("model_outcome", **outcome)
+                raise
+            except (KeyboardInterrupt, SystemExit) as error:
+                reason = f"cancelled: {type(error).__name__}"
+                step = _failed_step(run.journal, name)
+                run.journal.append(
+                    "model_outcome", model=name, outcome="cancelled", step=step, reason=reason
+                )
                 raise
             except Exception as error:
                 step = getattr(error, "step", None) or _failed_step(run.journal, name)
@@ -2618,11 +2826,19 @@ def run_attempt(
     run.heartbeat = Heartbeat(journal.dir, intervals["heartbeat_s"]).start()
     attempt, failure, outcomes = journal.dir, None, []
     timeout = intervals["command_timeout_s"]
+    saved_signals = cancel_on_signals(run)
 
     def tick(_: Mapping) -> Api:
         return api
 
     try:
+        need = round(package["ceiling_usd"] + CREDIT_MARGIN_USD, 6)
+        if initial_credit < need:
+            journal.append("credit_refused", credit=initial_credit, need_usd=need)
+            raise VastError(
+                f"the account credit {initial_credit:.2f} USD is below the ceiling plus "
+                f"{CREDIT_MARGIN_USD:.2f} USD ({need:.2f} USD); no create"
+            )
         with _step(journal, "arm"):
             arm(journal, runner, dry_run=dry_run)
             if watch_tick(journal, tick, runner=runner) != "idle":
@@ -2677,6 +2893,7 @@ def run_attempt(
             read_credit_after_close(journal, api)
         except BaseException as error:
             failure = failure or error
+        restore_signals(saved_signals)
     if failure is not None:
         raise failure
     if not any(o["outcome"] == "ok" for o in outcomes):
@@ -2769,7 +2986,7 @@ DRY_PACKAGE = {
     "envelope": {"dph_total": {"lte": 1.533}, "num_gpus": {"eq": 1}, "gpu_ram": {"gte": 79000}},
     "ceiling_usd": 4.0,
     "early_stop_usd": 2.5,
-    "spend_soft_usd": 2.3,
+    "spend_soft_usd": 2.1,
     "deadline_minutes": 100,
     "soft_end_minutes": 85,
     "weights_late_minutes": 1,
@@ -2848,7 +3065,9 @@ def dry_run(out: Path | None, config_: config.Config, *, scenario: Mapping | Non
     """The full timeline against the fakes; writes `timeline.json` and `fake-api.jsonl`.
 
     `scenario` (the rehearsal's knobs, all optional): `full_days`; `extended` (False: no
-    extended set); `vllm`, `hf`, `gpu` (the fake mode files); `package` and `models` (changes
+    extended set); `fixture` (arguments of `gpu_ext.fixture`, e.g. the 717-request shape);
+    `manifest_code_sha256` (the set as another `gpu_ext.py` built it); `vllm`, `hf`, `gpu`
+    (the fake mode files); `package` and `models` (changes
     to the package and to each model entry); `create_mode`; `fake` (a callable on the
     `FakeVast`); `hooks` (of `run_attempt`); `intervals`. A failure still writes both files
     and then propagates."""
@@ -2880,7 +3099,14 @@ def dry_run(out: Path | None, config_: config.Config, *, scenario: Mapping | Non
         entry.update(change)
     package = {**DRY_PACKAGE, "models": entries}
     if scenario.get("extended", True):
-        found = gpu_ext.fixture(out / "gpu-ext-fixture")
+        found = gpu_ext.fixture(out / "gpu-ext-fixture", **scenario.get("fixture", {}))
+        if "manifest_code_sha256" in scenario:
+            # the set as built by another gpu_ext.py: the package pins this manifest
+            manifest_path = out / "gpu-ext-fixture" / gpu_ext.MANIFEST_FILE
+            manifest = json.loads(manifest_path.read_bytes())
+            manifest["code_sha256"] = scenario["manifest_code_sha256"]
+            manifest_path.write_bytes(gpu_ext._json_bytes(manifest))
+            found["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         package["extended"] = {
             "dir": "gpu-ext-fixture",
             "manifest_sha256": found["manifest_sha256"],
@@ -2939,6 +3165,74 @@ def dry_run(out: Path | None, config_: config.Config, *, scenario: Mapping | Non
 
 # --- the CLI -------------------------------------------------------------------------------
 
+LAUNCH_TIMEOUT_STOP = "25min"
+
+
+def launch_argv(
+    package: Path, approval: str, config_path: Path, logs: Path, stamp: str, root: Path = REPO_ROOT
+) -> list[str]:
+    """The `systemd-run --user` argv of `deploy`, which outlives the tool session (up to the
+    deadline + 15 min): the checkout as working directory (the package's decision paths are
+    relative), `SOUND_SCOUT_CONFIG` absolute, the checkout's own `.venv` python, `systemd-inhibit`
+    against sleep, stdout and stderr appended under `logs`. A `systemctl --user stop` sends
+    SIGTERM, which `deploy` turns into download and destroy; `TimeoutStopSec` leaves that path
+    its evidence, stop, download and destroy timeouts before SIGKILL."""
+    return [
+        "systemd-run",
+        "--user",
+        f"--unit={LABEL_PREFIX}deploy-{stamp}",
+        "--collect",
+        f"--description=Sound Scout GPU deploy {package.name}",
+        f"--working-directory={root}",
+        f"--setenv={config.CONFIG_PATH_ENV}={config_path}",
+        f"--property=TimeoutStopSec={LAUNCH_TIMEOUT_STOP}",
+        f"--property=StandardOutput=append:{logs / 'deploy.out'}",
+        f"--property=StandardError=append:{logs / 'deploy.err'}",
+        "--",
+        shutil.which("systemd-inhibit") or "systemd-inhibit",
+        "--what=sleep:idle",
+        "--who=sound-scout",
+        "--why=GPU attempt: results are downloaded and the instance destroyed first",
+        "--mode=block",
+        str(root / ".venv" / "bin" / "python"),
+        "-m",
+        "sound_scout.eval.vast",
+        "deploy",
+        "--package",
+        str(package),
+        "--approval",
+        approval,
+    ]
+
+
+def prepare_launch(package: Path, approval: str, root: Path = REPO_ROOT) -> dict:
+    """The checks `deploy` runs before any API call (package, days, extended set and its code),
+    then the launch argv and a fresh 0700 directory for its output; nothing is started."""
+    if not approval.startswith("https://github.com/"):
+        raise VastError("launch needs --approval with the link to the owner's approval")
+    env = os.environ.get(config.CONFIG_PATH_ENV)
+    if not env:
+        raise VastError(f"launch needs {config.CONFIG_PATH_ENV} (0028, «Запуск»)")
+    config_path = Path(env).absolute()
+    if not (root / ".venv" / "bin" / "python").is_file():
+        raise VastError(f"no .venv/bin/python in {root}")
+    config_ = config.load()
+    package = Path(package).absolute()
+    loaded, package_sha = load_package(package, MODELS)
+    check_days(loaded, config_)
+    check_extended(loaded, config_)
+    stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    logs = gpu_root(config_) / "launches" / stamp
+    os.makedirs(logs.parent, 0o700, exist_ok=True)
+    os.mkdir(logs, 0o700)
+    argv = launch_argv(package, approval, config_path, logs, stamp, root)
+    return {
+        "argv": argv,
+        "unit": argv[2].split("=", 1)[1],
+        "logs": str(logs),
+        "package_sha256": package_sha,
+    }
+
 
 def status(journal: Journal) -> dict:
     state = summarize(journal.replay())
@@ -2960,6 +3254,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("watch", "cutoff", "destroy", "status"):
         commands.add_parser(name).add_argument("--journal", type=Path, required=True)
     commands.add_parser("dry-run").add_argument("--out", type=Path)
+    launch = commands.add_parser("launch-argv")
+    launch.add_argument("--package", type=Path, required=True)
+    launch.add_argument("--approval", required=True)
     args = parser.parse_args(argv)
     key = None
     try:
@@ -2980,6 +3277,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             print(json.dumps(status(Journal.open(args.journal)), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "launch-argv":
+            print(json.dumps(prepare_launch(args.package, args.approval), ensure_ascii=False))
             return 0
         config_ = config.load()
         if args.command == "dry-run":

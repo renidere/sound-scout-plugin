@@ -7,6 +7,7 @@ fakes prove the order and the contract of the stack, never the image, vLLM, a mo
 """
 
 import json
+import re
 
 import pytest
 
@@ -40,6 +41,9 @@ def test_every_plan_scenario_has_a_rehearsal() -> None:
         "spend_jump", "ssh_lost", "server_not_stopping", "interrupt_in_m2", "tunnel_death",
         "gpu_not_free", "offer_fallback", "final_pack_blocked", "compressed_time",
         "server_not_stopping_after_failure", "extended_error",
+        "network_blip_m1", "tunnel_slow_reopen", "half_alive_tunnel", "sigterm_mid_gate0",
+        "truncated_gate0_day", "spend_tail_real_numbers", "credit_below_ceiling",
+        "gpu_ext_sha_mismatch",
         "refusals", "analysis", "pack",
     } <= names  # fmt: skip
 
@@ -49,4 +53,19 @@ def test_the_report_lists_every_scenario_and_what_it_cannot_prove(tmp_path) -> N
     assert report["passed"] and [r["scenario"] for r in report["scenarios"]] == ["refusals"]
     text = (tmp_path / "r" / "report.md").read_text()
     assert "Чего репетиция не доказывает" in text and "`refusals`" in text
-    assert json.loads((tmp_path / "r" / "report.json").read_text())["cannot_prove"]
+    saved = json.loads((tmp_path / "r" / "report.json").read_text())
+    assert saved["cannot_prove"] and re.fullmatch(r"[0-9a-f]{40}", saved["code"]["commit"])
+    assert f"Коммит: `{saved['code']['commit']}`" in text
+
+
+def test_the_real_numbers_scenario_reads_the_preregistered_package() -> None:
+    found = rehearsal.real_package()
+    package = found["package"]
+    assert (package["ceiling_usd"], package["early_stop_usd"], package["spend_soft_usd"]) == (
+        3.0,
+        2.25,
+        1.9,
+    )
+    assert package["envelope"]["dph_total"] == {"lte": 1.2}
+    assert found["models"][0]["weights_timeout_s"] == 600
+    assert found["models"][1]["weights_timeout_s"] == 1500

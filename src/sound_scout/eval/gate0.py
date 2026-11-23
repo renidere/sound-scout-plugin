@@ -1453,7 +1453,7 @@ def run_spike(
                 _trace(trace, line)
                 exited = process is not None and process.poll() is not None
                 stop_reason = (
-                    line.get("limit") or transport_stop or ("server_exited" if exited else None)
+                    transport_stop or line.get("limit") or ("server_exited" if exited else None)
                 )
         finally:
             status = {} if process is None else proc_status(process.pid)
@@ -1526,15 +1526,24 @@ def transport_error(line: Mapping) -> bool:
 def send_checked(send: Callable[..., dict], transport_check) -> tuple[dict, str | None]:
     """One request; after a transport error `transport_check` decides: `resend` sends it once
     more without a second request file (`resent_after_tunnel`), any other answer is the reason
-    to stop. Returns the trace line and that reason or None."""
+    to stop. A request that ran out of time asks `transport_check(after_timeout=True)` once: a
+    tunnel that went stale while the server lives also shows as a timeout (#149); `timeout`
+    keeps the line as it is. Returns the trace line and that reason or None."""
     line = send()
-    if transport_check is None or not transport_error(line):
+    if transport_check is None:
         return line, None
-    decision = transport_check()
+    if line.get("limit") == "request_timeout":
+        decision = transport_check(after_timeout=True)
+        if decision == "timeout":
+            return line, None
+    elif transport_error(line):
+        decision = transport_check()
+    else:
+        return line, None
     if decision != "resend":
         return line, decision
     again = send(write_request=False)
-    again.update(resent_after_tunnel=True, first_error=line.get("error"))
+    again.update(resent_after_tunnel=True, first_error=line.get("error") or line.get("limit"))
     if transport_error(again):
         return again, "transport_errors"
     return again, None
@@ -1766,6 +1775,35 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
         result["verdict"], result["reason"] = "NOT READY", second_reason
     else:
         result["verdict"], result["reason"] = outcome, held_reason
+    return _incomplete(result, record, lines)
+
+
+RULE_STOPS = frozenset({"request_timeout", "rss_limit", "precondition_failed"})
+
+
+def _incomplete(result: dict, record: Mapping, lines: list[Mapping]) -> dict:
+    """A `vllm` day the stack stopped (soft end, spend, a lost tunnel or host, a server that
+    exited or went silent, a cancellation) has no Gate 0 verdict: its unanswered requests are
+    the server's or the stack's, not the model's answers (0028, «Правка 2026-11-23»). Only the
+    rule's own limits (`RULE_STOPS`) count unsent requests as failed, as in 0007 § 3. The
+    rule's reading of the answered part stays as `rule_verdict`, for the record only."""
+    stop = result["stop_reason"]
+    if record.get("runtime") != "vllm" or stop is None or stop in RULE_STOPS:
+        return result
+    if result["verdict"] == "not_applicable":
+        return result
+    planned = [line for line in lines if line["variant"] != "E0"]
+    unanswered = [line for line in planned if line.get("http_status") != 200]
+    result.update(
+        rule_verdict=result["verdict"],
+        rule_reason=result["reason"],
+        verdict="incomplete",
+        reason=(
+            f"день не завершён ({stop}): без ответа {len(unanswered)} из {len(planned)} "
+            "запросов; вердикта Gate 0 нет"
+        ),
+        unanswered=len(unanswered),
+    )
     return result
 
 
