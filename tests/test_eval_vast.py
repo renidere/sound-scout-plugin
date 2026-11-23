@@ -3145,5 +3145,41 @@ def test_the_ssh_window_counts_the_failed_try_itself(tmp_path: Path, key_file, f
 def test_a_pilot_whose_recovery_stops_fails_the_smoke_with_that_reason() -> None:
     dead = gate0.Client(vast._free_port(), "m")  # nothing listens: no HTTP answer
     with pytest.raises(vast.ModelFailed, match="pilot: ssh_lost") as raised:
-        vast.run_pilot(dead, lambda after_timeout=False: "ssh_lost", timeout=1.0)
+        vast.run_pilot(dead, lambda after_timeout=False: "ssh_lost", timeout=lambda: 1.0)
     assert raised.value.step == "smoke"
+
+
+def test_a_pilot_reads_its_timeout_for_every_request_and_a_resend() -> None:
+    asked, timeouts = [], [3.0, 2.0, 1.0, 0.5]
+
+    class Client:
+        model = "m"
+
+        def text_tokens(self, text):
+            return 5
+
+        def request(self, path, body=None, timeout=5):
+            asked.append(timeout)
+            if len(asked) == 1:
+                return None, None, "ConnectionResetError: reset"
+            return 200, json.dumps({"usage": {"prompt_tokens": 5 + 40 * len(asked)}}).encode(), None
+
+    pilot = vast.run_pilot(Client(), lambda after_timeout=False: "resend", lambda: timeouts.pop(0))
+    assert asked == [3.0, 2.0, 1.0] and pilot["ok"]
+    assert [line["resent_after_tunnel"] for line in pilot["lines"]] == [True, False]
+
+
+def test_a_long_try_that_lost_its_ssh_late_still_gets_most_of_the_window(
+    tmp_path: Path, key_file, fake
+) -> None:
+    host = _SlowProbeHost()
+    run = _transport_run(tmp_path, fake, key_file, host, ssh_lost_s=vast.SSH_SILENT_S + 2.0)
+    started = time.time()
+    with pytest.raises(vast.TransportError) as raised:
+        # the try began an hour ago and worked; its ssh noticed the loss only now
+        vast.await_host(run, "verify m", started + 1.0, "exit 255", since=started - 3600)
+    assert not isinstance(raised.value, vast.HostLost)
+    assert max(host.timeouts) <= 1.0 + 0.1
+    with pytest.raises(vast.HostLost):
+        vast.await_host(run, "verify m", time.time() + 3600, "exit 255", since=started - 3600)
+    assert time.time() - started >= 1.5

@@ -404,6 +404,9 @@ DRY_INTERVALS = {
 SSH_RETRIES = 3
 SSH_EXIT = 255
 SSH_PROBE_S = 30.0
+# the longest a lost network can go unseen by an ssh in flight: ServerAliveInterval 15 s times
+# the default ServerAliveCountMax 3 (a new connection gives up sooner, at ConnectTimeout 10 s)
+SSH_SILENT_S = 45.0
 MIN_STEP_S = 10.0
 STATE_TIMEOUT_S = 60.0
 RECOVER_HEALTH_S = 30.0
@@ -2056,12 +2059,13 @@ def pilot_clips() -> dict[str, bytes]:
 def run_pilot(
     client: gate0.Client,
     transport_check: Callable | None = None,
-    timeout: float = gate0.REQUEST_TIMEOUT_S,
+    timeout: Callable[[], float] = lambda: gate0.REQUEST_TIMEOUT_S,
 ) -> dict:
     """K1 on X1 and X2: audio tokens above zero and growing with the length (PROPOSAL § 5). A
     request without any HTTP answer goes to `transport_check` (`recover`) and, when the server
     answers again, once more (`gate0.send_checked`); any other answer of `transport_check` (the
-    host lost, the server gone, a stop) is `ModelFailed` at `smoke` with that reason."""
+    host lost, the server gone, a stop) is `ModelFailed` at `smoke` with that reason. `timeout`
+    is read for every request, so `timeout_cap` cuts a resend and the second clip too."""
     lines = []
     text = gate0.QUESTIONS["K1"]
     text_tokens = client.text_tokens(text)
@@ -2083,7 +2087,7 @@ def run_pilot(
         }
 
         def send(write_request: bool = True, body=body) -> dict:
-            status, raw, error = client.request(gate0.CHAT_ROUTE, body, timeout=timeout)
+            status, raw, error = client.request(gate0.CHAT_ROUTE, body, timeout=timeout())
             return {"sent": True, "http_status": status, "raw": raw, "error": error}
 
         answer, decision = gate0.send_checked(send, transport_check)
@@ -2444,11 +2448,13 @@ def await_host(
     `ssh_lost_s` window is `ssh_lost` for the attempt (`HostLost`); a window `until` cut short
     is a `TransportError` of this step alone. A destroy the watchdog asks for, before or during
     the wait, ends it at once. Journaled as `transport_retry`; True when the host answered the
-    first `true` (no outage seen). The window counts from `since`, when the failed try began:
-    an ssh needs its own timeout to fail, and that time was silence too."""
+    first `true` (no outage seen). The window counts from when the silence began: the start of
+    the failed try (`since`), but no earlier than `SSH_SILENT_S` before now, since an ssh in
+    flight notices a lost network that late at most and a long try worked before it."""
     _watchdog_stop(run, what, error)
     started = time.time()
-    window = (started if since is None else since) + run.intervals["ssh_lost_s"]
+    silent = started if since is None else max(since, started - SSH_SILENT_S)
+    window = silent + run.intervals["ssh_lost_s"]
     ends = min(until, window)
     tries = 0
     while True:
@@ -2810,7 +2816,7 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                 pilot = run_pilot(
                     client,
                     lambda after_timeout=False: recover(run, client, out, name, after_timeout),
-                    min(gate0.REQUEST_TIMEOUT_S, timeout_cap(run)),
+                    lambda: min(gate0.REQUEST_TIMEOUT_S, timeout_cap(run)),
                 )
                 (run.attempt / f"pilot-{name}.json").write_text(json.dumps(pilot, indent=2) + "\n")
                 detail.update(pilot_ok=pilot["ok"], tunnel_port=port)
