@@ -1020,6 +1020,17 @@ def check_sigterm_create(o: Outcome, c: Checks) -> None:
     c("no process of the attempt left", not left.strip(), left.strip().splitlines()[:3])
 
 
+def _put_in_flight(out: Path) -> bool:
+    """A second after `create_requested`: the PUT has left and the fake still holds its answer
+    (`timeout_s` 3 s), however slow the machine is to get from the journal line to the PUT."""
+    found = sorted((out / vast.GPU_DIR).glob(f"*/{vast.JOURNAL_FILE}"))
+    with contextlib.suppress(vast.VastError, IndexError):
+        events = vast.Journal(found[-1]).replay()
+        requested = [e["t"] for e in events if e["event"] == "create_requested"]
+        return bool(requested) and time.time() - requested[0] >= 1.0
+    return False
+
+
 ROUND2_SCENARIOS = [
     Scenario(
         "blip_m1_weights_poll",
@@ -1080,7 +1091,7 @@ ROUND2_SCENARIOS = [
         {"create_mode": "timeout", "fake": lambda fake: setattr(fake, "timeout_s", 3.0)},
         check_sigterm_create,
         expect_error="any",
-        signal_when=lambda out: _journal_has(out, "create_requested"),
+        signal_when=lambda out: _put_in_flight(out),
     ),
     Scenario(
         "watchdog_destroy_in_download",

@@ -212,7 +212,8 @@ def test_clean_install_job_reuses_the_ffmpeg_step_of_checks_and_runs_the_script(
     checks_uses = [step["uses"] for step in jobs["checks"]["steps"] if "uses" in step]
     assert uses == checks_uses
     assert job["steps"][-1]["run"] == "bash scripts/clean-install-check.sh"
-    assert job["timeout-minutes"] == 30
+    # the same suite as checks, with the #149 rehearsal: the same job limit
+    assert job["timeout-minutes"] == jobs["checks"]["timeout-minutes"] == 45
 
 
 def test_history_scan_job_checks_out_the_whole_history_and_runs_the_scanner() -> None:
