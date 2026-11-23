@@ -2152,3 +2152,36 @@ def test_a_cancelled_vllm_day_records_cancelled_and_still_writes_its_verdict(
     assert json.loads((attempt / gate0.RUN_FILE).read_text())["stop_reason"] == "cancelled"
     verdict = json.loads((attempt / gate0.VERDICT_FILE).read_text())
     assert verdict["verdict"] == "not_applicable" and verdict["stop_reason"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        (b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"choices"', "IncompleteRead"),
+        (b"garbage\r\n\r\n", "BadStatusLine"),
+        (b"", "RemoteDisconnected"),
+    ],
+    ids=["cut-body", "bad-status-line", "closed"],
+)
+def test_a_broken_http_answer_is_no_answer_for_the_transport_check(reply, kind) -> None:
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        connection.recv(65536)
+        connection.sendall(reply)
+        connection.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        status, raw, error = gate0.Client(listener.getsockname()[1]).request("/health", timeout=5)
+    finally:
+        thread.join(5)
+        listener.close()
+    assert (status, raw) == (None, None) and kind in error
+    assert gate0.transport_error({"sent": True, "http_status": status, "error": error})

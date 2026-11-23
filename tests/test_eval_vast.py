@@ -413,6 +413,22 @@ def test_a_lost_create_is_unknown_never_retried_and_the_tick_destroys_by_label(
     assert not any(fake._visible(item) for item in fake.instances.values())
 
 
+def test_a_signal_while_the_create_put_is_in_flight_journals_the_outcome_unknown(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    api = vast.Api(fake.url, key_file[1])
+
+    def signalled(offer_id, payload):
+        raise SystemExit(143)
+
+    monkeypatch.setattr(api, "create", signalled)
+    with pytest.raises(SystemExit):
+        vast.create_instance(api, journal, _package(), _no_system)
+    assert _events(journal)[-2:] == ["create_requested", "create_outcome_unknown"]
+    assert "SystemExit" in journal.replay()[-1]["error"]
+
+
 def test_a_lost_create_without_an_instance_is_searched_until_deadline_plus_15_min(
     tmp_path: Path, key_file, fake
 ) -> None:
@@ -2737,10 +2753,13 @@ def _spend_package(**changes) -> dict:
 def test_the_soft_spend_leaves_the_worst_tail_and_its_reserve_before_the_early_stop(
     tmp_path: Path,
 ) -> None:
-    assert vast.spend_tail_s() == 12 * 60 and vast.SPEND_TAIL_RESERVE_S == 3 * 60
+    # 2 min request, 65 s check after it, 2 min sync, 1 min evidence, 2 min stop, 5 min download
+    assert vast.spend_tail_s() == 785 and vast.SPEND_TAIL_RESERVE_S == 3 * 60
     loaded = _load(tmp_path, _spend_package(spend_soft_usd=1.9))
     assert loaded["spend_soft_usd"] == 1.9
-    _load(tmp_path, _spend_package(spend_soft_usd=1.95))
+    _load(tmp_path, _spend_package(spend_soft_usd=1.92))
+    with pytest.raises(vast.VastError, match="leaves 0.300 USD before the early stop"):
+        _load(tmp_path, _spend_package(spend_soft_usd=1.95))
     with pytest.raises(vast.VastError, match="leaves 0.150 USD before the early stop"):
         _load(tmp_path, _spend_package(spend_soft_usd=2.1))
     envelope = {**_spend_package()["envelope"], "dph_total": {"gte": 0.5}}
@@ -2839,6 +2858,13 @@ def test_launch_argv_runs_the_deploy_checks_and_prints_the_argv(
     monkeypatch.setenv("SOUND_SCOUT_CONFIG", str(toml))
     monkeypatch.setattr(vast, "MODELS", vast_fake.synthetic_models())
     approval = "https://github.com/renidere/sound-scout-plugin/issues/149#issuecomment-1"
+    # a rental needs the weights limit of every model; the dry run's package has none
+    assert vast.main(["launch-argv", "--package", str(path), "--approval", approval]) == 2
+    assert "needs weights_timeout_s for a rental" in capsys.readouterr().err
+    assert vast.load_package(path, vast_fake.synthetic_models())[0]["models"] == entries
+    for entry in entries:
+        entry["weights_timeout_s"] = 600
+    path.write_text(json.dumps(package))
     assert vast.main(["launch-argv", "--package", str(path), "--approval", approval]) == 0
     printed = json.loads(capsys.readouterr().out)
     logs = Path(printed["logs"])
@@ -2907,3 +2933,142 @@ def test_a_signal_inside_the_final_path_is_journaled_and_cuts_nothing(
     finally:
         vast.restore_signals(saved)
     assert vast.defer_signals(run, {}) is None
+
+
+# --- transport recovery (#149, round 2) ----------------------------------------------------------
+
+
+def _transport_run(tmp_path, fake, key_file, host, **intervals) -> vast.Run:
+    run = _recover_run(tmp_path, fake, key_file, host)
+    run.intervals = {**vast.DRY_INTERVALS, **intervals}
+    return run
+
+
+def _flaky(failures: int):
+    calls = []
+
+    def action(left: float) -> str:
+        calls.append(left)
+        if len(calls) <= failures:
+            raise vast.TransportError("host: size: no SSH answer (exit 255)")
+        return "done"
+
+    return action, calls
+
+
+def test_a_step_waits_out_the_host_then_runs_again(tmp_path: Path, key_file, fake) -> None:
+    host = _RecoverHost(down=3)
+    run = _transport_run(tmp_path, fake, key_file, host)
+    action, calls = _flaky(1)
+    assert vast.transport_retry(run, "weights m", action, time.time() + 60, tunnel=True) == "done"
+    assert len(calls) == 2 and run.fatal is None and host.reopened == [True]
+    (retry,) = [e for e in run.journal.replay() if e["event"] == "transport_retry"]
+    assert (retry["what"], retry["outcome"], retry["tries"]) == ("weights m", "retry", 4)
+    assert retry["tunnel_reopened"] is True and "exit 255" in retry["error"]
+
+
+def test_a_host_silent_for_the_whole_window_is_ssh_lost(tmp_path: Path, key_file, fake) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=10**9), ssh_lost_s=0.3)
+    action, calls = _flaky(10**9)
+    started = time.monotonic()
+    with pytest.raises(vast.HostLost, match="does not answer over SSH"):
+        vast.transport_retry(run, "stop m", action, time.time() + 60)
+    assert 0.3 <= time.monotonic() - started < 5 and len(calls) == 1
+    assert run.fatal == "ssh_lost"
+    (retry,) = [e for e in run.journal.replay() if e["event"] == "transport_retry"]
+    assert retry["outcome"] == "ssh_lost" and retry["waited_s"] >= 0.3
+
+
+def test_the_ssh_window_never_runs_past_the_steps_own_end(tmp_path: Path, key_file, fake) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=10**9), ssh_lost_s=300)
+    action, _ = _flaky(10**9)
+    started = time.monotonic()
+    with pytest.raises(vast.HostLost):
+        vast.transport_retry(run, "evidence m", action, time.time() + 0.5)
+    assert time.monotonic() - started < 3
+
+
+def test_a_step_failing_while_the_host_answers_is_its_own_failure(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost())
+    action, calls = _flaky(10**9)
+    with pytest.raises(vast.TransportError) as raised:
+        vast.transport_retry(run, "receipt m", action, time.time() + 60)
+    assert not isinstance(raised.value, vast.HostLost)
+    assert len(calls) == vast.SSH_RETRIES and run.fatal is None
+
+
+def test_a_watchdog_destroy_ends_the_wait_at_once(tmp_path: Path, key_file, fake) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(down=10**9))
+    run.journal.append("destroy_requested", instance_id=7, reason="early_stop")
+    action, calls = _flaky(10**9)
+    with pytest.raises(vast.VastError, match=r"watchdog destroyed the instance \(early_stop\)"):
+        vast.transport_retry(run, "download", action, time.time() + 60)
+    assert len(calls) == 1 and run.host.calls == []
+
+
+def test_a_step_before_the_stop_gets_the_ssh_window_and_a_tail_step_its_own_limit(
+    tmp_path: Path, key_file, fake
+) -> None:
+    run = _transport_run(tmp_path, fake, key_file, _RecoverHost(), ssh_lost_s=300)
+    now = time.time()
+    assert vast.step_until(run, 60) == pytest.approx(now + 300, abs=1)
+    assert vast.step_until(run, 600) == pytest.approx(now + 600, abs=1)
+    run.soft_end = now + 100
+    assert vast.step_until(run, 60) == pytest.approx(now + 100, abs=1)
+    assert vast.step_until(run, 120, tail=True) == pytest.approx(now + 120, abs=1)
+    run.soft_end = now - 10
+    assert vast.step_until(run, 60) <= now
+    assert vast.step_until(run, 300, tail=True) == pytest.approx(now + 300, abs=1)
+
+
+def test_a_lost_local_host_answers_as_ssh_and_a_spawn_starts_once(tmp_path: Path) -> None:
+    host = vast.LocalHost(tmp_path / "root", {})
+    (tmp_path / "root").mkdir()
+    (tmp_path / "local.txt").write_text("x")
+    host.spawn(["sh", "-c", "echo started"], f"{vast.WORKSPACE}/spawn.log")
+    host.spawn(["sh", "-c", "echo again"], f"{vast.WORKSPACE}/spawn.log")
+    assert len(host._spawned) == 1
+    host.lose()
+    done = host.run(["true"], 10)
+    assert done.returncode == vast.SSH_EXIT
+    with pytest.raises(vast.TransportError):
+        vast._checked(done, "true")
+    with pytest.raises(vast.TransportError):
+        host.put(tmp_path / "local.txt", f"{vast.WORKSPACE}/x", "k3y-secret-value")
+    with pytest.raises(vast.TransportError):
+        host.get(f"{vast.WORKSPACE}/spawn.log", tmp_path / "copy")
+    with pytest.raises(vast.TransportError):
+        host.spawn(["true"], f"{vast.WORKSPACE}/other.log")
+    host.close()
+
+
+def test_a_remote_spawn_starts_nothing_when_its_log_exists_and_ssh_failing_is_transport(
+    tmp_path: Path, monkeypatch
+) -> None:
+    host = vast.RemoteHost(tmp_path, "127.0.0.1", 22)
+    seen = []
+
+    def run(argv, timeout):
+        seen.append(argv)
+        return vast.proc.RunResult(255, b"", b"", False, False, 0.0)
+
+    monkeypatch.setattr(host, "run", run)
+    with pytest.raises(vast.TransportError):
+        host.spawn(["hf", "download", "x y"], "/workspace/out/m/download-wrapper.log")
+    (line,) = [argv[2] for argv in seen]
+    assert line == (
+        "test -e /workspace/out/m/download-wrapper.log || { nohup hf download 'x y' > "
+        "/workspace/out/m/download-wrapper.log 2>&1 < /dev/null & }"
+    )
+    for code, timed_out, transport in ((255, False, True), (-15, False, True), (0, True, True),
+                                       (1, False, False), (0, False, False)):  # fmt: skip
+        done = vast.proc.RunResult(code, b"", b"", timed_out, False, 0.0)
+        assert vast._transport_failed(done) is transport
+
+
+def test_term_stop_covers_the_final_path_up_to_the_delete() -> None:
+    minutes = int(vast.LAUNCH_TIMEOUT_STOP.removesuffix("min"))
+    # evidence 1 min, stop 2 min, download 5 min, listing and DELETE 1 min each
+    assert vast.stop_path_s() == 600 and minutes * 60 >= vast.stop_path_s()

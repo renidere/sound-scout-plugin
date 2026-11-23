@@ -54,6 +54,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -1118,7 +1119,8 @@ class Client:
                 return response.status, response.read(), None
         except urllib.error.HTTPError as error:
             return error.code, error.read(), f"HTTP {error.code}"
-        except (urllib.error.URLError, OSError) as error:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            # IncompleteRead, BadStatusLine, RemoteDisconnected: no whole answer came either
             reason = getattr(error, "reason", error)
             return None, None, f"{type(reason).__name__}: {reason}"
 

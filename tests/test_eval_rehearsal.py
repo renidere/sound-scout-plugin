@@ -44,8 +44,26 @@ def test_every_plan_scenario_has_a_rehearsal() -> None:
         "network_blip_m1", "tunnel_slow_reopen", "half_alive_tunnel", "sigterm_mid_gate0",
         "sigterm_in_final_path", "truncated_gate0_day", "spend_tail_real_numbers",
         "credit_below_ceiling", "gpu_ext_sha_mismatch",
+        "blip_m1_weights_poll", "blip_m2_weights_poll", "blip_m2_smoke_tunnel", "blip_gpu_free",
+        "blip_final_download", "outage_1s_gate0", "incomplete_read_mid_body",
+        "sigterm_during_create_put", "watchdog_destroy_in_download",
         "refusals", "analysis", "pack",
     } <= names  # fmt: skip
+
+
+def test_a_blip_is_rehearsed_at_every_kind_of_host_step() -> None:
+    names = {s.name for s in rehearsal.SCENARIOS}
+    kinds = {
+        "upload_mkdir", "upload_put", "upload_sha256sum", "preflight_nvidia_smi",
+        "preflight_vllm_version", "preflight_hostrun", "preflight_selftest", "fetch_mkdir",
+        "fetch_spawn", "weights_size", "weights_verify", "weights_receipt", "gpu_free",
+        "serve_spawn", "smoke_tunnel", "server_state", "sync_pack", "sync_get", "evidence",
+        "stop", "final_pack", "final_get", "pilot", "gate0_request",
+    }  # fmt: skip
+    assert set(rehearsal.STEP_KINDS) == kinds
+    assert {f"blip_step_{kind}" for kind in kinds} <= names
+    # the draw is seeded by the kind: the same call and length every run
+    assert [rehearsal._drawn(k, 3) for k in kinds] == [rehearsal._drawn(k, 3) for k in kinds]
 
 
 def test_the_report_lists_every_scenario_and_what_it_cannot_prove(tmp_path) -> None:

@@ -5,9 +5,11 @@ run of the whole two-model package (`vast.dry_run`: the fake Vast API, a directo
 with the real `hostrun.py serve` and guard, the fake vLLM, the real Gate 0 and extended-set
 clients) and checks what the owner asked for (#149, comment 7085422087): a failure of one model
 leaves the other's run whole, every failure keeps the journal and the answers already given,
-results are downloaded and destroy is verified. A few scenarios are unit checks (the set's
-refusals, the analysis numbers, `pack` of growing files). The report is `DIR/report.json` and
-`DIR/report.md`; the exit code is 0 only when every check of every scenario passed.
+results are downloaded and destroy is verified; a network loss at any kind of host step
+(`STEP_KINDS`, one scenario each) costs a wait, never a model. A few scenarios are unit checks
+(the set's refusals, the analysis numbers, `pack` of growing files). The report is
+`DIR/report.json` and `DIR/report.md`; the exit code is 0 only when every check of every
+scenario passed.
 
 What it proves is the stack's order and contract on this station; never the image, vLLM, the
 models, a real host or Vast.ai.
@@ -507,8 +509,8 @@ def check_ssh_lost(o: Outcome, c: Checks) -> None:
         any(line.get("http_status") == 200 for line in trace),
     )
     c(
-        "the transport check saw ssh_lost",
-        any(e.get("outcome") == "ssh_lost" for e in o.kinds("transport_check")),
+        "the host was awaited for the SSH window, then ssh_lost",
+        any(e.get("outcome") == "ssh_lost" for e in o.kinds("transport_retry")),
     )
     c("M2 never started", not o.steps("smoke", M2))
     destroyed(o, c)
@@ -806,10 +808,11 @@ def check_sigterm_late(o: Outcome, c: Checks) -> None:
     signals = o.kinds("signal")
     c("one SIGTERM journaled", [e["name"] for e in signals] == ["SIGTERM"], signals)
     downloads = o.steps("download")
+    retries = [e for e in o.kinds("transport_retry") if e["what"] == "download"]
     c(
         "the download killed in flight was tried once more and verified",
-        [d["ok"] for d in downloads] == [False, True],
-        [(d["ok"], (d.get("detail") or {}).get("error")) for d in downloads],
+        [d["ok"] for d in downloads] == [True] and [r["outcome"] for r in retries] == ["retry"],
+        {"steps": [d["ok"] for d in downloads], "retries": [r["error"] for r in retries]},
     )
     for model in (M1, M2):
         model_ok(o, c, model)
@@ -906,6 +909,9 @@ STEP_KINDS = {
     "stop": ("run", _hostrun("stop"), 2),
     "final_pack": ("run", _hostrun("pack", "/results.tar"), 1),
     "final_get": ("get", _remote("/results.tar"), 1),
+    # through the tunnel: the pilot of a model (the n-th model) and a Gate 0 request
+    "pilot": ("pilot", None, 2),
+    "gate0_request": ("gate0", None, 2),
 }
 
 
@@ -929,10 +935,22 @@ def check_both_complete(o: Outcome, c: Checks) -> None:
 def _step_kind_scenario(kind: str) -> Scenario:
     op, match, most = STEP_KINDS[kind]
     nth, seconds = _drawn(kind, most)
+    model = (M1, M2)[(nth - 1) % 2]
+
+    def blip(run, label: str = kind) -> None:
+        _fire(run, label)
+        _blip_for(seconds)(run)
+
+    if op == "pilot":
+        hooks = {"pilot": lambda run, **where: where["model"] == model and blip(run)}
+    elif op == "gate0":
+        hooks = _when_gate0_sent(model, 10, blip)
+    else:
+        hooks = {"host": _on_call(op, match, _blip_for(seconds), nth)}
     return Scenario(
         f"blip_step_{kind}",
         f"Обрыв сети {seconds} с на шаге {kind} (вызов {nth})",
-        {"hooks": {"host": _on_call(op, match, _blip_for(seconds), nth)}},
+        {"hooks": hooks},
         check_both_complete,
     )
 
@@ -1830,6 +1848,7 @@ CANNOT_PROVE = [
     "что модели слышат: ответы поддельного vLLM заданы сценарием (мок — не доказательство)",
     "поведение Vast.ai: API, биллинг и лаг кредита — поддельные",
     "настоящий SSH и его туннель: вместо него loopback-форвардер",
+    "коды выхода настоящих ssh и scp при обрыве сети: выход 255 имитирует каталог-хост",
     "настоящий полный диск: вместо него недоступный путь архива",
     "скорость и Xet-кэш настоящего `hf download`",
     "таймеры systemd сторожа: в репетиции сторож — поток с тем же watch_tick",

@@ -375,6 +375,7 @@ INTERVALS = {
     "gpu_free_timeout_s": 60.0,
     "gpu_free_poll_s": 2.0,
     "ssh_retry_s": 30.0,
+    "ssh_lost_s": 300.0,
     "evidence_timeout_s": 60.0,
     "stop_timeout_s": 120.0,
     "sync_timeout_s": 120.0,
@@ -398,8 +399,13 @@ DRY_INTERVALS = {
     "gpu_free_timeout_s": 1.0,
     "gpu_free_poll_s": 0.1,
     "ssh_retry_s": 0.1,
+    "ssh_lost_s": 5.0,
 }
 SSH_RETRIES = 3
+SSH_EXIT = 255
+SSH_PROBE_S = 30.0
+MIN_STEP_S = 10.0
+STATE_TIMEOUT_S = 60.0
 RECOVER_HEALTH_S = 30.0
 TUNNEL_READY_S = 15.0
 CREDIT_MARGIN_USD = 1.0
@@ -431,6 +437,14 @@ class ApiError(VastError):
 
 class Redirected(ApiError):
     pass
+
+
+class TransportError(VastError):
+    """The host gave no answer over SSH: ssh exit 255, a killed or timed-out ssh, a failed scp."""
+
+
+class HostLost(TransportError):
+    """The host stayed silent for the whole SSH window: `ssh_lost` for the attempt."""
 
 
 class CreateOutcomeUnknown(VastError):
@@ -949,8 +963,14 @@ def create_instance(api: Api, journal: Journal, package: Mapping, runner) -> int
         )
         try:
             answer = api.create(offer_id, payload)
-        except Exception as error:
-            journal.append("create_outcome_unknown", error=redact(str(error), api.key))
+        except BaseException as error:
+            # a SIGTERM (SystemExit) in flight too: the PUT may have created the instance
+            journal.append(
+                "create_outcome_unknown",
+                error=redact(f"{type(error).__name__}: {error}", api.key),
+            )
+            if not isinstance(error, Exception):
+                raise
             raise CreateOutcomeUnknown(f"create outcome unknown: {error}") from None
         instance_id = answer.get("new_contract")
         if answer.get("success") is True and type(instance_id) is int:
@@ -1275,10 +1295,11 @@ class RemoteHost:
         )
 
     def spawn(self, argv: list[str], log: str) -> None:
-        line = f"nohup {shlex.join(argv)} > {shlex.quote(log)} 2>&1 < /dev/null &"
-        done = self.run(["sh", "-c", line], timeout=60)
-        if done.returncode != 0:
-            raise VastError(f"host: cannot start {argv[0]}")
+        """Starts `argv` in the background once: an existing `log` means an earlier try whose
+        answer was lost already started it, so a retry after a transport error starts nothing."""
+        quoted = shlex.quote(log)
+        line = f"test -e {quoted} || {{ nohup {shlex.join(argv)} > {quoted} 2>&1 < /dev/null & }}"
+        _checked(self.run(["sh", "-c", line], timeout=60), f"start {argv[0]}")
 
     def put(self, local: Path, remote: str, key: str) -> None:
         check_no_secret(local.read_bytes(), key)
@@ -1289,7 +1310,7 @@ class RemoteHost:
             max_output_bytes=1 << 16,
         )
         if done.returncode != 0:
-            raise VastError(f"scp to the host failed for {Path(remote).name}")
+            raise TransportError(f"scp to the host failed for {Path(remote).name}")
 
     def get(self, remote: str, local: Path, timeout: float = 1800.0) -> None:
         source = f"{self._dest()}:{remote}"
@@ -1299,7 +1320,7 @@ class RemoteHost:
             max_output_bytes=1 << 16,
         )
         if done.returncode != 0:
-            raise VastError(f"scp from the host failed for {Path(remote).name}")
+            raise TransportError(f"scp from the host failed for {Path(remote).name}")
 
     def tunnel(self, remote_port: int, local_port: int | None = None) -> int:
         """`ssh -N -L` to the server port; returns once the local port accepts (or the ssh
@@ -1367,24 +1388,30 @@ class LocalHost(RemoteHost):
         return ["env", *(f"{k}={v}" for k, v in self.env.items()), *map(self._map, argv)]
 
     def run(self, argv: list[str], timeout: float) -> proc.RunResult:
-        if self.lost or any(argv[: len(prefix)] == prefix for prefix in self.failing):
+        if self.lost:  # as ssh: exit 255 when the host does not answer
+            return proc.run(["sh", "-c", f"exit {SSH_EXIT}"], timeout=timeout, max_output_bytes=64)
+        if any(argv[: len(prefix)] == prefix for prefix in self.failing):
             return proc.run(["false"], timeout=timeout, max_output_bytes=1 << 10)
         return proc.run(self._argv(argv), timeout=timeout, max_output_bytes=1 << 20)
 
     def spawn(self, argv: list[str], log: str) -> None:
         if self.lost:
-            raise VastError(f"host: cannot start {argv[0]}")
+            raise TransportError(f"host: start {argv[0]}: no SSH answer")
+        if os.path.exists(self._map(log)):
+            return
         handle = open(self._map(log), "wb")  # noqa: SIM115
         child, copier = proc.start(self._argv(argv), log=handle, max_log_bytes=1 << 20)
         self._spawned.append((child, copier, handle))
 
     def put(self, local: Path, remote: str, key: str) -> None:
         check_no_secret(local.read_bytes(), key)
+        if self.lost:
+            raise TransportError(f"scp to the host failed for {Path(remote).name}")
         shutil.copyfile(local, self._map(remote))
 
     def get(self, remote: str, local: Path, timeout: float = 1800.0) -> None:
         if self.lost:
-            raise VastError(f"scp from the host failed for {Path(remote).name}")
+            raise TransportError(f"scp from the host failed for {Path(remote).name}")
         shutil.copyfile(self._map(remote), local)
 
     def tunnel(self, remote_port: int, local_port: int | None = None) -> int:
@@ -1443,8 +1470,10 @@ class LocalHost(RemoteHost):
 PACKAGE_NUMBERS = ("ceiling_usd", "early_stop_usd", "deadline_minutes", "in_gb", "out_gb")
 
 
-def load_package(path: Path, models: Mapping) -> tuple[dict, str]:
-    """The approved package (JSON outside git) and its SHA-256; refuses a malformed one."""
+def load_package(path: Path, models: Mapping, *, real: bool = False) -> tuple[dict, str]:
+    """The approved package (JSON outside git) and its SHA-256; refuses a malformed one. A
+    `real` package (for a rental) must also set `weights_timeout_s` of every model: the stack's
+    3 h default is no limit for a $3 package."""
     data = Path(path).read_bytes()
     try:
         package = json.loads(data)
@@ -1506,6 +1535,8 @@ def load_package(path: Path, models: Mapping) -> tuple[dict, str]:
         for name in ("slot_minutes", "health_timeout_s", "weights_timeout_s"):
             if entry.get(name) is not None and _number(entry[name], name) <= 0:
                 raise VastError(f"package model {name} must be a positive number")
+        if real and entry.get("weights_timeout_s") is None:
+            raise VastError(f"package model {entry['name']} needs weights_timeout_s for a rental")
     names = [entry["name"] for entry in entries]
     if len(set(names)) != len(names):
         raise VastError("package lists a model twice")
@@ -1550,13 +1581,36 @@ def _check_limits(package: Mapping) -> None:
         )
 
 
+RECOVER_PAST_STOP_S = 5.0 + STATE_TIMEOUT_S
+
+
 def spend_tail_s(intervals: Mapping = INTERVALS) -> float:
     """The longest the agent runs after it stops itself (soft end or soft spend) until destroy:
-    the request in flight, the block's sync, the evidence, the server stop, the download."""
-    return REQUEST_PAST_SOFT_END_S + sum(
-        intervals[name]
-        for name in ("sync_timeout_s", "evidence_timeout_s", "stop_timeout_s", "download_timeout_s")
+    the request in flight, the check after it (`/health` and the server state, so a rule limit
+    keeps its name), the block's sync, the evidence, the server stop, the download — each
+    retry after a transport error inside its own limit (`step_until`, `tail=True`)."""
+    return (
+        REQUEST_PAST_SOFT_END_S
+        + RECOVER_PAST_STOP_S
+        + sum(
+            intervals[name]
+            for name in (
+                "sync_timeout_s",
+                "evidence_timeout_s",
+                "stop_timeout_s",
+                "download_timeout_s",
+            )
+        )
     )
+
+
+def stop_path_s(intervals: Mapping = INTERVALS) -> float:
+    """The longest `deploy` runs after SIGTERM until its DELETE is sent: the evidence, the
+    server stop, the final download and the first destroy tick (the label listing and the
+    DELETE, `HTTP_TIMEOUT_S` each). `TimeoutStopSec` must cover it; the absence check after the
+    DELETE is the watchdog's when SIGKILL comes first (0028 Д.10)."""
+    names = ("evidence_timeout_s", "stop_timeout_s", "download_timeout_s")
+    return sum(intervals[name] for name in names) + 2 * HTTP_TIMEOUT_S
 
 
 def _check_spend_margin(package: Mapping) -> None:
@@ -1743,8 +1797,19 @@ def wait_ssh(host, intervals: Mapping) -> None:
         time.sleep(intervals["ready_poll_s"])
 
 
+def _transport_failed(done: proc.RunResult) -> bool:
+    """ssh itself failed: its exit 255, or the ssh killed (by its timeout or a signal)."""
+    return done.timed_out or done.returncode == SSH_EXIT or done.returncode < 0
+
+
+def _answered(done: proc.RunResult, what: str) -> proc.RunResult:
+    if _transport_failed(done):
+        raise TransportError(f"host: {what}: no SSH answer (exit {done.returncode})")
+    return done
+
+
 def _checked(done: proc.RunResult, what: str) -> str:
-    if done.timed_out or done.returncode != 0:
+    if _answered(done, what).returncode != 0:
         raise VastError(f"host: {what} failed (exit {done.returncode})")
     return done.stdout.decode("utf-8", "replace")
 
@@ -1843,8 +1908,12 @@ def preflight(host, package: Mapping, models: Mapping, timeout: float, detail: d
         "preflight",
     )
     found["driver"] = _driver(gpu)
-    selftest_out = host.run(
-        ["python3", HOSTRUN, "selftest", "--out", f"{WORKSPACE}/out/guard-selftest.json"], timeout
+    selftest_out = _answered(
+        host.run(
+            ["python3", HOSTRUN, "selftest", "--out", f"{WORKSPACE}/out/guard-selftest.json"],
+            timeout,
+        ),
+        "selftest",
     )
     try:
         selftest = json.loads(selftest_out.stdout)
@@ -1885,10 +1954,10 @@ def start_fetch(host, journal: Journal, name: str, models: Mapping) -> None:
     journal.append("weights_started", model=name)
 
 
-def fetch_size(host, name: str) -> dict:
+def fetch_size(host, name: str, timeout: float = 60.0) -> dict:
     argv = ["python3", HOSTRUN, "size", "--dir", f"{WORKSPACE}/models/{name}"]
     argv += ["--rc-file", f"{_model_out(name)}/download.rc"]
-    return _checked_object(host.run(argv, 60), "size")
+    return _checked_object(host.run(argv, min(60.0, timeout)), "size")
 
 
 def _stop_fetch(host, name: str) -> None:
@@ -1898,12 +1967,8 @@ def _stop_fetch(host, name: str) -> None:
 
 
 def finish_fetch(
-    host,
-    attempt: Path,
-    journal: Journal,
+    run: "Run",
     name: str,
-    models: Mapping,
-    intervals: Mapping,
     *,
     timeout: float,
     late_unix: float | None = None,
@@ -1911,12 +1976,22 @@ def finish_fetch(
 ) -> Path:
     """Wait for the background download: bytes must keep growing (partial files included) and
     the exit code must be 0, else `ModelFailed`; then the host hashes every file and the receipt
-    must match the pins. `late_unix` ends the wait as `weights_late`."""
+    must match the pins. `late_unix` ends the wait as `weights_late`. Every host call goes
+    through `transport_retry`, so a network loss costs the wait, not the model."""
+    host, intervals, models = run.host, run.intervals, run.models
     detail = {} if detail is None else detail
     started = time.monotonic()
+    ends = time.time() + timeout
+
+    def until() -> float:
+        bound = step_until(run, ends - time.time())
+        return bound if late_unix is None else min(bound, late_unix)
+
     grown_at, last = started, -1
     while True:
-        found = fetch_size(host, name)
+        found = transport_retry(
+            run, f"weights {name}", lambda left: fetch_size(host, name, left), until()
+        )
         detail.update(bytes=found["bytes"], disk_free_bytes=found["disk_free_bytes"])
         now = time.monotonic()
         if found["bytes"] > last:
@@ -1940,15 +2015,25 @@ def finish_fetch(
     remote = f"{_model_out(name)}/weights-receipt.json"
     verify = ["python3", HOSTRUN, "weights", "--manifest", f"{WORKSPACE}/ss/models.json"]
     verify += ["--model", name, "--dir", target, "--out", remote]
-    host.run(verify, timeout)
-    receipts = attempt / RECEIPTS_DIR
+    transport_retry(
+        run,
+        f"verify {name}",
+        lambda left: _answered(host.run(verify, min(timeout, left)), "weights"),
+        step_until(run, timeout),
+    )
+    receipts = run.attempt / RECEIPTS_DIR
     with contextlib.suppress(FileExistsError):
         os.mkdir(receipts, 0o700)
     local = receipts / f"{name}.json"
     with contextlib.suppress(FileNotFoundError):
         local.unlink()
     try:
-        host.get(remote, local)
+        transport_retry(
+            run,
+            f"receipt {name}",
+            lambda left: host.get(remote, local, min(STATE_TIMEOUT_S, left)),
+            step_until(run, STATE_TIMEOUT_S),
+        )
         receipt = json.loads(local.read_text())
     except (VastError, OSError, ValueError):
         raise ModelFailed("weights", "no weights receipt from the host") from None
@@ -1968,11 +2053,15 @@ def pilot_clips() -> dict[str, bytes]:
     return clips
 
 
-def run_pilot(client: gate0.Client) -> dict:
-    """K1 on X1 and X2: audio tokens above zero and growing with the length (PROPOSAL § 5)."""
+def run_pilot(client: gate0.Client, transport_check: Callable | None = None) -> dict:
+    """K1 on X1 and X2: audio tokens above zero and growing with the length (PROPOSAL § 5). A
+    request without any HTTP answer goes to `transport_check` (`recover`) and, when the server
+    answers again, once more (`gate0.send_checked`)."""
     lines = []
     text = gate0.QUESTIONS["K1"]
     text_tokens = client.text_tokens(text)
+    if text_tokens is None and transport_check is not None and transport_check() == "resend":
+        text_tokens = client.text_tokens(text)
     for clip_id, wav in pilot_clips().items():
         audio = {
             "type": "input_audio",
@@ -1984,7 +2073,15 @@ def run_pilot(client: gate0.Client) -> dict:
             "max_tokens": gate0.CLOSED_MAX_TOKENS,
             **gate0.sampling("vllm"),
         }
-        status, raw, error = client.request(gate0.CHAT_ROUTE, body, timeout=gate0.REQUEST_TIMEOUT_S)
+
+        def send(write_request: bool = True, body=body) -> dict:
+            status, raw, error = client.request(
+                gate0.CHAT_ROUTE, body, timeout=gate0.REQUEST_TIMEOUT_S
+            )
+            return {"sent": True, "http_status": status, "raw": raw, "error": error}
+
+        answer, _ = gate0.send_checked(send, transport_check)
+        status, raw = answer["http_status"], answer["raw"]
         try:
             prompt = json.loads(raw)["usage"]["prompt_tokens"] if status == 200 else None
         except (ValueError, KeyError, TypeError):
@@ -1996,9 +2093,10 @@ def run_pilot(client: gate0.Client) -> dict:
             {
                 "clip": clip_id,
                 "http_status": status,
-                "error": error,
+                "error": answer["error"],
                 "prompt_tokens": prompt,
                 "audio_tokens": audio_tokens,
+                "resent_after_tunnel": answer.get("resent_after_tunnel", False),
             }
         )
     counts = [line["audio_tokens"] for line in lines]
@@ -2034,9 +2132,12 @@ def _wait_health(
     check: Callable[[], Mapping | None],
     check_every: float,
     start_grace: float,
+    reopen: Callable[[], object] = lambda: None,
 ) -> None:
     """`/health` every second until 200; every `check_every` also the server state from the
-    host, so a server that exited fails at once instead of at `timeout`."""
+    host, so a server that exited fails at once instead of at `timeout`. After each failed
+    `/health`, `reopen` opens a tunnel whose `ssh` exited again (a network loss kills it while
+    the server still loads)."""
     started = time.monotonic()
     ends, next_check = started + timeout, started + check_every
     while client.request("/health", timeout=5)[0] != 200:
@@ -2044,6 +2145,7 @@ def _wait_health(
         if now >= next_check:
             next_check = now + check_every
             _judge(check(), now - started > start_grace)
+        reopen()
         if time.monotonic() > ends:
             raise VastError("the vLLM server did not answer /health in time")
         time.sleep(1.0)
@@ -2057,15 +2159,21 @@ def _private_file(path: Path, text: str) -> None:
         os.close(fd)
 
 
-def fetch_server_evidence(
-    host, attempt: Path, journal: Journal, name: str, out: str, timeout: float = 60.0
-) -> None:
+def fetch_server_evidence(run: "Run", name: str, out: str) -> None:
     """Log tails and the process list of the host into `evidence-<name>.json` and the journal,
     while the server tree still lives. A failure is journaled, not raised, so destroy always
     follows; a cancellation (KeyboardInterrupt, SystemExit) is journaled and propagates."""
+    host, attempt, journal = run.host, run.attempt, run.journal
+    timeout = run.intervals["evidence_timeout_s"]
     try:
-        found = _checked_object(
-            host.run(["python3", HOSTRUN, "evidence", "--dir", out], timeout), "evidence"
+        found = transport_retry(
+            run,
+            f"evidence {name}",
+            lambda left: _checked_object(
+                host.run(["python3", HOSTRUN, "evidence", "--dir", out], min(timeout, left)),
+                "evidence",
+            ),
+            step_until(run, timeout, tail=True),
         )
         files = found.get("files")
         if not isinstance(files, dict) or not isinstance(found.get("processes"), list):
@@ -2102,7 +2210,7 @@ def fetch_server_evidence(
 def _state_or_none(host, out: str, journal: Journal, detail: dict) -> dict | None:
     """The server state, or None after a failed `state` call, counted in `state_errors`."""
     try:
-        return server_state(host, out, 60.0)
+        return server_state(host, out, STATE_TIMEOUT_S)
     except Exception as error:
         errors = detail.setdefault("state_errors", {"count": 0, "last": None})
         errors["count"] += 1
@@ -2286,15 +2394,84 @@ def check_credit(run: Run) -> None:
         run.spend_seen = True
 
 
-def host_reachable(run: Run) -> bool:
-    """`true` on the host within `SSH_RETRIES` tries `ssh_retry_s` apart."""
-    for number in range(SSH_RETRIES):
-        done = run.host.run(["true"], timeout=30)
-        if not done.timed_out and done.returncode == 0:
-            return True
-        if number + 1 < SSH_RETRIES:
-            time.sleep(run.intervals["ssh_retry_s"])
-    return False
+def stop_at(run: Run) -> float:
+    """The latest the agent works before it stops itself: the soft end or the moment the clock
+    estimate reaches the soft spend, else the deadline."""
+    ends = [t for t in (run.soft_end, spend_end_unix(run)) if t is not None]
+    return min(ends) if ends else run.opened["deadline_unix"]
+
+
+def step_until(run: Run, own_s: float, *, tail: bool = False) -> float:
+    """Until when a step may retry after transport errors. Before `stop_at`: its own limit, but
+    at least the SSH window `ssh_lost_s`, since a lost network is not the step's fault, and
+    never past `stop_at`. A `tail` step (sync, evidence, server stop, final download) also gets
+    its own limit after `stop_at`: `spend_tail_s` counts it."""
+    now = time.time()
+    until = min(stop_at(run), now + max(own_s, run.intervals["ssh_lost_s"]))
+    return max(until, now + own_s) if tail else until
+
+
+def await_host(run: Run, what: str, until: float, error: str, *, tunnel: bool = False) -> bool:
+    """After a transport error: `true` on the host every `ssh_retry_s` until it answers, for at
+    most `ssh_lost_s` and never past `until`; then, with `tunnel`, the tunnel opened again (a live
+    but stale `ssh` restarted). A host silent for the whole window is `ssh_lost` for the attempt
+    (`HostLost`); a destroy the watchdog asked for ends the wait at once. Journaled as
+    `transport_retry`; True when the host answered the first `true` (no outage seen)."""
+    destroyed = watchdog_destroy(run.journal)
+    if destroyed is not None:
+        run.journal.append("transport_retry", what=what, error=error, outcome="watchdog")
+        raise VastError(f"{what}: the watchdog destroyed the instance ({destroyed})")
+    started = time.time()
+    ends = min(until, started + run.intervals["ssh_lost_s"])
+    tries = 0
+    while True:
+        tries += 1
+        done = run.host.run(["true"], timeout=SSH_PROBE_S)
+        if not _transport_failed(done) and done.returncode == 0:
+            break
+        if time.time() >= ends:
+            run.fatal = run.fatal or "ssh_lost"
+            waited = round(time.time() - started, 3)
+            run.journal.append(
+                "transport_retry", what=what, error=error, outcome="ssh_lost", waited_s=waited
+            )
+            raise HostLost(f"the host does not answer over SSH ({what}, {waited:.0f} s)")
+        time.sleep(max(0.0, min(run.intervals["ssh_retry_s"], ends - time.time())))
+    reopened = bool(run.host.ensure_tunnel(force=True)) if tunnel else False
+    run.journal.append(
+        "transport_retry",
+        what=what,
+        error=error,
+        outcome="retry",
+        tries=tries,
+        waited_s=round(time.time() - started, 3),
+        tunnel_reopened=reopened,
+    )
+    return tries == 1
+
+
+def transport_retry(
+    run: Run, what: str, action: Callable[[float], object], until: float, *, tunnel: bool = False
+):
+    """The one recovery path of every host step: `action(left)` (`left`: the seconds to
+    `until`, at least `MIN_STEP_S`); after a `TransportError` the host is awaited
+    (`await_host`) and the step runs again, until `until` — the step's own end
+    (`step_until`). A step that failed `SSH_RETRIES` times while the host answered at once is
+    the step's own failure (a missing remote file, say), and its last error is raised."""
+    at_once = 0
+    while True:
+        try:
+            return action(max(MIN_STEP_S, until - time.time()))
+        except HostLost:
+            raise
+        except TransportError as error:
+            failure = error
+        if time.time() >= until:
+            raise failure
+        if await_host(run, what, until, redact(str(failure), run.journal.key), tunnel=tunnel):
+            at_once += 1
+            if at_once >= SSH_RETRIES:
+                raise failure
 
 
 def _health_within(run: Run, client: gate0.Client, seconds: float, state: Callable) -> int | None:
@@ -2325,7 +2502,8 @@ def recover(
     run: Run, client: gate0.Client, out: str, name: str, after_timeout: bool = False
 ) -> str:
     """After a request without any HTTP answer (or, `after_timeout`, one that ran out of time):
-    first the host (a brief network loss gets `SSH_RETRIES`), then the server's state, then the
+    first the host (`await_host` up to `ssh_lost_s`, never past `stop_at`), then the server's
+    state, then the
     tunnel — `/health` through the one in hand, else it is opened again (a live but stale `ssh`
     restarted) and `/health` asked for up to `RECOVER_HEALTH_S`. `resend` only when the server
     answers again; after a timeout a tunnel that still carries `/health` means the request
@@ -2347,10 +2525,13 @@ def recover(
     stopped = soft_stop(run)
     outcome, reopened, health = None, False, None
     if state is None and stopped is None:
-        if host_reachable(run):
+        try:
+            await_host(run, f"request {name}", stop_at(run), "no server state")
             state = _state_or_none(run.host, out, run.journal, detail)
-        else:
-            run.fatal = outcome = "ssh_lost"
+        except HostLost:
+            outcome = "ssh_lost"
+        except VastError:
+            outcome = "watchdog"
     if outcome is None:
         try:
             _judge(state, late=True)
@@ -2387,10 +2568,16 @@ def recover(
 def wait_gpu_free(run: Run) -> dict:
     """GPU memory below `GPU_FREE_MIB` before the next server: the driver may free the last
     one's memory late, and vLLM checks the free memory at start."""
-    ends = time.monotonic() + run.intervals["gpu_free_timeout_s"]
+    limit = run.intervals["gpu_free_timeout_s"]
+    ends = time.monotonic() + limit
     argv = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
     while True:
-        done = run.host.run(argv, 30)
+        done = transport_retry(
+            run,
+            "gpu_free",
+            lambda left: _answered(run.host.run(argv, min(SSH_PROBE_S, left)), "nvidia-smi"),
+            step_until(run, limit),
+        )
         try:
             used = (
                 sum(int(v) for v in done.stdout.decode().split()) if done.returncode == 0 else None
@@ -2409,13 +2596,15 @@ def sync(run: Run, label: str) -> None:
     run.syncs += 1
     number = run.syncs
     started = time.time()
+    limit = run.intervals["sync_timeout_s"]
     try:
-        found = download(
-            run.host,
-            run.attempt,
-            run.journal,
-            run.intervals["sync_timeout_s"],
-            name=f"sync-{number}",
+        found = transport_retry(
+            run,
+            f"sync-{number}",
+            lambda left: download(
+                run.host, run.attempt, run.journal, min(limit, left), name=f"sync-{number}"
+            ),
+            step_until(run, limit, tail=True),
         )
     except Exception as error:
         run.journal.append(
@@ -2444,12 +2633,12 @@ def run_extended(run: Run, entry: Mapping, client: gate0.Client, out: str) -> di
     directory, manifest, entries = run.extended
     slot = entry.get("slot_minutes")
     slot_end = None if slot is None else time.time() + slot * 60
-    first: dict = {}
-    try:
-        _judge(_state_or_none(run.host, out, run.journal, first), late=True)
-        initial = None
-    except ServerExited:
-        initial = "server_exited"
+    initial = None
+    if soft_stop(run) is None:  # past the stop every block is not_sent: no probe in the tail
+        try:
+            _judge(_state_or_none(run.host, out, run.journal, {}), late=True)
+        except ServerExited:
+            initial = "server_exited"
 
     def stop() -> str | None:
         reason = initial or soft_stop(run)
@@ -2461,7 +2650,8 @@ def run_extended(run: Run, entry: Mapping, client: gate0.Client, out: str) -> di
         run.journal.append("block_done", model=name, block=block, **record)
         run.hook("block_end", model=name, block=block)
         sync(run, f"{name}:{block}")
-        check_credit(run)
+        if soft_stop(run) is None:
+            check_credit(run)
 
     attempt_name = f"{run.opened['attempt_id']}-{name}"
     target = gpu_ext.new_attempt(directory, attempt_name, run.config_)
@@ -2523,26 +2713,57 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
     serve += vllm_argv(f"{WORKSPACE}/models/{name}", name, host.server_port)
     result: dict = {}
     fetched = False
+    health_s = entry.get("health_timeout_s") or intervals["health_timeout_s"]
+
+    def state_now(detail: dict) -> dict | None:
+        """The server state while it loads: a lost network is awaited and the tunnel reopened
+        (`transport_retry`); any other failure is counted and read as unknown."""
+        try:
+            return transport_retry(
+                run,
+                f"state {name}",
+                lambda left: server_state(host, out, min(STATE_TIMEOUT_S, left)),
+                step_until(run, STATE_TIMEOUT_S),
+                tunnel=True,
+            )
+        except HostLost:
+            raise
+        except VastError as error:
+            errors = detail.setdefault("state_errors", {"count": 0, "last": None})
+            errors["count"] += 1
+            errors["last"] = redact(f"{type(error).__name__}: {error}", journal.key)
+            return None
+
     try:
         try:
             with _step(journal, "smoke", model=name) as detail:
-                host.spawn(serve, f"{out}/hostrun.log")
+                transport_retry(
+                    run,
+                    f"serve {name}",
+                    lambda left: host.spawn(serve, f"{out}/hostrun.log"),
+                    step_until(run, intervals["server_start_s"]),
+                )
                 port = host.tunnel(host.server_port)
                 client = gate0.Client(port, name)
                 try:
                     _wait_health(
                         client,
-                        entry.get("health_timeout_s") or intervals["health_timeout_s"],
-                        lambda: _state_or_none(host, out, journal, detail),
+                        health_s,
+                        lambda: state_now(detail),
                         intervals["server_check_s"],
                         intervals["server_start_s"],
+                        host.ensure_tunnel,
                     )
                 except ServerExited as error:
                     detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
                     raise ModelFailed("smoke", str(error)) from None
                 except VastError as error:
                     raise ModelFailed("smoke", str(error)) from None
-                pilot = run_pilot(client)
+                run.hook("pilot", model=name)
+                pilot = run_pilot(
+                    client,
+                    lambda after_timeout=False: recover(run, client, out, name, after_timeout),
+                )
                 (run.attempt / f"pilot-{name}.json").write_text(json.dumps(pilot, indent=2) + "\n")
                 detail.update(pilot_ok=pilot["ok"], tunnel_port=port)
                 if not pilot["ok"]:
@@ -2579,10 +2800,14 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                     reason=verdict["reason"],
                     stop_reason=verdict.get("stop_reason"),
                 )
-                try:
-                    _judge(_state_or_none(host, out, journal, detail), late=True)
-                except ServerExited as error:
-                    detail["server_exit"] = {"reason": error.reason, "returncode": error.returncode}
+                if soft_stop(run) is None:  # past the stop the tail takes no extra probe
+                    try:
+                        _judge(_state_or_none(host, out, journal, detail), late=True)
+                    except ServerExited as error:
+                        detail["server_exit"] = {
+                            "reason": error.reason,
+                            "returncode": error.returncode,
+                        }
             after_gate0()
             if run.extended is not None:
                 try:
@@ -2594,31 +2819,39 @@ def serve_model(run: Run, entry: Mapping, receipt: Path, after_gate0=lambda: Non
                         f"{type(error).__name__}: {error}", run.api.key
                     )
             fetched = True
-            fetch_server_evidence(
-                host, run.attempt, journal, name, out, intervals["evidence_timeout_s"]
-            )
+            fetch_server_evidence(run, name, out)
         except BaseException:
             if not fetched:
-                fetch_server_evidence(
-                    host, run.attempt, journal, name, out, intervals["evidence_timeout_s"]
-                )
+                fetch_server_evidence(run, name, out)
             raise
     finally:
         stop = ["python3", HOSTRUN, "stop", "--pid-file", f"{out}/serve.pid"]
-        stopped = host.run(
-            [*stop, "--stats", f"{out}/server-stats.jsonl"], intervals["stop_timeout_s"]
-        )
+        stop += ["--stats", f"{out}/server-stats.jsonl"]
+        last: dict = {}
+        limit = intervals["stop_timeout_s"]
+
+        def stop_server(left: float) -> str:
+            last["done"] = done = host.run(stop, min(limit, left))
+            return _checked(done, "stop")
+
+        failed = None
+        try:
+            transport_retry(run, f"stop {name}", stop_server, step_until(run, limit, tail=True))
+        except VastError as error:
+            failed = error
+        done = last.get("done")
         with contextlib.suppress(BaseException):
             journal.append(
                 "server_stopped",
                 model=name,
-                returncode=stopped.returncode,
-                timed_out=stopped.timed_out,
+                returncode=None if done is None else done.returncode,
+                timed_out=None if done is None else done.timed_out,
+                error=None if failed is None else redact(str(failed), journal.key),
             )
         # a server left running is fatal whether or not this model failed first; only a
         # cancellation in flight keeps its own exception
         cancelled = isinstance(sys.exc_info()[1], KeyboardInterrupt | SystemExit)
-        if (stopped.timed_out or stopped.returncode != 0) and not cancelled:
+        if failed is not None and not cancelled:
             destroyed = watchdog_destroy(journal)
             if run.fatal == "ssh_lost":
                 raise AttemptFatal(
@@ -2700,7 +2933,13 @@ def download(
     digest = _sha256(local)
     if digest != printed.get("archive_sha256"):
         raise VastError("downloaded archive SHA-256 differs from the host's")
-    files = verify_archive(local, attempt / (HOST_DIR if name == "results" else f"host-{name}"))
+    target = attempt / (HOST_DIR if name == "results" else f"host-{name}")
+    if target.exists():  # an earlier try of this download, cut short: kept beside it
+        number = 1
+        while target.with_name(f"{target.name}-failed-{number}").exists():
+            number += 1
+        os.rename(target, target.with_name(f"{target.name}-failed-{number}"))
+    files = verify_archive(local, target)
     found = {
         "archive_sha256": digest,
         "files": files,
@@ -2715,19 +2954,24 @@ def ensure_weights(run: Run, entry: Mapping, late_unix: float | None) -> Path:
     name = entry["name"]
     with _step(run.journal, "weights", model=name) as detail:
         if name not in run.fetching:
-            start_fetch(run.host, run.journal, name, run.models)
-            run.fetching.add(name)
+            start_weights(run, name)
         return finish_fetch(
-            run.host,
-            run.attempt,
-            run.journal,
+            run,
             name,
-            run.models,
-            run.intervals,
             timeout=entry.get("weights_timeout_s") or run.intervals["weights_timeout_s"],
             late_unix=late_unix,
             detail=detail,
         )
+
+
+def start_weights(run: Run, name: str) -> None:
+    transport_retry(
+        run,
+        f"start weights {name}",
+        lambda left: start_fetch(run.host, run.journal, name, run.models),
+        step_until(run, run.intervals["command_timeout_s"]),
+    )
+    run.fetching.add(name)
 
 
 def _failed_step(journal: Journal, name: str) -> str | None:
@@ -2756,12 +3000,12 @@ def run_models(run: Run) -> list[dict]:
     late_minutes = run.package.get("weights_late_minutes")
 
     def start_next(index: int) -> None:
-        if index + 1 < len(entries):
+        # past the stop the next model never runs: its weights would only lengthen the tail
+        if index + 1 < len(entries) and soft_stop(run) is None:
             name = entries[index + 1]["name"]
             if name not in run.fetching:
                 try:
-                    start_fetch(run.host, run.journal, name, run.models)
-                    run.fetching.add(name)
+                    start_weights(run, name)
                 except Exception as error:
                     run.journal.append("weights_start_failed", model=name, error=str(error))
 
@@ -2807,7 +3051,7 @@ def run_models(run: Run) -> list[dict]:
                 kind = "skipped" if step == "gpu_free" else "failed"
                 message = redact(getattr(error, "reason", None) or str(error), run.api.key)
                 outcome = {"model": name, "outcome": kind, "step": step, "reason": message}
-                if not host_reachable(run):
+                if run.fatal == "ssh_lost":  # `await_host` gave the host its whole window
                     run.journal.append("model_outcome", **outcome)
                     raise AttemptFatal("the host does not answer over SSH") from None
         run.journal.append("model_outcome", **outcome)
@@ -2834,7 +3078,7 @@ def run_attempt(
     """Every step of one attempt. Each model is isolated (`run_models`); whatever happens the
     host's results are downloaded while the host answers and the watchdog is not destroying,
     then destroy and the absence check follow. Raises when no model gave a Gate 0 verdict."""
-    package, package_sha = load_package(package_path, models)
+    package, package_sha = load_package(package_path, models, real=not dry_run)
     if not dry_run and not (approval_url or "").startswith("https://github.com/"):
         raise VastError("deploy needs --approval with the link to the owner's approval")
     check_days(package, config_)
@@ -2909,8 +3153,20 @@ def run_attempt(
             wait_ssh(run.host, intervals)
             detail["status"] = instance.get("actual_status")
         with _step(journal, "preflight") as detail:
-            detail["host_files"] = upload_host_files(run.host, attempt, models, api.key, timeout)
-            preflight(run.host, package, models, timeout, detail)
+            detail["host_files"] = transport_retry(
+                run,
+                "upload",
+                lambda left: upload_host_files(
+                    run.host, attempt, models, api.key, min(timeout, left)
+                ),
+                step_until(run, timeout),
+            )
+            transport_retry(
+                run,
+                "preflight",
+                lambda left: preflight(run.host, package, models, min(timeout, left), detail),
+                step_until(run, timeout),
+            )
         outcomes = run_models(run)
     except BaseException as error:
         failure = error
@@ -2919,23 +3175,26 @@ def run_attempt(
         if run.host is not None:
             state = summarize(journal.replay())
             if state["closed"] is None and not state["destroy_requested"]:
-                # `systemctl stop` (KillMode=control-group) also kills an ssh or scp in flight,
-                # so after a signal a failed download gets one more try
-                for number in (1, 2):
-                    if number == 2 and (attempt / HOST_DIR).exists():
-                        os.rename(attempt / HOST_DIR, attempt / f"{HOST_DIR}-failed-1")
-                    try:
-                        with _step(journal, "download") as detail:
-                            detail.update(
-                                download(
-                                    run.host, attempt, journal, intervals["download_timeout_s"]
-                                )
+                # a network loss, and `systemctl stop` (KillMode=control-group) killing the ssh
+                # or scp in flight, are transport errors: retried within the download's limit
+                limit = intervals["download_timeout_s"]
+                try:
+                    with _step(journal, "download") as detail:
+                        detail.update(
+                            transport_retry(
+                                run,
+                                "download",
+                                lambda left: download(run.host, attempt, journal, min(limit, left)),
+                                step_until(run, limit, tail=True),
                             )
-                        break
-                    except BaseException as error:
-                        if number == 2 or run.fatal != "cancelled":
-                            failure = failure or error
-                            break
+                        )
+                except BaseException as error:
+                    destroyed = watchdog_destroy(journal)
+                    cut = destroyed and VastError(
+                        f"final download cut: the watchdog destroyed the instance ({destroyed}); "
+                        "only the syncs and the client's answers are on the station"
+                    )
+                    failure = failure or cut or error
             else:
                 journal.append("download_skipped", reason="the watchdog is destroying the instance")
                 failure = failure or VastError(
@@ -3046,7 +3305,7 @@ DRY_PACKAGE = {
     "envelope": {"dph_total": {"lte": 1.533}, "num_gpus": {"eq": 1}, "gpu_ram": {"gte": 79000}},
     "ceiling_usd": 4.0,
     "early_stop_usd": 2.5,
-    "spend_soft_usd": 2.1,
+    "spend_soft_usd": 2.0,
     "deadline_minutes": 100,
     "soft_end_minutes": 85,
     "weights_late_minutes": 1,
@@ -3235,8 +3494,9 @@ def launch_argv(
     deadline + 15 min): the checkout as working directory (the package's decision paths are
     relative), `SOUND_SCOUT_CONFIG` absolute, the checkout's own `.venv` python, `systemd-inhibit`
     against sleep, stdout and stderr appended under `logs`. A `systemctl --user stop` sends
-    SIGTERM, which `deploy` turns into download and destroy; `TimeoutStopSec` leaves that path
-    its evidence, stop, download and destroy timeouts before SIGKILL."""
+    SIGTERM, which `deploy` turns into download and destroy; `TimeoutStopSec` covers that path
+    up to the DELETE (`stop_path_s`) before SIGKILL; the watchdog timers finish the absence
+    check if it comes."""
     return [
         "systemd-run",
         "--user",
@@ -3278,7 +3538,7 @@ def prepare_launch(package: Path, approval: str, root: Path = REPO_ROOT) -> dict
         raise VastError(f"no .venv/bin/python in {root}")
     config_ = config.load()
     package = Path(package).absolute()
-    loaded, package_sha = load_package(package, MODELS)
+    loaded, package_sha = load_package(package, MODELS, real=True)
     check_days(loaded, config_)
     check_extended(loaded, config_)
     stamp = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
