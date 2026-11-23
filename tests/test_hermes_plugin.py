@@ -1228,8 +1228,8 @@ def test_journal_lookups_flag_a_journal_grep_for_the_mount_line() -> None:
 
 
 EVIDENCE = re.compile(r"issues/\d+#issuecomment-\d+")
-PROVEN = ("1", "2", "3", "4а", "5а", "5б", "5в", "6")
-UNPROVEN = {"4б": "issues/105", "4в": "issues/108"}
+PROVEN = ("1", "2", "3", "4а", "4б", "4в", "5а", "5б", "5в", "6")
+PROVEN_BY = {"4б": "issues/105#issuecomment-", "4в": "issues/108#issuecomment-"}
 
 
 def _results(section: str) -> dict[str, tuple[str, str]]:
@@ -1249,13 +1249,8 @@ def _unsupported_results(results: dict[str, tuple[str, str]]) -> list[str]:
         or not results[criterion][0].startswith("выполнено")
         or not EVIDENCE.search(results[criterion][1])
     ]
-    wrong += [
-        criterion
-        for criterion, issue in UNPROVEN.items()
-        if criterion not in results
-        or not results[criterion][0].startswith("не доказано")
-        or issue not in results[criterion][1]
-    ]
+    wrong += [c for c, link in PROVEN_BY.items() if c in results and link not in results[c][1]]
+    wrong += [c for c, cells in results.items() if cells[0].startswith("не доказано")]
     wrong += [c for c, cells in results.items() if "прогона не было" in " ".join(cells)]
     return sorted(set(wrong))
 
@@ -1275,16 +1270,26 @@ def test_criterion_6_decision_records_the_results_with_evidence() -> None:
 
 def test_results_check_refuses_a_row_without_a_run_or_evidence() -> None:
     link = "[#96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-1)"
-    rows = [f"| {c}. x | y | выполнено | {link} |" for c in PROVEN if c != "3"]
-    rows += [
-        f"| {c}. x | y | не доказано | [#](https://x/{issue}) |" for c, issue in UNPROVEN.items()
-    ]
+    rows = [f"| {c}. x | y | выполнено | {link} |" for c in PROVEN if c not in ("3", *PROVEN_BY)]
+    rows += [f"| {c}. x | y | выполнено | [#](https://x/{to}1) |" for c, to in PROVEN_BY.items()]
     good = _results("\n".join([*rows, f"| 3. x | y | выполнено | {link} |"]))
     assert _unsupported_results(good) == []
     stale = _results("\n".join([*rows, f"| 3. x | y | не выполнено: прогона не было | {link} |"]))
     assert _unsupported_results(stale) == ["3"]
     bare = _results("\n".join([*rows, "| 3. x | y | выполнено | тест |"]))
     assert _unsupported_results(bare) == ["3"]
+    other_issue = _results(
+        "\n".join([*rows, f"| 3. x | y | выполнено | {link} |"]).replace(
+            "issues/105#", "issues/96#"
+        )
+    )
+    assert _unsupported_results(other_issue) == ["4б"]
+    waiting = _results(
+        "\n".join(
+            [*rows, f"| 3. x | y | выполнено | {link} |", f"| 7. x | y | не доказано | {link} |"]
+        )
+    )
+    assert _unsupported_results(waiting) == ["7"]
 
 
 def test_the_control_link_queries_are_one_argv_item_each_and_the_cli_checks_them(

@@ -1,8 +1,9 @@
 # 0015 — Spike B: пакет-заглушка на backend (ctx.rest, доставка заметки, запуск runner)
 
-- **Статус:** результаты записаны (2026-11-21): критерии 1–3 и 5 выполнены, 4а выполнен через
-  production-доставку; 4б и 4в не доказаны —
-  [#105](https://github.com/renidere/sound-scout-plugin/issues/105) и
+- **Статус:** результаты записаны (2026-11-21, дополнено 2026-11-23): все критерии записаны,
+  открытых строк нет. Критерии 1–3 и 5 выполнены, 4а выполнен через production-доставку, 4б —
+  прогоном владельца в [#105](https://github.com/renidere/sound-scout-plugin/issues/105), 4в
+  записан: директива не используется, её убрала
   [#108](https://github.com/renidere/sound-scout-plugin/issues/108). Инструкцию зонда после этапа B
   0017 не выполняют.
 - **Дата:** 2026-11-20.
@@ -268,19 +269,19 @@ gh issue comment 96 --repo renidere/sound-scout-plugin --body-file <файл с 
 | 2. инструкция включения и удаления | этот документ, разделы «Инструкция владельцу» и «Удаление» | выполнено в репозитории | [#96 7024144812](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024144812); установка production-пакета при `in_process` по умолчанию — [#104 7060137735](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7060137735), [#104 7062974709](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7062974709) |
 | 3. `GET /health` через `ctx.rest` с Windows | `ok`, `pid` = `MainPID` gateway, `session_owner` | выполнено: production health 0.1.0, `session_owner=true`, `pid` = `MainPID` | палитра Desktop 0.23.3 → `Sound Scout: health`, `pid` = `MainPID` `hermes-gateway.service`: [#120 7062836106](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7062836106), [#120 7062968106](https://github.com/renidere/sound-scout-plugin/issues/120#issuecomment-7062968106) |
 | 4а. заметка в открытый чат | ровно одна заметка, `state=delivered` | выполнено по смыслу: production-доставка, ровно одно сообщение с меткой; состояние чата не записано | поток `sound-scout-delivery` в процессе gateway — [#104 7060137735](https://github.com/renidere/sound-scout-plugin/issues/104#issuecomment-7060137735); метка задания ровно в одном сообщении Desktop-чата владельца — [#114 7060137985](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7060137985); вторая сессия, Hermes v0.23.3 — [#114 7063057772](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7063057772) |
-| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | не доказано: проверяет #105 | Desktop-чат не закрывали; проверяет [#105](https://github.com/renidere/sound-scout-plugin/issues/105) |
-| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | не доказано: заметка без директивы, запасной путь 0013 § 3.7; карточка — #108 | Decision в #102 [#102 7026672015](https://github.com/renidere/sound-scout-plugin/issues/102#issuecomment-7026672015); карточка — [#108](https://github.com/renidere/sound-scout-plugin/issues/108) |
+| 4б. заметка в закрытый чат | ровно одна заметка после открытия, в другом чате ничего | выполнено (production, Windows): задание `ded07379…`, Desktop отключился в 15:18:15 UTC во время анализа, заметка доставлена в 15:18:39 (`delivered`, `confirmed_by = send`) до нового подключения в 15:18:46; метка задания ровно в одном сообщении `state.db`, в чате X; в других чатах метки нет. Не показано: ручное переименование X в `state.db` не видно (`title_source = llm`); что владелец увидел заметку после открытия, в комментарии не записано | Hermes v0.23.3 `caafe5389a`, Desktop 0.23.3, `plugin.js` `5f6b58f1…`, пакет 0.1.0: [#105 7105419047](https://github.com/renidere/sound-scout-plugin/issues/105#issuecomment-7105419047) |
+| 4в. директива `::sound-scout-report` | карточка или строка текста, для обеих заметок | выполнено: записано — директива не используется. Её отрисовку вживую не проверяли; #108 убрала её, заметка — простой текст, карточка задания показывается опросом `GET /jobs/{id}` (запасной путь 0013 § 3.7 стал production-путём) | Decision в #102 [#102 7026672015](https://github.com/renidere/sound-scout-plugin/issues/102#issuecomment-7026672015); директива убрана, карточка — [#108 7111247942](https://github.com/renidere/sound-scout-plugin/issues/108#issuecomment-7111247942) (`fe996f4`, `4173417`); выкладка на станцию — [#105 7111246230](https://github.com/renidere/sound-scout-plugin/issues/105#issuecomment-7111246230) |
 | 5а. unit вне cgroup gateway | `ControlGroup` вне `hermes-gateway.service` | выполнено (зонд, Linux): `ControlGroup=…/app.slice/sound-scout-spike-b.service` | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870) |
 | 5б. unit переживает перезапуск gateway | тот же `MainPID`, `ActiveState=active` | выполнено (зонд, Linux): `MainPID` 725759 до и после `restart hermes-autonomous.service`, `ActiveState=active`; production: runner `sound-scout-jobs-runner.service` пережил два перезапуска `hermes-gateway.service` | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870); production — [#114 7063057772](https://github.com/renidere/sound-scout-plugin/issues/114#issuecomment-7063057772) |
 | 5в. повторный старт живого unit | отказ systemd | выполнено (зонд, Linux): `returncode=1`, `Unit sound-scout-spike-b.service was already loaded`; unit остановлен | [#96 7024288870](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7024288870) |
 | 6. запись результатов | эта таблица заполнена | выполнено: эта таблица | [#96](https://github.com/renidere/sound-scout-plugin/issues/96#issuecomment-7065924531) |
 
 Что заменило зонд. Маршруты `/spike/*` убраны: production-копия 0.1.0 заменила зонд в gateway
-([#128 7060138271](https://github.com/renidere/sound-scout-plugin/issues/128#issuecomment-7060138271)). Критерии 3, 4а и 5 подтверждены production-путём #104, #114 и #120.
+([#128 7060138271](https://github.com/renidere/sound-scout-plugin/issues/128#issuecomment-7060138271)). Критерии 3, 4а, 4б и 5 подтверждены production-путём #104, #105, #114 и #120.
 Повторный прогон зонда запрещён: он вернул бы тестовые маршруты в живой gateway.
 
-Если директива не рисуется (заметки cron хранятся как `internal_notification`), действует запасной
-путь 0013 § 3.7: простой текст в заметке и карточка через опрос `GET /jobs/<id>`.
+Директива `sound-scout-report` в заметке не используется (#108): заметка — простой текст, карточка
+задания показывается опросом `GET /jobs/<id>`. Это запасной путь 0013 § 3.7, теперь production-путь.
 
 ## Удаление
 
