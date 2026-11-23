@@ -222,7 +222,7 @@ function textContent(node) {
 }
 
 function findButton(node, label) {
-  if (node?.type === 'button' && textContent(node) === label) return node
+  if (node?.type === 'Button' && textContent(node) === label) return node
   return [].concat(node?.props?.children || []).map(child => findButton(child, label)).find(Boolean)
 }
 
@@ -365,7 +365,7 @@ test('the registered recorder shows the restored draft with Delete, and Delete r
   const ctx = fakeCtx()
   const plugin = await loadPlugin({ path: RECORDER_PATH, globals: { ...env, indexedDB: idb }, sdk: { host: fake.host } })
   plugin.default.register(ctx)
-  const element = ctx.registered[0].render()
+  const element = ctx.registered.find(item => item.id === 'record').render()
   const render = () => element.type(element.props)
   for (let i = 0; i < 50 && element.props.recorder.state.get().phase !== 'ready'; i++) await tick()
   assert.match(textContent(render()), /Неотправленная запись/)
@@ -420,7 +420,7 @@ test('the registered recorder renders the not-protected note while the WAV waits
   const ctx = fakeCtx()
   const plugin = await loadPlugin({ path: RECORDER_PATH, globals: { ...env, indexedDB: fakeIndexedDB({ fail: 'open' }) }, sdk: { host: fake.host } })
   plugin.default.register(ctx)
-  const element = ctx.registered[0].render()
+  const element = ctx.registered.find(item => item.id === 'record').render()
   const render = () => element.type(element.props)
   const recorder = element.props.recorder
   await recorder.start()
