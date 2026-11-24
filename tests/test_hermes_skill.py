@@ -136,6 +136,10 @@ PLAIN_SEND_TERMS = (
     "прочитать это задание по `job_id` из метки заметки через `speech_job_status` и "
     "`speech_job_result`",
 )
+# The model sees only the description in the skill index, not the body (#177): the description
+# itself says a voice message without an explicit request needs no tool call.
+DESCRIPTION_TERMS = ("просьб", "голосовое", "без вызова")
+OLD_DESCRIPTION = "Разбор русской речи из аудиовложения (Sound Scout)."
 JOB_CLAIM = re.compile(
     r"(?<!не говорить, что )задани[ея] (?:этой |новой )?(?:записи )?(?:уже )?(?:есть|нет)"
 )
@@ -170,7 +174,15 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
         problems.append(f"name {name!r} does not match the directory {directory!r}")
     if not description or len(description) > DESCRIPTION_LIMIT:
         problems.append(f"description of {len(description)} characters")
+    problems += description_problems(description)
     return problems
+
+
+def description_problems(description: str) -> list[str]:
+    """The index line exempts a voice message sent without an explicit request (#177)."""
+    if all(term in description for term in DESCRIPTION_TERMS):
+        return []
+    return ["description does not exempt a plain voice message"]
 
 
 def procedure_problems(text: str) -> list[str]:
@@ -365,7 +377,7 @@ def test_plain_send_matches_no_note_to_a_recording_and_reads_a_job_by_the_note_t
     assert OLD_NOTE_MATCH not in flat(text)
     assert plain.index("Приходит она только после конца задания") < plain.index("пункту 6")
     assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
-    assert frontmatter(text)["version"] == "0.5.2"
+    assert frontmatter(text)["version"] == "0.5.3"
 
 
 def test_plain_send_facts_agree_with_the_note_and_the_recorder() -> None:
@@ -534,7 +546,29 @@ def test_lint_reports_a_long_description_and_a_wrong_name() -> None:
     assert skill_problems(text, "speech_review") == [
         "name 'speech-review' does not match the directory 'speech_review'",
         f"description of {len(long)} characters",
+        "description does not exempt a plain voice message",
     ]
+
+
+def test_description_says_a_voice_message_without_a_request_needs_no_tool_call() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    description = frontmatter(text)["description"]
+    assert len(description) <= DESCRIPTION_LIMIT
+    assert all(term in description for term in DESCRIPTION_TERMS)
+    assert description_problems(description) == []
+    assert frontmatter(text)["version"] == "0.5.3"
+
+
+def test_lint_reports_the_old_description_that_invites_a_call_on_any_attachment() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = re.sub(r"^description: .*$", f"description: {OLD_DESCRIPTION}", text, count=1, flags=re.M)
+    assert len(OLD_DESCRIPTION) <= DESCRIPTION_LIMIT
+    assert skill_problems(old) == ["description does not exempt a plain voice message"]
+    for term in DESCRIPTION_TERMS:
+        without = frontmatter(text)["description"].replace(term, "")
+        assert description_problems(without) == [
+            "description does not exempt a plain voice message"
+        ]
 
 
 def test_skill_triggers_on_an_audio_message_an_exercise_and_a_control_attempt() -> None:

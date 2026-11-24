@@ -1450,6 +1450,19 @@ def test_speech_job_redeliver_description_limits_it_to_the_users_explicit_reques
     assert "speech_job_redeliver only on the user's explicit request" in mcp_server.INSTRUCTIONS
 
 
+def test_speech_analyze_description_sends_chat_attachments_to_the_job_tools() -> None:
+    tool = next(tool for tool in mcp_server.TOOLS if tool.name == "speech_analyze")
+    text = " ".join(tool.description.split())
+    assert "Not for audio attachments or voice messages in a chat" in text
+    assert "speech_job_submit only on the user's explicit request" in text
+    assert "the recorder showed «разбор принят» or a job card is already queued" in text
+    assert "sent with «Отправить и разобрать» is already queued" not in text
+    assert "refused busy while the jobs runner works" in text
+    assert text.startswith("Analyze one recording of Russian speech")
+    others = [tool.description for tool in mcp_server.TOOLS if tool.name != "speech_analyze"]
+    assert not any("Not for audio attachments" in other for other in others)
+
+
 def test_docs_mcp_describes_speech_job_redeliver_and_no_longer_calls_it_cli_only() -> None:
     text = " ".join((REPO / "docs" / "mcp.md").read_text(encoding="utf-8").split())
     assert "есть только в CLI" not in text

@@ -187,7 +187,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_analyze",
-  "description": "Analyze one recording of Russian speech: transcript, acoustic measurements and the audio backend's observations, each with its own status. Writes a run directory under the server's data root and answers with a compact summary (statuses, coverage, up to three findings, limitations, links into the run directory). The same request_id with the same file returns the earlier result; with another file it is refused.",
+  "description": "Analyze one recording of Russian speech: transcript, acoustic measurements and the audio backend's observations, each with its own status. Writes a run directory under the server's data root and answers with a compact summary (statuses, coverage, up to three findings, limitations, links into the run directory). The same request_id with the same file returns the earlier result; with another file it is refused. Not for audio attachments or voice messages in a chat: a chat agent uses the speech_job_* tools (speech_job_submit only on the user's explicit request), and a recording for which the recorder showed «разбор принят» or a job card is already queued. A call here holds the analysis lock and is refused busy while the jobs runner works.",
   "inputSchema": {
     "type": "object",
     "properties": {

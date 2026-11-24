@@ -1,7 +1,7 @@
 ---
 name: speech-review
-description: Разбор русской речи из аудиовложения (Sound Scout).
-version: 0.5.2
+description: Разбор речи по явной просьбе; голосовое без неё — без вызова
+version: 0.5.3
 author: Sound Scout
 metadata:
   hermes:
