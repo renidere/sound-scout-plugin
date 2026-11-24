@@ -3352,6 +3352,151 @@ def test_a_second_signal_inside_the_first_handler_at_the_lock_exit_still_closes_
     assert calls == [signal.SIGHUP]  # the first deferred handler ends the window's run
 
 
+_LOCK_PROBE = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("free")
+except BlockingIOError:
+    print("busy")
+"""
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("handlers", ["cancel", "defer"])
+def test_a_signal_in_the_lock_enter_after_its_yield_runs_at_the_body_start(
+    tmp_path: Path, handlers: str, signum: int
+) -> None:
+    """A real signal lands at each point of `contextlib`'s `__enter__` after `next(self.gen)`
+    returns: the end of that call, where the interpreter checks for signals, and each
+    instruction after it. Its handler runs once, at the start of the body, before the body's
+    work, and the body runs outside the window (#178)."""
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    run = vast.Run(None, journal, {}, {}, None, {}, None)
+    enter_code = contextlib._GeneratorContextManager.__enter__.__code__
+    state = {}
+
+    def point(*_args):
+        frame = sys._getframe(1)
+        gen = getattr(frame.f_locals.get("self"), "gen", None)
+        if state["armed"] and getattr(gen, "gi_code", None) is vast._LOCK_CODE and gen.gi_suspended:
+            state["seen"] += 1
+            if state["seen"] == state["point"] + 1:
+                state.update(armed=False, fired=True)
+                signal.raise_signal(signum)
+
+    def released(at: int) -> None:
+        assert journal._held == 0, at
+        assert vast._LOCK_WINDOW.pending is None, at
+        assert sorted(os.listdir("/proc/self/fd")) == fds, at
+        probe = subprocess.run(
+            [sys.executable, "-c", _LOCK_PROBE, str(journal.dir / vast.LOCK_FILE)],
+            capture_output=True,
+            text=True,
+        )
+        assert probe.stdout.strip() == "free", (at, probe.stdout, probe.stderr)
+
+    monitoring, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+    events = monitoring.events
+    monitoring.use_tool_id(tool, "lock-signal-test")
+    monitoring.register_callback(tool, events.C_RETURN, point)
+    monitoring.register_callback(tool, events.INSTRUCTION, point)
+    saved = vast.cancel_on_signals(run)
+    fds = sorted(os.listdir("/proc/self/fd"))
+    try:
+        for at in itertools.count():
+            vast.cancel_on_signals(run)  # the cancel ignores both signals once it ran
+            if handlers == "defer":
+                vast.defer_signals(run, saved)
+            state.update(point=at, seen=0, armed=True, fired=False, window="unset")
+            run.fatal = None
+            start = len(journal.replay())
+            exited = False
+            monitoring.set_local_events(tool, enter_code, events.CALL | events.INSTRUCTION)
+            try:
+                with journal.lock():
+                    state["armed"] = False
+                    journal.append("body")
+                    state["window"] = vast._LOCK_WINDOW.pending
+            except SystemExit as error:
+                exited = True
+                assert error.code == 128 + signum, at
+                released(at)  # while the exception lives, as in the attempt's `finally`
+            finally:
+                monitoring.set_local_events(tool, enter_code, 0)
+            if not state["fired"]:
+                break  # past the last point
+            expected = [("signal", None)]
+            if handlers == "defer":
+                expected = [("signal", True), ("body", None)]
+                assert state["window"] is None, at
+            assert [
+                (e["event"], e.get("deferred")) for e in journal.replay()[start:]
+            ] == expected, at
+            assert exited == (handlers == "cancel"), at
+            assert run.fatal == "cancelled", at
+            released(at)
+    finally:
+        vast.restore_signals(saved)
+        monitoring.register_callback(tool, events.C_RETURN, None)
+        monitoring.register_callback(tool, events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+    assert at == state["seen"] >= 2  # the end of `next(self.gen)` and `RETURN_VALUE`
+
+
+def test_a_signal_held_in_the_create_lock_enter_stops_the_create_before_its_put(
+    tmp_path: Path, key_file, fake, monkeypatch
+) -> None:
+    """A cancel held in the `__enter__` of the create's lock runs at the start of its body: no
+    `create_requested` and no PUT after the signal, and the lock is free (#178)."""
+    journal, _ = _journal(tmp_path, fake, key_file, deadline_unix=time.time() + 9000)
+    api = vast.Api(fake.url, key_file[1])
+    run = vast.Run(None, journal, {}, {}, None, {}, None)
+    real_offer, real_lock = api.offer, vast.Journal.lock
+    state = {"armed": False}
+
+    def offer(*args):
+        state["armed"] = True  # the next outer lock is the create's
+        return real_offer(*args)
+
+    class SignalInEnter:
+        def __init__(self, manager) -> None:
+            self.manager = manager
+
+        def __enter__(self):
+            held = self.manager.__enter__()
+            if state["armed"] and journal._held == 1:
+                state["armed"] = False
+                vast._LOCK_WINDOW.pending = []  # as `_exiting_lock` opens it in `__enter__`
+                signal.raise_signal(signal.SIGTERM)
+                assert run.fatal is None  # held, not run
+            return held
+
+        def __exit__(self, *exc):
+            return self.manager.__exit__(*exc)
+
+    monkeypatch.setattr(api, "offer", offer)
+    monkeypatch.setattr(vast.Journal, "lock", lambda self, *a: SignalInEnter(real_lock(self, *a)))
+    saved = vast.cancel_on_signals(run)
+    try:
+        with pytest.raises(SystemExit) as error:
+            vast.create_instance(api, journal, _package(), _no_system)
+    finally:
+        vast.restore_signals(saved)
+    assert error.value.code == 128 + signal.SIGTERM
+    assert run.fatal == "cancelled"
+    assert fake.count("PUT") == 0
+    assert "create_requested" not in _events(journal) and _events(journal)[-1] == "signal"
+    assert journal._held == 0 and vast._LOCK_WINDOW.pending is None
+    probe = subprocess.run(
+        [sys.executable, "-c", _LOCK_PROBE, str(journal.dir / vast.LOCK_FILE)],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.stdout.strip() == "free", probe.stderr
+
+
 # --- transport recovery (#149, round 2) ----------------------------------------------------------
 
 

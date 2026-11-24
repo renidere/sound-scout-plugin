@@ -675,9 +675,11 @@ class Api:
 
 class _LockWindow(threading.local):
     """The signals (`(handler, signum)`) that land while this thread opens, locks or closes a
-    journal `flock`, or ends its body; `None` outside that. Run there, a handler would block on
-    the lock this thread already holds, or its exception would skip the `close` and keep the
-    lock (#170, #173)."""
+    journal `flock`, or starts or ends its body; `None` outside that. Run there, a handler would
+    block on the lock this thread already holds, or its exception would skip the `close` and
+    keep the lock (#170, #173, #178). A window that a signal opens in the lock's `__enter__`
+    stays open into the body until `_run_held_signals` at the body's start, at the latest until
+    the close."""
 
     pending: list | None = None
 
@@ -689,6 +691,14 @@ def _close_lock_window() -> None:
     pending, _LOCK_WINDOW.pending = _LOCK_WINDOW.pending, None
     for handler, signum in pending or ():
         handler(signum, None)
+
+
+def _run_held_signals() -> None:
+    """The first statement of a journal lock's body: the handlers of a signal held in the
+    lock's `__enter__` (#178) run here, where their exception takes the lock's `__exit__`, so
+    the body does not run its work, a create PUT included, after a cancel. Elsewhere in a body
+    the window is `None`, and this does nothing."""
+    _close_lock_window()
 
 
 def _outside_lock_window(handler: Callable) -> Callable:
@@ -797,6 +807,7 @@ class Journal:
         line = json.dumps(record, sort_keys=True, ensure_ascii=False, allow_nan=False)
         line = redact(line, self.key)
         with self.lock():
+            _run_held_signals()
             fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
                 size = os.fstat(fd).st_size
@@ -826,15 +837,20 @@ class Journal:
 
 
 _LOCK_CODE = Journal.lock.__wrapped__.__code__
-_CONTEXT_EXIT = contextlib._GeneratorContextManager.__exit__.__code__
+_CONTEXT_CODES = (
+    contextlib._GeneratorContextManager.__enter__.__code__,
+    contextlib._GeneratorContextManager.__exit__.__code__,
+)
 
 
 def _exiting_lock(frame) -> bool:
-    """The signal landed in `contextlib`'s `__exit__` of a `Journal.lock()` that has its fd and
-    is not resumed yet, or in a handler that such an `__exit__` runs: an exception there would
-    skip the lock's `finally` (#173)."""
+    """The signal landed in `contextlib`'s `__enter__` or `__exit__` of a `Journal.lock()` that
+    has its fd and is suspended at its `yield`, or in a handler that such a frame runs: an
+    exception there would skip the lock's `finally` (#173) or keep the generator, its fd and
+    its `flock` alive with the exception (#178). The handler then runs at the start of the
+    body (`_run_held_signals`) or at the lock's close."""
     while frame is not None:
-        if frame.f_code is _CONTEXT_EXIT:
+        if frame.f_code in _CONTEXT_CODES:
             lock = getattr(frame.f_locals.get("self"), "gen", None)
             if (
                 getattr(lock, "gi_code", None) is _LOCK_CODE
@@ -1032,6 +1048,7 @@ def create_instance(api: Api, journal: Journal, package: Mapping, runner) -> int
     check_no_secret(payload, api.key)
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     with journal.lock():
+        _run_held_signals()
         _refuse_create(summarize(journal.replay()))
         journal.append(
             "create_requested",
@@ -1179,6 +1196,7 @@ def watch_tick(
     `searching`, `destroying`, `closed` or `error`; destroy by id is idempotent."""
     now = time.time() if now is None else now
     with journal.lock(blocking=False) as held:
+        _run_held_signals()
         if not held:
             return "busy"
         state = summarize(journal.replay())
@@ -2374,8 +2392,9 @@ def cancel_on_signals(run: Run) -> dict:
     destroyed. The first signal counts; later ones are ignored, so they cannot cut that path
     short; `run.fatal` keeps the stop even where the exception is swallowed. A signal inside
     the journal lock's open, flock or close, or between the end of its body and the close, is
-    handled as soon as the close ends. Only the main thread can set handlers: elsewhere nothing
-    changes."""
+    handled as soon as the close ends; one between its `yield` and the start of its body, at
+    the start of the body (`_run_held_signals`), before the body's work. Only the main thread
+    can set handlers: elsewhere nothing changes."""
     if threading.current_thread() is not threading.main_thread():
         return {}
 
