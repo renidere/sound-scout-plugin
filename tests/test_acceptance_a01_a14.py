@@ -178,3 +178,26 @@ def test_the_count_checker_refuses_a_wrong_or_prefix_count_and_an_uncounted_stat
     assert summary_problems(waiting, fixed) == []
     no_owner = good.replace(", ждёт владельца 3", "")
     assert "ждёт владельца is not counted" in summary_problems(current, no_owner)
+
+
+def test_a11_names_the_chat_path_and_no_longer_waits_for_an_owner_decision() -> None:
+    text = TABLE_DOC.read_text(encoding="utf-8")
+    a11 = next(row for row in table(text) if row[0] == "A11")
+    for word in (
+        "«Отправить и разобрать»",
+        "`sound-scout-job:<job_id>`",
+        "после обеих заметок пользователь просит",
+        "«Обычная отправка»",
+        "`speech_job_result`",
+        "`speech_compare`",
+        "шаг 7",
+    ):
+        assert word in a11[2], word
+    assert "plugin.js" not in a11[3]
+    assert "`hermes/skills/speech-review/SKILL.md`" in a11[3]
+    assert "нет evidence на живой системе" in a11[3]
+    assert status(a11) == "не проверено"
+    assert f"{REPO_URL}/issues/90" in a11[4]
+    assert f"{REPO_URL}/issues/175#issuecomment-7125074558" in a11[4]
+    assert "нужно решение владельца" not in a11[4]
+    assert not any("Нужен владелец" in line and "A11" in line for line in text.splitlines())
