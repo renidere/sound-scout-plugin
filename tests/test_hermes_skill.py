@@ -1,5 +1,5 @@
-"""Lint of the Hermes skill `speech-review` (issues #38, #100, #179; R12, AGENT_PROMPT D.14,
-decision 0013 § 3.8)."""
+"""Lint of the Hermes skill `speech-review` (issues #38, #100, #179, #180; R12, AGENT_PROMPT
+D.14, decision 0013 § 3.8)."""
 
 import json
 import re
@@ -121,6 +121,24 @@ DESKTOP_PITFALL_TERMS = (
     f"итог придёт заметкой, если рекордер показал «{RECORDER_ACCEPTED}»",
     "кнопкой «Отправить и разобрать»",
 )
+# Issue #180: `delivery.note_text` names no recording (no file name, no `request_id`, only the
+# tag `sound-scout-job:<job_id>`) and comes only after the job ends, so the plain-send section never
+# matches a note to a new recording; it reads a job by the tag of a note the user asks about.
+OLD_NOTE_MATCH = "заметка Sound Scout с `job_id` этой записи"
+PLAIN_SEND_TERMS = (
+    "Заметка Sound Scout не называет запись: в ней нет имени файла и `request_id`, только метка "
+    "`sound-scout-job:<job_id>`",
+    "Приходит она только после конца задания",
+    "по заметкам не искать задание новой записи",
+    "не говорить, что задание этой записи есть или что его нет",
+    "Запись в `attachments/` — по пункту 6 раздела «Вложения Hermes»",
+    "Если пользователь спрашивает о заметке Sound Scout в чате, не ставить новое задание: "
+    "прочитать это задание по `job_id` из метки заметки через `speech_job_status` и "
+    "`speech_job_result`",
+)
+JOB_CLAIM = re.compile(
+    r"(?<!не говорить, что )задани[ея] (?:этой |новой )?(?:записи )?(?:уже )?(?:есть|нет)"
+)
 QUEUE_AS_FACT = re.compile(r"(?<!не утверждать, что )задание (?:уже )?в очереди")
 OPERATOR_SETTING = re.compile(r"(?<!не )настройка оператора")
 SEND_ONLY = re.compile(r"«Отправить»")
@@ -145,6 +163,7 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
     problems += [f"request_id suffix advice: {m.group(0)}" for m in SUFFIX_ADVICE.finditer(text)]
     problems += procedure_problems(text)
     problems += desktop_attachment_problems(text)
+    problems += plain_send_problems(text)
     if str(Path.home()) in text:
         problems.append("home directory in the text")
     if not SKILL_NAME.fullmatch(name) or name != directory:
@@ -205,6 +224,18 @@ def desktop_attachment_problems(text: str) -> list[str]:
         desktop = pitfall.split("`attachments/`", 1)[-1]
         if "`attachments/`" in pitfall and OPERATOR_SETTING.search(desktop):
             problems.append("path_denied pitfall calls the Desktop case an operator setting")
+    return problems
+
+
+def plain_send_problems(text: str) -> list[str]:
+    """The plain-send section matches no note to a recording and reads a job by its note tag
+    (#180)."""
+    problems = ["old note match by recording"] if OLD_NOTE_MATCH in flat(text) else []
+    if "\n## Обычная отправка\n" in text:
+        plain = flat(section(text, "## Обычная отправка"))
+        problems += [f"plain send lacks: {t}" for t in PLAIN_SEND_TERMS if t not in plain]
+        if JOB_CLAIM.search(plain):
+            problems.append("plain send claims a job of the recording")
     return problems
 
 
@@ -325,6 +356,81 @@ def test_plain_send_starts_no_analysis_and_the_runner_path_delivers_it() -> None
 def test_lint_reports_a_missing_plain_send_rule() -> None:
     text = SKILL.read_text(encoding="utf-8").replace("Для неё анализ не запускать", "Анализ можно")
     assert skill_problems(text) == ["missing term: Для неё анализ не запускать"]
+
+
+def test_plain_send_matches_no_note_to_a_recording_and_reads_a_job_by_the_note_tag() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    assert plain_send_problems(text) == []
+    plain = flat(section(text, "## Обычная отправка"))
+    assert OLD_NOTE_MATCH not in flat(text)
+    assert plain.index("Приходит она только после конца задания") < plain.index("пункту 6")
+    assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
+    assert frontmatter(text)["version"] == "0.5.2"
+
+
+def test_plain_send_facts_agree_with_the_note_and_the_recorder() -> None:
+    source = (REPO / "src" / "sound_scout" / "delivery.py").read_text(encoding="utf-8")
+    note = source.split("def note_text(", 1)[1].split("\ndef ", 1)[0]
+    assert "request_id" not in note and "path" not in note.split('"""', 2)[2]
+    assert note.rstrip().endswith('lines.append(tag(job["job_id"]))\n    return "\\n".join(lines)')
+    assert 'TAG_PREFIX = "sound-scout-job:"' in source
+    send = RECORDER.read_text(encoding="utf-8").split("async send(", 1)[1]
+    send = send.split("async submitJob(", 1)[0]
+    assert send.index("'prompt.submit'") < send.index("this.submitJob(")
+
+
+def test_lint_reports_the_old_note_match_by_recording() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    plain = section(text, "## Обычная отправка")
+    old = (
+        "- Если в чате уже есть заметка Sound Scout с `job_id` этой записи, не ставить новое "
+        "задание:\n  читать его через `speech_job_status` и `speech_job_result`.\n"
+    )
+    wrong = text.replace(plain, plain.split("- Заметка Sound Scout", 1)[0] + old + "\n")
+    assert skill_problems(wrong) == ["old note match by recording"] + [
+        f"plain send lacks: {t}" for t in PLAIN_SEND_TERMS
+    ]
+
+
+def test_lint_reports_a_plain_send_without_the_note_facts() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = " Приходит она только после конца задания."
+    assert old in text
+    assert skill_problems(text.replace(old, "")) == [
+        "plain send lacks: Приходит она только после конца задания"
+    ]
+    old = "только метка\n  `sound-scout-job:<job_id>`"
+    assert old in text
+    assert skill_problems(text.replace(old, "и метка\n  `sound-scout-job:<job_id>`")) == [
+        f"plain send lacks: {PLAIN_SEND_TERMS[0]}"
+    ]
+
+
+def test_lint_reports_a_plain_send_without_the_desktop_pointer() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = " Запись в `attachments/` — по пункту 6 раздела «Вложения Hermes»."
+    assert old in text
+    assert skill_problems(text.replace(old, "")) == [f"plain send lacks: {PLAIN_SEND_TERMS[4]}"]
+
+
+def test_lint_reports_a_plain_send_without_the_tag_lookup() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "по `job_id` из метки заметки через"
+    assert old in text
+    assert skill_problems(text.replace(old, "через")) == [
+        f"plain send lacks: {PLAIN_SEND_TERMS[5]}"
+    ]
+
+
+def test_lint_reports_a_plain_send_that_claims_a_job_of_a_new_recording() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "не говорить, что задание этой записи есть или что\n  его нет"
+    assert old in text
+    for claim in ("задание этой записи уже есть", "задания этой записи нет"):
+        assert skill_problems(text.replace(old, f"сказать, что {claim}")) == [
+            f"plain send lacks: {PLAIN_SEND_TERMS[3]}",
+            "plain send claims a job of the recording",
+        ]
 
 
 def test_agent_never_calls_the_synchronous_speech_analyze() -> None:
