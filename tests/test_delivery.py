@@ -407,6 +407,7 @@ def test_redeliver_takes_a_delivery_unconfirmed_job_and_records_the_request(
     assert after["delivery"] == {
         "state": "redelivery_requested",
         "tag": f"sound-scout-job:{job_id}",
+        "attempt": 0,
         "requested_at": request["requested_at"],
     }
     assert after["updated_at"] == before["updated_at"] and after["state"] == "finished"
@@ -579,6 +580,316 @@ def test_criterion_2_each_accepted_jobs_redeliver_is_recorded_in_job_json_with_i
     for request in (first, second):
         assert datetime.fromisoformat(request["requested_at"]).tzinfo is not None
     assert first["requested_at"] < second["requested_at"]
+
+
+# --- one note per attempt after a retry (#187) ------------------------------------------------
+
+
+def run_attempt(cfg: Config, job_id: str, state: str = "finished") -> None:
+    """Stand in for the runner: one more attempt that starts now and ends `state`."""
+    job = job_file(cfg, job_id)
+    number = len(job["attempts"]) + 1
+    attempt = {"number": number, "request_id": f"{job_id}-a{number}", "run_id": None}
+    attempt["started_at"] = jobs._now()
+    set_job(cfg, job_id, attempts=[*job["attempts"], attempt], state=state, state_reason=None)
+
+
+def delivered(cfg: Config, job_id: str) -> dict:
+    """The loop takes the next note of `job_id` and its send ends `delivered`."""
+    answer = delivery.next_delivery("default", "loop-1", cfg)
+    assert answer["action"] == "send" and answer["job_id"] == job_id
+    delivery.end_delivery(job_id, "delivered", None, cfg)
+    return answer
+
+
+@pytest.mark.parametrize("ended", ["cancelled", "failed"])
+def test_a_retried_attempt_gets_one_note_of_its_own_with_its_own_tag(
+    setup: Config, make_wav: WavFactory, ended: str
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, ended)
+    first = delivered(setup, job_id)
+    noted = job_file(setup, job_id)["delivery"]
+
+    jobs.retry(job_id, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    run_attempt(setup, job_id)
+    second = delivery.next_delivery("default", "loop-1", setup)
+
+    assert first["tag"] == f"sound-scout-job:{job_id}" and noted["attempt"] == 1
+    assert noted["state"] == "delivered"
+    assert second["action"] == "send" and second["session_id"] == "chat-1"
+    assert second["tag"] == f"sound-scout-job:{job_id}-a2" != first["tag"]
+    assert second["text"].splitlines()[-1] == second["tag"]
+    assert first["tag"] not in second["text"].splitlines()
+    job = job_file(setup, job_id)
+    assert job["deliveries"] == [noted]
+    assert job["delivery"]["state"] == "sending" and job["delivery"]["attempt"] == 2
+    delivery.end_delivery(job_id, "delivered", None, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    assert delivery.next_delivery("default", "loop-2", setup) == {"action": "none"}
+    final = jobs.status(job_id, setup)["delivery"]
+    assert final["state"] == "delivered" and final["tag"] == second["tag"]
+    assert final["attempt"] == 2
+
+
+def test_each_later_retry_gets_its_own_tag_and_keeps_every_earlier_note(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    tags = [delivered(setup, job_id)["tag"]]
+    for _ in range(2):
+        jobs.retry(job_id, setup)
+        run_attempt(setup, job_id, "failed")
+        tags.append(delivered(setup, job_id)["tag"])
+
+    job = job_file(setup, job_id)
+    assert tags == [f"sound-scout-job:{job_id}", f"sound-scout-job:{job_id}-a2"] + [
+        f"sound-scout-job:{job_id}-a3"
+    ]
+    assert [item["tag"] for item in job["deliveries"]] == tags[:2]
+    assert job["delivery"]["tag"] == tags[2]
+
+
+def test_a_job_without_a_retry_gets_one_note_with_the_job_tag_after_a_recovered_attempt(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "running")
+    run_attempt(setup, job_id)
+
+    answer = delivered(setup, job_id)
+
+    assert answer["tag"] == f"sound-scout-job:{job_id}"
+    assert job_file(setup, job_id)["delivery"]["attempt"] == 2
+    assert "deliveries" not in job_file(setup, job_id)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+
+def test_a_retry_before_the_first_note_gives_one_note_of_the_last_attempt(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "cancelled")
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+
+    answer = delivered(setup, job_id)
+
+    assert answer["tag"] == f"sound-scout-job:{job_id}"
+    assert job_file(setup, job_id)["delivery"]["attempt"] == 2
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+
+def test_a_retry_cancelled_in_the_queue_runs_no_attempt_and_gets_no_note(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="cancelled")
+    first = delivered(setup, job_id)
+    assert job_file(setup, job_id)["delivery"]["attempt"] == 0
+
+    jobs.retry(job_id, setup)
+    jobs.cancel(job_id, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    second = delivered(setup, job_id)
+
+    assert first["tag"] == f"sound-scout-job:{job_id}"
+    assert second["tag"] == f"sound-scout-job:{job_id}-a1"
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+
+def test_a_stopped_loop_of_a_retried_attempt_leaves_a_check_with_the_attempt_tag(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "cancelled")
+    delivered(setup, job_id)
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    sent = delivery.next_delivery("default", "loop-1", setup)
+
+    check = delivery.next_delivery("default", "loop-2", setup)
+
+    assert check == {
+        "action": "check",
+        "job_id": job_id,
+        "session_id": "chat-1",
+        "tag": f"sound-scout-job:{job_id}-a2",
+    }
+    assert sent["tag"] == check["tag"]
+    delivery.end_delivery(job_id, "delivered_by_history", None, setup)
+    recorded = job_file(setup, job_id)["delivery"]
+    assert recorded["tag"] == check["tag"] and recorded["attempt"] == 2
+    assert delivery.next_delivery("default", "loop-2", setup) == {"action": "none"}
+
+
+def test_a_redelivery_of_a_retried_attempt_keeps_its_tag_and_attempt(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivered(setup, job_id)
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    delivery.next_delivery("default", "loop-1", setup)
+    delivery.end_delivery(job_id, "unconfirmed", "timed out", setup)
+
+    requested = delivery.request_redelivery(job_id, setup)["delivery"]
+    answer = delivery.next_delivery("default", "loop-2", setup)
+
+    tag = f"sound-scout-job:{job_id}-a2"
+    assert requested["tag"] == tag and requested["attempt"] == 2
+    assert answer["action"] == "redeliver" and answer["tag"] == tag
+    assert answer["text"].splitlines()[-1] == tag
+    assert len(job_file(setup, job_id)["deliveries"]) == 1
+    delivery.end_delivery(job_id, "released", "no gateway in this process owns it", setup)
+    waiting = job_file(setup, job_id)["delivery"]
+    assert waiting["state"] == "redelivery_requested" and waiting["attempt"] == 2
+    assert delivery.next_delivery("default", "loop-2", setup)["tag"] == tag
+
+
+def test_a_released_note_of_a_retried_attempt_is_claimed_again_with_the_same_tag(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivered(setup, job_id)
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    first = delivery.next_delivery("default", "loop-1", setup)
+    delivery.end_delivery(job_id, "released", "no gateway in this process owns it", setup)
+
+    again = delivery.next_delivery("default", "loop-1", setup)
+
+    assert again["tag"] == first["tag"] == f"sound-scout-job:{job_id}-a2"
+    assert len(job_file(setup, job_id)["deliveries"]) == 1
+
+
+def test_a_note_recorded_before_187_counts_the_attempts_that_started_before_it(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivered(setup, job_id)
+    old = job_file(setup, job_id)["delivery"]
+    del old["attempt"]
+    set_job(setup, job_id, delivery=old)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    assert answer["action"] == "send" and answer["tag"] == f"sound-scout-job:{job_id}-a2"
+    assert job_file(setup, job_id)["deliveries"] == [old | {"attempt": 1}]
+
+
+def test_a_note_recorded_before_187_of_a_job_retried_before_the_update_gets_no_late_note(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivered(setup, job_id)
+    old = job_file(setup, job_id)["delivery"]
+    del old["attempt"]
+    set_job(setup, job_id, delivery=old)
+    run_attempt(setup, job_id, "failed")
+
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    assert job_file(setup, job_id)["delivery"] == old
+    assert "deliveries" not in job_file(setup, job_id)
+
+
+def test_a_redelivery_request_superseded_by_a_later_attempt_gives_way_to_its_note(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivery.next_delivery("default", "loop-1", setup)
+    delivery.end_delivery(job_id, "unconfirmed", "timed out", setup)
+    requested = delivery.request_redelivery(job_id, setup)["delivery"]
+    jobs.retry(job_id, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    run_attempt(setup, job_id)
+
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    assert answer["action"] == "send" and answer["tag"] == f"sound-scout-job:{job_id}-a2"
+    job = job_file(setup, job_id)
+    assert job["deliveries"] == [requested]
+    assert requested["state"] == "redelivery_requested" and requested["attempt"] == 1
+    delivery.end_delivery(job_id, "delivered", None, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+
+def test_the_note_of_a_retried_attempt_never_reports_the_result_of_an_earlier_one(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = analyzed_job(setup, wav, state="cancelled")
+    first = delivered(setup, job_id)
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id, "failed")
+    set_job(setup, job_id, state_reason="input_error: the input is gone")
+
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    assert first["text"].startswith("Sound Scout: анализ записи закончен")
+    assert jobs.result(job_id, setup)["attempt"] == 1
+    lines = answer["text"].splitlines()
+    assert lines[0] == (
+        "Sound Scout: анализ записи не дал результата — задание `failed`, код `input_error`."
+    )
+    assert not any(line.startswith("Отчёт:") for line in lines)
+    assert lines[-1] == f"sound-scout-job:{job_id}-a2"
+
+
+@pytest.mark.slow
+def test_the_note_of_a_retried_attempt_with_its_own_result_reports_that_result(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = analyzed_job(setup, wav, state="cancelled")
+    delivered(setup, job_id)
+    jobs.retry(job_id, setup)
+    layers = tuple(job_file(setup, job_id)["request"]["layers"])
+    analysis = app.analyze(
+        app.AnalyzeRequest(str(wav), request_id=f"{job_id}-a2", layers=layers), setup
+    )
+    attempts = job_file(setup, job_id)["attempts"]
+    attempt = {"number": 2, "request_id": f"{job_id}-a2", "run_id": analysis.run.run_id}
+    set_job(setup, job_id, attempts=[*attempts, attempt], state="finished", state_reason=None)
+
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    lines = answer["text"].splitlines()
+    assert lines[0].startswith("Sound Scout: анализ записи закончен — `partial`")
+    assert f"Отчёт: runs/{analysis.run.run_id}/report.md" in lines
+    assert lines[-1] == f"sound-scout-job:{job_id}-a2"
+
+
+@pytest.mark.slow
+def test_a_retried_attempt_gets_its_note_through_the_console_entry(
+    setup: Config, make_wav: WavFactory, config_file: Path
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "cancelled")
+    delivered(setup, job_id)
+    retried = run_cli(config_file, "retry", job_id, "--json")
+    assert retried.returncode == 0, retried.stderr
+    run_attempt(setup, job_id)
+
+    sent = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
+    ended = run_cli(config_file, "deliver-end", "--outcome=delivered", job_id, "--json")
+    again = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
+
+    assert json.loads(sent.stdout)["tag"] == f"sound-scout-job:{job_id}-a2"
+    assert ended.returncode == 0, ended.stderr
+    assert json.loads(ended.stdout)["delivery"]["state"] == "delivered"
+    assert json.loads(again.stdout) == {"action": "none"}
 
 
 # --- the comparison block of a control job's note (#110) -------------------------------------

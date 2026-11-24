@@ -19,10 +19,11 @@ from pathlib import Path
 
 import pytest
 
-from sound_scout import config, jobs
+from sound_scout import app, config, jobs
 from sound_scout.config import Config
 from tests.conftest import WavFactory
-from tests.test_delivery import analyzed_job, ended_job, job_file, unconfirmed_job
+from tests.test_delivery import analyzed_job, ended_job, job_file, run_attempt, unconfirmed_job
+from tests.test_jobs_runner import POLL, runner_thread, substitute, wait_until
 
 REPO = Path(__file__).resolve().parent.parent
 MODULE = REPO / "hermes" / "plugin" / "sound-scout" / "delivery.py"
@@ -70,7 +71,7 @@ class Chats:
 
     def send(self, chat_id: str, text: str):
         self.sent.append((chat_id, text))
-        job_id = text.splitlines()[-1].removeprefix("sound-scout-job:")
+        job_id = text.splitlines()[-1].removeprefix("sound-scout-job:").partition("-a")[0]
         self.markers.append(job_file(self.cfg, job_id)["delivery"])
         answer = self.answers.pop(0) if self.answers else None
         if isinstance(answer, BaseException):
@@ -671,6 +672,74 @@ def test_a_history_as_long_as_the_scan_without_the_tag_cannot_answer(loop, monke
         loop.hermes_history_has("chat-1", "sound-scout-job:j1")
 
 
+def test_the_history_check_of_one_attempt_never_matches_the_note_of_another(
+    loop, monkeypatch
+) -> None:
+    segments = {
+        "tip": [
+            {"role": "user", "content": "Sound Scout: анализ\nsound-scout-job:j1-a2"},
+            {"role": "user", "content": [{"type": "text", "text": "x\nsound-scout-job:j2-a3"}]},
+            {"role": "user", "content": "Sound Scout: анализ\nsound-scout-job:j3"},
+        ]
+    }
+    hermes_with_history(monkeypatch, segments, [])
+
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1-a2") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1") is False
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j1-a3") is False
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j2-a3") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j2") is False
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j3") is True
+    assert loop.hermes_history_has("chat-1", "sound-scout-job:j3-a2") is False
+
+
+class NotedChats(Chats):
+    """A chat whose history holds the notes this fake sent and confirmed (a timed-out note never
+    arrives), checked by the loop's own match."""
+
+    def __init__(self, loop, cfg: Config, *answers) -> None:
+        super().__init__(cfg, *answers)
+        self.loop = loop
+        self.notes: list[tuple[str, str]] = []
+
+    def send(self, chat_id: str, text: str):
+        answer = super().send(chat_id, text)
+        if answer is None:
+            self.notes.append((chat_id, text))
+        return answer
+
+    def history_has(self, chat_id: str, tag: str) -> bool:
+        self.checked.append((chat_id, tag))
+        rows = [{"role": "user", "content": text} for chat, text in self.notes if chat == chat_id]
+        return any(self.loop._is_note(row, tag) for row in rows)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("ended", ["cancelled", "failed"])
+def test_a_retried_attempt_gets_one_more_note_and_its_check_misses_the_first_note(
+    loop, setup: Config, make_wav: WavFactory, ended: str
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), session_id="chat-1", state="running")
+    run_attempt(setup, job_id, ended)
+    chats = NotedChats(loop, setup, None, TIMEOUT)
+
+    assert ticks(loop, chats, 2) == ["delivered", "idle"]
+    jobs.retry(job_id, setup)
+    assert ticks(loop, chats, 1) == ["idle"]
+    run_attempt(setup, job_id)
+    assert ticks(loop, chats, 2) == ["unconfirmed", "idle"]
+
+    first, second = f"sound-scout-job:{job_id}", f"sound-scout-job:{job_id}-a2"
+    assert [(chat, text.splitlines()[-1]) for chat, text in chats.sent] == [
+        ("chat-1", first),
+        ("chat-1", second),
+    ]
+    assert chats.checked == [("chat-1", second)]
+    job = job_file(setup, job_id)
+    assert [item["tag"] for item in job["deliveries"]] == [first]
+    assert job["delivery"]["state"] == "delivery_unconfirmed" and job["delivery"]["tag"] == second
+
+
 # --- redelivery on the operator's request (#122) ---------------------------------------------
 
 
@@ -839,3 +908,124 @@ def test_criterion_1_jobs_redeliver_takes_no_job_but_a_delivery_unconfirmed_one(
     chats = Chats(setup)
     assert ticks(loop, chats) == ["delivered", "idle", "idle"]
     assert [chat for chat, _ in chats.sent] == ["chat-7"]
+
+
+# --- acceptance criteria of #187 through the real runner, `jobs retry` and the loop ----------
+
+
+def jobs_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    """The operator's real `sound-scout jobs` command, with the configuration of `setup`."""
+    return subprocess.run(
+        [os.environ["SOUND_SCOUT_BIN"], "jobs", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(os.environ),
+    )
+
+
+def bound_job(cfg: Config, wav: Path) -> str:
+    binding = jobs.Binding(submitter="desktop", session_id="chat-1")
+    return jobs.submit(jobs.SubmitRequest(str(wav)), binding, cfg)["job_id"]
+
+
+def run_to_end(cfg: Config, job_id: str, ended: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real runner takes the queued attempt; its analysis fails, finishes or is cancelled
+    while it runs (`jobs.cancel`, as the job card's button does)."""
+    calls: list[str] = []
+    if ended == "cancelled":
+        monkeypatch.setattr(app, "analyze", substitute(calls, until_cancelled=True))
+        runner = runner_thread(cfg)
+        wait_until(lambda: len(calls) == 1)
+        jobs.cancel(job_id, cfg)
+        runner.join(timeout=30)
+        assert not runner.is_alive()
+    else:
+        monkeypatch.setattr(app, "analyze", substitute(calls, fail_first=ended == "failed"))
+        jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
+    assert job_file(cfg, job_id)["state"] == ended
+
+
+def last_lines(chats: Chats) -> list[tuple[str, str]]:
+    return [(chat, text.splitlines()[-1]) for chat, text in chats.sent]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("ended", ["cancelled", "failed"])
+def test_criterion_1_after_jobs_retry_the_loop_sends_one_more_note_when_the_new_attempt_ends(
+    loop, setup: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch, ended: str
+) -> None:
+    job_id = bound_job(setup, make_wav("recordings/a.wav"))
+    run_to_end(setup, job_id, ended, monkeypatch)
+    chats = NotedChats(loop, setup, None, TIMEOUT)
+    assert ticks(loop, chats, 2) == ["delivered", "idle"]
+
+    retried = jobs_cli("retry", job_id)
+    assert retried.returncode == 0, retried.stderr
+    assert ticks(loop, chats, 2) == ["idle", "idle"]
+    run_to_end(setup, job_id, "finished", monkeypatch)
+    # criterion 2: the second send times out; its history check must not take the first note
+    assert ticks(loop, chats, 3) == ["unconfirmed", "idle", "idle"]
+
+    first, second = f"sound-scout-job:{job_id}", f"sound-scout-job:{job_id}-a2"
+    assert last_lines(chats) == [("chat-1", first), ("chat-1", second)]
+    assert first not in chats.sent[1][1].splitlines()
+    assert chats.checked == [("chat-1", second)]
+    status = jobs.status(job_id, setup)
+    assert status["state"] == "finished" and status["attempts"] == 2
+    assert status["delivery"]["state"] == "delivery_unconfirmed"
+    assert status["delivery"]["tag"] == second
+    # criterion 3: one note per attempt; the console answers `none` after `deliver-end`
+    again = jobs_cli("deliver-next", "--profile=default", "--loop=loop-1", "--json")
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout) == {"action": "none"}
+
+    # criterion 5: `jobs redeliver` of the retried attempt's note keeps its tag; its history
+    # check misses the first note, so the loop sends it once
+    accepted = jobs_cli("redeliver", job_id)
+    assert accepted.returncode == 0, accepted.stderr
+    assert ticks(loop, chats, 3) == ["delivered", "idle", "idle"]
+    assert last_lines(chats)[2:] == [("chat-1", second)]
+    assert chats.checked == [("chat-1", second), ("chat-1", second)]
+    assert delivery_of(setup, job_id)["state"] == "delivered"
+    assert len(chats.sent) == 3
+
+
+@pytest.mark.slow
+def test_criterion_5_a_stopped_loop_of_a_retried_attempt_is_checked_by_its_own_tag(
+    loop, setup: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = bound_job(setup, make_wav("recordings/a.wav"))
+    run_to_end(setup, job_id, "failed", monkeypatch)
+    chats = NotedChats(loop, setup)
+    assert ticks(loop, chats, 1) == ["delivered"]
+    assert jobs_cli("retry", job_id).returncode == 0
+    run_to_end(setup, job_id, "finished", monkeypatch)
+    stopped = jobs_cli("deliver-next", "--profile=default", "--loop=stopped", "--json")
+    assert json.loads(stopped.stdout)["tag"] == f"sound-scout-job:{job_id}-a2"
+
+    assert ticks(loop, chats, 2) == ["unconfirmed", "idle"]
+
+    assert chats.checked == [("chat-1", f"sound-scout-job:{job_id}-a2")]
+    assert last_lines(chats) == [("chat-1", f"sound-scout-job:{job_id}")]
+    marker = delivery_of(setup, job_id)
+    assert marker["state"] == "delivery_unconfirmed"
+    assert marker["tag"] == f"sound-scout-job:{job_id}-a2"
+
+
+@pytest.mark.slow
+def test_criterion_4_a_job_without_a_retry_gets_one_note_with_the_job_tag(
+    loop, setup: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = bound_job(setup, make_wav("recordings/a.wav"))
+    run_to_end(setup, job_id, "finished", monkeypatch)
+    chats = NotedChats(loop, setup)
+
+    assert ticks(loop, chats, 3) == ["delivered", "idle", "idle"]
+
+    assert last_lines(chats) == [("chat-1", f"sound-scout-job:{job_id}")]
+    assert loop._is_note({"role": "user", "content": chats.sent[0][1]}, f"sound-scout-job:{job_id}")
+    job = job_file(setup, job_id)
+    assert job["delivery"]["tag"] == f"sound-scout-job:{job_id}" and "deliveries" not in job
+    again = jobs_cli("deliver-next", "--profile=default", "--loop=loop-1", "--json")
+    assert json.loads(again.stdout) == {"action": "none"}

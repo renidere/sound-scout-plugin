@@ -91,9 +91,10 @@ state; anything else is `not_bindable`. It writes the three fields and `bound_at
 that ended before its `bind` waits: the delivery loop takes only jobs with a `session_id`.
 
 `delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
-kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. About once a minute
-the runner deletes the staging copies that are due (`sound_scout.staging.sweep`) and marks their
-jobs `staging_removed_at`.
+kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. After a retry the
+new attempt gets a note of its own, and the earlier note moves to `deliveries` (#187). About
+once a minute the runner deletes the staging copies that are due (`sound_scout.staging.sweep`)
+and marks their jobs `staging_removed_at`.
 
 A control attempt (Decision in #110) is a job submitted with `previous_run_id` and `criterion`,
 always together. `submit` checks them with the functions of `compare`: the criterion by
@@ -567,7 +568,8 @@ def cancel(job_id: str, config: Config) -> dict:
 def retry(job_id: str, config: Config) -> dict:
     """Queue a `failed` or `cancelled` job again, at the end of the queue, through admission;
     the runner takes it as its next attempt `<job_id>-a<n+1>`. The job keeps its `job_id`,
-    `request_id`, request, plan, binding and delivery; `retries` keeps how it ended before.
+    `request_id`, request, plan, binding and delivery; `retries` keeps how it ended before. When
+    the new attempt ends, the delivery loop sends its own note (`sound_scout.delivery`, #187).
 
     The answer is the job's status with `retry: queued` and `next_attempt`. `not_retryable` for
     a job in another state or one whose staging copy `staging.sweep` removed (it has no input
@@ -593,6 +595,10 @@ def retry(job_id: str, config: Config) -> dict:
         (job_dir / CANCEL_MARKER_NAME).unlink(missing_ok=True)
         number = len(job["attempts"]) + 1
         next_attempt = f"{job_id}-a{number}"
+        note = job.get("delivery")
+        if isinstance(note, dict) and "attempt" not in note:
+            # A note from before #187 covers the attempts so far, not the one queued now.
+            note["attempt"] = number - 1
         now = _now()
         job.setdefault("retries", []).append(
             {

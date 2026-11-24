@@ -267,6 +267,10 @@ def test_o6_is_rewritten_to_cancel_the_second_job_while_the_first_runs() -> None
         "«Открыть отчёт»",
         "нажимай клавишей Tab, затем Enter или Space",
         "Кнопка «Отмена» рекордера отменяет запись",
+        # #187: the retried attempt's result comes to the chat as a note of its own
+        "В X должны прийти три заметки",
+        "об отмене (метка `sound-scout-job:<job_id>`)",
+        "об итоге повтора отдельной заметкой (метка `sound-scout-job:<job_id>-a1`",
     ):
         assert words in o6, words
     for n in (1, 3, 4, 5, 7, 8):

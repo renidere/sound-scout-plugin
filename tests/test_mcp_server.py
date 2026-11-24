@@ -1360,6 +1360,7 @@ def test_speech_job_redeliver_over_stdio_records_the_request_and_refuses_a_repea
     assert job["delivery"] == {
         "state": "redelivery_requested",
         "tag": delivery.tag(job_id),
+        "attempt": 0,
         "requested_at": request["requested_at"],
     }
     assert answer_of(accepted) == jobs.status(job_id, cfg)

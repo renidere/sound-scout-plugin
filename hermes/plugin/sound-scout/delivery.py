@@ -1,5 +1,7 @@
-"""Delivery loop of the Sound Scout plugin: one final note per ended job to its bound chat
-(decision 0013 § 3.7, Decision in #102).
+"""Delivery loop of the Sound Scout plugin: one final note per ended attempt of a job to its
+bound chat (decision 0013 § 3.7, Decision in #102; a retried attempt's own note, Decision in
+#187). Each note has its own tag: `sound-scout-job:<job_id>` for the first one,
+`sound-scout-job:<job_id>-a<n>` after a retry; the history check matches the whole tag.
 
 Runs on the Hermes interpreter (Python >= 3.11) and imports only the stdlib; Hermes modules are
 imported inside the edge functions. Sound Scout keeps the delivery state: the loop calls
@@ -44,6 +46,7 @@ The Hermes names follow the Decision in #102, read from Hermes v0.23.1 (`3b42157
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -251,13 +254,14 @@ def hermes_history_has(chat_id: str, tag: str) -> bool:
 
 def _is_note(message, tag: str) -> bool:
     """Whether the message carries the note's tag line. A tool result (the job status shows the
-    tag inside JSON) is never a note; content that is not text is matched by substring, so a
-    note is never missed."""
+    tag inside JSON) is never a note; content that is not text is matched by the whole tag, so a
+    note is never missed. Whole means exact: `sound-scout-job:<job_id>` of a job's first note
+    never matches the tag `sound-scout-job:<job_id>-a<n>` of a later attempt's note."""
     if _field(message, "role") == "tool":
         return False
     content = _field(message, "content")
     if not isinstance(content, str):
-        return tag in str(content or "")
+        return re.search(rf"{re.escape(tag)}(?![\w-])", str(content or "")) is not None
     return any(line.strip() == tag for line in content.splitlines())
 
 

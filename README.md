@@ -46,7 +46,7 @@ MCP — равноправные входы в ту же очередь (`docs/d
 `sound-scout jobs` (`src/sound_scout/jobs.py`; режимы плана и повтор —
 `docs/decisions/0018-job-modes-and-retry.md`), MCP-инструменты заданий (`docs/mcp.md`), пакет
 плагина `hermes/plugin/sound-scout/` (маршруты `GET /health`, `POST /jobs`, `GET /jobs/<job_id>`
-под `/api/plugins/sound-scout/`; цикл доставки одной заметки с итогом задания в привязанный чат —
+под `/api/plugins/sound-scout/`; цикл доставки итоговой заметки каждой попытки задания в привязанный чат —
 `delivery.py`) и skill `hermes/skills/speech-review/`. Пакет на хосте Hermes ещё не развёрнут
 ([#104](https://github.com/renidere/sound-scout-plugin/issues/104)). Рекордер Desktop есть в
 `hermes/plugin/sound-scout/desktop/plugin.js`

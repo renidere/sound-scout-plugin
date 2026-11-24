@@ -408,7 +408,7 @@ def test_readme_shows_the_unified_plugin_direction_and_what_main_has() -> None:
         "`hermes/plugin/sound-scout/`",
         "`GET /health`, `POST /jobs`, `GET /jobs/<job_id>`",
         "`/api/plugins/sound-scout/`",
-        "одной заметки с итогом задания в привязанный чат",
+        "итоговой заметки каждой попытки задания в привязанный чат",
         "`hermes/skills/speech-review/`",
         f"([#104]({ISSUE.format(104)}))",
         f"([#103]({ISSUE.format(103)}))",

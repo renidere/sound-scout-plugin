@@ -370,7 +370,7 @@ def test_compare_step_reads_both_existing_jobs_by_the_note_tags_and_submits_none
     attached = step.split("**Контрольная попытка вложением.**", 1)[1].split(COMPARE_EXISTING_CASE)
     assert "шаги 3–5" in attached[0] and "`task_differs`" in attached[0]
     assert step.index(COMPARE_EXISTING_CASE) < step.index(CRITERION_RULE)
-    assert frontmatter(text)["version"] == "0.5.4"
+    assert frontmatter(text)["version"] == "0.5.5"
 
 
 def test_lint_reports_a_compare_step_without_the_case_of_existing_jobs() -> None:
@@ -464,14 +464,16 @@ def test_plain_send_matches_no_note_to_a_recording_and_reads_a_job_by_the_note_t
     assert OLD_NOTE_MATCH not in flat(text)
     assert plain.index("Приходит она только после конца задания") < plain.index("пункту 6")
     assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
-    assert frontmatter(text)["version"] == "0.5.4"
+    assert frontmatter(text)["version"] == "0.5.5"
 
 
 def test_plain_send_facts_agree_with_the_note_and_the_recorder() -> None:
     source = (REPO / "src" / "sound_scout" / "delivery.py").read_text(encoding="utf-8")
     note = source.split("def note_text(", 1)[1].split("\ndef ", 1)[0]
     assert "request_id" not in note and "path" not in note.split('"""', 2)[2]
-    assert note.rstrip().endswith('lines.append(tag(job["job_id"]))\n    return "\\n".join(lines)')
+    assert note.rstrip().endswith(
+        'lines.append(note_tag or tag(job["job_id"]))\n    return "\\n".join(lines)'
+    )
     assert 'TAG_PREFIX = "sound-scout-job:"' in source
     send = RECORDER.read_text(encoding="utf-8").split("async send(", 1)[1]
     send = send.split("async submitJob(", 1)[0]
@@ -646,7 +648,7 @@ def test_description_says_a_voice_message_without_a_request_needs_no_tool_call()
     assert len(description) <= DESCRIPTION_LIMIT
     assert all(term in description for term in DESCRIPTION_TERMS)
     assert description_problems(description) == []
-    assert frontmatter(text)["version"] == "0.5.4"
+    assert frontmatter(text)["version"] == "0.5.5"
 
 
 def test_lint_reports_the_old_description_that_invites_a_call_on_any_attachment() -> None:
@@ -859,3 +861,32 @@ def test_install_doc_attachment_limits_agree_with_the_skill_on_the_desktop_item(
     assert "`attachments` корнем не бывает" in limits
     assert "`attachments`" in flat(section(doc, "## Установка на хосте backend"))
     assert "отдельный каталог (не `attachments/`)" in limits
+
+
+# Issue #187: the result of a retried attempt comes to the chat as a note of its own, tagged
+# `sound-scout-job:<job_id>-a<n>`; the skill reads the job id of either tag.
+RETRY_NOTE_TERMS = (
+    "у заметки повтора метка `sound-scout-job:<job_id>-a<n>`, где `n` — номер попытки",
+    "После `speech_job_retry` приходит ещё одна — когда кончится новая попытка.",
+    "`job_id` — часть метки после `sound-scout-job:` и до `-a<n>`, если он есть.",
+)
+
+
+def test_the_skill_says_a_retried_attempt_gets_its_own_note_with_the_attempt_tag() -> None:
+    from sound_scout import delivery
+
+    text = SKILL.read_text(encoding="utf-8")
+    plain = flat(section(text, "## Обычная отправка"))
+    for term in RETRY_NOTE_TERMS:
+        assert term in plain, term
+    step = flat(text.split(COMPARE_STEP, 1)[1].split("\n8. ", 1)[0])
+    assert "Метки `sound-scout-job:<job_id>` и `sound-scout-job:<job_id>-a<n>` — одно задание." in (
+        step
+    )
+    pitfalls = flat(section(text, "## Pitfalls"))
+    assert (
+        "Итог новой попытки придёт в чат отдельной заметкой с меткой "
+        "`sound-scout-job:<job_id>-a<n>`" in pitfalls
+    )
+    assert delivery.tag("J") == "sound-scout-job:J"
+    assert delivery.tag("J", 2) == "sound-scout-job:J-a2"

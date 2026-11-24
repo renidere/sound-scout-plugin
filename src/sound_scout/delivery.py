@@ -1,18 +1,33 @@
-"""Delivery of one final note per job to the chat bound at submit (decision 0013 § 3.7, Decision
-in #102): the state of `job.json["delivery"]` and the text of the note.
+"""Delivery of one final note per ended attempt to the chat bound at submit (decision 0013 § 3.7,
+Decision in #102): the state of `job.json["delivery"]` and the text of the note.
 
 The plugin's delivery loop (`hermes/plugin/sound-scout/delivery.py`) calls these functions through
 `sound-scout jobs deliver-next|deliver-end`; it sends, Sound Scout keeps the state. Hermes does not
-deduplicate notes, so a job is delivered at most once: `next_delivery` writes the marker
+deduplicate notes, so a note is sent at most once per attempt: `next_delivery` writes the marker
 `{"state": "sending", ...}` under `jobs.lock` before it answers with the text, that is before any
 send, and nothing here ever puts a job back to send except `released` (the send function returned
-before sending, because no gateway in the calling process owns the session).
+before sending, because no gateway in the calling process owns the session) or a later ended
+attempt.
 
-`delivery` of a job: `null` (not delivered yet), the marker `sending` (`tag`, `loop_id`,
-`claimed_at`), or how it ended: `delivered` (`confirmed_by`: `send` or `history`),
+`delivery` of a job: `null` (not delivered yet), the marker `sending` (`tag`, `attempt`,
+`loop_id`, `claimed_at`), or how it ended: `delivered` (`confirmed_by`: `send` or `history`),
 `delivery_unconfirmed` or `delivery_failed` (`error`), each with `claimed_at` and `ended_at`. A
 job whose `job.json` has no `delivery` key (submitted before this field) is never delivered. The
 job `state` does not change: delivery is an axis of its own, like the result `status`.
+
+One note per attempt (Decision in #187, decision 0018 "Повтор и доставка"): `attempt` of a note is
+the number of attempts the job had when its note was claimed (0 for a job cancelled before any
+attempt). When a job ends again after `jobs retry` with more attempts than its note counts, that
+note moves to `job.json["deliveries"]` and the job gets a new one. The first note of a job is
+tagged `sound-scout-job:<job_id>`, as before #187; each later one `sound-scout-job:<job_id>-a<n>`,
+`n` its attempt, so no two notes of a job share a tag. A retry whose attempt never ran (cancelled
+in the queue) adds no attempt and gets no note. A note written before #187 has no `attempt`: it
+covers every attempt the job has, so a job retried before the update gets no late note; `jobs
+retry` writes that number into it before it queues the job again, so the next attempt gets one.
+The text of a note is about its own attempt: when `jobs.result` answers with an earlier attempt,
+the note says that its attempt gave no result. A redelivery requested for a note that a later
+ended attempt supersedes is not sent: the later attempt's note replaces it, and the request stays
+in `deliveries` as `redelivery_requested`.
 
 A second delivery is only an explicit request through `sound-scout jobs redeliver` or the MCP tool
 `speech_job_redeliver`, both `request_redelivery` (#122, decision 0013 § 3.1): it takes only
@@ -91,9 +106,24 @@ NO_BACKEND = " — audio backend не выбран (`backend = none`)"
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]*")
 
 
-def tag(job_id: str) -> str:
-    """The job's mark in the note and in the chat history."""
-    return f"{TAG_PREFIX}{job_id}"
+def tag(job_id: str, attempt: int | None = None) -> str:
+    """The mark of a note in the note and in the chat history: of the job's first note without
+    `attempt`, of a later note with the attempt it reports. See the module docstring."""
+    return f"{TAG_PREFIX}{job_id}" if attempt is None else f"{TAG_PREFIX}{job_id}-a{attempt}"
+
+
+def _noted_attempt(job: dict, marker: dict) -> int:
+    """The number of attempts the note of `marker` counts; see the module docstring."""
+    return marker.get("attempt", len(job["attempts"]))
+
+
+def _superseded(job: dict, marker: object) -> bool:
+    """Whether the job ended again after a retry since its settled note was claimed."""
+    return (
+        isinstance(marker, dict)
+        and marker.get("state") != SENDING
+        and _noted_attempt(job, marker) < len(job["attempts"])
+    )
 
 
 def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
@@ -101,9 +131,10 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
 
     `check`: a `sending` marker of another loop (one stopped in the middle of a send); the loop
     looks for the tag in the chat history and never sends. `send`: the oldest ended job with a
-    `session_id` and `delivery: null`, now marked `sending`, with the note text; `redeliver`: the
-    same for a job with `redelivery_requested`, whose tag the loop looks for in the chat history
-    before it sends. `none` otherwise.
+    `session_id` and `delivery: null` (or a note of an earlier attempt, now moved to
+    `deliveries`), now marked `sending`, with the note text; `redeliver`: the same for a job with
+    `redelivery_requested`, whose tag the loop looks for in the chat history before it sends.
+    `none` otherwise.
     """
     jobs._check_identifier("profile", profile)
     jobs._check_identifier("loop_id", loop_id)
@@ -125,13 +156,22 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
             if job["state"] not in ENDED_STATES or job["binding"].get("session_id") is None:
                 continue
             marker = job.get("delivery", False)
+            if _superseded(job, marker):
+                job.setdefault("deliveries", []).append(marker)
+                marker = None
             requested = isinstance(marker, dict) and marker.get("state") == REDELIVERY_REQUESTED
             if marker is not None and not requested:
                 continue
-            text = note_text(job, config)
+            if requested:
+                note_tag, attempt = marker["tag"], _noted_attempt(job, marker)
+            else:
+                attempt = len(job["attempts"])
+                note_tag = tag(job["job_id"], attempt if job.get("deliveries") else None)
+            text = note_text(job, config, note_tag, attempt)
             job["delivery"] = {
                 "state": SENDING,
-                "tag": tag(job["job_id"]),
+                "tag": note_tag,
+                "attempt": attempt,
                 "loop_id": loop_id,
                 "claimed_at": jobs._now(),
             }
@@ -139,7 +179,7 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
                 job["delivery"] |= {"redelivery": True, "requested_at": marker["requested_at"]}
             jobs._save(jobs_dir / job["job_id"], job)
             action = "redeliver" if requested else "send"
-            return _address(action, job) | {"tag": tag(job["job_id"]), "text": text}
+            return _address(action, job) | {"tag": note_tag, "text": text}
     return {"action": "none"}
 
 
@@ -159,7 +199,12 @@ def request_redelivery(job_id: str, config: Config) -> dict:
             )
         now = jobs._now()
         job.setdefault("redeliveries", []).append({"requested_at": now, "previous": marker})
-        job["delivery"] = {"state": REDELIVERY_REQUESTED, "tag": marker["tag"], "requested_at": now}
+        job["delivery"] = {
+            "state": REDELIVERY_REQUESTED,
+            "tag": marker["tag"],
+            "attempt": _noted_attempt(job, marker),
+            "requested_at": now,
+        }
         jobs._save(job_dir, job)
         return jobs._view(job_dir, job, config)
 
@@ -189,12 +234,13 @@ def end_delivery(job_id: str, outcome: str, error: str | None, config: Config) -
             job["delivery"] = {
                 "state": REDELIVERY_REQUESTED,
                 "tag": marker["tag"],
+                "attempt": _noted_attempt(job, marker),
                 "requested_at": marker["requested_at"],
             }
         elif state is None:
             job["delivery"] = None
         else:
-            ended = {"state": state, "tag": marker["tag"]}
+            ended = {"state": state, "tag": marker["tag"], "attempt": _noted_attempt(job, marker)}
             if confirmed_by is not None:
                 ended["confirmed_by"] = confirmed_by
             else:
@@ -209,9 +255,13 @@ def end_delivery(job_id: str, outcome: str, error: str | None, config: Config) -
         return jobs._view(job_dir, job, config)
 
 
-def note_text(job: dict, config: Config) -> str:
+def note_text(
+    job: dict, config: Config, note_tag: str | None = None, attempt: int | None = None
+) -> str:
     """The plain Russian note of an ended job: the result status, every requested layer with its
-    stage status, what was not assessed, the report and the tag in the last line.
+    stage status, what was not assessed, the report and the tag in the last line (`note_tag`,
+    by default the tag of the job's first note). With `attempt`, the note is about the job's
+    first `attempt` attempts: a result of an earlier attempt than the last of them reads as none.
 
     Never the transcript, a path of the input or a root, nor any "all done": `finished` is the
     queue's state, the layers say what was covered. An unreadable `result.json` reads as no result.
@@ -225,6 +275,11 @@ def note_text(job: dict, config: Config) -> str:
     except (ValueError, KeyError):
         # An unreadable result.json must not block every later note of the profile.
         answer = None
+    if attempt is not None:
+        job = job | {"attempts": job["attempts"][:attempt]}
+        last = job["attempts"][-1].get("number") if job["attempts"] else None
+        if answer is not None and answer["attempt"] != last:
+            answer = None
     if answer is not None:
         status = answer["status"]
         lines = [
@@ -262,7 +317,7 @@ def note_text(job: dict, config: Config) -> str:
         lines.append(f"Отчёт: {answer['run_dir']}/{report.REPORT_FILE_NAME}")
     if job["request"].get("control"):
         lines += _compare_lines(job, answer)
-    lines.append(tag(job["job_id"]))
+    lines.append(note_tag or tag(job["job_id"]))
     return "\n".join(lines)
 
 

@@ -898,7 +898,7 @@ def test_retry_of_a_failed_job_queues_its_next_attempt_with_the_same_ids(
     calls: list[str] = []
     monkeypatch.setattr(app, "analyze", substitute(calls, fail_first=True))
     jobs.run_runner(cfg, exit_when_idle=True, poll_seconds=POLL)
-    delivery = {"state": "delivered", "tag": f"sound-scout-job:{job_id}"}
+    delivery = {"state": "delivered", "tag": f"sound-scout-job:{job_id}", "attempt": 1}
     set_job(cfg, job_id, delivery=delivery)
     before = job_file(cfg, job_id)
 
