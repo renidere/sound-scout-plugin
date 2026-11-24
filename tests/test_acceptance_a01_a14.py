@@ -246,6 +246,11 @@ def test_the_rows_never_run_live_stay_open_and_name_what_is_missing() -> None:
     assert "ждёт #140" not in a07[4] and "issues/140" not in a07[4]
     assert "«разрыв MCP» — путь задания MCP из #140" not in a07[2]
     assert "«разрыв MCP» — `не проверено на живой системе`" in a07[4]
+    mcp_break = "test_a_queued_job_runs_and_is_delivered_once_after_the_server_stops"
+    assert f"«разрыв MCP» — контракт, не приёмка: `{mcp_break}`" in a07[3]
+    mcp_tests = (REPO_ROOT / "tests" / "test_mcp_server.py").read_text(encoding="utf-8")
+    assert f"def {mcp_break}(" in mcp_tests
+    assert "контрактного теста именно обрыва нет" not in a07[4]
 
 
 def test_o6_is_rewritten_to_cancel_the_second_job_while_the_first_runs() -> None:

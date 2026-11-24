@@ -1516,6 +1516,81 @@ def test_no_mcp_tool_binds_a_job_and_the_submit_schema_has_no_binding_field() ->
     assert "binds the job to that chat after this call" in submit.description
 
 
+# --- the server stops while a job is queued: «разрыв MCP» (A07, #186) ------------------------
+
+
+def child_pids(pid: int) -> list[str]:
+    """The children of every thread of `pid`, from Linux `/proc`; none without `/proc`."""
+    tasks = Path(f"/proc/{pid}/task")
+    return [
+        child
+        for task in (tasks.iterdir() if tasks.is_dir() else ())
+        for child in (task / "children").read_text(encoding="utf-8").split()
+    ]
+
+
+@pytest.mark.slow
+@needs_ffmpeg
+@pytest.mark.parametrize("stop", ["sigkill", "stdin_closed"])
+def test_a_queued_job_runs_and_is_delivered_once_after_the_server_stops(
+    stop: str, stdio_env: dict[str, str], make_wav: WavFactory
+) -> None:
+    """Decision 0013 § 3.6 and 0025: the job of a server that is gone is the queue's, not the
+    server's; R11: the server owns no process that its stop leaves behind."""
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+
+    def jobs_cli(*args: str) -> str:
+        done = subprocess.run(
+            [sys.executable, "-m", "sound_scout", "jobs", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=stdio_env,
+        )
+        assert done.returncode == 0, (args, done.stderr)
+        return done.stdout
+
+    def jobs_json(*args: str) -> dict:
+        return json.loads(jobs_cli(*args, "--json"))
+
+    session = StdioSession(stdio_env)
+    session.initialize()
+    submitted = session.call_tool("speech_job_submit", {"path": str(wav), "request_id": "a07"})
+    assert submitted.get("isError") is not True, submitted
+    job_id = answer_of(submitted)["job_id"]
+    bound = jobs_json("bind", "--session-id=chat-a", "--profile=work", job_id)
+    assert child_pids(session.process.pid) == []
+
+    if stop == "sigkill":
+        session.process.kill()
+        session.process.stdin.close()
+        code = session.process.wait(timeout=RESPONSE_SECONDS)
+        session.process.stderr.close()
+        assert code == -9
+    else:
+        code, stderr = session.close()
+        assert code == 0, stderr
+
+    after_stop = jobs_json("status", job_id)
+    assert bound["state"] == after_stop["state"] == "queued"
+    assert after_stop["binding"] == bound["binding"]
+    assert after_stop["binding"]["session_id"] == "chat-a"
+
+    jobs_cli("run", "--exit-when-idle")
+    ended = jobs_json("result", job_id)
+    assert ended["job_state"] == "finished"
+
+    assert jobs_json("deliver-next", "--profile=default", "--loop=l-1") == {"action": "none"}
+    sent = jobs_json("deliver-next", "--profile=work", "--loop=l-1")
+    assert sent["action"] == "send"
+    assert sent["job_id"] == job_id and sent["session_id"] == "chat-a"
+    assert sent["text"].endswith(delivery.tag(job_id))
+    delivered = jobs_json("deliver-end", "--outcome=delivered", job_id)
+    assert delivered["delivery"]["state"] == "delivered"
+    assert jobs_json("deliver-next", "--profile=work", "--loop=l-1") == {"action": "none"}
+    assert jobs_json("deliver-next", "--profile=work", "--loop=l-2") == {"action": "none"}
+
+
 # --- a control attempt through speech_job_submit (#110) --------------------------------------
 
 
