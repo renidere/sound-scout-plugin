@@ -191,10 +191,14 @@ def test_a11_names_the_chat_path_and_no_longer_waits_for_an_owner_decision() -> 
         "`speech_job_result`",
         "`speech_compare`",
         "шаг 7",
+        "«Задание контрольной попытки уже есть»",
     ):
         assert word in a11[2], word
     assert "plugin.js" not in a11[3]
     assert "`hermes/skills/speech-review/SKILL.md`" in a11[3]
+    skill = (REPO_ROOT / "hermes" / "skills" / "speech-review" / "SKILL.md").read_text("utf-8")
+    step = skill.split("7. **Сравнение попыток.**", 1)[1]
+    assert "**Задание контрольной попытки уже есть.**" in step
     assert "нет evidence на живой системе" in a11[3]
     assert status(a11) == "не проверено"
     assert f"{REPO_URL}/issues/90" in a11[4]

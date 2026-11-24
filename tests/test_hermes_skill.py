@@ -1,4 +1,4 @@
-"""Lint of the Hermes skill `speech-review` (issues #38, #100, #179, #180; R12, AGENT_PROMPT
+"""Lint of the Hermes skill `speech-review` (issues #38, #100, #179, #180, #185; R12, AGENT_PROMPT
 D.14, decision 0013 § 3.8)."""
 
 import json
@@ -143,6 +143,26 @@ OLD_DESCRIPTION = "Разбор русской речи из аудиовлож�
 JOB_CLAIM = re.compile(
     r"(?<!не говорить, что )задани[ея] (?:этой |новой )?(?:записи )?(?:уже )?(?:есть|нет)"
 )
+# Issue #185: in the chat path of A11 the recorder has submitted both jobs, and their notes carry
+# the tags; step 7 reads both jobs by the tags and never submits a recorder file (`path_denied`).
+# One criterion rule follows both cases.
+COMPARE_STEP = "7. **Сравнение попыток.**"
+COMPARE_EXISTING_CASE = "**Задание контрольной попытки уже есть.**"
+COMPARE_EXISTING_TERMS = (
+    COMPARE_EXISTING_CASE,
+    "в чате есть две заметки Sound Scout с метками `sound-scout-job:<job_id>`",
+    "прочитать оба задания по `job_id` из меток заметок через `speech_job_result`",
+    "взять из ответов оба `run_id`",
+    "`speech_job_submit` не вызывать",
+    "Взять две последние заметки с разными `job_id`, если пользователь не назвал другие.",
+    "Роли задаёт `submitted_at` из `speech_job_status`",
+    "Если пара или роли неясны, спросить пользователя.",
+)
+CRITERION_RULE = (
+    "Правило критерия одно для обоих случаев. `speech_compare` применим, только если у поправки "
+    "`evidence_basis` = `audio_model_observation` и её `category` — одна из четырёх категорий "
+    "критериев"
+)
 QUEUE_AS_FACT = re.compile(r"(?<!не утверждать, что )задание (?:уже )?в очереди")
 OPERATOR_SETTING = re.compile(r"(?<!не )настройка оператора")
 SEND_ONLY = re.compile(r"«Отправить»")
@@ -168,6 +188,7 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
     problems += procedure_problems(text)
     problems += desktop_attachment_problems(text)
     problems += plain_send_problems(text)
+    problems += compare_step_problems(text)
     if str(Path.home()) in text:
         problems.append("home directory in the text")
     if not SKILL_NAME.fullmatch(name) or name != directory:
@@ -251,6 +272,28 @@ def plain_send_problems(text: str) -> list[str]:
     return problems
 
 
+def compare_step(text: str) -> str:
+    """Step 7 of the Procedure, flattened; empty when the step is missing."""
+    if "\n## Procedure\n" not in text or COMPARE_STEP not in text:
+        return ""
+    return flat(section(text, "## Procedure").split(COMPARE_STEP, 1)[1].split("\n8. **", 1)[0])
+
+
+def compare_step_problems(text: str) -> list[str]:
+    """Step 7 has the case of existing jobs, and one criterion rule follows both cases (#185)."""
+    step = compare_step(text)
+    if not step:
+        return ["procedure lacks the compare step"] if "\n## Procedure\n" in text else []
+    problems = [f"compare step lacks: {t}" for t in COMPARE_EXISTING_TERMS if t not in step]
+    if CRITERION_RULE not in step:
+        problems.append("compare step lacks the criterion rule for both cases")
+    elif COMPARE_EXISTING_CASE in step and step.index(CRITERION_RULE) < step.index(
+        COMPARE_EXISTING_CASE
+    ):
+        problems.append("criterion rule comes before the case of existing jobs")
+    return problems
+
+
 def json_block(text: str, lead: str) -> object:
     return json.loads(text.split(lead, 1)[1].split("```", 1)[0])
 
@@ -315,6 +358,50 @@ def test_compare_is_offered_only_for_an_audio_model_finding_of_a_criterion_categ
     assert "`audio_model_observation`" in answer and "не проверяет" in answer
 
 
+def test_compare_step_reads_both_existing_jobs_by_the_note_tags_and_submits_none() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    assert compare_step_problems(text) == []
+    step = compare_step(text)
+    case = step.split(COMPARE_EXISTING_CASE, 1)[1].split("Правило критерия", 1)[0]
+    assert "«Отправить и разобрать»" in case
+    assert "`speech_job_submit`" not in case.replace("`speech_job_submit` не вызывать", "")
+    assert "`path_denied`" in case and "пункт 6 раздела «Вложения Hermes»" in case
+    assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
+    attached = step.split("**Контрольная попытка вложением.**", 1)[1].split(COMPARE_EXISTING_CASE)
+    assert "шаги 3–5" in attached[0] and "`task_differs`" in attached[0]
+    assert step.index(COMPARE_EXISTING_CASE) < step.index(CRITERION_RULE)
+    assert frontmatter(text)["version"] == "0.5.4"
+
+
+def test_lint_reports_a_compare_step_without_the_case_of_existing_jobs() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    step = section(text, "## Procedure").split(COMPARE_STEP, 1)[1]
+    body = step.split(COMPARE_EXISTING_CASE, 1)[1].split("\n\n")[0]
+    case = f"   - {COMPARE_EXISTING_CASE}{body}"
+    assert case in text
+    assert skill_problems(text.replace(case + "\n", "")) == [
+        f"compare step lacks: {t}" for t in COMPARE_EXISTING_TERMS
+    ]
+    old = "`speech_job_submit` не вызывать:"
+    assert skill_problems(text.replace(old, "`speech_job_submit` вызвать:")) == [
+        f"compare step lacks: {COMPARE_EXISTING_TERMS[4]}"
+    ]
+    old = "Правило критерия одно для обоих случаев. "
+    assert skill_problems(text.replace(old, "")) == [
+        "compare step lacks the criterion rule for both cases"
+    ]
+    assert skill_problems(text.replace(COMPARE_STEP, "7. **Сравнение.**")) == [
+        "procedure lacks the compare step"
+    ]
+    rule = step.split("Правило критерия", 1)[1].split("\n8. **", 1)[0]
+    rule = "   Правило критерия" + rule.rstrip("\n") + "\n"
+    assert rule in text
+    attached = "   - **Контрольная попытка вложением.**"
+    assert attached in text
+    moved = text.replace("\n" + rule, "\n").replace(attached, rule + "\n" + attached)
+    assert skill_problems(moved) == ["criterion rule comes before the case of existing jobs"]
+
+
 def test_skill_gives_no_correction_or_control_without_a_fitting_finding() -> None:
     text = SKILL.read_text(encoding="utf-8")
     answer = section(text, "## Ответ пользователю")
@@ -377,7 +464,7 @@ def test_plain_send_matches_no_note_to_a_recording_and_reads_a_job_by_the_note_t
     assert OLD_NOTE_MATCH not in flat(text)
     assert plain.index("Приходит она только после конца задания") < plain.index("пункту 6")
     assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
-    assert frontmatter(text)["version"] == "0.5.3"
+    assert frontmatter(text)["version"] == "0.5.4"
 
 
 def test_plain_send_facts_agree_with_the_note_and_the_recorder() -> None:
@@ -471,10 +558,13 @@ def test_lint_reports_job_tools_missing_or_out_of_order_in_the_procedure() -> No
     steps = section(text, "## Procedure")
     without_result = steps.replace("`speech_job_result`", "`speech_result`")
     result_first = steps.replace("1. **Возможности.**", "1. **Возможности.** `speech_job_result`.")
-    for changed in (without_result, result_first):
-        assert skill_problems(text.replace(steps, changed)) == [
-            "procedure lacks submit, status, result in this order"
-        ]
+    order = "procedure lacks submit, status, result in this order"
+    assert skill_problems(text.replace(steps, result_first)) == [order]
+    # step 7 reads existing jobs with `speech_job_result` too (#185)
+    assert skill_problems(text.replace(steps, without_result)) == [
+        order,
+        f"compare step lacks: {COMPARE_EXISTING_TERMS[2]}",
+    ]
 
 
 def test_explicit_request_submits_a_job_reads_its_status_and_result_and_cancels_on_request() -> (
@@ -556,7 +646,7 @@ def test_description_says_a_voice_message_without_a_request_needs_no_tool_call()
     assert len(description) <= DESCRIPTION_LIMIT
     assert all(term in description for term in DESCRIPTION_TERMS)
     assert description_problems(description) == []
-    assert frontmatter(text)["version"] == "0.5.3"
+    assert frontmatter(text)["version"] == "0.5.4"
 
 
 def test_lint_reports_the_old_description_that_invites_a_call_on_any_attachment() -> None:

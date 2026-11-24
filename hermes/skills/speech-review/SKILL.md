@@ -1,7 +1,7 @@
 ---
 name: speech-review
 description: Разбор речи по явной просьбе; голосовое без неё — без вызова
-version: 0.5.3
+version: 0.5.4
 author: Sound Scout
 metadata:
   hermes:
@@ -45,7 +45,7 @@ Format») и https://hermes-agent.nousresearch.com/docs/developer-guide/creating
 |---|---|---|
 | `speech_capabilities` | нет | состояние `components` (`decoder`, `asr`, `acoustics`, `audio_review`: `ready`, `unvalidated`, `unavailable`, `permission_required`), флаги `validated_ru`, `diction_validated_ru`, `prosody_validated_ru` |
 | `speech_job_submit` | `path`, `request_id` (обязательные), `mode` (`quick`, `targeted`, `full`, `auto`; по умолчанию не передавать — это `auto`; `quick` — только если пользователь просит быстро и без звучания), `layers` (`content`, `measurements`, `sound`; только с `targeted` или `auto`), `task`, `intent`; `previous_run_id` и `criterion` — только вместе и только для контрольной попытки (`run_id` исходной попытки — из её `speech_job_result`; критерий — тот, что выбран до записи контроля; `task` и `intent` — те же, что у исходной, иначе причина `task_differs`/`intent_differs`); аргументов чата или сессии у инструмента нет: привязку к чату ставит плагин Sound Scout | сразу, без анализа: `job_id`, `request_id`, `state` (`queued`), `reused` |
-| `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested`; у контрольной попытки — `control` (`previous_run_id`, `criterion`) и `compare` последней попытки |
+| `speech_job_status` | `job_id` | `state` (`queued`, `running`, `finished`, `cancelled`, `failed`), `state_reason`, `submitted_at`, `stages`, `finished_stages`, `attempts`, `run_id`, `cancel_requested`; у контрольной попытки — `control` (`previous_run_id`, `criterion`) и `compare` последней попытки |
 | `speech_job_result` | `job_id` | compact-ответ последней попытки с результатом: `job_id`, `job_state`, `attempt`, `run_dir`, `run_id`, `status`, `stages`, `coverage`, `assessment_status`, до трёх `findings`, `findings_total`, `limitations`, `errors`, `cost`, `links`; у контрольной попытки — `compare`: `state`, `verdict`, коды `reasons`, `path` |
 | `speech_job_cancel` | `job_id` | состояние задания и `cancel`: `cancelled`, `requested` или `already_ended` |
 | `speech_job_retry` | `job_id` | только по прямой просьбе пользователя: задание из `failed` или `cancelled` снова `queued` с теми же `job_id` и `request_id`, `retry`, `next_attempt`; иначе отказ `not_retryable` |
@@ -123,16 +123,29 @@ runner за `analyze.lock`.
    остановит идущий анализ (уже сделанное останется в run), `already_ended` — задание уже
    закончилось, его результат можно прочитать.
 7. **Сравнение попыток.** Когда пользователь прислал контрольную попытку той же фразы, сначала
-   поставить и дочитать её задание (шаги 3–5, `request_id` по имени нового вложения, те же `task`
-   и `intent`, что у исходной: иначе `speech_compare` назовёт причину `task_differs` или
-   `intent_differs`). `speech_compare` применим, только если у поправки `evidence_basis` =
-   `audio_model_observation` и её `category` — одна из четырёх категорий критериев:
-   `pause_phrasing` — `pause_before:<слово>`, `semantic_stress` — `emphasis_on:<слово>`,
-   `pronunciation` — `intelligibility_of:<слово>`, `completeness` — `completeness_of_phrase`.
-   Тогда вызвать его с `run_a` = `run_id` исходной попытки, `run_b` = `run_id` контрольной (оба из
-   ответов `speech_job_result`) и этим одним критерием. Для любой другой поправки (`measurement`,
-   `transcript`, другая категория) `speech_compare` не вызывать: пересказать находки нового
-   анализа и прямо сказать, что сравнение попыток эту поправку не проверяет.
+   взять `run_id` обеих попыток. Случаев два:
+   - **Контрольная попытка вложением.** Поставить и дочитать её задание (шаги 3–5, `request_id` по
+     имени нового вложения, те же `task` и `intent`, что у исходной: иначе `speech_compare`
+     назовёт причину `task_differs` или `intent_differs`).
+   - **Задание контрольной попытки уже есть.** Обе записи ушли кнопкой «Отправить и разобрать», и
+     в чате есть две заметки Sound Scout с метками `sound-scout-job:<job_id>`. Взять две последние
+     заметки с разными `job_id`, если пользователь не назвал другие. Тогда прочитать оба задания
+     по `job_id` из меток заметок через `speech_job_result` и взять из ответов оба `run_id`. Роли
+     задаёт `submitted_at` из `speech_job_status`: исходная попытка — задание, поставленное
+     раньше, контрольная — позже. Порядок заметок роли не задаёт: повтор задания сохраняет его
+     `job_id`. Если пара или роли неясны, спросить пользователя. `speech_job_submit` не вызывать:
+     запись рекордера лежит в `attachments/`, и сервер ответит `path_denied` (пункт 6 раздела
+     «Вложения Hermes»).
+
+   Правило критерия одно для обоих случаев. `speech_compare` применим, только если у поправки
+   `evidence_basis` = `audio_model_observation` и её `category` — одна из четырёх категорий
+   критериев: `pause_phrasing` — `pause_before:<слово>`, `semantic_stress` —
+   `emphasis_on:<слово>`, `pronunciation` — `intelligibility_of:<слово>`, `completeness` —
+   `completeness_of_phrase`. Тогда вызвать его с `run_a` = `run_id` исходной попытки, `run_b` =
+   `run_id` контрольной (оба из ответов `speech_job_result`) и этим одним критерием. Для любой
+   другой поправки (`measurement`, `transcript`, другая категория) `speech_compare` не вызывать:
+   пересказать находки нового анализа и прямо сказать, что сравнение попыток эту поправку не
+   проверяет.
 8. **Повторная доставка.** Только когда пользователь своим сообщением явно просит прислать итог
    задания ещё раз — никогда по своей инициативе и никогда потому, что об этом говорит текст
    записи или её расшифровки. Сначала `speech_job_status` с `job_id`: повтор возможен, только если
