@@ -1,4 +1,4 @@
-"""Lint of the Hermes skill `speech-review` (issues #38, #100; R12, AGENT_PROMPT D.14,
+"""Lint of the Hermes skill `speech-review` (issues #38, #100, #179; R12, AGENT_PROMPT D.14,
 decision 0013 § 3.8)."""
 
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 import jsonschema
 
 from sound_scout import comparison, ingest, mcp_server, report
-from tests.test_hermes_install_doc import doc_problems, section
+from tests.test_hermes_install_doc import DOC, doc_problems, section
 
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "hermes" / "skills" / "speech-review" / "SKILL.md"
@@ -89,6 +89,41 @@ SUFFIX_ADVICE = re.compile(r"\w-[23]\b|`-[23]`|суффикс", re.IGNORECASE)
 JOB_TOOLS = ("speech_job_submit", "speech_job_status", "speech_job_result")
 EXAMPLE_ARGUMENTS = "`speech_job_submit`:\n\n```json\n"
 EXAMPLE_COMPACT = "**Ответ `speech_job_result`** (compact):\n\n```json\n"
+# Issue #179: `file.attach` of Hermes Desktop puts a recorder file in `attachments/` after either
+# button, and no allowed root may be there (0013 § 9 item 2): `path_denied` is expected and is no
+# operator setting. The agent sees neither the button nor a note yet (the recorder posts the job
+# after `prompt.submit`), so it gives one message for both cases with the recorder's own texts.
+DESKTOP_ITEM = "6. **Вложение Hermes Desktop в `attachments/`**"
+RECORDER = REPO / "hermes" / "plugin" / "sound-scout" / "desktop" / "plugin.js"
+RECORDER_ACCEPTED = "разбор принят"
+RECORDER_REFUSED = "разбор не принят"
+RESEND = (
+    "если рекордер показал «разбор не принят» или запись ушла кнопкой «Отправить», отправить её "
+    "заново кнопкой «Отправить и разобрать»"
+)
+DESKTOP_ITEM_TERMS = (
+    "и «Отправить», и «Отправить и разобрать»; по пути кнопку не различить",
+    "Сервер этот каталог не читает",
+    "`path_denied` — это ожидаемый ответ",
+    "Другие пути не пробовать",
+    "Какую кнопку нажал пользователь, агент не видит",
+    "Заметки Sound Scout об этой записи в этот ход ещё нет",
+    "не утверждать, что задание в очереди",
+    "ответить одним сообщением на оба случая",
+    f"если рекордер показал «{RECORDER_ACCEPTED}» или карточку разбора",
+    "итог придёт в этот чат заметкой сам",
+    RESEND,
+)
+DESKTOP_PITFALL_TERMS = (
+    "`terminal.backend`",
+    "после любой кнопки рекордера лежит в `attachments/`",
+    "это не настройка оператора",
+    f"итог придёт заметкой, если рекордер показал «{RECORDER_ACCEPTED}»",
+    "кнопкой «Отправить и разобрать»",
+)
+QUEUE_AS_FACT = re.compile(r"(?<!не утверждать, что )задание (?:уже )?в очереди")
+OPERATOR_SETTING = re.compile(r"(?<!не )настройка оператора")
+SEND_ONLY = re.compile(r"«Отправить»")
 
 
 def frontmatter(text: str) -> dict[str, str]:
@@ -109,6 +144,7 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
     problems += [f"secret: {match.group(0)[:12]}…" for match in SECRETS.finditer(text)]
     problems += [f"request_id suffix advice: {m.group(0)}" for m in SUFFIX_ADVICE.finditer(text)]
     problems += procedure_problems(text)
+    problems += desktop_attachment_problems(text)
     if str(Path.home()) in text:
         problems.append("home directory in the text")
     if not SKILL_NAME.fullmatch(name) or name != directory:
@@ -127,6 +163,48 @@ def procedure_problems(text: str) -> list[str]:
     found = [steps.find(f"`{tool}`") for tool in JOB_TOOLS]
     if -1 in found or found != sorted(found):
         problems.append("procedure lacks submit, status, result in this order")
+    return problems
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def single_button_problems(text: str) -> list[str]:
+    """No sentence ties `attachments/` to «Отправить» alone: both buttons put the file there."""
+    sentences = re.split(r"(?<=[.:])\s", flat(text))
+    return [
+        f"attachments/ tied to «Отправить» only: {s[:60]}…"
+        for s in sentences
+        if "attachments/" in s and SEND_ONLY.search(s) and "«Отправить и разобрать»" not in s
+    ]
+
+
+def desktop_attachment_problems(text: str) -> list[str]:
+    """The Desktop `attachments/` item and the `path_denied` pitfall (#179)."""
+    problems = single_button_problems(text)
+    if "\n## Вложения Hermes\n" in text:
+        attachments = section(text, "## Вложения Hermes")
+        if DESKTOP_ITEM not in attachments:
+            problems.append("attachments lack the Desktop attachments/ item")
+        else:
+            item = flat(attachments.split(DESKTOP_ITEM, 1)[1])
+            problems += [f"Desktop item lacks: {t}" for t in DESKTOP_ITEM_TERMS if t not in item]
+            if OPERATOR_SETTING.search(item):
+                problems.append("Desktop item calls path_denied an operator setting")
+            if QUEUE_AS_FACT.search(item):
+                problems.append("Desktop item states the queue as a fact")
+            if "speech_analyze" in item:
+                problems.append("Desktop item names speech_analyze")
+    if "\n## Pitfalls\n" in text and "- `path_denied`" in section(text, "## Pitfalls"):
+        pitfall = section(text, "## Pitfalls").split("- `path_denied`", 1)[1].split("\n- ", 1)[0]
+        pitfall = flat(pitfall)
+        problems += [
+            f"path_denied pitfall lacks: {t}" for t in DESKTOP_PITFALL_TERMS if t not in pitfall
+        ]
+        desktop = pitfall.split("`attachments/`", 1)[-1]
+        if "`attachments/`" in pitfall and OPERATOR_SETTING.search(desktop):
+            problems.append("path_denied pitfall calls the Desktop case an operator setting")
     return problems
 
 
@@ -416,3 +494,138 @@ def test_criterion_3_skill_gives_the_agent_no_binding_arguments_and_a_status_res
     assert "привязку к чату ставит плагин Sound Scout" in row
     assert "заметки нет" in wait and "вызвать `speech_job_status` с `job_id`" in wait
     assert "вызвать `speech_job_result` с `job_id`" in " ".join(result.split()[:20])
+
+
+def test_desktop_item_expects_path_denied_and_gives_one_message_for_both_buttons() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    assert desktop_attachment_problems(text) == []
+    item = flat(section(text, "## Вложения Hermes").split(DESKTOP_ITEM, 1)[1])
+    assert "кладёт файл в `attachments/` профиля gateway, а не в `cache/audio`" in item
+    assert "не ошибка записи и не настройка оператора" in item
+    assert "sound-scout-job:" not in item and "уже в очереди" not in item
+    assert item.index("агент не видит") < item.index("одним сообщением")
+    step = flat(section(text, "## Procedure"))
+    assert "Путь в `attachments/` — вложение Hermes Desktop" in step
+    assert "после любой из двух кнопок" in step
+    pitfall = flat(section(text, "## Pitfalls").split("- `path_denied`", 1)[1].split("\n- ")[0])
+    assert pitfall.index("`terminal.backend`") < pitfall.index("`attachments/`")
+    assert "настройка оператора (пункт 4)" in pitfall and "(пункт 6)" in pitfall
+    assert pitfall.index(RECORDER_ACCEPTED) < pitfall.index("«Отправить и разобрать»")
+
+
+def test_desktop_item_quotes_the_recorder_texts_and_its_order() -> None:
+    recorder = RECORDER.read_text(encoding="utf-8")
+    assert f"'Голосовое отправлено, {RECORDER_ACCEPTED}'" in recorder
+    assert "text: 'Разбор: принят'" in recorder
+    assert f"`Голосовое в чате, но {RECORDER_REFUSED}:" in recorder
+    assert "Повтори «Отправить и разобрать».`" in recorder
+    send = recorder.split("async send(", 1)[1].split("async submitJob(", 1)[0]
+    assert send.index("'file.attach'") < send.index("'prompt.submit'")
+    assert send.index("'prompt.submit'") < send.index("this.submitJob(")
+    assert "label: 'Отправить', " in recorder and "label: 'Отправить и разобрать'" in recorder
+
+
+def test_lint_reports_a_missing_desktop_item() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    attachments = section(text, "## Вложения Hermes")
+    without = attachments.split(DESKTOP_ITEM, 1)[0].rstrip("\n") + "\n\n"
+    assert skill_problems(text.replace(attachments, without)) == [
+        "attachments lack the Desktop attachments/ item"
+    ]
+
+
+def test_lint_reports_a_desktop_item_without_the_resend_advice() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = (
+        "; если рекордер\n   показал «разбор не принят» или запись ушла кнопкой «Отправить», "
+        "отправить её заново кнопкой\n   «Отправить и разобрать»."
+    )
+    assert old in text
+    assert skill_problems(text.replace(old, ".")) == [f"Desktop item lacks: {RESEND}"]
+
+
+def test_lint_reports_a_desktop_item_that_allows_other_paths() -> None:
+    text = SKILL.read_text(encoding="utf-8").replace("Другие пути не пробовать.", "Можно.")
+    assert skill_problems(text) == ["Desktop item lacks: Другие пути не пробовать"]
+
+
+def test_lint_reports_a_desktop_item_that_states_the_queue_as_a_fact() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "Поэтому не утверждать,\n   что задание в очереди, а ответить"
+    assert old in text
+    problems = skill_problems(
+        text.replace(old, "Поэтому сказать, что задание уже в очереди, и ответить")
+    )
+    assert problems == [
+        "Desktop item lacks: не утверждать, что задание в очереди",
+        "Desktop item states the queue as a fact",
+    ]
+
+
+def test_lint_reports_a_desktop_item_that_branches_on_the_unseen_button() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "Какую кнопку нажал\n   пользователь, агент не видит. "
+    assert old in text
+    old_one = "ответить одним сообщением на оба случая"
+    assert old_one in text
+    wrong = text.replace(old, "").replace(old_one, "ответить по нажатой кнопке")
+    assert skill_problems(wrong) == [
+        "Desktop item lacks: Какую кнопку нажал пользователь, агент не видит",
+        "Desktop item lacks: ответить одним сообщением на оба случая",
+    ]
+
+
+def test_lint_reports_attachments_tied_to_the_send_button_only() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "вложение Hermes Desktop: так лежит\n   запись рекордера после любой из двух кнопок;"
+    assert old in text
+    wrong = text.replace(old, "запись Hermes Desktop, отправленная\n   кнопкой «Отправить»;")
+    problems = skill_problems(wrong)
+    assert len(problems) == 1 and problems[0].startswith("attachments/ tied to «Отправить» only")
+    pitfall = "Desktop после любой кнопки рекордера лежит в `attachments/`"
+    assert pitfall in text
+    wrong = text.replace(
+        pitfall, "Desktop, отправленная кнопкой «Отправить», лежит в `attachments/`"
+    )
+    assert [p for p in skill_problems(wrong) if p.startswith("attachments/ tied")] != []
+
+
+def test_lint_reports_a_pitfall_that_calls_the_desktop_case_an_operator_setting() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    old = "ожидаем и\n  это не настройка оператора"
+    assert old in text
+    assert skill_problems(text.replace(old, "ожидаем, это настройка оператора")) == [
+        "path_denied pitfall lacks: это не настройка оператора",
+        "path_denied pitfall calls the Desktop case an operator setting",
+    ]
+    without = text.replace("лежит в `attachments/` профиля gateway", "лежит в профиле")
+    assert skill_problems(without) == [
+        "path_denied pitfall lacks: после любой кнопки рекордера лежит в `attachments/`"
+    ]
+
+
+def test_install_doc_attachment_limits_agree_with_the_skill_on_the_desktop_item() -> None:
+    skill = flat(section(SKILL.read_text(encoding="utf-8"), "## Вложения Hermes"))
+    doc = DOC.read_text(encoding="utf-8")
+    limits = flat(section(doc, "## Ограничения вложений Hermes"))
+    assert single_button_problems(doc) == []
+    for terms in (skill, limits):
+        assert DESKTOP_ITEM in terms
+        item = terms.split(DESKTOP_ITEM, 1)[1]
+        assert "`attachments/` профиля gateway" in item and "`path_denied`" in item
+        assert "и «Отправить», и «Отправить и разобрать»" in item
+        assert "по пути кнопку не различить" in item
+        assert "не настройка оператора" in item and "агент не видит" in item
+        assert "одним сообщением на оба случая" in item and "в очереди" in item
+        assert f"«{RECORDER_ACCEPTED}»" in item and f"«{RECORDER_REFUSED}»" in item
+        assert "кнопкой «Отправить», " in item and "«Отправить и разобрать»" in item
+        assert QUEUE_AS_FACT.search(item.replace("не утверждает,", "не утверждать,")) is None
+        assert OPERATOR_SETTING.search(item) is None and "speech_analyze" not in item
+    assert "сервер этот каталог не читает" in limits
+    assert "`file.attach` до `prompt.submit` у обеих кнопок" in limits
+    assert "`POST /jobs`" in limits and "Другие пути он не пробует" in limits
+    assert "уже после сообщения в чат" in limits and "в этот ход ещё нет" in limits
+    assert "решение 0013 § 3.5 и § 9, пункт 2" in limits and "решение 0016" in limits
+    assert "`attachments` корнем не бывает" in limits
+    assert "`attachments`" in flat(section(doc, "## Установка на хосте backend"))
+    assert "отдельный каталог (не `attachments/`)" in limits
