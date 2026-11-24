@@ -805,10 +805,12 @@ def test_serve_records_its_own_and_the_leader_start_for_stop(tmp_path) -> None:
         pid_file = tmp_path / "pid"
         _wait_for(lambda: pid_file.is_file() and pid_file.read_text())
         assert pid_file.read_text() == f"{serve.pid} {hostrun.start_ticks(serve.pid)}"
+        assert hostrun.serve_state(tmp_path / "stats.jsonl", pid_file)["serve_alive"] is True
         stats = _wait_for(lambda: [r for r in _stats(tmp_path) if r["event"] == "stats"])
         assert stats[0]["ticks"] >= started["ticks"]
         serve.send_signal(signal.SIGTERM)
         assert serve.wait(30) == 0
+        assert hostrun.serve_state(tmp_path / "stats.jsonl", pid_file)["serve_alive"] is False
         records = _stats(tmp_path)
         assert records[-1]["event"] == "exit"
         assert records[-1]["ticks"] >= max(r["ticks"] for r in records[:-1])
@@ -960,7 +962,7 @@ def test_state_reports_alive_exit_and_violation(tmp_path, capsys) -> None:
     }
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        (tmp_path / "serve.pid").write_text(str(child.pid))
+        (tmp_path / "serve.pid").write_text(f"{child.pid} {hostrun.start_ticks(child.pid)}")
         stats = tmp_path / "stats.jsonl"
         stats.write_text(json.dumps({"event": "started", "t": 1.0, "pid": 5}) + "\n")
         with open(stats, "a") as out:
@@ -984,6 +986,26 @@ def test_state_reports_alive_exit_and_violation(tmp_path, capsys) -> None:
     state = _state(tmp_path, capsys)
     assert state["serve_alive"] is False and state["violation"] == sockets
     assert state["exit"] == {"reason": "violation", "returncode": -9, "t": 3.5}
+
+
+def test_state_reports_alive_only_for_the_recorded_start_ticks(tmp_path, capsys) -> None:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        start = hostrun.start_ticks(child.pid)
+        pid_file = tmp_path / "serve.pid"
+        for text in (
+            f"{child.pid} {start + 1}",
+            f"{child.pid}",
+            f"{child.pid} later",
+            f"{child.pid} {start} {start}",
+        ):
+            pid_file.write_text(text)
+            assert _state(tmp_path, capsys)["serve_alive"] is False, text
+        pid_file.write_text(f"{child.pid} {start}")
+        assert _state(tmp_path, capsys)["serve_alive"] is True
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_evidence_tails_are_bounded_line_cut_and_list_processes(tmp_path, capsys) -> None:

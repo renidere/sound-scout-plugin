@@ -476,11 +476,10 @@ def _records(path: Path) -> list[dict]:
 
 def serve_state(stats: Path, pid_file: Path) -> dict:
     """Whether `serve` started, is alive, and how it ended; the pid is read before the stats, so
-    a `serve` gone between the two reads has already written its `exit` line."""
-    try:
-        alive = _alive(int(Path(pid_file).read_text().split()[0]))
-    except (OSError, ValueError, IndexError):
-        alive = False
+    a `serve` gone between the two reads has already written its `exit` line. A pid the kernel
+    gave to a new process (other start ticks) is not `serve`."""
+    serve_ = _serve_identity(pid_file)
+    alive = serve_ is not None and _is_running(*serve_)
     records = _records(stats)
     exits = [r for r in records if r.get("event") == "exit"]
     violations_ = [r for r in records if r.get("event") == "violation"]

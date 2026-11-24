@@ -168,7 +168,9 @@ exec. Рабочий под хуком: loopback и `AF_UNIX` работают, 
   по-прежнему сравнивается с `rss_bytes` (VmRSS); лимит пакета не меняется. Так улики различают
   H2. Смена определения или величины лимита — решение владельца о новом пакете.
 - `hostrun.py state --stats F --pid-file P` печатает `serve_state`: `started`, `serve_alive`,
-  последнюю запись `exit` и сокеты последней записи `violation`.
+  последнюю запись `exit` и сокеты последней записи `violation`. `serve_alive` — `true`, только
+  когда pid из `serve.pid` жив и его start ticks равны записанным (#181); pid, отданный ядром
+  новому процессу, и `serve.pid` без числовых start ticks дают `false`.
 - `smoke` раз в `server_check_s` = 15 с спрашивает `state` и падает сразу с `ServerExited`:
   запись `exit` — её `reason` и `returncode`; `serve` умер без `exit` — `hostrun_gone`; нет записи
   `started` дольше `server_start_s` = 60 с — `not_started`. Шаг пишет
