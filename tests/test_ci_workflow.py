@@ -1,6 +1,7 @@
-"""Acceptance checks of issues #65, #70 and #183: CI installs ffmpeg through one path with bounded
-time — the .deb set from the Actions cache with no apt mirror, or on a cache miss a download that
-survives a slow apt mirror by retrying."""
+"""Acceptance checks of issues #65, #70, #183 and #184: CI installs ffmpeg through one path with
+bounded time — the .deb set from the Actions cache with no apt mirror, the checked set of another
+runner image when this image has none, or else a download that survives a slow apt mirror by
+retrying."""
 
 import os
 import re
@@ -71,13 +72,15 @@ def test_install_ffmpeg_step_retries_the_download_within_its_timeout() -> None:
     assert kill_after, "kill-after is missing"
     kill_after_minutes = int(kill_after.group(1)) / 60
     assert 2 <= attempts <= 5
-    # Худший успешный путь: застрявшее восстановление кэша до своего предела, все попытки, кроме
-    # последней, висят до timeout и kill-after, последняя укладывается в свой предел, затем
-    # установка из кэша apt и сохранение набора в кэш Actions.
+    # Худший успешный путь: застрявшее восстановление кэша до своего предела, набор другого образа,
+    # который не встал, все попытки, кроме последней, висят до timeout и kill-after, последняя
+    # укладывается в свой предел, затем установка из кэша apt и сохранение набора в кэш Actions.
+    unfit_set_minutes = 1
     install_margin_minutes = 2
     save_margin_minutes = 2
     worst_success = (
         restore_minutes
+        + unfit_set_minutes
         + (attempts - 1) * (attempt_minutes + kill_after_minutes)
         + attempt_minutes
         + install_margin_minutes
@@ -85,7 +88,10 @@ def test_install_ffmpeg_step_retries_the_download_within_its_timeout() -> None:
     )
     assert worst_success <= step_timeout
     # ::error:: после всех попыток успевает в лог до предела шага.
-    assert restore_minutes + attempts * (attempt_minutes + kill_after_minutes) < step_timeout
+    assert (
+        restore_minutes + unfit_set_minutes + attempts * (attempt_minutes + kill_after_minutes)
+        < step_timeout
+    )
     assert 'for attempt in $(seq "$attempts")' in download
     assert 'sudo timeout --kill-after=30s "${attempt_minutes}m"' in download
     assert re.search(r"install -y --download-only ffmpeg", download)
@@ -106,7 +112,7 @@ def test_install_ffmpeg_step_fails_the_job_when_apt_gives_up() -> None:
     step = step_block(CI.read_text(encoding="utf-8"), "Install ffmpeg")
     assert "continue-on-error" not in step
     assert all("continue-on-error" not in s for s in action_steps())
-    for name in ("download_and_install", "install_from_cache"):
+    for name in ("download_and_install", "install_from_cache", "install_restored", "install_set"):
         body = shell_function(name)
         assert "|| true" not in body
         assert "set +e" not in body
@@ -145,9 +151,14 @@ def test_the_action_restores_installs_and_saves_the_deb_set_under_one_key() -> N
     assert restore["uses"].split("@")[1] == save["uses"].split("@")[1]
     assert re.fullmatch(r"v\d+\.\d+\.\d+", restore["uses"].split("@")[1]), "pinned to a tag"
     debs = "${{ runner.temp }}/ffmpeg-debs"
-    assert restore["with"] == save["with"] == {"path": debs, "key": "${{ steps.key.outputs.key }}"}
+    assert save["with"] == {"path": debs, "key": "${{ steps.key.outputs.key }}"}
+    assert restore["with"] == {
+        **save["with"],
+        "restore-keys": "${{ steps.key.outputs.restore-keys }}",
+    }
     assert key["env"]["FFMPEG_DEBS"] == install["env"]["FFMPEG_DEBS"] == debs
     assert install["env"]["CACHE_HIT"] == "${{ steps.restore.outputs.cache-hit }}"
+    assert install["env"]["RESTORED_KEY"] == "${{ steps.restore.outputs.cache-matched-key }}"
     assert "if" not in install
     assert save["if"] == "steps.restore.outputs.cache-hit != 'true'"
 
@@ -178,7 +189,8 @@ exec {real} --kill-after=1s 1s "$@"
 
 # Попытка скачивания номер n ведёт себя по MODES[n]: hang — медленное зеркало, которое
 # игнорирует SIGTERM; fail — ошибка apt; stale — скачаны пакеты $STALE_DEBS, затем ошибка apt;
-# ok — пакеты $DEBS скачаны в $APT_ARCHIVES.
+# ok — пакеты $DEBS скачаны в $APT_ARCHIVES. В каждой попытке apt докачивает только то, чего в
+# $APT_ARCHIVES нет, — имена докачанных идут в $FETCHED. Установка — пакеты $DEBS в $STATE.
 FAKE_APT = """#!/bin/bash
 echo "apt-get $*" >> "$CALLS"
 case " $* " in
@@ -192,15 +204,31 @@ case " $* " in
       fail) exit 100 ;;
       stale) for deb in $STALE_DEBS; do echo deb > "$APT_ARCHIVES/$deb"; done; exit 100 ;;
     esac
-    for deb in $DEBS; do echo deb > "$APT_ARCHIVES/$deb"; done ;;
+    for deb in $DEBS; do
+      [ -f "$APT_ARCHIVES/$deb" ] && continue
+      echo deb > "$APT_ARCHIVES/$deb"
+      echo "$deb" >> "$FETCHED"
+    done ;;
+  *" --no-download "*) for deb in $DEBS; do echo "$deb" >> "$STATE"; done ;;
 esac
 exit 0
 """
 
+# Установленные пакеты — имена файлов .deb в $STATE: в начале пакеты образа `installed`, dpkg -i
+# добавляет свои, dpkg --purge снимает названные.
 FAKE_DPKG = """#!/bin/bash
 case "$1" in
   --print-architecture) echo amd64 ;;
-  -i) echo "dpkg $*" >> "$CALLS"; exit "${DPKG_EXIT:-0}" ;;
+  -i)
+    echo "dpkg $*" >> "$CALLS"
+    [ "${DPKG_EXIT:-0}" = 0 ] || exit "$DPKG_EXIT"
+    shift
+    for deb in "$@"; do basename "$deb" >> "$STATE"; done ;;
+  --purge)
+    echo "dpkg $*" >> "$CALLS"
+    for name in "$@"; do
+      case "$name" in -*) ;; *) sed -i "/^${name}_/d" "$STATE" ;; esac
+    done ;;
   *) exit 2 ;;
 esac
 """
@@ -212,19 +240,30 @@ version=${name#*_}
 printf '%s %s' "${name%%_*}" "${version%_*}" | sed 's/%3a/:/g'
 """
 
-# Установленные версии — пары `<package>=<version>` из $INSTALLED.
-FAKE_DPKG_QUERY = """#!/bin/bash
-for pair in $INSTALLED; do
-  if [ "${pair%%=*}" = "${@: -1}" ]; then echo "installed ${pair#*=}"; exit 0; fi
-done
+FAKE_DPKG_QUERY = r"""#!/bin/bash
+while read -r deb; do
+  name=${deb%.deb}
+  version=${name#*_}
+  if [ "${name%%_*}" = "${@: -1}" ]; then
+    echo "installed ${version%_*}" | sed 's/%3a/:/g'
+    exit 0
+  fi
+done < "$STATE"
 echo "dpkg-query: no packages found matching ${@: -1}" >&2
 exit 1
 """
 
-FAKE_FFMPEG = '#!/bin/sh\necho "ffmpeg version 8.0.1-3ubuntu2 Copyright"\necho "built with gcc"\n'
+# ffmpeg -version печатает версию; любой другой вызов (тестовый сигнал) завершается с $FFMPEG_EXIT.
+FAKE_FFMPEG = """#!/bin/sh
+if [ "$1" = -version ]; then
+  echo "ffmpeg version 8.0.1-3ubuntu2 Copyright"
+  echo "built with gcc"
+  exit 0
+fi
+exit "${FFMPEG_EXIT:-0}"
+"""
 
 DEB_SET = ["ffmpeg_7%3a8.0.1-3ubuntu2_amd64.deb", "libavcodec62_7%3a8.0.1-3ubuntu2_amd64.deb"]
-INSTALLED = "ffmpeg=7:8.0.1-3ubuntu2 libavcodec62=7:8.0.1-3ubuntu2"
 
 
 def run_install(
@@ -234,6 +273,7 @@ def run_install(
     cache_hit: str = "",
     cached: list[str] = (),
     env: dict[str, str] | None = None,
+    installed: list[str] = (),
 ) -> tuple[subprocess.CompletedProcess, list[str], Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -260,10 +300,12 @@ def run_install(
             (debs / name).write_text("deb")
     calls = tmp_path / "calls"
     calls.touch()
+    state = tmp_path / "state"
+    state.write_text("".join(f"{deb}\n" for deb in installed))
     environ = {
         key: value
         for key, value in os.environ.items()
-        if key not in ("ImageOS", "ImageVersion", "GITHUB_RUN_ID", "CACHE_HIT")
+        if key not in ("ImageOS", "ImageVersion", "GITHUB_RUN_ID", "CACHE_HIT", "RESTORED_KEY")
     }
     environ.update(
         PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -272,7 +314,8 @@ def run_install(
         MODES=" ".join(modes),
         DEBS=" ".join(DEB_SET),
         STALE_DEBS="",
-        INSTALLED=INSTALLED,
+        STATE=str(state),
+        FETCHED=str(tmp_path / "fetched"),
         APT_ARCHIVES=str(archives),
         FFMPEG_DEBS=str(debs),
         CACHE_HIT=cache_hit,
@@ -313,13 +356,19 @@ def test_a_cache_hit_installs_the_cached_set_with_no_apt_and_no_mirror(tmp_path:
         ([], "0", "the ffmpeg package cache has no single ffmpeg_*.deb (0 files)"),
         (DEB_SET[1:], "0", "the ffmpeg package cache has no single ffmpeg_*.deb (1 files)"),
         (DEB_SET, "1", "the cached ffmpeg packages did not install with dpkg -i"),
+        (DEB_SET, "0", "ffmpeg of the cached packages does not encode a test signal"),
     ],
+    ids=["no-deb", "no-ffmpeg-deb", "dpkg-fails", "ffmpeg-fails"],
 )
 def test_a_bad_cache_hit_fails_with_a_reason_and_never_falls_back_to_the_mirror(
     tmp_path: Path, cached: list[str], dpkg_exit: str, reason: str
 ) -> None:
+    ffmpeg_exit = "1" if "test signal" in reason else "0"
     done, calls, _ = run_install(
-        tmp_path, cache_hit="true", cached=cached, env={"DPKG_EXIT": dpkg_exit}
+        tmp_path,
+        cache_hit="true",
+        cached=cached,
+        env={"DPKG_EXIT": dpkg_exit, "FFMPEG_EXIT": ffmpeg_exit},
     )
     assert done.returncode == 1
     assert f"::error::{reason}" in done.stdout
@@ -383,34 +432,286 @@ def test_a_cache_miss_saves_no_set_without_a_single_ffmpeg_deb(
     assert re.search(r"^ffmpeg installed in \d+ s \(cache miss\)$", done.stdout, re.MULTILINE)
 
 
+def github_output(tmp_path: Path, env: dict[str, str]) -> tuple[str, dict[str, str]]:
+    tmp_path.mkdir()
+    done, _, _ = run_install(tmp_path, "key", env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    output = (tmp_path / "github-output").read_text()
+    match = re.fullmatch(r"key=(.+)\nrestore-keys(?:<<EOF\n(.*)\nEOF|=)\n", output, re.DOTALL)
+    assert match, output
+    return done.stdout, {
+        "key": match.group(1),
+        "restore-keys": (match.group(2) or "").split("\n") if match.group(2) else [],
+    }
+
+
 def test_the_cache_key_names_the_runner_image_arch_cpu_level_and_the_script(
     tmp_path: Path,
 ) -> None:
     image = {"ImageOS": "ubuntu26", "ImageVersion": "20261116.202.1", "GITHUB_RUN_ID": "7"}
-    (tmp_path / "a").mkdir()
-    done, _, _ = run_install(tmp_path / "a", "key", env=image)
-    assert done.returncode == 0, done.stdout + done.stderr
-    output = (tmp_path / "a" / "github-output").read_text()
+    stdout, output = github_output(tmp_path / "a", image)
     match = re.fullmatch(
-        r"key=ffmpeg-debs-ubuntu26-20261116\.202\.1-amd64-(x86-64-v\d|cpu-unknown)-([0-9a-f]{16})\n",
-        output,
+        r"ffmpeg-debs-ubuntu26-amd64-(x86-64-v\d|cpu-unknown)-20261116\.202\.1-([0-9a-f]{16})",
+        output["key"],
     )
     assert match, output
     script_sha = subprocess.run(
         ["sha256sum", str(INSTALL)], capture_output=True, text=True, check=True
     ).stdout[:16]
     assert match.group(2) == script_sha
-    assert "::warning::" not in done.stdout
+    assert "::warning::" not in stdout
 
-    (tmp_path / "b").mkdir()
-    done, _, _ = run_install(tmp_path / "b", "key", env={"GITHUB_RUN_ID": "7"})
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert "::warning::ImageOS or ImageVersion is not set" in done.stdout
-    assert (
-        (tmp_path / "b" / "github-output")
-        .read_text()
-        .startswith("key=ffmpeg-debs-unknown-image-run-7-amd64-")
+    stdout, output = github_output(tmp_path / "b", {"GITHUB_RUN_ID": "7"})
+    assert "::warning::ImageOS or ImageVersion is not set" in stdout
+    assert output["key"].startswith("ffmpeg-debs-unknown-image-run-7-amd64-")
+    assert output["restore-keys"] == [], "a run of an unknown image takes no other set"
+
+
+# Issue #184: a runner image with no set of its own takes the set of another image.
+
+
+def test_the_restore_keys_take_the_set_of_another_image_of_the_same_os_arch_and_cpu_level(
+    tmp_path: Path,
+) -> None:
+    _, this = github_output(
+        tmp_path / "a", {"ImageOS": "ubuntu26", "ImageVersion": "20261116.88.1"}
     )
+    _, other = github_output(
+        tmp_path / "b", {"ImageOS": "ubuntu26", "ImageVersion": "20261116.202.1"}
+    )
+    assert this["key"] != other["key"], "each image keeps a set of its own"
+    first, second = this["restore-keys"]
+    assert this["key"] == f"{first}20261116.88.1-{this['key'][-16:]}"
+    assert re.fullmatch(r"ffmpeg-debs-ubuntu26-amd64-(x86-64-v\d|cpu-unknown)-", first)
+    assert second == "ffmpeg-debs-ubuntu26-"
+    # actions/cache matches restore-keys as key prefixes, the first prefix that matches wins.
+    assert other["key"].startswith(first)
+    # the set saved under the key of #183, while no set of the new key is there
+    assert "ffmpeg-debs-ubuntu26-20261116.202.1-amd64-x86-64-v4-efc3ecf63bf7afc5".startswith(second)
+
+
+OTHER_IMAGE = "20261116.202.1"
+OTHER_SHA = "efc3ecf63bf7afc5"
+
+
+def this_cpu(tmp_path: Path) -> str:
+    """Arch and CPU level of this host as install.sh names them, e.g. `amd64-x86-64-v3`."""
+    _, output = github_output(tmp_path / "key", {"ImageOS": "ubuntu26", "ImageVersion": "1"})
+    return output["restore-keys"][0].removeprefix("ffmpeg-debs-ubuntu26-").removesuffix("-")
+
+
+def restored(tmp_path: Path) -> dict[str, str]:
+    """Env of a restore that took the set of another image of this OS, arch and CPU level."""
+    key = f"ffmpeg-debs-ubuntu26-{this_cpu(tmp_path)}-{OTHER_IMAGE}-{OTHER_SHA}"
+    return {"ImageOS": "ubuntu26", "RESTORED_KEY": key}
+
+
+def test_a_set_of_another_image_installs_with_no_apt_and_goes_to_the_cache_of_this_one(
+    tmp_path: Path,
+) -> None:
+    env = restored(tmp_path)
+    done, calls, debs = run_install(tmp_path, cache_hit="false", cached=DEB_SET, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert calls == [
+        "dpkg -i " + " ".join(str(tmp_path / "ffmpeg-debs" / name) for name in sorted(DEB_SET))
+    ]
+    assert (
+        f"ffmpeg package set of another runner image ({env['RESTORED_KEY']}): dpkg -i of 2 "
+        "cached .deb files (ffmpeg_7%3a8.0.1-3ubuntu2_amd64.deb); no apt-get update, nothing "
+        "downloaded from the apt mirror"
+    ) in done.stdout
+    assert re.search(
+        r"^ffmpeg installed in \d+ s \(set of another runner image\)$", done.stdout, re.MULTILINE
+    )
+    assert sorted(p.name for p in debs.iterdir()) == sorted(DEB_SET), "the save step stores it"
+    assert "::error::" not in done.stdout and "::warning::" not in done.stdout
+
+
+def test_a_set_of_another_image_never_replaces_a_package_the_image_has(tmp_path: Path) -> None:
+    image_lib = "libavcodec62_7%3a8.0.1-3ubuntu3_amd64.deb"
+    done, calls, _ = run_install(
+        tmp_path,
+        cache_hit="false",
+        cached=DEB_SET,
+        env=restored(tmp_path),
+        installed=[image_lib],
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert calls == [f"dpkg -i {tmp_path / 'ffmpeg-debs' / DEB_SET[0]}"]
+    assert (
+        "1 cached .deb files are of packages the runner image already has: the image keeps its own"
+    ) in done.stdout
+    assert image_lib in (tmp_path / "state").read_text().splitlines()
+
+
+def test_a_cache_hit_replays_the_upgrades_of_image_packages_that_its_set_holds(
+    tmp_path: Path,
+) -> None:
+    # The install from the mirror upgraded libavcodec62 of the image; this image's set holds it.
+    image_lib = "libavcodec62_7%3a8.0.1-3ubuntu1_amd64.deb"
+    done, calls, _ = run_install(tmp_path, cache_hit="true", cached=DEB_SET, installed=[image_lib])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert calls == [
+        "dpkg -i " + " ".join(str(tmp_path / "ffmpeg-debs" / name) for name in sorted(DEB_SET))
+    ]
+    assert "dpkg -i of 2 cached .deb files" in done.stdout
+    assert "the image keeps its own" not in done.stdout
+
+
+def test_a_bad_cache_hit_purges_no_package_the_image_had(tmp_path: Path) -> None:
+    image_lib = "libavcodec62_7%3a8.0.1-3ubuntu1_amd64.deb"
+    done, calls, _ = run_install(
+        tmp_path,
+        cache_hit="true",
+        cached=DEB_SET,
+        env={"FFMPEG_EXIT": "1"},
+        installed=[image_lib],
+    )
+    assert done.returncode == 1
+    assert calls[-1] == "dpkg --purge --force-depends --force-remove-reinstreq ffmpeg"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        # new key, another CPU level or arch
+        "ffmpeg-debs-ubuntu26-{other_level}-20261116.202.1-efc3ecf63bf7afc5",
+        "ffmpeg-debs-ubuntu26-arm64-cpu-unknown-20261116.202.1-efc3ecf63bf7afc5",
+        # key of #183, another CPU level
+        "ffmpeg-debs-ubuntu26-20261116.202.1-{other_level}-efc3ecf63bf7afc5",
+        # another OS
+        "ffmpeg-debs-ubuntu24-{cpu}-20261116.202.1-efc3ecf63bf7afc5",
+    ],
+    ids=["new-other-level", "new-other-arch", "old-other-level", "other-os"],
+)
+def test_a_restored_set_of_another_arch_or_cpu_level_is_a_cache_miss(
+    tmp_path: Path, key: str
+) -> None:
+    cpu = this_cpu(tmp_path)
+    other_level = "amd64-x86-64-v2" if cpu != "amd64-x86-64-v2" else "amd64-x86-64-v4"
+    key = key.format(cpu=cpu, other_level=other_level)
+    done, calls, debs = run_install(
+        tmp_path,
+        cache_hit="false",
+        cached=DEB_SET,
+        env={"ImageOS": "ubuntu26", "RESTORED_KEY": key},
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        f"::warning::the restored ffmpeg package set ({key}) is not of this OS, arch and CPU "
+        f"level ({cpu}): download from the apt mirror"
+    ) in done.stdout
+    assert not any(c.startswith("dpkg") for c in calls), "no .deb of that set is installed"
+    # nothing of that set seeds the apt cache: the mirror gives the whole set
+    assert (tmp_path / "fetched").read_text().splitlines() == DEB_SET
+    assert sorted(p.name for p in debs.iterdir()) == sorted(DEB_SET)
+    assert re.search(r"^ffmpeg installed in \d+ s \(cache miss\)$", done.stdout, re.MULTILINE)
+
+
+def test_a_restored_set_under_the_key_of_183_with_this_cpu_level_installs(
+    tmp_path: Path,
+) -> None:
+    key = f"ffmpeg-debs-ubuntu26-{OTHER_IMAGE}-{this_cpu(tmp_path)}-{OTHER_SHA}"
+    done, calls, _ = run_install(
+        tmp_path,
+        cache_hit="false",
+        cached=DEB_SET,
+        env={"ImageOS": "ubuntu26", "RESTORED_KEY": key},
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"ffmpeg package set of another runner image ({key})" in done.stdout
+    assert not any(c.startswith(("apt-get", "timeout")) for c in calls), calls
+    assert re.search(
+        r"^ffmpeg installed in \d+ s \(set of another runner image\)$", done.stdout, re.MULTILINE
+    )
+
+
+@pytest.mark.parametrize(
+    ("cached", "env", "reason", "purged"),
+    [
+        (DEB_SET[1:], {}, "the ffmpeg package cache has no single ffmpeg_*.deb (1 files)", False),
+        (
+            DEB_SET,
+            {"DPKG_EXIT": "1"},
+            "the cached ffmpeg packages did not install with dpkg -i",
+            True,
+        ),
+        (
+            DEB_SET,
+            {"FFMPEG_EXIT": "1"},
+            "ffmpeg of the cached packages does not encode a test signal",
+            True,
+        ),
+    ],
+    ids=["no-ffmpeg-deb", "dpkg-fails", "ffmpeg-fails"],
+)
+def test_a_set_of_another_image_that_does_not_fit_falls_back_to_the_mirror(
+    tmp_path: Path, cached: list[str], env: dict[str, str], reason: str, purged: bool
+) -> None:
+    done, calls, debs = run_install(
+        tmp_path, cache_hit="false", cached=cached, env={**restored(tmp_path), **env}
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        f"::warning::{reason}: the set of another runner image does not fit this one, "
+        "download from the apt mirror"
+    ) in done.stdout
+    purges = [c for c in calls if c.startswith("dpkg --purge")]
+    assert purges == (
+        ["dpkg --purge --force-depends --force-remove-reinstreq ffmpeg libavcodec62"]
+        if purged
+        else []
+    )
+    assert sum("--download-only" in c for c in calls) == 1
+    assert calls[-1].endswith("install -y --no-download ffmpeg")
+    # the mirror gives only what the set of the other image did not hold
+    fetched = tmp_path / "fetched"
+    assert (fetched.read_text().splitlines() if fetched.exists() else []) == sorted(
+        set(DEB_SET) - set(cached)
+    )
+    assert sorted(p.name for p in debs.iterdir()) == sorted(DEB_SET)
+    assert re.search(r"^ffmpeg installed in \d+ s \(cache miss\)$", done.stdout, re.MULTILINE)
+    assert "::error::" not in done.stdout
+
+
+def test_criterion_1_an_unfit_set_of_another_image_never_purges_a_package_the_image_has(
+    tmp_path: Path,
+) -> None:
+    image_lib = "libavcodec62_7%3a8.0.1-3ubuntu3_amd64.deb"
+    done, calls, _ = run_install(
+        tmp_path,
+        cache_hit="false",
+        cached=DEB_SET,
+        env={**restored(tmp_path), "DPKG_EXIT": "1"},
+        installed=[image_lib],
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert calls[0] == f"dpkg -i {tmp_path / 'ffmpeg-debs' / DEB_SET[0]}"
+    assert calls[1] == "dpkg --purge --force-depends --force-remove-reinstreq ffmpeg"
+    assert image_lib in (tmp_path / "state").read_text().splitlines()
+    assert calls[-1].endswith("install -y --no-download ffmpeg")
+
+
+def test_criterion_1_an_unfit_set_of_another_image_and_a_failing_mirror_fail_the_job(
+    tmp_path: Path,
+) -> None:
+    done, calls, debs = run_install(
+        tmp_path,
+        modes=["fail", "fail", "fail"],
+        cache_hit="false",
+        cached=DEB_SET,
+        env={**restored(tmp_path), "FFMPEG_EXIT": "1"},
+    )
+    assert done.returncode == 1
+    assert "the set of another runner image does not fit this one" in done.stdout
+    assert (
+        "::error::ffmpeg packages were not downloaded in 3 attempts of 5 min each "
+        "(slow or failing apt mirror)"
+    ) in done.stdout
+    assert sum("--download-only" in c for c in calls) == 3
+    assert not any("--no-download" in c for c in calls)
+    assert not debs.exists(), "nothing goes to the cache"
+    assert "ffmpeg installed in" not in done.stdout
 
 
 @pytest.mark.slow

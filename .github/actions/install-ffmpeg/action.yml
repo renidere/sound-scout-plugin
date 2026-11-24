@@ -1,7 +1,8 @@
 name: Install ffmpeg
 description: >-
-  ffmpeg из пакетов Ubuntu: набор .deb из кэша Actions без зеркала apt, при промахе — скачивание
-  с ограниченными повторами и сохранение набора в кэш (#183).
+  ffmpeg из пакетов Ubuntu: набор .deb из кэша Actions без зеркала apt — свой набор образа runner'а
+  или, если его нет, проверенный набор другого образа (#184); без годного набора — скачивание с
+  ограниченными повторами и сохранение набора в кэш (#183).
 runs:
   using: composite
   steps:
@@ -21,12 +22,14 @@ runs:
       with:
         path: ${{ runner.temp }}/ffmpeg-debs
         key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.restore-keys }}
 
     - name: Install the ffmpeg packages
       shell: bash
       env:
         FFMPEG_DEBS: ${{ runner.temp }}/ffmpeg-debs
         CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
       run: bash "$GITHUB_ACTION_PATH/install.sh" install
 
     - name: Save the ffmpeg packages
