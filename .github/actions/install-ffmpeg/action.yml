@@ -1,0 +1,37 @@
+name: Install ffmpeg
+description: >-
+  ffmpeg из пакетов Ubuntu: набор .deb из кэша Actions без зеркала apt, при промахе — скачивание
+  с ограниченными повторами и сохранение набора в кэш (#183).
+runs:
+  using: composite
+  steps:
+    - name: Key of the ffmpeg package cache
+      id: key
+      shell: bash
+      env:
+        FFMPEG_DEBS: ${{ runner.temp }}/ffmpeg-debs
+      run: bash "$GITHUB_ACTION_PATH/install.sh" key
+
+    - name: Restore the ffmpeg packages
+      id: restore
+      uses: actions/cache/restore@v6.1.0
+      env:
+        # Застрявшая загрузка из кэша — промах через 2 мин, а не через 10 по умолчанию.
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
+      with:
+        path: ${{ runner.temp }}/ffmpeg-debs
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Install the ffmpeg packages
+      shell: bash
+      env:
+        FFMPEG_DEBS: ${{ runner.temp }}/ffmpeg-debs
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh" install
+
+    - name: Save the ffmpeg packages
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: ${{ runner.temp }}/ffmpeg-debs
+        key: ${{ steps.key.outputs.key }}

@@ -10,7 +10,8 @@
 
 - **Python 3.13** — `.python-version` и `requires-python = ">=3.13,<3.14"` в `pyproject.toml`.
 - **`uv` и FFmpeg** — версии на станции разработки и способ установки: `docs/dependencies.md` §2.
-  В CI FFmpeg ставится из apt runner'а, `uv` — `astral-sh/setup-uv` той версии, что в §2.
+  В CI FFmpeg — пакеты Ubuntu из кэша Actions или, при промахе, с зеркала apt (абзац CI в §2),
+  `uv` — `astral-sh/setup-uv` той версии, что в §2.
 - **Python-пакеты** — источник истины `uv.lock`; установка только `uv sync --locked`. Прямые
   зависимости с версиями и лицензиями — `docs/dependencies.md` §1; что §1 не разошёлся с
   `uv.lock`, проверяет `tests/test_dependencies_doc.py`. Полный закреплённый список со всеми

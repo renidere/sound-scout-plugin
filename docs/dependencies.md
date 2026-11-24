@@ -50,7 +50,7 @@ Extra `corpus-tts` (`uv sync --locked --extra corpus-tts`) нужен тольк
 
 | Программа | Версия на станции разработки | Зачем | Как ставится |
 |---|---|---|---|
-| FFmpeg (`ffmpeg`, `ffprobe`) | 8.0.1 | декодирование входа, ресемплинг, клипы | пакет дистрибутива (`apt install ffmpeg`) |
+| FFmpeg (`ffmpeg`, `ffprobe`) | 8.0.1 | декодирование входа, ресемплинг, клипы | пакет дистрибутива (`apt install ffmpeg`); в CI — абзац CI ниже |
 | `uv` | 0.13.1 | среда и lock | https://docs.astral.sh/uv/ |
 | llama.cpp | v1.0.0, сборка `b12359` (commit `b1b770d90`) | runtime audio backend (раздел 3) | архив релиза, раздел 3.2 |
 | Node.js | 24.21.0 (минимум 20: `node:test`, `vm.SourceTextModule` под `--experimental-vm-modules`) | только тесты зонда Spike A и рекордера Desktop (`tests/js/probe_a.test.mjs`, `tests/js/recorder.test.mjs` на общем загрузчике `tests/js/load_plugin.mjs`; запуск из `tests/test_hermes_probe_a.py` и `tests/test_hermes_plugin.py`); npm-пакетов нет | https://nodejs.org/; в CI — из образа `ubuntu-latest` |
@@ -64,9 +64,20 @@ Extra `corpus-tts` (`uv sync --locked --extra corpus-tts`) нужен тольк
 espeak-ng отдельно не ставится: фонемизатор и его данные встроены в wheel `piper-tts` (extra
 `corpus-tts`, раздел 1), системный пакет не нужен.
 
-CI (`.github/workflows/ci.yml`): `actions/checkout@v7.0.1`, `astral-sh/setup-uv@v10.3.3`, FFmpeg из
-apt runner'а, Node.js — предустановленный в образе runner'а (без `actions/setup-node`). Без Node
-тесты зонда и рекордера в CI падают, а не пропускаются (фикстура `node` в `tests/conftest.py`).
+CI (`.github/workflows/ci.yml`): `actions/checkout@v7.0.1`, `astral-sh/setup-uv@v10.3.3`,
+`actions/cache/restore@v6.1.0` и `actions/cache/save@v6.1.0` (последний стабильный релиз
+`actions/cache` на 2026-11-24, тег на commit `55cc8345863c7cc4c66a329aec7e433d2d1c52a9`, MIT),
+Node.js — предустановленный в образе runner'а (без `actions/setup-node`). Без Node тесты зонда и
+рекордера в CI падают, а не пропускаются (фикстура `node` в `tests/conftest.py`). FFmpeg в CI —
+пакет дистрибутива Ubuntu из архива `archive.ubuntu.com` (`resolute/universe`): на образе
+`ubuntu-26.04` версии 20261116.202.1 это `ffmpeg` 7:8.0.1-3ubuntu2 и 89 пакетов .deb (69 MB) вместе
+с зависимостями. Jobs `checks` и `clean-install` ставят его одним локальным действием
+`.github/actions/install-ffmpeg` (#183): набор .deb лежит в кэше Actions под ключом из `ImageOS`,
+`ImageVersion`, архитектуры, уровня CPU и SHA-256 `install.sh`; при попадании набор ставит
+`dpkg -i` без `apt-get` и без зеркала apt, при промахе набор скачивается с зеркала с ограниченными
+повторами (#65, #70), и в кэш идут только .deb установленных версий; набор без единственного
+`ffmpeg_*.deb` не сохраняется (предупреждение в логе). Новый образ runner'а — новый ключ и одно
+скачивание.
 
 ## 3. Audio-understanding backend
 
