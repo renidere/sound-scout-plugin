@@ -86,11 +86,20 @@ CLAUDE.md). Статусы `проверено` в матрице опирают
 - **A01–A14 — новые пункты приёмки**, не часть T01–T10: сценарии из поручения владельца на
   настоящем Windows-клиенте (0013 § 8), задача [#112](https://github.com/renidere/sound-scout-plugin/issues/112). Таблица «критерий → действие →
   evidence → результат», стенды и шаги владельца O1–O9 — `docs/acceptance/A01-A14.md`. Состояние
-  на 2026-11-23 (проверка агента только чтением, 23:12–23:40 MSK, `plugin.js` `0d247e4b…`):
-  пройдено 0, частично 10, не проверено 1, ждёт владельца 3. Пройденные части опираются на
-  прогоны владельца в [#105](https://github.com/renidere/sound-scout-plugin/issues/105) и задания
-  [#114](https://github.com/renidere/sound-scout-plugin/issues/114); клиентский путь после #108 и
-  #109 владелец повторяет шагами O1–O9.
+  на 2026-11-24 (прогон владельца на Windows Desktop, стенд S3: `main` `b1f2b27`, `plugin.js`
+  `cb0e3979…`, [комментарий](https://github.com/renidere/sound-scout-plugin/issues/112#issuecomment-7125530016);
+  сверка агента только чтением): пройдено 0, частично 12, не проверено 1, ждёт владельца 1.
+  На S3 пройдены части A01 (установка копией, шаг O1; версии Hermes и Desktop и строка health
+  ждут O9) и A12 (рекордер, тема, reduced motion, шаг O8; клавиатура по кнопкам карточки ждёт O6).
+  Остальные пройденные части опираются на прогоны владельца в
+  [#105](https://github.com/renidere/sound-scout-plugin/issues/105), задания
+  [#114](https://github.com/renidere/sound-scout-plugin/issues/114), живую проверку
+  [#140](https://github.com/renidere/sound-scout-plugin/issues/140), шаги O3–O5, O7 прогона S3 и
+  O2 (проверен владельцем ранее, стенд не назван). Не выполнен шаг O6 (отмена и повтор разбора):
+  короткие задания кончались за ~10 с; от него зависят A08, карточка A06, диалог отчёта A10,
+  клавиатура карточки A12 и queued-задание A13. A11 — `не проверено`: путь
+  через чат, вердикт ждёт READY backend
+  ([#90](https://github.com/renidere/sound-scout-plugin/issues/90)).
 
 ## Evaluation note
 

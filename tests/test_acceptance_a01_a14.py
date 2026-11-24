@@ -205,3 +205,82 @@ def test_a11_names_the_chat_path_and_no_longer_waits_for_an_owner_decision() -> 
     assert f"{REPO_URL}/issues/175#issuecomment-7125074558" in a11[4]
     assert "нужно решение владельца" not in a11[4]
     assert not any("Нужен владелец" in line and "A11" in line for line in text.splitlines())
+
+
+OWNER_RUN = f"{REPO_URL}/issues/112#issuecomment-7125530016"
+
+
+def test_the_owner_run_of_24_november_is_stand_s3_and_backs_every_pass() -> None:
+    text = TABLE_DOC.read_text(encoding="utf-8")
+    stands = text.split("## Стенды", 1)[1].split("\n## ", 1)[0]
+    s3 = stands.split("- **S3**", 1)[1].split("\n- **", 1)[0]
+    assert "cb0e3979ffeb9760f4928d113fae0b72fbb5e11ffd411418b145a2a2980f406e" in s3
+    assert "`main` `b1f2b27`" in s3
+    assert OWNER_RUN in s3
+    rows = {row[0]: row for row in table(text)}
+    assert {rid for rid, row in rows.items() if status(row) == "пройдено"} == set()
+    for rid in ("A01", "A12"):
+        assert OWNER_RUN in rows[rid][3], rid
+        assert status(rows[rid]) == "частично", rid
+        assert "S3" in rows[rid][4] and "2026-11-24" in rows[rid][4], rid
+    assert "ждёт владельца: O9" in rows["A01"][4]
+    assert "Версии Hermes и Desktop стенда S3" in rows["A01"][4]
+    assert "ждёт владельца: O6" in rows["A12"][4]
+    assert "«замечаний нет»" in rows["A12"][3]
+    assert "Tab, Enter и Space" not in rows["A12"][3]
+
+
+def test_the_rows_never_run_live_stay_open_and_name_what_is_missing() -> None:
+    rows = {row[0]: row for row in table(TABLE_DOC.read_text(encoding="utf-8"))}
+    assert status(rows["A08"]) == "ждёт владельца: O6"
+    assert "`не проверено на живой системе`" in rows["A08"][4]
+    for rid in ("A06", "A10", "A13"):
+        assert status(rows[rid]) == "частично", rid
+        assert "ждёт владельца: O6" in rows[rid][4], rid
+    assert "ждёт владельца: O9" in rows["A02"][4]
+    assert "`не проверено на живой системе`" in rows["A03"][4]
+    assert "`не проверено на живой системе`" in rows["A05"][4]
+    a07 = rows["A07"]
+    assert status(a07) == "частично"
+    assert f"{REPO_URL}/issues/140#issuecomment-7125714049" in a07[3]
+    assert "ждёт #140" not in a07[4] and "issues/140" not in a07[4]
+    assert "«разрыв MCP» — путь задания MCP из #140" not in a07[2]
+    assert "«разрыв MCP» — `не проверено на живой системе`" in a07[4]
+
+
+def test_o6_is_rewritten_to_cancel_the_second_job_while_the_first_runs() -> None:
+    text = TABLE_DOC.read_text(encoding="utf-8")
+    steps = text.split("## Шаги владельца", 1)[1].split("\n## ", 1)[0]
+    assert OWNER_RUN in steps
+    o6 = steps.split("- **O6.**", 1)[1].split("\n- **", 1)[0]
+    for words in (
+        "Не выполнен 2026-11-24",
+        "запиши около 3 минут, запиши вторую запись, отмени вторую, пока идёт первая, "
+        "затем повтори",
+        "«Отменить разбор», пока первое ещё идёт",
+        "«Повторить разбор»",
+        "«Открыть отчёт»",
+        "нажимай клавишей Tab, затем Enter или Space",
+        "Кнопка «Отмена» рекордера отменяет запись",
+    ):
+        assert words in o6, words
+    for n in (1, 3, 4, 5, 7, 8):
+        assert f"- **O{n}.** Выполнено 2026-11-24" in steps, n
+    assert "- **O2.** Проверено владельцем ранее" in steps
+    o9 = steps.split("- **O9.**", 1)[1].split("\n", 1)[0]
+    for words in (
+        "одно подключение или несколько",
+        "`Sound Scout: health`",
+        "версии Hermes и Desktop",
+    ):
+        assert words in o9, words
+
+
+def test_acceptance_dates_the_owner_run_with_its_stand_versions() -> None:
+    section = acceptance_section()
+    assert "на 2026-11-24" in section
+    assert "стенд S3: `main` `b1f2b27`, `plugin.js` `cb0e3979…`" in section
+    assert OWNER_RUN in section
+    assert "пройдено 0, частично 12" in section
+    assert "O2 (проверен владельцем ранее, стенд не назван)" in section
+    assert "Не выполнен шаг O6" in section
