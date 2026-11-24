@@ -708,13 +708,39 @@ export class Recorder {
     if (seen) this.setJob({ view, text: seen.text, final: seen.final })
   }
 
+  // The job is cancelled first; the turn of the chat of the job stops only after that (#188),
+  // also when a newer job took the card meanwhile — unless that job went into the same chat,
+  // whose running turn can then be the one the newer job started.
   cancelJob() {
     return this.act('cancel', async (jobId, current) => {
+      const { owner, sessionId } = this.job.get()
       const answer = await checked(() => this.ctx.rest(`/jobs/${jobId}/cancel`, { method: 'POST', body: {}, timeoutMs: STATUS_TIMEOUT_MS }))
-      if (!current()) return
-      this.adopt(answer.job)
-      this.refresh()
+      if (current()) {
+        this.adopt(answer.job)
+        this.refresh()
+      } else if (this.job.get()?.sessionId === sessionId) return
+      try {
+        await this.stopTurn(owner, sessionId)
+      } catch (error) {
+        if (current()) this.setJob({ error: `Разбор отменён, но ход чата не остановлен: ${desktopErrorText(error)}` })
+      }
     })
+  }
+
+  // The Stop of Desktop: session.interrupt of the runtime session of this chat (decision 0029).
+  // A chat without a running turn gets no interrupt.
+  async stopTurn(owner, stored) {
+    const route = await this.findRoute(owner)
+    const release = await this.host.retainProfile(route, FOREGROUND)
+    try {
+      const resumed = await this.host.requestProfile(route, 'session.resume',
+        { session_id: stored, omit_messages: true }, undefined, FOREGROUND)
+      if (typeof resumed?.session_id !== 'string' || !resumed.session_id) throw new Error('Чат недоступен')
+      if (resumed.running !== true) return
+      const params = { session_id: resumed.session_id }
+      if (Number.isInteger(resumed.execution_generation)) params.execution_generation = resumed.execution_generation
+      await this.host.requestProfile(route, 'session.interrupt', params, undefined, FOREGROUND)
+    } finally { release() }
   }
 
   // One status request after a refused or lost retry: the card shows the state the job has now,

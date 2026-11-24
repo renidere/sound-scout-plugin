@@ -74,6 +74,9 @@ function fakeHost(order) {
       profile: { get: () => focus.profile }
     },
     routes: [local, remote],
+    // stored chat → its running turn in the session.resume reply
+    turns: {},
+    interruptFailure: null,
     profileRoutes: async () => {
       calls.push(['profileRoutes'])
       return host.routes
@@ -85,7 +88,13 @@ function fakeHost(order) {
     requestProfile: async (route, method, params, timeoutMs, options) => {
       calls.push([method, structuredClone(params), route, timeoutMs, options && structuredClone(options)])
       order.push(method)
-      if (method === 'session.resume') return { session_id: 'runtime-a', stored_session_id: params.session_id }
+      if (method === 'session.resume') {
+        return { session_id: params.session_id.replace('stored-', 'runtime-'), stored_session_id: params.session_id, ...host.turns[params.session_id] }
+      }
+      if (method === 'session.interrupt') {
+        if (host.interruptFailure) throw host.interruptFailure
+        return { execution_state: 'idle' }
+      }
       if (method === 'file.attach') return { attached: true, ref_text: REF }
       if (method === 'prompt.submit') return { admission_id: 'admission-1', status: 'accepted' }
       throw new Error(`Unexpected RPC: ${method}`)
@@ -1124,7 +1133,7 @@ test('the plugin source holds no non-stock call, no directive, no Markdown or HT
   const imports = [...source.matchAll(/^\s*import\b.*?from\s+['"]([^'"]+)['"]/gm)].map(m => m[1])
   same(imports, ['@hermes/plugin-sdk', 'react/jsx-runtime'])
   const rpc = new Set([...source.matchAll(/'((?:session|file|prompt)\.[a-z_]+)'/g)].map(m => m[1]))
-  same([...rpc].sort(), ['file.attach', 'prompt.submit', 'session.resume'])
+  same([...rpc].sort(), ['file.attach', 'prompt.submit', 'session.interrupt', 'session.resume'])
 })
 
 // --- the job card (#108) -------------------------------------------------------------------------
@@ -1305,6 +1314,174 @@ test('criterion 3: cancel acts on the job of the card only and polls that job at
   assert.match(textContent(card()), /Разбор отменён/)
   assert.ok(findButton(card(), 'Повторить разбор'))
   assert.ok(findButton(card(), 'Скрыть'))
+})
+
+// #188: «Отменить разбор» also stops the running Hermes turn of the chat of the job.
+const cancelled = (jobId = JOB) => ({ ok: true, job: { ...view('cancelled', {}, jobId).job, cancel: 'cancelled' } })
+const stopCalls = (calls, from) => calls.slice(from).filter(call => ['retain', 'release', 'session.resume', 'session.interrupt'].includes(call[0]))
+const INTERRUPT_FAILURE = "Error invoking remote method 'hermes:api': Error: Session execution identity unavailable; reconnect before controlling this turn"
+
+test('cancel stops the running turn of the chat of the job with session.interrupt and no turn of another chat', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, calls, host, focus, remote, card } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await poll.wake()
+  focus.stored = 'stored-b'
+  ctx.post = { ok: true, job_id: SECOND, reused: false }
+  ctx.statuses = [view('running', {}, SECOND)]
+  await analyzed(context)
+  await poll.wake()
+  assert.equal(recorder.job.get().sessionId, 'stored-b')
+  host.turns = { 'stored-a': { running: true, execution_generation: 5 }, 'stored-b': { running: true, execution_generation: 7 } }
+  focus.stored = 'stored-a'
+  ctx.actions = [cancelled(SECOND)]
+  ctx.statuses = [view('cancelled', {}, SECOND)]
+  const before = calls.length
+  await recorder.cancelJob()
+  await recorder.polling
+  same(stopCalls(calls, before).map(call => [call[0], call[1]]), [
+    ['retain', remote],
+    ['session.resume', { session_id: 'stored-b', omit_messages: true }],
+    ['session.interrupt', { session_id: 'runtime-b', execution_generation: 7 }],
+    ['release', null]
+  ])
+  const interrupt = named(calls, 'session.interrupt')
+  assert.equal(interrupt.length, 1)
+  same(interrupt[0].slice(2), [remote, null, FOREGROUND])
+  assert.ok(context.order.indexOf(`rest POST /jobs/${SECOND}/cancel`) < context.order.indexOf('session.interrupt'))
+  assert.equal(recorder.job.get().error, '')
+  context.composer.stored = 'stored-b'
+  assert.match(textContent(card()), /Разбор отменён/)
+  assert.equal(nodes(card(), 'p').length, 0)
+})
+
+test('cancel stops the turn of the chat of the job when a newer job of another chat took the card meanwhile', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, calls, host, focus, remote } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await poll.wake()
+  host.turns = { 'stored-a': { running: true, execution_generation: 5 }, 'stored-b': { running: true, execution_generation: 7 } }
+  let finish
+  ctx.actions = [() => new Promise(resolve => { finish = resolve })]
+  const cancelling = recorder.cancelJob()
+  await tick()
+  focus.stored = 'stored-b'
+  ctx.post = { ok: true, job_id: SECOND, reused: false }
+  ctx.statuses = [view('running', {}, SECOND)]
+  await analyzed(context)
+  await poll.wake()
+  assert.equal(recorder.job.get().jobId, SECOND)
+  const before = calls.length
+  finish(cancelled())
+  await cancelling
+  same(stopCalls(calls, before).map(call => [call[0], call[1]]), [
+    ['retain', remote],
+    ['session.resume', { session_id: 'stored-a', omit_messages: true }],
+    ['session.interrupt', { session_id: 'runtime-a', execution_generation: 5 }],
+    ['release', null]
+  ])
+  const job = recorder.job.get()
+  assert.equal(job.jobId, SECOND)
+  assert.equal(job.error, '')
+  assert.equal(job.busy, null)
+})
+
+test('cancel never stops a turn of its chat when a newer job of the same chat took the card meanwhile', async () => {
+  const poll = gate()
+  const context = await setup({ options: { sleep: poll.sleep } })
+  const { recorder, ctx, calls, host } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await poll.wake()
+  host.turns = { 'stored-a': { running: true, execution_generation: 6 } }
+  let finish
+  ctx.actions = [() => new Promise(resolve => { finish = resolve })]
+  const cancelling = recorder.cancelJob()
+  await tick()
+  ctx.post = { ok: true, job_id: SECOND, reused: false }
+  ctx.statuses = [view('running', {}, SECOND)]
+  await analyzed(context)
+  await poll.wake()
+  const job = recorder.job.get()
+  assert.equal(job.jobId, SECOND)
+  assert.equal(job.sessionId, 'stored-a')
+  const before = calls.length
+  finish(cancelled())
+  await cancelling
+  same(stopCalls(calls, before), [])
+  assert.equal(named(calls, 'session.interrupt').length, 0)
+  assert.equal(recorder.job.get().error, '')
+})
+
+test('cancel of a job whose chat has no running turn only cancels the job and shows no error', async () => {
+  const context = await setup()
+  const { recorder, ctx, calls, host, card } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await recorder.polling
+  host.turns = { 'stored-a': { running: false, execution_generation: 2 } }
+  ctx.actions = [cancelled()]
+  ctx.statuses = [view('cancelled')]
+  const before = calls.length
+  await recorder.cancelJob()
+  await recorder.polling
+  same(stopCalls(calls, before).map(call => call[0]), ['retain', 'session.resume', 'release'])
+  assert.equal(named(calls, 'session.interrupt').length, 0)
+  assert.equal(recorder.job.get().error, '')
+  assert.match(textContent(card()), /Разбор отменён/)
+  assert.equal(nodes(card(), 'p').length, 0)
+  assert.ok(notices(calls).every(notice => notice.kind !== 'error'))
+})
+
+test('a failed turn stop keeps the job cancelled and shows the Desktop error text on the card', async () => {
+  for (const [name, fail] of [
+    ['interrupt', host => { host.turns = { 'stored-a': { running: true, execution_generation: 4 } }; host.interruptFailure = new Error(INTERRUPT_FAILURE) }],
+    ['resume', host => {
+      const request = host.requestProfile
+      host.requestProfile = (...args) => args[1] === 'session.resume' ? Promise.reject(new Error(INTERRUPT_FAILURE)) : request(...args)
+    }],
+    ['retain', host => { host.retainProfile = async () => { throw new Error(INTERRUPT_FAILURE) } }]
+  ]) {
+    const context = await setup()
+    const { recorder, ctx, calls, host, card } = context
+    ctx.statuses = [view('running')]
+    await analyzed(context)
+    await recorder.polling
+    fail(host)
+    ctx.actions = [cancelled()]
+    ctx.statuses = [view('cancelled')]
+    const before = calls.length
+    await recorder.cancelJob()
+    await recorder.polling
+    const job = recorder.job.get()
+    assert.equal(job.view.state, 'cancelled', name)
+    assert.equal(job.busy, null, name)
+    const text = 'Разбор отменён, но ход чата не остановлен: Session execution identity unavailable; reconnect before controlling this turn'
+    assert.equal(job.error, text, name)
+    const tree = card()
+    assert.match(textContent(tree), /Разбор отменён/, name)
+    same(nodes(tree, 'p').map(node => [node.props.role, node.props.children]), [['alert', text]])
+    assert.ok(findButton(tree, 'Повторить разбор'), name)
+    if (name !== 'retain') assert.equal(calls.slice(before).filter(call => call[0] === 'release').length, 1, name)
+  }
+})
+
+test('a refused job cancel shows its error and stops no turn', async () => {
+  const context = await setup()
+  const { recorder, ctx, calls, host } = context
+  ctx.statuses = [view('running')]
+  await analyzed(context)
+  await recorder.polling
+  host.turns = { 'stored-a': { running: true, execution_generation: 1 } }
+  ctx.actions = [{ ok: false, error: 'not_cancellable' }]
+  const before = calls.length
+  await recorder.cancelJob()
+  assert.equal(stopCalls(calls, before).length, 0)
+  assert.equal(recorder.job.get().error, 'Отменить разбор не удалось: not_cancellable')
 })
 
 test('criterion 3: retry keeps the job_id, shows the attempt and reads the report of the new attempt', async () => {
