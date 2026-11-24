@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import gc
 import hashlib
 import io
 import itertools
@@ -26,6 +27,7 @@ import threading
 import time
 import urllib.request
 import wave
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -3184,7 +3186,7 @@ def test_a_signal_inside_the_lock_window_runs_its_handler_once_the_window_ends(
     seen = []
 
     def handler(signum, _frame):
-        seen.append((signum, vast._LOCK_WINDOW.pending, journal._held))
+        seen.append((signum, vast._LOCK_WINDOW.pending, journal._held is not None))
         journal.append("signal", name=signal.Signals(signum).name)
 
     safe = vast._outside_lock_window(handler)
@@ -3198,18 +3200,20 @@ def test_a_signal_inside_the_lock_window_runs_its_handler_once_the_window_ends(
 
     monkeypatch.setattr(vast.fcntl, "flock", flock)
     journal.append("one")
-    assert seen == [(signal.SIGHUP, None, 1)]
+    assert seen == [(signal.SIGHUP, None, True)]
     assert [e["event"] for e in journal.replay()] == ["signal", "one"]
     assert vast._LOCK_WINDOW.pending is None
     safe(signal.SIGTERM, None)  # outside the window: at once
-    assert seen[-1] == (signal.SIGTERM, None, 0)
+    assert seen[-1] == (signal.SIGTERM, None, False)
 
 
 def test_a_signal_before_a_failed_lock_open_still_runs_its_handler(tmp_path: Path) -> None:
     journal = vast.Journal.create(tmp_path, "a1", None)
     seen = []
     safe = vast._outside_lock_window(
-        lambda signum, _frame: seen.append((signum, vast._LOCK_WINDOW.pending, journal._held))
+        lambda signum, _frame: seen.append(
+            (signum, vast._LOCK_WINDOW.pending, journal._held is not None)
+        )
     )
 
     class Missing:
@@ -3221,7 +3225,7 @@ def test_a_signal_before_a_failed_lock_open_still_runs_its_handler(tmp_path: Pat
     journal.dir = Missing()
     with pytest.raises(FileNotFoundError), journal.lock():
         pass
-    assert seen == [(signal.SIGTERM, None, 0)]
+    assert seen == [(signal.SIGTERM, None, False)]
     assert vast._LOCK_WINDOW.pending is None
 
 
@@ -3258,7 +3262,7 @@ def test_a_raising_signal_at_any_instruction_after_the_lock_body_still_closes_th
     fds = sorted(os.listdir("/proc/self/fd"))
 
     def released(point: int) -> None:
-        assert journal._held == 0, point
+        assert journal._held is None, point
         assert vast._LOCK_WINDOW.pending is None, point
         assert sorted(os.listdir("/proc/self/fd")) == fds, point
         fd = os.open(journal.dir / vast.LOCK_FILE, os.O_RDWR)
@@ -3335,7 +3339,7 @@ def test_a_second_signal_inside_the_first_handler_at_the_lock_exit_still_closes_
     except SystemExit:
         exited = True
         # while the exception lives: its traceback keeps the lock's generator from `close`
-        assert journal._held == 0
+        assert journal._held is None
         assert vast._LOCK_WINDOW.pending is None
         assert sorted(os.listdir("/proc/self/fd")) == fds
         fd = os.open(journal.dir / vast.LOCK_FILE, os.O_RDWR)
@@ -3387,7 +3391,7 @@ def test_a_signal_in_the_lock_enter_after_its_yield_runs_at_the_body_start(
                 signal.raise_signal(signum)
 
     def released(at: int) -> None:
-        assert journal._held == 0, at
+        assert journal._held is None, at
         assert vast._LOCK_WINDOW.pending is None, at
         assert sorted(os.listdir("/proc/self/fd")) == fds, at
         probe = subprocess.run(
@@ -3465,8 +3469,9 @@ def test_a_signal_held_in_the_create_lock_enter_stops_the_create_before_its_put(
             self.manager = manager
 
         def __enter__(self):
+            outer = journal._held is None
             held = self.manager.__enter__()
-            if state["armed"] and journal._held == 1:
+            if state["armed"] and outer and journal._held is not None:  # the outer lock's flock
                 state["armed"] = False
                 vast._LOCK_WINDOW.pending = []  # as `_exiting_lock` opens it in `__enter__`
                 signal.raise_signal(signal.SIGTERM)
@@ -3488,13 +3493,95 @@ def test_a_signal_held_in_the_create_lock_enter_stops_the_create_before_its_put(
     assert run.fatal == "cancelled"
     assert fake.count("PUT") == 0
     assert "create_requested" not in _events(journal) and _events(journal)[-1] == "signal"
-    assert journal._held == 0 and vast._LOCK_WINDOW.pending is None
+    assert journal._held is None and vast._LOCK_WINDOW.pending is None
     probe = subprocess.run(
         [sys.executable, "-c", _LOCK_PROBE, str(journal.dir / vast.LOCK_FILE)],
         capture_output=True,
         text=True,
     )
     assert probe.stdout.strip() == "free", probe.stderr
+
+
+def _flock_taken(journal: vast.Journal) -> bool:
+    """Whether a second open file of `<attempt>/lock` fails to take the `flock`."""
+    fd = os.open(journal.dir / vast.LOCK_FILE, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def _cut_after_nested_enter(journal: vast.Journal, gens: list) -> None:
+    nested = journal.lock()
+    nested.__enter__()
+    gens.append(weakref.ref(nested.gen))
+    raise RuntimeError("after the nested enter")
+
+
+def _cut_in_nested_exit(journal: vast.Journal, gens: list) -> None:
+    """The exception lands on the first instruction of `contextlib`'s `__exit__` of the nested
+    lock, before it ends the generator, as a raising signal handler can."""
+    nested = journal.lock()
+    gens.append(weakref.ref(nested.gen))
+    exit_code = contextlib._GeneratorContextManager.__exit__.__code__
+    monitoring, tool = sys.monitoring, sys.monitoring.DEBUGGER_ID
+
+    def instruction(_code, _offset):
+        if sys._getframe(1).f_locals.get("self") is nested:
+            monitoring.set_local_events(tool, exit_code, 0)
+            raise RuntimeError("in the nested exit")
+
+    monitoring.use_tool_id(tool, "nested-lock-test")
+    monitoring.register_callback(tool, monitoring.events.INSTRUCTION, instruction)
+    try:
+        with nested:
+            monitoring.set_local_events(tool, exit_code, monitoring.events.INSTRUCTION)
+    finally:
+        monitoring.set_local_events(tool, exit_code, 0)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+
+
+@pytest.mark.parametrize("late_close", ["before the next lock", "inside the next lock"])
+@pytest.mark.parametrize("cut", [_cut_after_nested_enter, _cut_in_nested_exit])
+def test_a_nested_journal_lock_cut_by_an_exception_keeps_the_flock_of_later_locks(
+    tmp_path: Path, cut, late_close: str
+) -> None:
+    """The traceback keeps the cut nested generator at its `yield` past the outer close; its
+    late close changes no lock state, and every later lock holds the `flock` (#182)."""
+    journal = vast.Journal.create(tmp_path, "a1", None)
+    gens = []
+    with pytest.raises(RuntimeError) as kept, journal.lock():
+        cut(journal, gens)
+    (gen,) = gens
+    assert gen() is not None and gen().gi_suspended  # cut: not ended by the outer close
+    assert journal._held is None and not _flock_taken(journal)
+
+    def close_late() -> None:
+        nonlocal kept
+        kept = None
+        gc.collect()
+        assert gen() is None  # the late close ran
+
+    if late_close == "before the next lock":
+        close_late()
+    with journal.lock() as held:
+        assert held and journal._held is not None and _flock_taken(journal)
+        if late_close == "inside the next lock":
+            close_late()
+            assert journal._held is not None and _flock_taken(journal)
+        with journal.lock(blocking=False) as nested:  # a second flock would fail, not hang
+            assert nested and _flock_taken(journal)
+        journal.append("next")  # a nested lock inside: no second flock, no deadlock
+        assert journal._held is not None and _flock_taken(journal)
+    assert journal._held is None and not _flock_taken(journal)
+    with journal.lock() as held:
+        assert held and _flock_taken(journal)
+    assert journal._held is None and not _flock_taken(journal)
+    assert [e["event"] for e in journal.replay()] == ["next"]
 
 
 # --- transport recovery (#149, round 2) ----------------------------------------------------------

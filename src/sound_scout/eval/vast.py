@@ -723,7 +723,7 @@ class Journal:
         self.path = Path(path)
         self.dir = self.path.parent
         self.key = key
-        self._held = 0
+        self._held = None  # the token of the outer `lock()` that holds the `flock`
 
     @classmethod
     def create(cls, gpu: Path, attempt_id: str, key: str | None) -> "Journal":
@@ -765,16 +765,14 @@ class Journal:
 
     @contextlib.contextmanager
     def lock(self, blocking: bool = True):
-        """`flock` of `<attempt>/lock`, shared by the agent and both timers; yields whether held."""
-        if self._held:
-            self._held += 1
-            try:
-                yield True
-            finally:
-                self._held -= 1
+        """`flock` of `<attempt>/lock`, shared by the agent and both timers; yields whether held.
+        A nested lock changes no state: a late close of one cut by an exception cannot release
+        the `flock` of the outer lock or of a later one (#182)."""
+        if self._held is not None:
+            yield True
             return
         _LOCK_WINDOW.pending = []
-        fd, held = None, False
+        fd, held, token = None, False, object()
         try:
             fd = os.open(
                 self.dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
@@ -785,7 +783,7 @@ class Journal:
                 pass
             else:
                 held = True
-                self._held = 1
+                self._held = token
             _close_lock_window()
             try:
                 yield held
@@ -796,8 +794,8 @@ class Journal:
             # again: a handler's exception can cut the statement above short (#173)
             if _LOCK_WINDOW.pending is None:
                 _LOCK_WINDOW.pending = []
-            if held:
-                self._held = 0
+            if self._held is token:
+                self._held = None
             if fd is not None:
                 os.close(fd)
             _close_lock_window()
