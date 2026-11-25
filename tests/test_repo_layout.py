@@ -116,6 +116,19 @@ def flat(text: str) -> str:
     return " ".join(text.split())
 
 
+def readme_section(heading: str) -> str:
+    """The body of the README section `## <heading>` up to the next `## ` heading."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    return readme.split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0]
+
+
+WORKS_NOW = "Что работает сейчас"
+INTEGRATION = "Интеграция с другими харнесами"
+DEPENDENCIES = "Зависимости"
+MODELS = "Модели на стенде"
+REPLACEMENTS = "Чем можно заменить"
+
+
 def stale_owner_choice(text: str) -> list[str]:
     return STALE_OWNER_CHOICE.findall(flat(text))
 
@@ -127,9 +140,9 @@ def open_issue_68_mentions(text: str) -> int:
 
 def test_readme_status_says_gemma_failed_gate0_and_no_backend_is_chosen() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    status = flat(readme.split("Статус:", 1)[1].split("\n\n", 1)[0])
+    status = flat(readme_section(WORKS_NOW) + readme_section(MODELS))
     for fragment in (
-        "Audio backend сейчас не выбран (`backend = none`)",
+        "Audio backend не подключён (`backend = none`)",
         "Gemma 4 E4B-it",
         "llama.cpp",
         "только локально",
@@ -139,10 +152,10 @@ def test_readme_status_says_gemma_failed_gate0_and_no_backend_is_chosen() -> Non
         CLOSED_CHOICE_ISSUE,
         NEXT_EXPERIMENT_ISSUE,
         CONNECT_BACKEND_ISSUE,
-        "Русская квалификация (Gate 1) не пройдена",
+        "русская квалификация (Gate 1) не пройдена",
         "подключён к Hermes 2026-11-19",
         f"{ISSUE_40}, закрыта",
-        "инструмент не считается готовым",
+        "Инструмент не считается готовым",
     ):
         assert fragment in status, fragment
     assert "validated_ru" not in readme
@@ -216,11 +229,10 @@ def test_backend_docs_name_no_replacement_candidate_as_chosen() -> None:
         assert "пока Gate 0 не скажет иное" not in text, name
         assert not re.search(r"/home/|/Users/|[A-Z]:\\", text), name
     claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
     backend_paragraphs = (
         claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
-        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        readme_section(MODELS),
         dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
     )
     for paragraph in backend_paragraphs:
@@ -234,11 +246,10 @@ def test_backend_docs_name_no_replacement_candidate_as_chosen() -> None:
 
 def test_backend_status_records_that_borealis_failed_gate0_too() -> None:
     claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
     for paragraph in (
         claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
-        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        readme_section(MODELS),
         dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
     ):
         text = flat(paragraph)
@@ -348,11 +359,10 @@ def test_criterion_5_of_81_tests_synthesize_audio_and_no_tts_or_openstt_data_is_
 
 def test_backend_status_records_that_gigachat_failed_gate0_on_p3() -> None:
     claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     dependencies = (REPO_ROOT / "docs" / "dependencies.md").read_text(encoding="utf-8")
     for paragraph in (
         claude_md.split("- **Стек:**", 1)[1].split("\n- **", 1)[0],
-        readme.split("Статус:", 1)[1].split("\n\n", 1)[0],
+        readme_section(MODELS),
         dependencies.split("## 3. Audio-understanding backend", 1)[1].split("### 3.1.", 1)[0],
     ):
         text = flat(paragraph)
@@ -381,10 +391,8 @@ def test_docs_name_the_hermes_connection_of_issue_40_as_done() -> None:
     """#111 criterion 1: no document still says that Hermes is not connected."""
     for name in ("README.md", "docs/hermes-install.md", "docs/ACCEPTANCE.md"):
         assert stale_hermes_claims(read(name)) == [], name
-    status = flat(read("README.md").split("Статус:", 1)[1].split("\n\n", 1)[0])
-    assert "native вызовы из новой сессии `hermes -z` и из Hermes Desktop вернули `partial`" in (
-        status
-    )
+    status = flat(readme_section(WORKS_NOW))
+    assert "Вызовы из `hermes -z` и из Hermes Desktop вернули `partial`" in status
     assert "Подключение на другом хосте — шаг владельца (`docs/hermes-install.md`)" in status
 
 
@@ -395,35 +403,63 @@ def test_stale_hermes_claim_check_reports_the_old_readme_line() -> None:
     assert stale_hermes_claims("Сервер подключён к Hermes 2026-11-19.") == []
 
 
-def test_readme_shows_the_unified_plugin_direction_and_what_main_has() -> None:
-    """#111 criterion 1: the direction of decision 0013 and the parts that are on main."""
-    readme = read("README.md")
-    direction = flat(readme.split("Направление (с 20 ноября 2026):", 1)[1].split("\n\n", 1)[0])
+README_PATH = re.compile(r"`((?:src|docs|hermes|tests|scripts)/[^`\s]+)`")
+
+
+def readme_paths(text: str) -> list[str]:
+    return [path.rstrip("/") for path in README_PATH.findall(text)]
+
+
+def test_readme_what_works_now_links_its_code_and_names_closed_plugin_steps() -> None:
+    """#191: each part that works links its code or decision; #104 and #105 are closed."""
+    section = readme_section(WORKS_NOW)
+    text = flat(section)
     for fragment in (
+        "Состояние `main` на",
         "`docs/decisions/0013-voice-note-integration.md`",
-        f"сначала Linux-часть ([#114]({ISSUE.format(114)}))",
-        f"затем Windows-клиент (эпик [#115]({ISSUE.format(115)}))",
-        "`sound-scout jobs`",
         "`docs/decisions/0018-job-modes-and-retry.md`",
         "`hermes/plugin/sound-scout/`",
-        "`GET /health`, `POST /jobs`, `GET /jobs/<job_id>`",
-        "`/api/plugins/sound-scout/`",
-        "итоговой заметки каждой попытки задания в привязанный чат",
-        "`hermes/skills/speech-review/`",
-        f"([#104]({ISSUE.format(104)}))",
-        f"([#103]({ISSUE.format(103)}))",
+        "`hermes/skills/speech-review/SKILL.md`",
+        "`docs/mcp.md`",
+        "итог анализа со слоем `sound` — `partial`",
+        f"([#104]({ISSUE.format(104)}), закрыта)",
+        f"([#105]({ISSUE.format(105)}), закрыта)",
+        f"([#114]({ISSUE.format(114)}), закрыта)",
+        f"[#115]({ISSUE.format(115)})",
     ):
-        assert fragment in direction, fragment
-    for path in (
-        "src/sound_scout/jobs.py",
-        "docs/mcp.md",
-        "hermes/plugin/sound-scout/delivery.py",
-        "hermes/skills/speech-review/SKILL.md",
+        assert fragment in text, fragment
+    assert "ещё не развёрнут" not in text and "не проверен ([#105]" not in text
+    rows = [line for line in section.splitlines() if line.startswith("| ") and "---" not in line]
+    for row in rows[1:]:
+        assert readme_paths(row), row
+    for path in readme_paths(section):
+        assert (REPO_ROOT / path).exists(), path
+
+
+def test_readme_integration_names_every_entry_point_and_the_hermes_only_parts() -> None:
+    """#191: CLI, MCP stdio, the job queue and the Hermes plugin; untested hosts are marked."""
+    section = readme_section(INTEGRATION)
+    text = flat(section)
+    tools = section.split("Инструменты MCP:", 1)[1].split("Подключение другого", 1)[0]
+    assert re.findall(r"`(speech_\w+)`", tools) == [tool.name for tool in mcp_server.TOOLS]
+    for fragment in (
+        "MCP stdio `sound-scout serve`",
+        "CLI `sound-scout`",
+        "Очередь `jobs`",
+        "Плагин Hermes",
+        "проверен только Hermes",
+        "(Claude Code, Codex CLI, Cursor и др.) не проверено",
+        "`allowed_roots`",
+        "`data_root`",
+        "Stdout сервера несёт только JSON-RPC",
+        "Без runner задание остаётся `queued`",
+        "Клиент опрашивает `speech_job_status`",
+        "Этот путь вне Hermes не проверен",
+        "Только для Hermes:",
     ):
-        assert (REPO_ROOT / path).is_file(), path
-    assert "Решения по направлению — 0013, 0015–0018" in direction
-    for number in (13, 15, 16, 17, 18):
-        assert len(list((REPO_ROOT / "docs" / "decisions").glob(f"00{number}-*.md"))) == 1
+        assert fragment in text, fragment
+    for path in readme_paths(section):
+        assert (REPO_ROOT / path).exists(), path
     routes = read("hermes/plugin/sound-scout/dashboard/plugin_api.py")
     for route in (
         '@router.get("/health")',
@@ -431,9 +467,55 @@ def test_readme_shows_the_unified_plugin_direction_and_what_main_has() -> None:
         '@router.get("/jobs/{job_id}")',
     ):
         assert route in routes, route
-    intro = flat(readme.split("Статус:", 1)[0])
-    names = [tool.name for tool in mcp_server.TOOLS]
-    assert re.findall(r"`(speech_\w+)`", intro) == names
+
+
+def test_readme_dependencies_point_to_the_pins_and_do_not_copy_them() -> None:
+    section = readme_section(DEPENDENCIES)
+    assert "`docs/dependencies.md`" in section
+    for name in ("FFmpeg", "`faster-whisper`", "`onnxruntime`", "`praat-parselmouth`", "`mcp`"):
+        assert name in section, name
+    assert not re.search(r"\b[0-9a-f]{40,64}\b", section)
+
+
+def test_readme_models_match_the_pinned_asr_and_the_gpu_reference_run() -> None:
+    from sound_scout import config
+
+    section = flat(readme_section(MODELS))
+    dependencies = flat(read("docs/dependencies.md").split("## 4.", 1)[1].split("\n## ", 1)[0])
+    model = config.Asr().model
+    revision = re.search(rf"`{re.escape(model)}`, ревизия `([0-9a-f]{{40}})`", dependencies)
+    assert revision, dependencies
+    assert f"`{model}` @ `{revision[1]}`" in section
+    assert "Silero VAD" in section and "нет (`backend = none`)" in section
+    for fragment in (
+        f"[#149]({ISSUE.format(149)})",
+        "`docs/decisions/0028-gpu-reference-gate0.md`",
+        "vLLM 0.34.0",
+        "Qwen2.5-Omni-7B, bf16",
+        "Qwen3-Omni-30B-A3B-Instruct, bf16",
+        "Qwen3-Omni-30B-A3B-Instruct, GGUF Q4_K_M",
+        "Qwen2.5-Omni-7B, GGUF Q8_0",
+        "`docs/decisions/0023-gate0-qwen3-omni.md`",
+        "`docs/decisions/0024-gate0-qwen25-omni.md`",
+    ):
+        assert fragment in section, fragment
+    assert section.count("NOT READY") >= 7
+
+
+def test_readme_replacement_candidates_are_unchecked_and_each_has_a_source() -> None:
+    section = readme_section(REPLACEMENTS)
+    text = flat(section)
+    for fragment in ("не проверены", "решения владельца", "`docs/dependencies.md`", "Gate 0"):
+        assert fragment in text, fragment
+    assert not re.search(CANDIDATE_CHOSEN, text)
+    rows = [
+        line
+        for line in section.splitlines()
+        if line.startswith("| ") and "---" not in line and not line.startswith("| Кандидат")
+    ]
+    assert len(rows) >= 4
+    for row in rows:
+        assert re.search(r"\| https://\S+ \|$", row), row
 
 
 def test_readme_and_acceptance_record_four_backend_candidates_without_ready() -> None:
