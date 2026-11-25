@@ -16,15 +16,16 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   questions. The audio backend is not touched.
 - `prepare --date D --reuse D0` copies the clips and words of the prepare of D0 under the rule
   of `--decision`, each clip checked against D0's manifest (`reuse_clips`, #144).
-- `run --date D [--runtime llama|borealis|gigachat|qwen3omni|qwen25omni]` checks the weights,
-  the prompt, the rule and the clips against what was recorded, starts the local server —
+- `run --date D [--runtime llama|borealis|gigachat|qwen3omni|qwen25omni|gemma12b]` checks the
+  weights, the prompt, the rule and the clips against what was recorded, starts the local server —
   `llama-server` with local `-m`/`--mmproj` only (Gemma 4 E4B-it, or for `qwen3omni`
   Qwen3-Omni-30B-A3B-Instruct of #144, capped at 26e9 bytes without swap, or for `qwen25omni`
-  Qwen2.5-Omni-7B of #145, capped at 18e9 bytes without swap), or for `borealis` the
+  Qwen2.5-Omni-7B of #145, or for `gemma12b` Gemma 4 12B-it of #193, both capped at 18e9 bytes
+  without swap), or for `borealis` the
   `gate0_borealis` module
   with the local weights directory (#68), which must run inside a cgroup capped at 20e9 bytes
   without swap, or for `gigachat` the `gate0_gigachat` module (#85), capped at 26e9 bytes
-  without swap; `gigachat`, `qwen3omni` and `qwen25omni` start only when the host has
+  without swap; `gigachat`, `qwen3omni`, `qwen25omni` and `gemma12b` start only when the host has
   `MIN_AVAILABLE_BYTES` of their runtime available — on
   127.0.0.1 and a free port, sends the fixed list of requests one at a time and once each, and
   stops the server whatever happens. The empty input `E0` goes through the same
@@ -170,7 +171,18 @@ QWEN25OMNI_WEIGHTS = {
 QWEN25OMNI_MODEL_DIR = (
     Path.home() / ".cache/sound-scout/models/ggml-org--Qwen2.5-Omni-7B-GGUF" / QWEN25OMNI_REVISION
 )
-RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "vllm")
+GEMMA12B_REPO = "ggml-org/gemma-4-12B-it-GGUF"
+GEMMA12B_REVISION = "501d13dba70e3c02b1b12c78fd9e6b08ad413960"
+GEMMA12B_MODEL_FILE = "gemma-4-12B-it-Q8_0.gguf"
+GEMMA12B_MMPROJ_FILE = "mmproj-gemma-4-12B-it-BF16.gguf"
+GEMMA12B_WEIGHTS = {
+    GEMMA12B_MODEL_FILE: "3730903965b3e57bcad0a387110322ce66409559c356a1ae1b61701024e5ce60",
+    GEMMA12B_MMPROJ_FILE: "b9d4500e269ea3ad8a83b1fc55f553ed8c6b9ed35309b86c2fe9c4d8b47f9440",
+}
+GEMMA12B_MODEL_DIR = (
+    Path.home() / ".cache/sound-scout/models/ggml-org--gemma-4-12B-it-GGUF" / GEMMA12B_REVISION
+)
+RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "gemma12b", "vllm")
 # served models of the `vllm` runtime: a vLLM server on a rented GPU host behind an SSH tunnel
 # (`sound_scout.eval.vast`, docs/decisions/0026-gpu-stack.md); the run never starts it
 VLLM_MODELS = ("qwen25omni", "qwen3omni")
@@ -180,6 +192,7 @@ LLAMA_RUNTIMES = {
     "llama": (MODEL_FILE, MMPROJ_FILE, ()),
     "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE, ("--load-mode", "none")),
     "qwen25omni": (QWEN25OMNI_MODEL_FILE, QWEN25OMNI_MMPROJ_FILE, ("--load-mode", "none")),
+    "gemma12b": (GEMMA12B_MODEL_FILE, GEMMA12B_MMPROJ_FILE, ("--load-mode", "none")),
 }
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 MEMINFO = Path("/proc/meminfo")
@@ -191,10 +204,12 @@ QWEN3OMNI_MIN_AVAILABLE_BYTES = 22 * 10**9
 QWEN25OMNI_MEMORY_CAP_BYTES = 18 * 10**9
 QWEN25OMNI_RSS_LIMIT_BYTES = 17_500_000_000
 QWEN25OMNI_MIN_AVAILABLE_BYTES = 14 * 10**9
+GEMMA12B_MIN_AVAILABLE_BYTES = 18 * 10**9
 MIN_AVAILABLE_BYTES = {
     "gigachat": GIGACHAT_MIN_AVAILABLE_BYTES,
     "qwen3omni": QWEN3OMNI_MIN_AVAILABLE_BYTES,
     "qwen25omni": QWEN25OMNI_MIN_AVAILABLE_BYTES,
+    "gemma12b": GEMMA12B_MIN_AVAILABLE_BYTES,
 }
 PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca"
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
@@ -253,6 +268,7 @@ RUNTIME_LIMITS = {
     "gigachat": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
     "qwen3omni": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
     "qwen25omni": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
+    "gemma12b": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
     "vllm": (None, None),
 }
 STOP_GRACE_S = 10.0
@@ -1307,6 +1323,7 @@ def run_spike(
         "gigachat": (GIGACHAT_MODEL_DIR, GIGACHAT_WEIGHTS),
         "qwen3omni": (QWEN3OMNI_MODEL_DIR, QWEN3OMNI_WEIGHTS),
         "qwen25omni": (QWEN25OMNI_MODEL_DIR, QWEN25OMNI_WEIGHTS),
+        "gemma12b": (GEMMA12B_MODEL_DIR, GEMMA12B_WEIGHTS),
         "vllm": (None, None),
     }
     model_dir = model_dir or defaults[runtime][0]

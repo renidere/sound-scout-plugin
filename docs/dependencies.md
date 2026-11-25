@@ -192,6 +192,30 @@ sha256 из API Hugging Face. `gate0 run --runtime qwen25omni` пересчит�
 сервера (предусловие P2) по константе `QWEN25OMNI_WEIGHTS`, равной этой таблице. Не используются:
 `Q4_K_M`, `f16` LLM (15,24 GB), `mmproj-…-Q8_0`.
 
+#### Gemma 4 12B-it — Gate 0 #193 (решение владельца 7173265163)
+
+Решение владельца — [комментарий 7173265163](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7173265163)
+(2026-11-25): загрузка двух файлов закреплённой ревизии и локальный прогон Gate 0 на CPU по
+`GATE0-RULE v1`. Репозиторий `ggml-org/gemma-4-12B-it-GGUF` на Hugging Face, ревизия
+`501d13dba70e3c02b1b12c78fd9e6b08ad413960` (lastModified 2026-11-12), не gated. Исходная модель
+`google/gemma-4-12B-it`, ревизия `43c9d014b231474fa7212dbb48a762566c2b255d`. Лицензия Apache-2.0
+(карточка GGUF `license: apache-2.0` и карточка исходной модели). Каталог по умолчанию:
+`~/.cache/sound-scout/models/ggml-org--gemma-4-12B-it-GGUF/<ревизия>/`. Решение —
+`docs/decisions/0031-gate0-gemma4-12b.md`.
+
+| Файл | Байт | SHA-256 | Назначение |
+|---|---|---|---|
+| `gemma-4-12B-it-Q8_0.gguf` | 12 669 641 920 | `3730903965b3e57bcad0a387110322ce66409559c356a1ae1b61701024e5ce60` | языковая модель, Q8_0 |
+| `mmproj-gemma-4-12B-it-BF16.gguf` | 175 115 648 | `b9d4500e269ea3ad8a83b1fc55f553ed8c6b9ed35309b86c2fe9c4d8b47f9440` | аудио/визуальный проектор (тип аудио `gemma4ua`), BF16 |
+
+Всего 12 844 757 568 байт. Загрузка — только по прямому URL
+`https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/<ревизия>/<файл>`
+(`curl --proto =https --proto-redir =https`) в файл `.part`; после загрузки размер и SHA-256 на
+диске сверяются с LFS sha256 из `GET /api/models/ggml-org/gemma-4-12B-it-GGUF/tree/<ревизия>`, и
+только затем `.part` переименовывается. `gate0 run --runtime gemma12b` пересчитывает SHA-256 перед
+стартом сервера (предусловие P2) по константе `GEMMA12B_WEIGHTS`, равной этой таблице. Не
+используются: `BF16` LLM (23,8 GB), `Q4_0`, `mmproj-…-Q8_0`, `mtp-*`.
+
 #### GigaChat3.1-Audio-10B-A1.8B — кандидат Gate 0 #85 (разрешение владельца 2026-11-19)
 
 Разрешение владельца — тело [#85](https://github.com/renidere/sound-scout-plugin/issues/85)
@@ -310,6 +334,12 @@ qwen3omni`, #144): тот же argv с файлами этой модели и �
 cgroup `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ
 до попытки) и когда у хоста `MemAvailable` ≥ 14e9 байт; сторож RSS сервера — 17,5e9 байт.
 Подробности и измерения — `docs/decisions/0024-gate0-qwen25-omni.md`.
+
+Так же запускается Gemma 4 12B-it (`gate0 run --runtime gemma12b`, #193): тот же argv с файлами
+этой модели и `--load-mode none`, тип аудиопроектора `gemma4ua`. Запуск возможен только внутри
+cgroup `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ
+до попытки) и когда у хоста `MemAvailable` ≥ 18e9 байт; сторож RSS сервера — 17,5e9 байт.
+Подробности и измерения — `docs/decisions/0031-gate0-gemma4-12b.md`.
 
 #### Runtime Borealis-5b-it (Gate 0 spike #68)
 

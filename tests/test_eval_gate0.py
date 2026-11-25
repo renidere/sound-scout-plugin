@@ -1821,6 +1821,127 @@ def test_qwen25omni_record_names_the_clip_set_and_bounds_causes_three_pairs_cann
     assert "три пары по одному прогону не показывают" in weak
 
 
+# --- the gemma12b runtime of #193 under GATE0-RULE v1 (docs/decisions/0031-gate0-gemma4-12b.md) -
+
+GEMMA12B_DOC = Path("docs/decisions/0031-gate0-gemma4-12b.md")
+GEMMA12B_DAY = "2026-11-25"
+
+
+def test_gemma12b_decision_holds_rule_v1_unchanged() -> None:
+    document = (REPO / GEMMA12B_DOC).read_text(encoding="utf-8")
+    recorded = re.search(r"SHA-256 блока: `([0-9a-f]{64})`", document).group(1)
+    assert gate0.rule_sha256(document) == recorded == DECISION_RULE_SHA256
+    assert gate0.rule_name(gate0.rule_sha256(document)) == gate0.RULE_V1
+    assert _rule_lines(GEMMA12B_DOC) == _rule_lines(gate0.DECISION_DOC)
+    assert not re.search(r"/(home|Users)/", document)
+
+
+def test_gemma12b_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    gemma = weights[weights.index("#### Gemma 4 12B") :].split("\n#### ", 1)[0]
+    rows = re.findall(r"^\| `([^`]+)` \| ([\d ]+) \| `([0-9a-f]{64})` \|", gemma, re.M)
+    assert {name: sha for name, _, sha in rows} == gate0.GEMMA12B_WEIGHTS
+    assert sum(int(size.replace(" ", "")) for _, size, _ in rows) == 12_844_757_568
+    assert gate0.GEMMA12B_REVISION in gemma and gate0.GEMMA12B_REPO in gemma
+    assert str(gate0.GEMMA12B_REVISION) in str(gate0.GEMMA12B_MODEL_DIR)
+    assert gate0.WEIGHTS != gate0.GEMMA12B_WEIGHTS  # the llama runtime stays pinned to E4B
+
+
+def test_gemma12b_server_argv_is_the_llama_argv_with_its_local_files() -> None:
+    files = gate0.LLAMA_RUNTIMES["gemma12b"]
+    argv = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12, files)
+    gemma = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12)
+    assert argv[argv.index("-m") + 1] == f"/models/{gate0.GEMMA12B_MODEL_FILE}"
+    assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.GEMMA12B_MMPROJ_FILE}"
+    assert [a for a in argv if "/models/" not in a] == [
+        *[a for a in gemma if "/models/" not in a],
+        "--load-mode",
+        "none",
+    ]
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+
+
+def _gemma12b_run(
+    spike, tmp_path, memory_max=QWEN25OMNI_CAP, swap_max="0", available=20 * 10**9, broken=None
+):
+    """The fake spike prepared again under the real GATE0-RULE v1 block of 0031, 12B weights."""
+    gate0.prepare_clips(
+        GEMMA12B_DAY, spike["config"], decision=REPO / GEMMA12B_DOC, transcribe=_fake_transcribe
+    )
+    models = spike["kwargs"]["model_dir"]
+    weights = {}
+    for name in gate0.GEMMA12B_WEIGHTS:
+        (models / name).write_bytes(name.encode())
+        weights[name] = "0" * 64 if name == broken else hashlib.sha256(name.encode()).hexdigest()
+    return gate0.run_spike(
+        GEMMA12B_DAY,
+        spike["config"],
+        runtime="gemma12b",
+        cgroup_root=_cgroup(tmp_path / "cgroup", memory_max, swap_max),
+        meminfo=_meminfo(tmp_path / "meminfo", available),
+        **{**spike["kwargs"], "decision": REPO / GEMMA12B_DOC, "weights": weights},
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_gemma12b_run_under_the_18e9_cap_uses_its_files_rule_v1_and_the_same_plan(
+    spike, tmp_path
+) -> None:
+    result = _gemma12b_run(spike, tmp_path)
+    attempt = spike["out"].parent / GEMMA12B_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    argv = record["argv"]
+    assert argv[argv.index("-m") + 1].endswith(gate0.GEMMA12B_MODEL_FILE)
+    assert argv[argv.index("--mmproj") + 1].endswith(gate0.GEMMA12B_MMPROJ_FILE)
+    assert argv[-2:] == ["--load-mode", "none"]
+    assert record["runtime"] == "gemma12b" and record["rule"] == gate0.RULE_V1
+    assert record["limits"]["rss_limit_bytes"] == 17_500_000_000 < gate0.RSS_LIMIT_BYTES
+    assert record["cgroup"]["memory_max"] == QWEN25OMNI_CAP
+    assert record["requests_planned"] == 42
+    assert result["rule"] == gate0.RULE_V1 and result["audio_route"]["min_rate"] == 20.0
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+    assert gate0.RUNTIME_LIMITS["gemma12b"] == (18 * 10**9, 17_500_000_000)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max", "available", "message"),
+    [
+        ("max", "0", 20 * 10**9, "MemoryMax=18000000000"),
+        (GIGACHAT_CAP, "0", 20 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "max", 20 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "0", 18 * 10**9 - 4096, "MemAvailable"),
+    ],
+)
+def test_gemma12b_run_without_the_cap_or_the_free_memory_is_refused_before_any_attempt(
+    spike, tmp_path, memory_max, swap_max, available, message
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match=message):
+        _gemma12b_run(spike, tmp_path, memory_max, swap_max, available)
+    assert not (spike["out"].parent / GEMMA12B_DAY / gate0.ATTEMPTS_DIR).exists()
+    assert not spike["marker"].exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize("broken", [gate0.GEMMA12B_MODEL_FILE, gate0.GEMMA12B_MMPROJ_FILE])
+def test_gemma12b_wrong_weights_are_refused_before_the_server_start(
+    spike, tmp_path, broken
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        _gemma12b_run(spike, tmp_path, broken=broken)
+    assert not spike["marker"].exists() and not spike["received"].exists()
+    attempt = spike["out"].parent / GEMMA12B_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["stop_reason"] == "precondition_failed"
+    assert record["preconditions"]["checks"]["weights"] is False
+    verdict = json.loads((attempt / gate0.VERDICT_FILE).read_text())
+    assert verdict["verdict"] == "NOT READY"
+    assert verdict["reason"].startswith("протокол не выполнен")
+    assert verdict["preconditions"]["P2"] is False
+
+
 # --- the vllm runtime and the controls-only prepare (#147) ---------------------------------
 
 
@@ -1915,7 +2036,7 @@ def test_vllm_run_starts_no_server_sends_model_and_tokenizes_messages(controls) 
 
 
 def test_sampling_drops_llama_only_fields_for_vllm_and_keeps_them_for_local_runtimes() -> None:
-    for runtime in ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni"):
+    for runtime in ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "gemma12b"):
         assert gate0.sampling(runtime) is gate0.SAMPLING
     assert gate0.SAMPLING["cache_prompt"] is False
     assert gate0.sampling("vllm") == {
