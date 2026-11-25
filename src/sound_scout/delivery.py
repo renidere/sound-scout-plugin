@@ -39,6 +39,21 @@ on its own.
 
 The address is always `binding.session_id` of the job; there is no other address.
 
+No note for an attempt the chat already saw (decision 0030, Decision in #190). `mark_seen` (`jobs
+seen`, called only by the plugin's `post_tool_call` hook after a successful `speech_job_result`
+in a turn of the bound chat) writes `seen_at` into the job's last attempt when the job has ended
+and that attempt is the one the turn read. For such an attempt `next_delivery` writes the
+delivery state `seen_in_chat` (with the tag its note would have had, so the `-a<n>` tags of later
+attempts do not shift) and sends nothing. A note must be decided before its send: once admitted,
+Hermes writes it after the running turn and it cannot be taken back. So for a note not yet sent,
+`next_delivery` answers `probe` (nothing written) until the loop names the chat in `idle_chats`
+(its admission queue in Hermes is empty: send now) or in `busy_chats` (a turn runs or waits in
+it: skip the job, look further). `TURN_WAIT_SECONDS` after the attempt ended (for a redelivery
+request: after `requested_at`) the note goes without a probe: a stuck queue row, an unreadable
+queue or a turn that never reads the result must not hold the note for long, and a note admitted
+behind a running turn still waits for that turn in the Hermes FIFO. The seen mark does not apply
+to `redelivery_requested`, an explicit request of the operator; the wait does.
+
 The note of a control job (Decision in #110) has one comparison block after the layers, from the
 `compare` summary of the attempt that answers (`jobs.result`), or of the last attempt without a
 result: the verdict with a fixed label and, for `inconclusive`, the reasons by
@@ -46,6 +61,8 @@ result: the verdict with a fixed label and, for `inconclusive`, the reasons by
 """
 
 import re
+from collections.abc import Collection
+from datetime import UTC, datetime
 
 from sound_scout import jobs, paths, report
 from sound_scout.config import Config
@@ -58,6 +75,10 @@ UNCONFIRMED = "delivery_unconfirmed"
 FAILED = "delivery_failed"
 RELEASED = "released"
 REDELIVERY_REQUESTED = "redelivery_requested"
+SEEN_IN_CHAT = "seen_in_chat"
+NOT_SEEN = "not_seen"
+# The turn of the owner's chats reads the result about a minute after the job ends.
+TURN_WAIT_SECONDS = 600
 # outcome of `end_delivery` -> (delivery state, confirmed_by)
 OUTCOMES = {
     "delivered": (DELIVERED, "send"),
@@ -126,7 +147,13 @@ def _superseded(job: dict, marker: object) -> bool:
     )
 
 
-def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
+def next_delivery(
+    profile: str,
+    loop_id: str,
+    config: Config,
+    idle_chats: Collection[str] = (),
+    busy_chats: Collection[str] = (),
+) -> dict:
     """What the loop `loop_id` of the Hermes profile `profile` does next, under `jobs.lock`.
 
     `check`: a `sending` marker of another loop (one stopped in the middle of a send); the loop
@@ -134,10 +161,14 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
     `session_id` and `delivery: null` (or a note of an earlier attempt, now moved to
     `deliveries`), now marked `sending`, with the note text; `redeliver`: the same for a job with
     `redelivery_requested`, whose tag the loop looks for in the chat history before it sends.
-    `none` otherwise.
+    A job whose last attempt the chat saw gets `seen_in_chat` on the way and no answer. `probe`
+    (nothing written): the job waits for the turn check of its chat, see the module docstring;
+    a job of a chat in `busy_chats` is passed over. `none` otherwise.
     """
     jobs._check_identifier("profile", profile)
     jobs._check_identifier("loop_id", loop_id)
+    for chat_id in (*idle_chats, *busy_chats):
+        jobs._check_identifier("chat", chat_id)
     with jobs._store(config.data_root) as (jobs_dir, _):
         mine = sorted(
             (
@@ -164,9 +195,27 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
                 continue
             if requested:
                 note_tag, attempt = marker["tag"], _noted_attempt(job, marker)
+                since = marker.get("requested_at")
             else:
                 attempt = len(job["attempts"])
                 note_tag = tag(job["job_id"], attempt if job.get("deliveries") else None)
+                last = job["attempts"][attempt - 1] if attempt else {}
+                if last.get("seen_at"):
+                    job["delivery"] = {
+                        "state": SEEN_IN_CHAT,
+                        "tag": note_tag,
+                        "attempt": attempt,
+                        "seen_at": last["seen_at"],
+                        "ended_at": jobs._now(),
+                    }
+                    jobs._save(jobs_dir / job["job_id"], job)
+                    continue
+                since = last.get("ended_at") or job["updated_at"]
+            session_id = job["binding"]["session_id"]
+            if not _waited(since) and session_id not in idle_chats:
+                if session_id in busy_chats:
+                    continue
+                return _address("probe", job)
             text = note_text(job, config, note_tag, attempt)
             job["delivery"] = {
                 "state": SENDING,
@@ -181,6 +230,47 @@ def next_delivery(profile: str, loop_id: str, config: Config) -> dict:
             action = "redeliver" if requested else "send"
             return _address(action, job) | {"tag": note_tag, "text": text}
     return {"action": "none"}
+
+
+def _waited(since: object) -> bool:
+    """Whether `TURN_WAIT_SECONDS` passed since `since`; a time that cannot be read has passed,
+    so it never holds a note."""
+    try:
+        elapsed = datetime.now(UTC) - datetime.fromisoformat(since)
+    except (TypeError, ValueError):
+        return True
+    return elapsed.total_seconds() >= TURN_WAIT_SECONDS
+
+
+def mark_seen(job_id: str, session_id: str, attempt: int, config: Config) -> dict:
+    """Mark the last attempt of an ended job seen in its bound chat `session_id`, after a turn of
+    that chat read its result; the answer is the job's status. See the module docstring.
+
+    `invalid_request` for a malformed `session_id` or `attempt`, `job_not_found`, `not_seen` (and
+    nothing changes) for another chat or an unbound job, a job not ended, or an `attempt` that is
+    not the job's last. A second mark changes nothing. `updated_at` does not change: the staging
+    retention counts from it."""
+    jobs._check_identifier("session_id", session_id)
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise jobs.JobError(jobs.INVALID_REQUEST, f"attempt must be an integer >= 1: {attempt!r}")
+    with jobs._store(config.data_root):
+        job_dir = jobs._job_dir(job_id, config)
+        job = jobs._load(job_dir)
+        if job["binding"].get("session_id") != session_id:
+            raise jobs.JobError(NOT_SEEN, f"job {job_id} is not bound to the chat of the turn")
+        if job["state"] not in ENDED_STATES:
+            raise jobs.JobError(NOT_SEEN, f"job {job_id} is {job['state']}, not ended")
+        last = job["attempts"][-1] if job["attempts"] else None
+        if last is None or last.get("number") != attempt:
+            raise jobs.JobError(
+                NOT_SEEN,
+                f"attempt {attempt} is not the last attempt of job {job_id} "
+                f"({last.get('number') if last else None})",
+            )
+        if not last.get("seen_at"):
+            last["seen_at"] = jobs._now()
+            jobs._save(job_dir, job)
+        return jobs._view(job_dir, job, config)
 
 
 def request_redelivery(job_id: str, config: Config) -> dict:

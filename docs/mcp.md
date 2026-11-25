@@ -74,7 +74,7 @@ uv run sound-scout serve
   (решение 0013 § 3.1, § 3.8): вызывают те же функции `sound_scout.jobs` и `sound_scout.delivery` и
   отвечают тем же документом, что `--json` этих подкоманд, с теми же
   кодами отказа (`job_not_found`, `no_result`, `queue_full`, `staging_full`, `invalid_request`,
-  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, `not_bindable` (только `jobs bind`), коды приёма входа, коды `compare` у контрольной попытки). Lock сервера они не берут, поэтому отвечают
+  `not_retryable`, `request_mismatch`, `path_denied`, `delivery_not_unconfirmed`, `not_bindable` (только `jobs bind`), `not_seen` (только `jobs seen`), коды приёма входа, коды `compare` у контрольной попытки). Lock сервера они не берут, поэтому отвечают
   и во время синхронного `speech_analyze`; хранилище заданий держит свой lock миллисекунды.
   `speech_job_submit` проверяет путь, размер и SHA-256 входа и сразу отвечает `job_id` в состоянии
   `queued`; проверка входа через ffprobe и сам анализ — дело runner. Сервер runner не запускает:
@@ -89,6 +89,9 @@ uv run sound-scout serve
   после успешного вызова берёт `job_id` из ответа сервера, а id чата — из контекста сессии хода
   Hermes (`HERMES_SESSION_PLATFORM` = `local`, `HERMES_SESSION_CHAT_ID`), и вызывает
   `sound-scout jobs bind`. Итоговая заметка задания приходит в этот чат один раз на попытку (0013 § 3.7, 0018 «Повтор и доставка»).
+  Если ход этого чата уже прочитал итог попытки через `speech_job_result`, заметки этой попытки нет:
+  плагин ставит метку `sound-scout jobs seen`, доставка — `seen_in_chat`; `speech_job_status`
+  показывает `seen_at` последней попытки (0030).
   `jobs bind` привязывает только задание `submitter = "mcp"` без привязки и с `delivery: null`,
   один раз; иначе отказ `not_bindable`. MCP-инструмента для привязки нет. `speech_job_status`
   показывает `binding` и `bound_at`. Без плагина в процессе Hermes или вне локального чата привязки
@@ -287,7 +290,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_submit",
-  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full. A control attempt names previous_run_id (the run_id of the initial attempt, from its speech_job_result) and criterion, both together: after the control analysis the server compares the two attempts and puts the verdict into the job's result (compare). In a local Hermes chat the Sound Scout plugin binds the job to that chat after this call, and the chat gets at most one final note for each ended attempt of the job: one when the job ends and one more each time it ends again after speech_job_retry; a retry before the note is sent gives a single note about the latest attempt. The call takes no chat or session argument.",
+  "description": "Queue one recording of Russian speech for analysis and answer at once with its job_id and state (queued); the analysis runs later in the operator's job runner (sound-scout jobs start), never in this call; without a running runner the job stays queued. Follow it with speech_job_status and read it with speech_job_result. The same request_id with the same request returns the same job; with another file or other arguments it is refused. A full queue is refused with queue_full or staging_full. A control attempt names previous_run_id (the run_id of the initial attempt, from its speech_job_result) and criterion, both together: after the control analysis the server compares the two attempts and puts the verdict into the job's result (compare). In a local Hermes chat the Sound Scout plugin binds the job to that chat after this call, and the chat gets at most one final note for each ended attempt of the job: one when the job ends and one more each time it ends again after speech_job_retry; a retry before the note is sent gives a single note about the latest attempt. An attempt whose result a turn of that chat already read with speech_job_result gets no note. The call takes no chat or session argument.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -392,7 +395,7 @@ uv run sound-scout serve
 ```json
 {
   "name": "speech_job_result",
-  "description": "Read the result of a job: the compact summary of its latest attempt's run, as speech_analyze answers it, with job_id, job_state and attempt; a control attempt adds compare: the verdict, its reason codes and the file compare/<compare_id>.json. A job without a run result yet is refused with no_result. Reads only.",
+  "description": "Read the result of a job: the compact summary of its latest attempt's run, as speech_analyze answers it, with job_id, job_state and attempt; a control attempt adds compare: the verdict, its reason codes and the file compare/<compare_id>.json. A job without a run result yet is refused with no_result. Reads only in Sound Scout; in the job's local Hermes chat the plugin then marks the ended attempt as read, and the chat gets no final note for it: answer with this result.",
   "inputSchema": {
     "type": "object",
     "properties": {

@@ -1331,7 +1331,8 @@ def unconfirmed_job(cfg: config.Config, wav: Path) -> str:
     path.write_text(
         json.dumps(json.loads(path.read_text("utf-8")) | {"state": "finished"}), encoding="utf-8"
     )
-    assert delivery.next_delivery("default", "loop-1", cfg)["job_id"] == job_id
+    claimed = delivery.next_delivery("default", "loop-1", cfg, idle_chats=("chat-1",))
+    assert claimed["job_id"] == job_id
     delivery.end_delivery(job_id, "unconfirmed", "timed out", cfg)
     return job_id
 
@@ -1530,6 +1531,18 @@ def test_speech_job_submit_description_promises_one_note_per_attempt_not_one_per
     assert "note of the job arrives" not in text
 
 
+def test_submit_and_result_descriptions_name_no_note_for_an_attempt_the_chat_read() -> None:
+    described = {tool.name: " ".join(tool.description.split()) for tool in mcp_server.TOOLS}
+    assert (
+        "An attempt whose result a turn of that chat already read with speech_job_result gets "
+        "no note." in described["speech_job_submit"]
+    )
+    assert (
+        "the chat gets no final note for it: answer with this result"
+        in (described["speech_job_result"])
+    )
+
+
 # --- the server stops while a job is queued: «разрыв MCP» (A07, #186) ------------------------
 
 
@@ -1595,7 +1608,7 @@ def test_a_queued_job_runs_and_is_delivered_once_after_the_server_stops(
     assert ended["job_state"] == "finished"
 
     assert jobs_json("deliver-next", "--profile=default", "--loop=l-1") == {"action": "none"}
-    sent = jobs_json("deliver-next", "--profile=work", "--loop=l-1")
+    sent = jobs_json("deliver-next", "--profile=work", "--loop=l-1", "--idle-chat=chat-a")
     assert sent["action"] == "send"
     assert sent["job_id"] == job_id and sent["session_id"] == "chat-a"
     assert sent["text"].endswith(delivery.tag(job_id))

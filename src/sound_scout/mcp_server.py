@@ -272,7 +272,8 @@ TOOLS = (
             "the job to that chat after this call, and the chat gets at most one final note for "
             "each ended attempt of the job: one when the job ends and one more each time it ends "
             "again after speech_job_retry; a retry before the note is sent gives a single note "
-            "about the latest attempt. The call takes no chat or session argument."
+            "about the latest attempt. An attempt whose result a turn of that chat already read "
+            "with speech_job_result gets no note. The call takes no chat or session argument."
         ),
         input_schema=_closed(
             {
@@ -312,7 +313,9 @@ TOOLS = (
             "Read the result of a job: the compact summary of its latest attempt's run, as "
             "speech_analyze answers it, with job_id, job_state and attempt; a control attempt "
             "adds compare: the verdict, its reason codes and the file compare/<compare_id>.json. "
-            "A job without a run result yet is refused with no_result. Reads only."
+            "A job without a run result yet is refused with no_result. Reads only in Sound "
+            "Scout; in the job's local Hermes chat the plugin then marks the ended attempt as "
+            "read, and the chat gets no final note for it: answer with this result."
         ),
         input_schema=_job_id(),
         annotations=_hints(read_only=True, destructive=False, idempotent=True),

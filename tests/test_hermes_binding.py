@@ -48,7 +48,7 @@ def plugin(monkeypatch: pytest.MonkeyPatch):
         submodule_search_locations=[str(PACKAGE)],
     )
     package = importlib.util.module_from_spec(spec)
-    for name in ("binding", "delivery"):
+    for name in ("binding", "delivery", "seen"):
         monkeypatch.delitem(sys.modules, f"{spec.name}.{name}", raising=False)
     monkeypatch.setitem(sys.modules, spec.name, package)
     spec.loader.exec_module(package)
@@ -463,7 +463,7 @@ def test_an_exception_never_leaves_the_hook_and_logs_no_chat(
     assert "chat-a" not in caplog.text and "chat-b" not in caplog.text and JOB_ID not in caplog.text
 
 
-def test_register_adds_one_post_tool_call_hook_and_starts_the_delivery_loop(
+def test_register_adds_the_binding_and_seen_hooks_and_starts_the_delivery_loop(
     plugin, monkeypatch
 ) -> None:
     started = []
@@ -478,7 +478,10 @@ def test_register_adds_one_post_tool_call_hook_and_starts_the_delivery_loop(
 
     ctx = Ctx()
     assert plugin.register(ctx) is None
-    assert ctx.hooks == [("post_tool_call", plugin.binding.post_tool_call)]
+    assert ctx.hooks == [
+        ("post_tool_call", plugin.binding.post_tool_call),
+        ("post_tool_call", plugin.seen.post_tool_call),
+    ]
     assert started == [True]
 
 

@@ -1,6 +1,7 @@
 """Delivery loop of the Sound Scout plugin: one final note per ended attempt of a job to its
-bound chat (decision 0013 § 3.7, Decision in #102; a retried attempt's own note, Decision in
-#187). Each note has its own tag: `sound-scout-job:<job_id>` for the first one,
+bound chat, unless a turn of that chat read the result (decision 0013 § 3.7, Decision in #102; a
+retried attempt's own note, Decision in #187; the seen mark and the turn wait, decision 0030).
+Each note has its own tag: `sound-scout-job:<job_id>` for the first one,
 `sound-scout-job:<job_id>-a<n>` after a retry; the history check matches the whole tag.
 
 Runs on the Hermes interpreter (Python >= 3.11) and imports only the stdlib; Hermes modules are
@@ -36,6 +37,21 @@ job status the agent reads shows it inside JSON. Hermes writes the note as a `us
 user or the agent quoting the note is taken as delivered, which misses a redelivery rather than
 sending a second note.
 
+No note for an attempt the chat saw, and none in the middle of a turn (decision 0030, Decision
+in #190). A note not yet due comes from `deliver-next` as `probe`: the loop asks `chat_busy`
+whether the chat has a pending admission in the session authority and calls `deliver-next` again
+with the chat as `--idle-chat` (send now) or `--busy-chat` (the note waits; look further), up to
+`PROBES_PER_TICK` times a tick. An error of the check counts as busy; Sound Scout sends the note
+anyway `TURN_WAIT_SECONDS` after the attempt ended. An attempt the `seen` hook marked ends
+`seen_in_chat` inside `deliver-next`, without a send. The turn signal is the admission queue of
+the chat, not a hook: a hook Hermes skips on its timeout or a turn that raises would leave a
+wrong state, and a queued turn ahead of the note shows in the queue only. Hermes v0.23.3
+(`caafe5389a`), read only: `gateway/session_authority.py:349-356` (`execution_state` from the
+pending admissions), `:277-284` (`logical_owner`, the FIFO identity),
+`persistence/sqlite/authority/admissions.py:175-178` (`admissions.list`, pending only),
+`gateway/run_turn_persistence.py:484` (the same "is anything in the chat FIFO" check),
+`gateway/session_cron.py:65-80` (work on the owner loop from another thread).
+
 The Hermes names follow the Decision in #102, read from Hermes v0.23.1 (`3b42157858`):
 `hermes_constants.get_hermes_home`, `hermes_constants.profile_name_for_home`,
 `gateway.session_cron.owner_for_home` (it returns `(authority, loop)` or None),
@@ -43,6 +59,7 @@ The Hermes names follow the Decision in #102, read from Hermes v0.23.1 (`3b42157
 `authority.db.get_messages`.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -56,6 +73,8 @@ POLL_SECONDS = 10
 CLI_TIMEOUT_SECONDS = 30
 CLI_MAX_OUTPUT_BYTES = 64 * 1024
 HISTORY_SCAN = 2000
+PROBES_PER_TICK = 16
+PROBE_TIMEOUT_SECONDS = 10
 BIN_ENV = "SOUND_SCOUT_BIN"
 CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 PASSED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
@@ -108,7 +127,7 @@ def run_cli(args: list[str]) -> dict | None:
     return answer if isinstance(answer, dict) else None
 
 
-def tick(*, owner, profile, loop_id: str, cli, send, history_has, state: dict) -> str:
+def tick(*, owner, profile, loop_id: str, cli, send, history_has, chat_busy, state: dict) -> str:
     """One step of the loop; every dependency is given. Returns what it did."""
     if not owner():
         return "idle_no_owner"
@@ -118,11 +137,23 @@ def tick(*, owner, profile, loop_id: str, cli, send, history_has, state: dict) -
             return "end_pending"
         del state["pending"]
         return "end_recorded"
-    answer = cli(["deliver-next", f"--profile={profile()}", f"--loop={loop_id}"])
-    if answer is None or "error" in answer:
-        return "cli_failed"
+    idle: set[str] = set()
+    busy: set[str] = set()
+    for _ in range(PROBES_PER_TICK):
+        args = ["deliver-next", f"--profile={profile()}", f"--loop={loop_id}"]
+        args += [f"--idle-chat={chat}" for chat in sorted(idle)]
+        args += [f"--busy-chat={chat}" for chat in sorted(busy)]
+        answer = cli(args)
+        if answer is None or "error" in answer:
+            return "cli_failed"
+        if answer["action"] != "probe":
+            break
+        chat_id = answer["session_id"]
+        (busy if _chat_busy(chat_busy, chat_id) else idle).add(chat_id)
+    else:
+        return "waiting_turn"
     if answer["action"] not in ("check", "send", "redeliver"):
-        return "idle"
+        return "waiting_turn" if busy else "idle"
     job_id = answer["job_id"]
     # The marker is written: whatever happens now, the outcome reaches deliver-end or pending.
     try:
@@ -138,6 +169,15 @@ def tick(*, owner, profile, loop_id: str, cli, send, history_has, state: dict) -
     if not recorded:
         state["pending"] = (job_id, outcome, error)
     return outcome
+
+
+def _chat_busy(chat_busy, chat_id: str) -> bool:
+    """Whether a turn runs or waits in the chat; a check that fails counts as busy."""
+    try:
+        return bool(chat_busy(chat_id))
+    except Exception as exc:
+        _log.warning("sound-scout delivery: turn check failed: %s", type(exc).__name__)
+        return True
 
 
 def _settle(answer: dict, send, history_has) -> tuple[str, str | None]:
@@ -224,6 +264,34 @@ def hermes_send(chat_id: str, text: str) -> str | None:
     return deliver_to_local_chat(_home(), chat_id, text)
 
 
+def hermes_chat_busy(chat_id: str) -> bool:
+    """Whether the chat has a pending admission (`queued`, `started` or `unknown`): a turn runs or
+    waits ahead of any note admitted now. Read on the owner loop, as `deliver_to_local_chat`
+    works; see the module docstring for the Hermes lines.
+
+    Raises when it cannot answer: `RuntimeError` without the owner process, `TimeoutError` after
+    `PROBE_TIMEOUT_SECONDS`.
+    """
+    from gateway.session_cron import owner_for_home
+    from gateway.session_persistence import authority_persistence
+
+    owner = owner_for_home(_home())
+    if owner is None:
+        raise RuntimeError("no gateway in this process owns the session authority")
+    authority, loop = owner
+
+    async def pending() -> bool:
+        admissions = authority_persistence(authority).admissions
+        return bool(admissions.list(session_id=authority.logical_owner(chat_id)))
+
+    future = asyncio.run_coroutine_threadsafe(pending(), loop)
+    try:
+        return future.result(timeout=PROBE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        raise
+
+
 def hermes_history_has(chat_id: str, tag: str) -> bool:
     """Whether the tag is in the newest `HISTORY_SCAN` messages of the chat's whole lineage.
 
@@ -273,6 +341,7 @@ def start(
     *,
     send=hermes_send,
     history_has=hermes_history_has,
+    chat_busy=hermes_chat_busy,
     owner=hermes_owner,
     profile=hermes_profile,
     cli=run_cli,
@@ -296,6 +365,7 @@ def start(
         "cli": cli,
         "send": send,
         "history_has": history_has,
+        "chat_busy": chat_busy,
         "state": {},
     }
     thread = threading.Thread(

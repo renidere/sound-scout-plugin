@@ -56,16 +56,25 @@ def chat_of(session_env) -> str | None:
     return chat_id if chat_id.isprintable() else None
 
 
-def job_id_of(result: object) -> str | None:
-    """The `job_id` of a `speech_job_submit` answer as Hermes hands it to the hook, or None."""
+def answer_of(result: object) -> dict | None:
+    """The Sound Scout answer of an MCP tool result as Hermes hands it to the hook, or None."""
     try:
         wrapped = json.loads(result) if isinstance(result, str) else None
         text = wrapped.get("result") if isinstance(wrapped, dict) else None
         answer = json.loads(text) if isinstance(text, str) else None
     except ValueError:
         return None
-    job_id = answer.get("job_id") if isinstance(answer, dict) else None
-    return job_id if isinstance(job_id, str) and _JOB_ID.fullmatch(job_id) else None
+    return answer if isinstance(answer, dict) else None
+
+
+def is_job_id(value: object) -> bool:
+    return isinstance(value, str) and _JOB_ID.fullmatch(value) is not None
+
+
+def job_id_of(result: object) -> str | None:
+    """The `job_id` of a `speech_job_submit` answer as Hermes hands it to the hook, or None."""
+    job_id = (answer_of(result) or {}).get("job_id")
+    return job_id if is_job_id(job_id) else None
 
 
 def bind_after_submit(

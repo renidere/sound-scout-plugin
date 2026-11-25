@@ -92,7 +92,10 @@ that ended before its `bind` waits: the delivery loop takes only jobs with a `se
 
 `delivery` of `job.json` (`null` at submit) is the state of the job's final note to its chat,
 kept by `sound_scout.delivery` under the same `jobs.lock`; `status` shows it. After a retry the
-new attempt gets a note of its own, and the earlier note moves to `deliveries` (#187). About
+new attempt gets a note of its own, and the earlier note moves to `deliveries` (#187). An
+attempt that a turn of the bound chat read through `speech_job_result` carries `seen_at` (`jobs
+seen`, `delivery.mark_seen`, decision 0030) and gets no note; `status` shows `seen_at` of the
+last attempt. About
 once a minute the runner deletes the staging copies that are due (`sound_scout.staging.sweep`)
 and marks their jobs `staging_removed_at`.
 
@@ -1182,6 +1185,7 @@ def _view(job_dir: Path, job: dict, config: Config) -> dict:
         "binding": job["binding"],
         "bound_at": job.get("bound_at"),
         "delivery": job.get("delivery"),
+        "seen_at": job["attempts"][-1].get("seen_at") if job["attempts"] else None,
         STAGING_REMOVED_AT: job.get(STAGING_REMOVED_AT),
         "control": job["request"].get("control"),
         "compare": job["attempts"][-1].get("compare") if job["attempts"] else None,

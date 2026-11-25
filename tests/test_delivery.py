@@ -28,6 +28,13 @@ needs_ffmpeg = pytest.mark.skipif(
 ALL_DONE = ("готово", "всё выполнено", "все выполнено", "всё хорошо")
 
 
+@pytest.fixture(autouse=True)
+def turn_wait_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tests of the note state machine run after the turn wait (decision 0030); the tests of
+    the wait itself set `TURN_WAIT_SECONDS` back."""
+    monkeypatch.setattr(delivery, "TURN_WAIT_SECONDS", 0)
+
+
 @pytest.fixture
 def setup(tmp_path: Path) -> Config:
     (tmp_path / "recordings").mkdir()
@@ -357,7 +364,14 @@ def test_deliver_next_and_end_through_the_console_entry(
     assert none.returncode == 0, none.stderr
     assert none.stdout.strip() == "action: none"
 
-    sent = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l-1", "--json")
+    sent = run_cli(
+        config_file,
+        "deliver-next",
+        "--profile=default",
+        "--loop=l-1",
+        "--idle-chat=chat-1",
+        "--json",
+    )
     assert sent.returncode == 0, sent.stderr
     answer = json.loads(sent.stdout)
     assert answer["action"] == "send" and answer["job_id"] == job_id
@@ -386,9 +400,15 @@ def test_deliver_next_and_end_through_the_console_entry(
 # --- redelivery on the operator's request (#122) ---------------------------------------------
 
 
+def claim(cfg: Config, job_id: str, loop_id: str = "loop-1") -> dict:
+    """`next_delivery` after the loop found the job's chat without a turn."""
+    session_id = job_file(cfg, job_id)["binding"]["session_id"]
+    return delivery.next_delivery("default", loop_id, cfg, idle_chats=(session_id,))
+
+
 def unconfirmed_job(cfg: Config, wav: Path, **kwargs: object) -> str:
     job_id = ended_job(cfg, wav, **kwargs)
-    delivery.next_delivery("default", "loop-1", cfg)
+    claim(cfg, job_id)
     delivery.end_delivery(job_id, "unconfirmed", "timed out", cfg)
     return job_id
 
@@ -882,7 +902,9 @@ def test_a_retried_attempt_gets_its_note_through_the_console_entry(
     assert retried.returncode == 0, retried.stderr
     run_attempt(setup, job_id)
 
-    sent = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
+    sent = run_cli(
+        config_file, "deliver-next", "--profile=default", "--loop=l", "--idle-chat=chat-1", "--json"
+    )
     ended = run_cli(config_file, "deliver-end", "--outcome=delivered", job_id, "--json")
     again = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
 
@@ -1103,3 +1125,233 @@ def test_note_of_an_ordinary_job_has_no_comparison(setup: Config, make_wav: WavF
     text = delivery.next_delivery("default", "loop-1", setup)["text"]
 
     assert "Сравнение" not in text
+
+
+# --- no note for an attempt the chat saw, none before the turn check (#190, decision 0030) ---
+
+
+def ended_attempt(cfg: Config, wav: Path, *, session_id: str = "chat-1", ended_at=None) -> str:
+    """A bound job whose attempt 1 ended `finished` at `ended_at` (now by default)."""
+    job_id = ended_job(cfg, wav, session_id=session_id, state="running")
+    run_attempt(cfg, job_id)
+    job = job_file(cfg, job_id)
+    job["attempts"][-1]["ended_at"] = ended_at or jobs._now()
+    set_job(cfg, job_id, attempts=job["attempts"])
+    return job_id
+
+
+@pytest.fixture
+def turn_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(delivery, "TURN_WAIT_SECONDS", 600)
+
+
+def test_mark_seen_writes_seen_at_of_the_last_attempt_once_and_keeps_updated_at(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_attempt(setup, make_wav("recordings/a.wav"))
+    before = job_file(setup, job_id)
+
+    status = delivery.mark_seen(job_id, "chat-1", 1, setup)
+    marked = job_file(setup, job_id)
+    again = delivery.mark_seen(job_id, "chat-1", 1, setup)
+
+    assert (
+        marked["attempts"][-1]["seen_at"] and status["seen_at"] == marked["attempts"][-1]["seen_at"]
+    )
+    assert marked["updated_at"] == before["updated_at"] and marked["delivery"] is None
+    assert job_file(setup, job_id) == marked and again["seen_at"] == status["seen_at"]
+
+
+@pytest.mark.parametrize("case", ["other_chat", "unbound", "queued", "running", "earlier"])
+def test_mark_seen_refuses_not_seen_and_leaves_job_json_as_it_is(
+    setup: Config, make_wav: WavFactory, case: str
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    job_id = ended_attempt(setup, wav)
+    attempt = 1
+    if case == "unbound":
+        job_id = ended_job(setup, wav, session_id=None, state="running")
+        run_attempt(setup, job_id)
+    elif case in ("queued", "running"):
+        set_job(setup, job_id, state=case)
+    elif case == "earlier":
+        run_attempt(setup, job_id, "failed")
+    before = job_file(setup, job_id)
+
+    with pytest.raises(JobError) as refused:
+        delivery.mark_seen(job_id, "chat-2" if case == "other_chat" else "chat-1", attempt, setup)
+
+    assert refused.value.code == "not_seen"
+    assert job_file(setup, job_id) == before
+
+
+@pytest.mark.parametrize("attempt", [0, -1, True, "1", None])
+def test_mark_seen_refuses_a_malformed_attempt(
+    setup: Config, make_wav: WavFactory, attempt: object
+) -> None:
+    job_id = ended_attempt(setup, make_wav("recordings/a.wav"))
+    with pytest.raises(JobError) as refused:
+        delivery.mark_seen(job_id, "chat-1", attempt, setup)
+    assert refused.value.code == "invalid_request"
+    with pytest.raises(JobError) as missing:
+        delivery.mark_seen("b" * 32, "chat-1", 1, setup)
+    assert missing.value.code == "job_not_found"
+
+
+def test_a_seen_attempt_ends_seen_in_chat_and_the_next_job_comes_in_the_same_call(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    seen = ended_attempt(setup, wav)
+    other = ended_attempt(setup, wav, session_id="chat-2")
+    delivery.mark_seen(seen, "chat-1", 1, setup)
+
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    assert answer["action"] == "send" and answer["job_id"] == other
+    marker = job_file(setup, seen)["delivery"]
+    assert marker["state"] == "seen_in_chat" and marker["attempt"] == 1
+    assert marker["tag"] == f"sound-scout-job:{seen}"
+    assert marker["seen_at"] == job_file(setup, seen)["attempts"][0]["seen_at"]
+    assert marker["ended_at"]
+    delivery.end_delivery(other, "delivered", None, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+    with pytest.raises(JobError) as refused:
+        delivery.request_redelivery(seen, setup)
+    assert refused.value.code == "delivery_not_unconfirmed"
+
+
+def test_an_unseen_attempt_is_probed_and_job_json_stays_byte_for_byte(
+    setup: Config, make_wav: WavFactory, turn_wait: None
+) -> None:
+    job_id = ended_attempt(setup, make_wav("recordings/a.wav"))
+    path = setup.data_root / "jobs" / job_id / "job.json"
+    before = path.read_bytes()
+
+    answer = delivery.next_delivery("default", "loop-1", setup)
+
+    assert answer == {"action": "probe", "job_id": job_id, "session_id": "chat-1"}
+    assert path.read_bytes() == before
+
+
+def test_an_idle_chat_gets_its_note_and_a_busy_chat_is_passed_over(
+    setup: Config, make_wav: WavFactory, turn_wait: None
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    busy = ended_attempt(setup, wav, session_id="chat-x")
+    idle = ended_attempt(setup, wav, session_id="chat-y")
+
+    assert delivery.next_delivery("default", "l", setup, busy_chats=("chat-x",)) == {
+        "action": "probe",
+        "job_id": idle,
+        "session_id": "chat-y",
+    }
+    sent = delivery.next_delivery(
+        "default", "l", setup, idle_chats=("chat-y",), busy_chats=("chat-x",)
+    )
+    assert sent["action"] == "send" and sent["job_id"] == idle
+    assert job_file(setup, busy)["delivery"] is None
+    assert delivery.next_delivery("default", "l", setup, busy_chats=("chat-x",)) == {
+        "action": "none"
+    }
+    assert delivery.next_delivery("default", "l", setup, idle_chats=("chat-x",))["job_id"] == busy
+
+
+def test_after_the_turn_wait_the_note_goes_without_a_probe(
+    setup: Config, make_wav: WavFactory, turn_wait: None
+) -> None:
+    job_id = ended_attempt(
+        setup, make_wav("recordings/a.wav"), ended_at="2026-11-25T08:00:00+00:00"
+    )
+
+    answer = delivery.next_delivery("default", "loop-1", setup, busy_chats=("chat-1",))
+
+    assert answer["action"] == "send" and answer["job_id"] == job_id
+    assert job_file(setup, job_id)["delivery"]["state"] == "sending"
+
+
+def test_a_redelivery_request_waits_for_the_turn_check_too(
+    setup: Config, make_wav: WavFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = unconfirmed_job(setup, make_wav("recordings/a.wav"))
+    delivery.request_redelivery(job_id, setup)
+    monkeypatch.setattr(delivery, "TURN_WAIT_SECONDS", 600)
+
+    assert delivery.next_delivery("default", "loop-1", setup)["action"] == "probe"
+    answer = delivery.next_delivery("default", "loop-1", setup, idle_chats=("chat-1",))
+    assert answer["action"] == "redeliver"
+
+
+def test_a_seen_mark_does_not_cancel_an_explicit_redelivery_request(
+    setup: Config, make_wav: WavFactory, turn_wait: None
+) -> None:
+    job_id = ended_attempt(setup, make_wav("recordings/a.wav"))
+    claim(setup, job_id)
+    delivery.end_delivery(job_id, "unconfirmed", "timed out", setup)
+    delivery.request_redelivery(job_id, setup)
+    delivery.mark_seen(job_id, "chat-1", 1, setup)
+
+    answer = delivery.next_delivery("default", "loop-1", setup, idle_chats=("chat-1",))
+
+    assert answer["action"] == "redeliver" and answer["job_id"] == job_id
+    job = job_file(setup, job_id)
+    assert job["attempts"][-1]["seen_at"] and job["delivery"]["state"] == "sending"
+    assert job["delivery"]["redelivery"] is True
+    assert "seen_in_chat" not in json.dumps(job)
+
+
+def test_after_a_retry_of_a_seen_attempt_the_new_attempt_gets_its_own_note(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), state="running")
+    run_attempt(setup, job_id, "failed")
+    delivery.mark_seen(job_id, "chat-1", 1, setup)
+    assert delivery.next_delivery("default", "loop-1", setup) == {"action": "none"}
+
+    jobs.retry(job_id, setup)
+    run_attempt(setup, job_id)
+    second = delivery.next_delivery("default", "loop-1", setup)
+
+    assert second["action"] == "send" and second["tag"] == f"sound-scout-job:{job_id}-a2"
+    job = job_file(setup, job_id)
+    assert [item["state"] for item in job["deliveries"]] == ["seen_in_chat"]
+    assert job["delivery"]["attempt"] == 2
+
+
+@pytest.mark.slow
+def test_jobs_seen_and_deliver_next_chats_through_the_console_entry(
+    setup: Config, make_wav: WavFactory, config_file: Path
+) -> None:
+    job_id = ended_attempt(setup, make_wav("recordings/a.wav"))
+
+    shown = run_cli(config_file, "seen", "--session-id=chat-1", "--attempt=1", job_id)
+    assert shown.returncode == 0, shown.stderr
+    assert "seen_at: " in shown.stdout
+    as_json = run_cli(config_file, "seen", "--session-id=chat-1", "--attempt=1", job_id, "--json")
+    assert (
+        json.loads(as_json.stdout)["seen_at"] == job_file(setup, job_id)["attempts"][0]["seen_at"]
+    )
+    for args in (["--session-id=chat-2", "--attempt=1"], ["--session-id=chat-1", "--attempt=2"]):
+        refused = run_cli(config_file, "seen", *args, job_id)
+        assert refused.returncode == 1 and refused.stdout == ""
+        assert refused.stderr.startswith("sound-scout jobs: not_seen: ")
+    for attempt in ("x", "0", "-1"):
+        bad = run_cli(config_file, "seen", "--session-id=chat-1", f"--attempt={attempt}", job_id)
+        assert bad.returncode == 1 and bad.stderr.startswith("sound-scout jobs: invalid_request: ")
+
+    none = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
+    assert json.loads(none.stdout) == {"action": "none"}
+    assert job_file(setup, job_id)["delivery"]["state"] == "seen_in_chat"
+    other = ended_attempt(setup, make_wav("recordings/b.wav"), session_id="chat-2")
+    probe = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--json")
+    assert json.loads(probe.stdout)["action"] == "probe"
+    busy = run_cli(
+        config_file, "deliver-next", "--profile=default", "--loop=l", "--busy-chat=chat-2", "--json"
+    )
+    assert json.loads(busy.stdout) == {"action": "none"}
+    sent = run_cli(
+        config_file, "deliver-next", "--profile=default", "--loop=l", "--idle-chat=chat-2", "--json"
+    )
+    assert json.loads(sent.stdout)["job_id"] == other
+    bad = run_cli(config_file, "deliver-next", "--profile=default", "--loop=l", "--idle-chat=")
+    assert bad.returncode == 1 and bad.stderr.startswith("sound-scout jobs: invalid_request: ")

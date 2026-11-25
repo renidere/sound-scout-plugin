@@ -22,7 +22,14 @@ import pytest
 from sound_scout import app, config, jobs
 from sound_scout.config import Config
 from tests.conftest import WavFactory
-from tests.test_delivery import analyzed_job, ended_job, job_file, run_attempt, unconfirmed_job
+from tests.test_delivery import (
+    analyzed_job,
+    claim,
+    ended_job,
+    job_file,
+    run_attempt,
+    unconfirmed_job,
+)
 from tests.test_jobs_runner import POLL, runner_thread, substitute, wait_until
 
 REPO = Path(__file__).resolve().parent.parent
@@ -85,7 +92,18 @@ class Chats:
         return self.history
 
 
-def ticks(loop, chats: Chats, n: int = 3, *, owner=True, cli=None, state=None, loop_id="loop-1"):
+def ticks(
+    loop,
+    chats: Chats,
+    n: int = 3,
+    *,
+    owner=True,
+    cli=None,
+    state=None,
+    loop_id="loop-1",
+    chat_busy=None,
+):
+    """`n` ticks; by default every chat has no turn (`chat_busy` answers False)."""
     state = {} if state is None else state
     return [
         loop.tick(
@@ -95,6 +113,7 @@ def ticks(loop, chats: Chats, n: int = 3, *, owner=True, cli=None, state=None, l
             cli=cli or loop.run_cli,
             send=chats.send,
             history_has=chats.history_has,
+            chat_busy=chat_busy or (lambda chat_id: False),
             state=state,
         )
         for _ in range(n)
@@ -219,10 +238,9 @@ def test_a_failing_history_check_counts_as_tag_not_found(
 def test_a_marker_of_a_stopped_loop_is_checked_in_history_never_sent(
     loop, setup: Config, make_wav: WavFactory, history: bool, state: str
 ) -> None:
-    from sound_scout import delivery
 
     job_id = ended_job(setup, make_wav("recordings/a.wav"), session_id="chat-1")
-    delivery.next_delivery("default", "dead-loop", setup)
+    claim(setup, job_id, "dead-loop")
     chats = Chats(setup, history=history)
 
     ticks(loop, chats, 3, loop_id="live-loop")
@@ -465,6 +483,7 @@ def test_an_exception_in_a_tick_does_not_stop_the_loop(loop, caplog) -> None:
                 "cli": None,
                 "send": None,
                 "history_has": None,
+                "chat_busy": None,
                 "state": {},
             },
             stop,
@@ -1001,7 +1020,9 @@ def test_criterion_5_a_stopped_loop_of_a_retried_attempt_is_checked_by_its_own_t
     assert ticks(loop, chats, 1) == ["delivered"]
     assert jobs_cli("retry", job_id).returncode == 0
     run_to_end(setup, job_id, "finished", monkeypatch)
-    stopped = jobs_cli("deliver-next", "--profile=default", "--loop=stopped", "--json")
+    stopped = jobs_cli(
+        "deliver-next", "--profile=default", "--loop=stopped", "--idle-chat=chat-1", "--json"
+    )
     assert json.loads(stopped.stdout)["tag"] == f"sound-scout-job:{job_id}-a2"
 
     assert ticks(loop, chats, 2) == ["unconfirmed", "idle"]
@@ -1029,3 +1050,201 @@ def test_criterion_4_a_job_without_a_retry_gets_one_note_with_the_job_tag(
     assert job["delivery"]["tag"] == f"sound-scout-job:{job_id}" and "deliveries" not in job
     again = jobs_cli("deliver-next", "--profile=default", "--loop=loop-1", "--json")
     assert json.loads(again.stdout) == {"action": "none"}
+
+
+# --- acceptance criteria of #190: no note for a seen attempt, none before the turn ends ------
+
+
+class Turns:
+    """The fake turn check: which chats have a turn, and every chat it was asked about."""
+
+    def __init__(self, *busy: str, error: BaseException | None = None) -> None:
+        self.busy = set(busy)
+        self.error = error
+        self.asked: list[str] = []
+
+    def __call__(self, chat_id: str) -> bool:
+        self.asked.append(chat_id)
+        if self.error is not None:
+            raise self.error
+        return chat_id in self.busy
+
+
+def ended_now(cfg: Config, wav: Path, session_id: str = "chat-1") -> str:
+    """A bound job whose attempt 1 ended `finished` just now."""
+    job_id = ended_job(cfg, wav, session_id=session_id, state="running")
+    run_attempt(cfg, job_id)
+    age(cfg, job_id, 0)
+    return job_id
+
+
+def age(cfg: Config, job_id: str, seconds: float) -> None:
+    """Move the end of the job's last attempt `seconds` into the past."""
+    from datetime import UTC, datetime, timedelta
+
+    job = job_file(cfg, job_id)
+    ended = datetime.now(UTC) - timedelta(seconds=seconds)
+    job["attempts"][-1]["ended_at"] = ended.isoformat()
+    path = cfg.data_root / "jobs" / job_id / "job.json"
+    path.write_text(json.dumps(job), encoding="utf-8")
+
+
+@pytest.mark.slow
+def test_criterion_2_a_seen_attempt_gets_no_note_and_ends_seen_in_chat(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    from sound_scout import delivery
+
+    job_id = ended_now(setup, make_wav("recordings/a.wav"))
+    delivery.mark_seen(job_id, "chat-1", 1, setup)
+    chats, turns = Chats(setup), Turns()
+
+    assert ticks(loop, chats, 3, chat_busy=turns) == ["idle"] * 3
+
+    assert chats.sent == [] and turns.asked == []
+    recorded = delivery_of(setup, job_id)
+    assert recorded["state"] == "seen_in_chat" and recorded["attempt"] == 1
+
+
+@pytest.mark.slow
+def test_criterion_3_a_running_turn_holds_the_note_and_its_end_sends_one(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = ended_now(setup, make_wav("recordings/a.wav"))
+    chats, turns = Chats(setup), Turns("chat-1")
+
+    assert ticks(loop, chats, 3, chat_busy=turns) == ["waiting_turn"] * 3
+    assert chats.sent == [] and delivery_of(setup, job_id) is None
+
+    turns.busy.clear()
+    assert ticks(loop, chats, 2, chat_busy=turns) == ["delivered", "idle"]
+    assert [chat for chat, _ in chats.sent] == ["chat-1"]
+    assert turns.asked == ["chat-1"] * 4
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("turns", [Turns("chat-1"), Turns(error=TimeoutError("owner stalled"))])
+def test_criterion_3_without_the_turn_signal_the_note_goes_once_after_the_limit(
+    loop, setup: Config, make_wav: WavFactory, turns: Turns, caplog: pytest.LogCaptureFixture
+) -> None:
+    job_id = ended_now(setup, make_wav("recordings/a.wav"))
+    chats = Chats(setup)
+    caplog.set_level(logging.WARNING)
+
+    assert ticks(loop, chats, 2, chat_busy=turns) == ["waiting_turn"] * 2
+    age(setup, job_id, 601)
+    assert ticks(loop, chats, 3, chat_busy=turns) == ["delivered", "idle", "idle"]
+
+    assert len(chats.sent) == 1 and len(turns.asked) == 2
+    if turns.error is not None:
+        assert "turn check failed: TimeoutError" in caplog.text and "chat-1" not in caplog.text
+
+
+@pytest.mark.slow
+def test_criterion_3_a_busy_chat_does_not_hold_the_note_of_another_chat(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    held = ended_now(setup, wav, "chat-x")
+    sent = ended_now(setup, wav, "chat-y")
+    chats, turns = Chats(setup), Turns("chat-x")
+
+    assert ticks(loop, chats, 2, chat_busy=turns) == ["delivered", "waiting_turn"]
+
+    assert [(chat, text.splitlines()[-1]) for chat, text in chats.sent] == [
+        ("chat-y", f"sound-scout-job:{sent}")
+    ]
+    assert delivery_of(setup, held) is None
+
+
+@pytest.mark.slow
+def test_criterion_4_a_retry_from_the_card_with_no_turn_gets_one_note(
+    loop, setup: Config, make_wav: WavFactory
+) -> None:
+    from sound_scout import delivery
+
+    job_id = ended_job(setup, make_wav("recordings/a.wav"), session_id="chat-1", state="running")
+    run_attempt(setup, job_id, "failed")
+    delivery.mark_seen(job_id, "chat-1", 1, setup)
+    chats, turns = Chats(setup), Turns()
+    assert ticks(loop, chats, 1, chat_busy=turns) == ["idle"]
+
+    assert jobs_cli("retry", job_id).returncode == 0
+    run_attempt(setup, job_id)
+    age(setup, job_id, 0)
+    assert ticks(loop, chats, 3, chat_busy=turns) == ["delivered", "idle", "idle"]
+
+    assert [(chat, text.splitlines()[-1]) for chat, text in chats.sent] == [
+        ("chat-1", f"sound-scout-job:{job_id}-a2")
+    ]
+    assert turns.asked == ["chat-1"]
+
+
+def test_a_tick_with_more_busy_chats_than_its_probes_waits(loop) -> None:
+    calls = []
+
+    def cli(args):
+        calls.append(args)
+        return {"action": "probe", "job_id": "a" * 32, "session_id": f"chat-{len(calls)}"}
+
+    outcome = loop.tick(
+        owner=lambda: True,
+        profile=lambda: "default",
+        loop_id="l",
+        cli=cli,
+        send=None,
+        history_has=None,
+        chat_busy=lambda chat_id: True,
+        state={},
+    )
+
+    assert outcome == "waiting_turn" and len(calls) == loop.PROBES_PER_TICK
+    assert calls[-1][3:] == [f"--busy-chat=chat-{n}" for n in sorted(range(1, 16), key=str)]
+
+
+def test_the_turn_check_reads_the_pending_admissions_of_the_lineage_root_on_the_owner_loop(
+    loop, monkeypatch
+) -> None:
+    import asyncio
+
+    owner_loop = asyncio.new_event_loop()
+    runner = threading.Thread(target=owner_loop.run_forever, daemon=True)
+    runner.start()
+    asked = []
+
+    class Admissions:
+        def list(self, *, session_id):
+            asked.append((session_id, threading.current_thread() is runner))
+            return [{"status": "started"}] if session_id == "root-busy" else []
+
+    authority = types.SimpleNamespace(logical_owner=lambda chat: f"root-{chat}")
+    owners = {"HOME": (authority, owner_loop)}
+    monkeypatch.setitem(sys.modules, "gateway", stub("gateway"))
+    monkeypatch.setitem(
+        sys.modules, "gateway.session_cron", stub("gateway.session_cron", owner_for_home=owners.get)
+    )
+    persistence = stub(
+        "gateway.session_persistence",
+        authority_persistence=lambda auth: types.SimpleNamespace(admissions=Admissions()),
+    )
+    monkeypatch.setitem(sys.modules, "gateway.session_persistence", persistence)
+    monkeypatch.setitem(
+        sys.modules, "hermes_constants", stub("hermes_constants", get_hermes_home=lambda: "HOME")
+    )
+    try:
+        assert loop.hermes_chat_busy("busy") is True
+        assert loop.hermes_chat_busy("idle") is False
+        assert asked == [("root-busy", True), ("root-idle", True)]
+        owners.clear()
+        with pytest.raises(RuntimeError):
+            loop.hermes_chat_busy("busy")
+    finally:
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        runner.join(5)
+        owner_loop.close()
+
+
+def test_start_hands_the_hermes_turn_check_to_the_loop(loop) -> None:
+    import inspect
+
+    assert inspect.signature(loop.start).parameters["chat_busy"].default is loop.hermes_chat_busy

@@ -370,7 +370,7 @@ def test_compare_step_reads_both_existing_jobs_by_the_note_tags_and_submits_none
     attached = step.split("**Контрольная попытка вложением.**", 1)[1].split(COMPARE_EXISTING_CASE)
     assert "шаги 3–5" in attached[0] and "`task_differs`" in attached[0]
     assert step.index(COMPARE_EXISTING_CASE) < step.index(CRITERION_RULE)
-    assert frontmatter(text)["version"] == "0.5.5"
+    assert frontmatter(text)["version"] == "0.5.6"
 
 
 def test_lint_reports_a_compare_step_without_the_case_of_existing_jobs() -> None:
@@ -464,7 +464,7 @@ def test_plain_send_matches_no_note_to_a_recording_and_reads_a_job_by_the_note_t
     assert OLD_NOTE_MATCH not in flat(text)
     assert plain.index("Приходит она только после конца задания") < plain.index("пункту 6")
     assert DESKTOP_ITEM in section(text, "## Вложения Hermes")
-    assert frontmatter(text)["version"] == "0.5.5"
+    assert frontmatter(text)["version"] == "0.5.6"
 
 
 def test_plain_send_facts_agree_with_the_note_and_the_recorder() -> None:
@@ -648,7 +648,7 @@ def test_description_says_a_voice_message_without_a_request_needs_no_tool_call()
     assert len(description) <= DESCRIPTION_LIMIT
     assert all(term in description for term in DESCRIPTION_TERMS)
     assert description_problems(description) == []
-    assert frontmatter(text)["version"] == "0.5.5"
+    assert frontmatter(text)["version"] == "0.5.6"
 
 
 def test_lint_reports_the_old_description_that_invites_a_call_on_any_attachment() -> None:
@@ -705,6 +705,8 @@ def test_waiting_step_says_the_note_comes_to_a_local_chat_and_status_is_the_fall
     assert "В локальном чате Hermes плагин Sound Scout сам привязывает задание" in wait
     assert "итоговая заметка Sound Scout придёт в этот чат одна" in wait
     assert "Статус не опрашивать в цикле" in wait
+    assert "Если в этом ходе агент успешно прочитает итог на шаге 5" in wait
+    assert "заметки этой попытки не будет: итог — в ответе агента" in wait
     assert "заметки нет (чат другой платформы" in wait and "плагин не подключён" in wait
     assert "`speech_job_status`" in wait
     assert "никто не пришлёт" not in text

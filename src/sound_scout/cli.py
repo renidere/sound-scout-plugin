@@ -37,6 +37,13 @@ as the transient unit `jobs.RUNNER_UNIT` with this configuration file. `jobs del
 --profile=<p> --loop=<id>` and `jobs deliver-end --outcome=<o> [--error=<text>] <job_id>` are the
 calls of the plugin's delivery loop (`sound_scout.delivery`): the next note to send with its
 `sending` marker written first, and how its send ended; the same output and exit codes.
+With `--idle-chat=<id>` or `--busy-chat=<id>` (each may repeat) `deliver-next` takes the
+loop's turn check of those chats; without it a note not yet due answers `probe` and writes
+nothing (decision 0030). `jobs seen --session-id=<id> --attempt=<n> <job_id>` marks the last
+attempt of an ended job seen in its bound chat (`delivery.mark_seen`): the `sound-scout` Hermes
+plugin calls it after a successful `speech_job_result` in a turn of that chat, and the delivery
+loop then sends that attempt no note; another chat, a job not ended or an earlier attempt is
+`not_seen`. No MCP tool marks an attempt seen.
 `jobs redeliver <job_id>` is the operator's request to deliver the note of a
 `delivery_unconfirmed` job once more (`delivery.request_redelivery`); any other delivery state is
 the refusal `delivery_not_unconfirmed`. The MCP tool `speech_job_redeliver` calls the same
@@ -72,6 +79,7 @@ detector.
 
 import argparse
 import json
+import re
 import sys
 import traceback
 
@@ -88,8 +96,8 @@ SUBCOMMANDS = {
     "recording in SOUND_SCOUT_DEV_AUDIO) and save their smoke-receipts for doctor",
     "jobs": "queue an analysis and follow it: submit, status, result, report, cancel, retry; "
     "run the queue: run, start, recover; print the budgets and the staging root: limits; "
-    "deliver the final note: deliver-next, deliver-end, redeliver; bind an MCP job to its chat: "
-    "bind",
+    "deliver the final note: deliver-next, deliver-end, redeliver, seen; bind an MCP job to its "
+    "chat: bind",
 }
 # `smoke.COMPONENTS` and `smoke.DEFAULT_COMPONENTS`, repeated so that building the parser does
 # not import `smoke`.
@@ -98,6 +106,7 @@ SMOKE_DEFAULT_COMPONENTS = ("decoder", "acoustics")
 # `app.LAYERS`, repeated so that building the parser does not import `app`.
 ANALYZE_LAYERS = ("content", "measurements", "sound")
 ANALYZE_EXIT_CODES = {"complete": 0, "partial": 3, "blocked": 4, "failed": 1}
+ATTEMPT = re.compile(r"[0-9]{1,9}")
 ERROR_EXIT_CODE = 1
 SMOKE_FAILED_EXIT_CODE = 1
 CONFIG_ERROR = "config_error"
@@ -262,6 +271,18 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
     )
     deliver_next.add_argument("--profile", required=True, help="the Hermes profile of the loop")
     deliver_next.add_argument("--loop", required=True, help="the ID of the delivery loop")
+    deliver_next.add_argument(
+        "--idle-chat",
+        action="append",
+        default=[],
+        help="a chat with no turn running or queued: its note goes now (repeatable)",
+    )
+    deliver_next.add_argument(
+        "--busy-chat",
+        action="append",
+        default=[],
+        help="a chat with a turn running or queued: its note waits (repeatable)",
+    )
     end_help = "record how the send of a job's note ended"
     deliver_end = actions.add_parser(
         "deliver-end", help=end_help, description=end_help, parents=[common, as_json]
@@ -275,6 +296,16 @@ def _add_jobs_arguments(parser: argparse.ArgumentParser, common: argparse.Argume
         "--error", help="what the send function said, for unconfirmed and failed"
     )
     deliver_end.add_argument("job_id", help="the job_id that deliver-next printed")
+    seen_help = (
+        "mark the last attempt of an ended job seen in its bound chat, so the delivery loop sends "
+        "it no note; the Hermes plugin calls it after speech_job_result in a turn of that chat"
+    )
+    seen = actions.add_parser(
+        "seen", help=seen_help, description=seen_help, parents=[common, as_json]
+    )
+    seen.add_argument("--session-id", required=True, help="the chat of the turn")
+    seen.add_argument("--attempt", required=True, help="the attempt that speech_job_result named")
+    seen.add_argument("job_id", help="the job_id that speech_job_result answered")
     redeliver_help = (
         "deliver the final note of a delivery_unconfirmed job to its chat once more; the plugin's "
         "loop first looks for the job's tag in the chat history and sends nothing when it finds "
@@ -481,11 +512,16 @@ def run_jobs(args: argparse.Namespace) -> int:
             )
             answer = jobs.submit(jobs.SubmitRequest(args.file, **fields), binding, loaded)
         elif args.jobs_command == "deliver-next":
-            answer = delivery.next_delivery(args.profile, args.loop, loaded)
+            answer = delivery.next_delivery(
+                args.profile, args.loop, loaded, args.idle_chat, args.busy_chat
+            )
         elif args.jobs_command == "deliver-end":
             answer = delivery.end_delivery(args.job_id, args.outcome, args.error, loaded)
         elif args.jobs_command == "redeliver":
             answer = delivery.request_redelivery(args.job_id, loaded)
+        elif args.jobs_command == "seen":
+            attempt = int(args.attempt) if ATTEMPT.fullmatch(args.attempt) else args.attempt
+            answer = delivery.mark_seen(args.job_id, args.session_id, attempt, loaded)
         elif args.jobs_command == "bind":
             answer = jobs.bind(args.job_id, args.session_id, args.profile, args.connection, loaded)
         else:
