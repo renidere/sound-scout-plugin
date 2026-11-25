@@ -1,190 +1,83 @@
 # Sound Scout
 
-Sound Scout разбирает голосовой файл с русской речью. Результат — три раздельных слоя: транскрипт
-ASR, акустические измерения и наблюдения аудиомодели. У каждого слоя свой статус. Таймкоды и клипы
-лежат на шкале исходника. Итог — `result.json` и `report.md`. Пакет на Python даёт CLI и MCP stdio
-сервер поверх одного application layer (`src/sound_scout/app.py`). Для Hermes есть плагин.
+Sound Scout разбирает запись русской речи. Результат — три раздельных слоя: транскрипт ASR,
+акустические измерения, наблюдения аудиомодели. Входы — CLI, MCP stdio и плагин Hermes.
 
 ## Что работает сейчас
 
-Состояние `main` на 2026-11-25.
+Состояние на 2026-11-25.
 
-- Инструмент не считается готовым: русская квалификация (Gate 1) не пройдена
-  ([#29](https://github.com/renidere/sound-scout-plugin/issues/29),
-  [#30](https://github.com/renidere/sound-scout-plugin/issues/30)).
-- Gate 0–3 — `docs/spec/REQUIREMENTS.md`. Матрица приёмки — `docs/ACCEPTANCE.md`.
-- Audio backend не подключён (`backend = none`). Этап `audio_review` поэтому `unavailable`, итог
-  анализа со слоем `sound` — `partial`.
+- Инструмент не готов: русская квалификация (Gate 1) не пройдена
+  ([#29](https://github.com/renidere/sound-scout-plugin/issues/29)).
+- Audio backend не подключён (`backend = none`). Итог анализа со слоем `sound` — `partial`.
 
-| Часть | Что делает | Код и решения |
-|---|---|---|
-| CLI | `doctor`, `smoke`, `analyze`, `compare`, `jobs`, `serve`, `eval` | `src/sound_scout/cli.py` |
-| Приём входа | WAV, MP3, OGG/Opus, M4A/AAC через FFmpeg; лимиты R02; SHA-256 | `src/sound_scout/ingest.py` |
-| Слой `content` | ASR faster-whisper offline; правила `suspect_hallucination` и `no_vad_speech` | `src/sound_scout/asr.py`, `docs/decisions/0005-asr-silence-hallucination.md`, `docs/decisions/0021-asr-vad-hallucination.md` |
-| Слой `measurements` | речевые интервалы Silero VAD, F0 Praat, RMS; выбор канала | `src/sound_scout/acoustics.py`, `src/sound_scout/channels.py` |
-| Слой `sound` | адаптер audio backend, окна, валидатор ответа; без backend — `unavailable` | `src/sound_scout/review.py`, `src/sound_scout/findings.py` |
-| Отчёт | `result.json`, `report.md`, compact-ответ до 4 KiB | `src/sound_scout/report.py`, `docs/decisions/0004-report-priority.md` |
-| Сравнение попыток | вердикт по критерию, `compare/<id>.json` | `src/sound_scout/comparison.py`, `docs/decisions/0006-compare-rules.md` |
-| MCP stdio | 9 инструментов, список — в разделе ниже | `src/sound_scout/mcp_server.py`, `docs/mcp.md` |
-| Очередь заданий | `submit`, `status`, `result`, `report`, `cancel`, `retry`; один runner; режимы `quick`, `targeted`, `full`, `auto`; контрольная попытка | `src/sound_scout/jobs.py`, `docs/decisions/0018-job-modes-and-retry.md`, `docs/decisions/0020-control-attempt-jobs.md` |
-| Плагин Hermes | рекордер Desktop, карточка задания, привязка задания к чату, заметка с итогом в чат | `hermes/plugin/sound-scout/`, `docs/decisions/0013-voice-note-integration.md`, `docs/decisions/0025-mcp-chat-binding.md`, `docs/decisions/0029-cancel-stops-chat-turn.md` |
-| Skill Hermes | когда вызывать инструменты и как читать результат | `hermes/skills/speech-review/SKILL.md` |
+| Часть | Код |
+|---|---|
+| Транскрипт и измерения | `src/sound_scout/asr.py`, `src/sound_scout/acoustics.py` |
+| Отчёт и сравнение попыток | `src/sound_scout/report.py`, `src/sound_scout/comparison.py` |
+| Очередь заданий | `src/sound_scout/jobs.py` |
+| MCP stdio, 9 инструментов | `src/sound_scout/mcp_server.py`, `docs/mcp.md` |
+| Плагин Hermes: рекордер, карточка задания, заметка в чат | `hermes/plugin/sound-scout/` |
+| Skill Hermes | `hermes/skills/speech-review/SKILL.md` |
 
-Проверки на станции разработки:
-
-- MCP сервер `speech-review` подключён к Hermes 2026-11-19
-  ([#40](https://github.com/renidere/sound-scout-plugin/issues/40), закрыта). Вызовы из
-  `hermes -z` и из Hermes Desktop вернули `partial`: слоя `sound` нет. Подключение на другом хосте —
-  шаг владельца (`docs/hermes-install.md`).
-- Пакет плагина развёрнут в gateway Hermes 2026-11-21
-  ([#104](https://github.com/renidere/sound-scout-plugin/issues/104), закрыта).
-- Linux-путь прошёл: задание, runner, отчёт, заметка в чате
-  ([#114](https://github.com/renidere/sound-scout-plugin/issues/114), закрыта).
-- Рекордер прошёл минимальный путь на Windows-клиенте Desktop. Заметка дошла и в закрытый Desktop
-  ([#105](https://github.com/renidere/sound-scout-plugin/issues/105), закрыта).
-- Эпик Windows-клиента открыт ([#115](https://github.com/renidere/sound-scout-plugin/issues/115)).
-  Приёмка A01–A14 — `docs/acceptance/A01-A14.md`.
+На станции разработки сервер подключён к Hermes 2026-11-19
+([#40](https://github.com/renidere/sound-scout-plugin/issues/40)). Плагин работает в gateway и в
+Windows Desktop. Приёмка — `docs/acceptance/A01-A14.md`.
 
 ## Интеграция с другими харнесами
 
-| Вход | Что даёт | Кто может вызвать |
+| Клиент | Вход | Проверено |
 |---|---|---|
-| MCP stdio `sound-scout serve` | 9 инструментов поверх `app`, `jobs` и `delivery` | любой MCP-клиент со stdio; проверен только Hermes |
-| CLI `sound-scout` | те же функции, ответ `--json`, коды возврата | скрипты, CI, любой агент с shell |
-| Очередь `jobs` | асинхронный анализ одним runner | CLI и MCP; плагин Hermes — через CLI |
-| Плагин Hermes | рекордер, карточка, привязка к чату, заметка в чат | только Hermes |
+| MCP-клиент со stdio (Claude Code, Codex CLI, Cursor) | `sound-scout serve` | только Hermes |
+| Агент с shell, скрипт, CI | `sound-scout … --json` | да |
+| Hermes Desktop | плагин: рекордер, привязка к чату, заметка | да |
 
-Инструменты MCP:
+- Синхронный анализ — `speech_analyze`. Асинхронный — `speech_job_submit`, затем опрос
+  `speech_job_status` и `speech_job_result`.
+- Задания выполняет runner (`sound-scout jobs start`). Без runner задание остаётся `queued`.
+- Файл лежит на хосте сервера внутри `allowed_roots`. Сервер пишет только в `data_root`.
+- Заметка в чат есть только в Hermes. Другой клиент сам опрашивает статус.
 
-- синхронные: `speech_capabilities`, `speech_analyze`, `speech_compare`;
-- задания: `speech_job_submit`, `speech_job_status`, `speech_job_result`, `speech_job_cancel`,
-  `speech_job_retry`, `speech_job_redeliver`.
-
-Подключение другого MCP-хоста (Claude Code, Codex CLI, Cursor и др.) не проверено. Запись сервера
-строится так же, как для Hermes (`docs/examples/hermes-mcp-entry.example.yaml`):
-
-- команда `uv run --directory <checkout> --offline sound-scout serve`;
-- `env.SOUND_SCOUT_CONFIG` — путь к `sound-scout.toml`; `env.PATH` — каталоги с системным FFmpeg;
-- таймаут вызова клиента — не меньше 300 с при бюджетах по умолчанию: `speech_analyze` ждёт весь
-  анализ.
-
-Правила для любого клиента (`docs/mcp.md`):
-
-- Файл лежит на хосте сервера внутри `allowed_roots`. URL и Windows-путь получают отказ
-  `path_denied`.
-- Сервер пишет только в `data_root`.
-- `allowed_roots`, `data_root`, модель, backend и бюджеты задаёт оператор в `sound-scout.toml`.
-  Такой аргумент инструмента получает отказ `invalid_arguments`.
-- Stdout сервера несёт только JSON-RPC. Логи идут в stderr, пути в них замаскированы.
-- `speech_analyze` держит lock анализа: второй анализ получает отказ `busy`.
-- `speech_job_submit` сразу отвечает `job_id`. Анализ выполняет runner: `sound-scout jobs start`
-  (`systemd-run --user`) или `sound-scout jobs run`. Без runner задание остаётся `queued`.
-
-Асинхронный итог вне Hermes:
-
-- Заметка в чат приходит только через плагин Hermes. Задание из другого клиента остаётся без
-  привязки.
-- Клиент опрашивает `speech_job_status`, пока состояние не станет `finished`, `failed` или
-  `cancelled`, затем читает `speech_job_result`. `finished` не означает `complete`.
-- Цикл доставки плагина вызывает CLI `jobs bind`, `jobs deliver-next` и `jobs deliver-end`. Свою
-  доставку другой харнес может построить на этих командах. Этот путь вне Hermes не проверен.
-
-CLI для скриптов и CI:
-
-- `analyze --json` печатает compact-ответ. Код возврата: 0 `complete`, 3 `partial`, 4 `blocked`,
-  1 `failed`.
-- `doctor --json` печатает состояние компонентов и ничего не запускает.
-- `jobs … --json` печатает тот же документ, что инструменты MCP.
-- Отказ — одна строка в stderr, код 1. Stdout несёт только ответ.
-
-Только для Hermes:
-
-- рекордер и карточка задания на Desktop Plugin SDK —
-  `hermes/plugin/sound-scout/desktop/plugin.js`;
-- хук `post_tool_call` привязывает задание к чату хода — `hermes/plugin/sound-scout/binding.py`;
-- цикл доставки заметки в процессе gateway — `hermes/plugin/sound-scout/delivery.py`;
-- маршруты `/api/plugins/sound-scout/` (`GET /health`, `POST /jobs`, `GET /jobs/{job_id}`, отчёт,
-  отмена, повтор) — `hermes/plugin/sound-scout/dashboard/plugin_api.py`;
-- skill `speech-review` — `hermes/skills/speech-review/`.
+Подробно — `docs/mcp.md`, `docs/hermes-install.md`.
 
 ## Зависимости
 
-Версии, лицензии и SHA-256 — `docs/dependencies.md`. Python-пакеты закреплены в `uv.lock`.
-
-| Часть | Зачем |
-|---|---|
-| Python 3.13, `uv` | среда и lock |
-| FFmpeg (`ffmpeg`, `ffprobe`) из `PATH` | декодирование, ресемплинг, клипы |
-| `faster-whisper`, `ctranslate2`, `av` | ASR на CPU в int8 |
-| `onnxruntime` | Silero VAD (ONNX-файл из пакета `faster-whisper`), телеметрия выключена |
-| `praat-parselmouth` | F0 |
-| `numpy` | сигналы и измерения |
-| `jsonschema` | контракт результата, манифест корпуса, разметка |
-| `mcp` | MCP stdio сервер |
-| extra `gate0-borealis`, `gate0-gigachat` | только прогоны Gate 0 этих моделей (`torch`, `transformers`) |
-| extra `corpus-tts` | только синтез клипов корпуса (`piper-tts`, `onnx`) |
-| llama.cpp `llama-server` b12359 | только прогоны Gate 0 моделей GGUF |
-| Node.js ≥ 20 | только тесты плагина Desktop |
+Python 3.13 и `uv`, системный FFmpeg, `faster-whisper` (ASR), `onnxruntime` (Silero VAD),
+`praat-parselmouth` (F0), `mcp`. Версии, лицензии и SHA-256 — `docs/dependencies.md`.
 
 ## Модели на стенде
 
-Станция разработки работает только на CPU. Модели загружаются из локальных файлов. Сеть закрыта.
+Стенд — станция разработки: только CPU, без сети.
 
-| Роль | Модель | Источник |
-|---|---|---|
-| ASR | Whisper large-v3-turbo в CTranslate2, `mobiuslabsgmbh/faster-whisper-large-v3-turbo` @ `0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf`, CPU int8, язык `ru` | `docs/dependencies.md` § 4 |
-| VAD | Silero VAD, ONNX-файл из пакета `faster-whisper` 1.2.1 | `docs/dependencies.md` § 4 |
-| Audio backend | нет (`backend = none`) | `sound-scout.example.toml` |
+| Роль | Модель |
+|---|---|
+| ASR | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` @ `0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf`, int8 |
+| VAD | Silero VAD из `faster-whisper` |
+| Audio backend | нет (`backend = none`) |
 
-Прогоны Gate 0 кандидатов audio backend. Ни один кандидат не получил READY, поэтому `backend = none`.
+Кандидаты audio backend не прошли Gate 0. Вердикт у всех — NOT READY.
 
-| Кандидат | Runtime | Вердикт | Решение |
-|---|---|---|---|
-| Gemma 4 E4B-it, GGUF Q8_0 | llama.cpp, только локально; кандидат владельца (`docs/decisions/0001-audio-backend.md`) | Gate 0 не прошла — вердикт NOT READY | `docs/decisions/0007-gate0-result.md` |
-| Borealis-5b-it | `torch` CPU | NOT READY | `docs/decisions/0010-gate0-borealis.md` |
-| GigaChat3.1-Audio-10B-A1.8B | `torch` CPU, потолок 26 GB | NOT READY: не выполнено предусловие P3 (6,25 аудиопозиции в секунду при пороге 20); о слухе модели вердикт ничего не говорит | `docs/decisions/0011-gate0-gigachat-audio.md` |
-| Qwen3-Omni-30B-A3B-Instruct, GGUF Q4_K_M | llama.cpp, `GATE0-RULE v2` | NOT READY: 2 из 12 ответов контролей пустые или обрезанные | `docs/decisions/0023-gate0-qwen3-omni.md` |
-| Qwen2.5-Omni-7B, GGUF Q8_0 | llama.cpp, `GATE0-RULE v1`, диагностический прогон | NOT READY: прошли 7 из 12 пунктов контролей | `docs/decisions/0024-gate0-qwen25-omni.md` |
-
-MOSS-Audio-8B-Thinking-ru проверен диагностическим прогоном, это не формальный Gate 0: READY не
-получен ([#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195)).
-Замену владелец выбирал в [#68](https://github.com/renidere/sound-scout-plugin/issues/68)
-(закрыта). Следующий ограниченный эксперимент предлагает агент, утверждает владелец
-([#119](https://github.com/renidere/sound-scout-plugin/issues/119)). Подключение backend с READY —
-[#90](https://github.com/renidere/sound-scout-plugin/issues/90).
-
-GPU-эталон 2026-11-23 ([#149](https://github.com/renidere/sound-scout-plugin/issues/149),
-`docs/decisions/0028-gpu-reference-gate0.md`, «Результат»): Vast.ai, 1 × A100 80GB, vLLM 0.34.0,
-веса bf16. Стенд разработки эти модели в bf16 не запускает.
-
-| Модель | Правило | Вердикт |
-|---|---|---|
-| Qwen2.5-Omni-7B, bf16 | `GATE0-RULE v1` | NOT READY: не прошли 4 из 12 пунктов контролей, `P(S0)` и `A` на трёх контролях |
-| Qwen3-Omni-30B-A3B-Instruct, bf16 | `GATE0-RULE v2` | NOT READY: не прошёл 1 из 12, `P(T1)` |
+| Кандидат | Решение |
+|---|---|
+| Gemma 4 E4B-it, GGUF | `docs/decisions/0007-gate0-result.md` |
+| Borealis-5b-it | `docs/decisions/0010-gate0-borealis.md` |
+| GigaChat3.1-Audio-10B-A1.8B (не выполнено предусловие P3, о слухе модели вердикт не говорит) | `docs/decisions/0011-gate0-gigachat-audio.md` |
+| Qwen3-Omni-30B-A3B-Instruct, GGUF и bf16 на GPU | `docs/decisions/0023-gate0-qwen3-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
+| Qwen2.5-Omni-7B, GGUF и bf16 на GPU | `docs/decisions/0024-gate0-qwen25-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
+| MOSS-Audio-8B-Thinking-ru, диагностический прогон | [#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195) |
 
 ## Чем можно заменить
 
-Кандидаты ниже не проверены. Замена требует решения владельца и новой записи в
-`docs/dependencies.md` с ревизией и SHA-256. Кандидату audio backend нужен ещё прогон Gate 0.
+Кандидаты не проверены. Замена требует решения владельца и записи в `docs/dependencies.md`.
+Кандидат audio backend проходит Gate 0.
 
-ASR:
-
-| Кандидат | Почему | Лицензия | Источник |
+| Роль | Кандидат | Лицензия | Источник |
 |---|---|---|---|
-| GigaAM-v3 (`ai-sage/GigaAM-v3`) | Conformer 220–240M для русского; карточка даёт средний WER 8,4 у RNNT против 25,1 у Whisper; нужен собственный код модели | MIT | https://huggingface.co/ai-sage/GigaAM-v3 |
-| T-one (`t-tech/T-one`) | потоковый CTC-Conformer 71M для русского, в первую очередь телефония | Apache-2.0 | https://huggingface.co/t-tech/T-one |
-| Parakeet-TDT-0.6B-v3 (`nvidia/parakeet-tdt-0.6b-v3`) | 25 европейских языков, в том числе русский; таймкоды слов; runtime NeMo | CC-BY-4.0 | https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 |
-| Canary-1B-v2 (`nvidia/canary-1b-v2`) | 25 европейских языков, в том числе русский; таймкоды слов; runtime NeMo | CC-BY-4.0 | https://huggingface.co/nvidia/canary-1b-v2 |
-
-Audio backend (не входили в Gate 0):
-
-| Кандидат | Почему | Лицензия | Источник |
-|---|---|---|---|
-| Gemma 4 12B (`google/gemma-4-12B-it`) | запасной кандидат `docs/decisions/0022-gate0-next-candidate.md`; аудио до 30 с; по `0022` русский ASR есть в техотчёте; GGUF есть, аудио 12B нет в аудиотестах llama.cpp b12359 | Apache-2.0 | https://huggingface.co/google/gemma-4-12B-it |
-| Qolda-AVL-5B-OptimizedTokenizer (`issai/Qolda-AVL-5B-OptimizedTokenizer`) | аудио на входе, языки казахский, русский, английский; энкодер Whisper-large-v3-turbo; по `0022` 12,5 аудиотокена в секунду — P3 `GATE0-RULE v1` не выполняется; GGUF нет | Apache-2.0 | https://huggingface.co/issai/Qolda-AVL-5B-OptimizedTokenizer |
-
-Решение `0022` отклонило остальные модели своего обзора: нет русского, некоммерческая лицензия или
-не выполнено P3.
+| ASR | GigaAM-v3 | MIT | https://huggingface.co/ai-sage/GigaAM-v3 |
+| ASR | T-one | Apache-2.0 | https://huggingface.co/t-tech/T-one |
+| ASR | Parakeet-TDT-0.6B-v3 | CC-BY-4.0 | https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 |
+| ASR | Canary-1B-v2 | CC-BY-4.0 | https://huggingface.co/nvidia/canary-1b-v2 |
+| Audio backend | Gemma 4 12B, запасной кандидат `docs/decisions/0022-gate0-next-candidate.md` | Apache-2.0 | https://huggingface.co/google/gemma-4-12B-it |
 
 ## Документы
 
