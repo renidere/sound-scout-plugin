@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -250,6 +252,63 @@ def test_a_child_dies_with_its_killed_parent(tmp_path: Path) -> None:
     finally:
         parent.kill()
         parent.wait()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG exists on Linux only")
+def test_a_started_child_gets_the_chosen_signal_when_its_parent_is_killed(tmp_path: Path) -> None:
+    """SIGTERM lets the child stop what it owns before it exits (#198)."""
+    ready, caught = tmp_path / "ready", tmp_path / "caught"
+    child = (
+        "import os, signal, sys, time\n"
+        "def caught(s, f):\n"
+        "    open(sys.argv[2] + '.tmp', 'w').write(str(s))\n"
+        "    os.replace(sys.argv[2] + '.tmp', sys.argv[2])\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, caught)\n"
+        "open(sys.argv[1], 'w').close()\n"
+        "time.sleep(600)\n"
+    )
+    parent_script = (
+        "import signal, sys, time\n"
+        "from sound_scout import proc\n"
+        "proc.start([sys.executable, '-c', *sys.argv[1:]], log=open('/dev/null', 'wb'),"
+        " max_log_bytes=0, parent_death_signal=signal.SIGTERM)\n"
+        "time.sleep(600)\n"
+    )
+    parent = subprocess.Popen([PYTHON, "-c", parent_script, child, str(ready), str(caught)])
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists():
+            assert time.monotonic() < deadline, "the child did not start"
+            time.sleep(0.02)
+        parent.kill()
+        parent.wait()
+        deadline = time.monotonic() + 10
+        while not caught.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert caught.read_text() == str(int(signal.SIGTERM))
+    finally:
+        parent.kill()
+        parent.wait()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG exists on Linux only")
+def test_a_started_child_does_not_inherit_an_ignored_parent_death_signal(tmp_path: Path) -> None:
+    """An ignored signal stays ignored across exec; the child setup resets it (#198)."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # `reset_process_globals` restores it
+    log = tmp_path / "status"
+    with log.open("wb") as handle:
+        child, copier = proc.start(
+            ["cat", "/proc/self/status"],
+            log=handle,
+            max_log_bytes=1 << 16,
+            parent_death_signal=signal.SIGTERM,
+        )
+        child.wait(10)
+        copier.join(10)
+    ignored = re.search(r"^SigIgn:\s*([0-9a-f]+)$", log.read_text(), re.M)
+    assert ignored is not None
+    assert not int(ignored.group(1), 16) & (1 << (signal.SIGTERM - 1))
 
 
 def test_die_with_parent_is_a_no_op_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:

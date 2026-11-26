@@ -281,6 +281,33 @@ def test_serve_kills_the_server_at_the_deadline(tmp_path) -> None:
     assert code == 1 and lines[-1]["reason"] == "deadline"
 
 
+def test_a_serve_that_fails_after_the_server_started_leaves_no_server_process(tmp_path) -> None:
+    """#198: `serve` cannot write its stats (a removed directory); the server it started, in a
+    session of its own, is killed before `serve` exits."""
+    marker = str(tmp_path / "server-marker")
+    argv = [sys.executable, str(HOST_DIR / "hostrun.py"), "serve", "--guard-dir", str(HOST_DIR)]
+    argv += ["--deadline", str(time.time() + 60), "--rss-limit", str(1 << 40)]
+    argv += ["--stats", str(tmp_path / "gone" / "stats.jsonl"), "--log", str(tmp_path / "log")]
+    argv += ["--", sys.executable, "-c", "import time; time.sleep(60)", marker]
+
+    def servers() -> list[int]:
+        found = []
+        for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+            with contextlib.suppress(OSError):
+                if marker.encode() in cmdline.read_bytes():
+                    found.append(int(cmdline.parent.name))
+        return [pid for pid in found if hostrun._alive(pid)]
+
+    try:
+        done = subprocess.run(argv, capture_output=True, timeout=60)
+        assert done.returncode != 0 and b"FileNotFoundError" in done.stderr
+        assert servers() == []
+    finally:
+        for pid in servers():
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
 def test_serve_runs_the_server_under_the_guard(tmp_path) -> None:
     child = hostrun.GUARDED_PRELUDE + (
         "import socket\n"

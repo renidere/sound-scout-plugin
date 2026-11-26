@@ -337,24 +337,26 @@ def serve(args) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    # The leader is not reaped before the first poll: its pid stays taken after `ticks`.
-    started = {"event": "started", "t": time.time(), "pid": child.pid}
-    started |= {"start": start_ticks(child.pid), "ticks": boot_ticks()}
-    if args.pid_file:
-        Path(args.pid_file).write_text(f"{os.getpid()} {start_ticks(os.getpid())}")
-    _write_line(args.stats, started)
     peaks: dict = {}
     held: dict = {}
-    reason = monitor(
-        child,
-        deadline=args.deadline,
-        rss_limit=args.rss_limit,
-        stats=args.stats,
-        stop=stop,
-        peaks=peaks,
-        held=held,
-    )
-    _kill_session(child, signal.SIGKILL)
+    try:
+        # The leader is not reaped before the first poll: its pid stays taken after `ticks`.
+        started = {"event": "started", "t": time.time(), "pid": child.pid}
+        started |= {"start": start_ticks(child.pid), "ticks": boot_ticks()}
+        if args.pid_file:
+            Path(args.pid_file).write_text(f"{os.getpid()} {start_ticks(os.getpid())}")
+        _write_line(args.stats, started)
+        reason = monitor(
+            child,
+            deadline=args.deadline,
+            rss_limit=args.rss_limit,
+            stats=args.stats,
+            stop=stop,
+            peaks=peaks,
+            held=held,
+        )
+    finally:  # a `serve` that fails leaves no server session behind (#198)
+        _kill_session(child, signal.SIGKILL)
     _write_line(
         args.stats,
         {

@@ -106,7 +106,8 @@ preflight и пилот X1/X2 в #148.
 - `hostrun.py serve`: окружение по allowlist плюс offline-переменные, новая сессия, каждые 0,5 с —
   сокеты всех процессов сессии по `/proc/<pid>/fd` и `/proc/net/{tcp,tcp6,udp,udp6}`. Сокет с
   не-loopback концом (и listener не на loopback) — `SIGKILL` сессии и запись `violation`. Там же
-  RSS дерева и память GPU раз в 5 с; RSS сверх лимита и дедлайн — остановка.
+  RSS дерева и память GPU раз в 5 с; RSS сверх лимита и дедлайн — остановка. Сбой самого
+  `serve` после запуска сервера тоже убивает сессию сервера (#198).
 - `hostrun.py selftest`: loopback проходит; `192.0.2.1:9`, `getaddrinfo("huggingface.co")` и
   дети `spawn`, `fork`, `forkserver` — отказ хука; native connect через `ctypes` к своему не-loopback адресу —
   детектор убивает процесс; `unshare -n true` — `netns_available`. Каждая проба сначала проверяет,
@@ -210,6 +211,10 @@ exec. Рабочий под хуком: loopback и `AF_UNIX` работают, 
 argv записывается в `armed` с `dry_run: true`, системные команды в dry run запрещены. Вывод —
 `timeline.json` и `fake-api.jsonl`. Прогон 2026-11-22: 11 шагов, все `ok`, один PUT, один DELETE,
 отсутствие по id и метке, 3,9 с.
+
+Процесс `hostrun.py serve` в dry run получает `SIGTERM` при смерти процесса dry run
+(`PR_SET_PDEATHSIG`), а не `SIGKILL`: `serve` успевает остановить сессию сервера. С `SIGKILL`
+убитый dry run оставлял поддельный `vllm serve` в его собственной сессии навсегда (#198).
 
 ## 7. Решения агента внутри Decision
 

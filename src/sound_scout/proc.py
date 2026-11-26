@@ -10,7 +10,8 @@ by SIGKILL, so a killed analysis worker leaves no decoder behind (R11).
 
 `start` is for the one long-lived child, the Gate 0 `llama-server` (`eval.gate0`): the same argv
 check, new session and `die_with_parent`, but no wall time, because its caller stops it; its
-stdout and stderr go to a log file kept to `max_log_bytes`.
+stdout and stderr go to a log file kept to `max_log_bytes`. `parent_death_signal` SIGTERM lets a
+child that owns a session of its own stop it when the parent dies (the dry-run `hostrun serve`).
 
 `ffmpeg_argv` and `ffprobe_argv` build the decoder command lines: the protocol whitelist
 `file,pipe` makes the decoder itself refuse `http://`, `concat:` and every other non-file
@@ -114,7 +115,11 @@ def run(
 
 
 def start(
-    argv: Sequence[str], *, log: BinaryIO, max_log_bytes: int
+    argv: Sequence[str],
+    *,
+    log: BinaryIO,
+    max_log_bytes: int,
+    parent_death_signal: int = signal.SIGKILL,
 ) -> tuple[subprocess.Popen, threading.Thread]:
     """Start a long-lived child the caller stops itself; return it and the thread copying its log.
 
@@ -131,7 +136,7 @@ def start(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
-        preexec_fn=_child_setup(None),
+        preexec_fn=_child_setup(None, parent_death_signal),
     )
     copier = threading.Thread(
         target=_copy_capped, args=(child.stdout, log, max_log_bytes), daemon=True
@@ -171,27 +176,33 @@ def _checked_argv(argv: object) -> list[str]:
     return list(argv)
 
 
-def die_with_parent(parent_pid: int | None = None) -> None:
-    """Have the kernel SIGKILL this process when its parent dies (Linux; elsewhere a no-op).
+def die_with_parent(parent_pid: int | None = None, sig: int = signal.SIGKILL) -> None:
+    """Have the kernel send `sig` to this process when its parent dies (Linux; elsewhere a no-op).
 
     With `parent_pid`, a parent that died before the request took effect is noticed too: the
-    process kills itself, as the signal would have.
+    process sends `sig` to itself, as the kernel would have. A catchable `sig` acts by the
+    handler this process has for it: a forked child that has not yet called exec sets it to
+    SIG_DFL first (`_child_setup`).
     """
     if _LIBC is None:
         return
-    if _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+    if _LIBC.prctl(_PR_SET_PDEATHSIG, sig) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
     if parent_pid is not None and os.getppid() != parent_pid:
-        os.kill(os.getpid(), signal.SIGKILL)
+        os.kill(os.getpid(), sig)
 
 
-def _child_setup(memory_bytes: int | None) -> Callable[[], None]:
+def _child_setup(
+    memory_bytes: int | None, parent_death_signal: int = signal.SIGKILL
+) -> Callable[[], None]:
     parent_pid = os.getpid()
     limit = _memory_limit(memory_bytes)
 
     def setup() -> None:
-        die_with_parent(parent_pid)
+        if parent_death_signal != signal.SIGKILL:  # not the parent's inherited handler (#198)
+            signal.signal(parent_death_signal, signal.SIG_DFL)
+        die_with_parent(parent_pid, parent_death_signal)
         if limit is not None:
             limit()
 

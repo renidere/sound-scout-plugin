@@ -36,6 +36,7 @@ import pytest
 
 from sound_scout import config
 from sound_scout.eval import gate0, gpu_ext, vast, vast_fake
+from sound_scout.eval.gpu_host import hostrun
 from sound_scout.smoke import speech_like_control
 
 REPO = Path(__file__).resolve().parent.parent
@@ -4091,3 +4092,81 @@ def test_a_slow_reopen_of_the_dry_tunnel_counts_as_a_live_ssh_until_it_binds(tmp
     assert host.ensure_tunnel() is False
     host.close()
     target.stop()
+
+
+# A dry run in a child process: `failed` raises once the fake server answered its health check,
+# before the first Gate 0 request (`pilot`); `killed` and `completed` run it unchanged.
+_ENDING_CHILD = """
+import sys
+from pathlib import Path
+
+from sound_scout import config
+from sound_scout.eval import vast
+
+out, ending = Path(sys.argv[1]), sys.argv[2]
+
+
+def fail(run, **_):
+    raise RuntimeError("the test fails the dry run after the server is up")
+
+
+hooks = {"pilot": fail} if ending == "failed" else {}
+(out.parent / "in").mkdir()
+config_ = config.Config(allowed_roots=((out.parent / "in").resolve(),), data_root=out.parent)
+vast.dry_run(out, config_, scenario={"hooks": hooks, "extended": False})
+"""
+
+
+def _processes_naming(path: Path, *, fake_vllm: bool = False) -> list[int]:
+    """Live processes whose argv holds `path`: the dry run, its `hostrun serve` and fake
+    `vllm serve`; with `fake_vllm`, only the fake `vllm serve`."""
+    found = []
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        with contextlib.suppress(OSError):
+            pid = int(cmdline.parent.name)
+            argv = cmdline.read_bytes().split(b"\0")
+            if fake_vllm and not any(
+                a.endswith(b"/bin/vllm") and b == b"serve" for a, b in itertools.pairwise(argv)
+            ):
+                continue
+            if any(str(path).encode() in a for a in argv) and hostrun._alive(pid):
+                found.append(pid)
+    return found
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("ending", ["completed", "failed", "killed"])
+def test_a_dry_run_leaves_no_process_of_its_fake_host_however_it_ends(
+    tmp_path: Path, ending: str
+) -> None:
+    """#198: a SIGKILLed dry run had the kernel SIGKILL its `hostrun serve`, and the fake vLLM
+    server, in a session of its own, lived on."""
+    out = tmp_path / "dry"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _ENDING_CHILD, str(out), ending],
+        cwd=REPO,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        ends = time.monotonic() + 120
+        while not list(out.glob("host-root/out/*/serve.pid")) and time.monotonic() < ends:
+            assert child.poll() is None, f"the dry run exited {child.returncode} before serve"
+            time.sleep(0.05)
+        assert _processes_naming(out, fake_vllm=True), "no fake server process started"
+        if ending == "killed":
+            os.killpg(child.pid, signal.SIGKILL)
+        code = child.wait(240)
+        assert (code == 0) == (ending == "completed"), code
+        ends = time.monotonic() + 30  # `serve` stops its session within `hostrun.GRACE_S`
+        while _processes_naming(out) and time.monotonic() < ends:
+            time.sleep(0.1)
+        assert _processes_naming(out) == []
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait(30)
+        for pid in _processes_naming(out):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)

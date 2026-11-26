@@ -1498,7 +1498,11 @@ class LocalHost(RemoteHost):
         if os.path.exists(self._map(log)):
             return
         handle = open(self._map(log), "wb")  # noqa: SIM115
-        child, copier = proc.start(self._argv(argv), log=handle, max_log_bytes=1 << 20)
+        # SIGTERM, not SIGKILL: `hostrun serve` stops its server session when the dry run dies
+        # (#198); a SIGKILLed one leaves the server, which has a session of its own.
+        child, copier = proc.start(
+            self._argv(argv), log=handle, max_log_bytes=1 << 20, parent_death_signal=signal.SIGTERM
+        )
         self._spawned.append((child, copier, handle))
 
     def put(self, local: Path, remote: str, key: str) -> None:
