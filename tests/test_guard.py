@@ -5,8 +5,10 @@ run in a child interpreter so they see a fresh process."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -14,6 +16,7 @@ import pytest
 
 from sound_scout import guard
 from sound_scout.config import Config, Network
+from tests import conftest
 
 PRELUDE = """
 import json, os, socket, sys
@@ -124,17 +127,58 @@ def test_guard_denies_each_network_operation(operation: str) -> None:
     assert outcome["result"] == "denied"
 
 
-def test_guard_leaves_unix_socket_bind_allowed(tmp_path: Path) -> None:
+def test_guard_leaves_unix_socket_bind_allowed(short_socket_dir: Path) -> None:
     outcome = run_in_child(
         f"""
     guard.install_network_guard(config(allow=False))
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.bind({str(tmp_path / "listener")!r})
+        sock.bind({str(short_socket_dir / "listener")!r})
         sock.listen(1)
     print(json.dumps({{"bound": True}}))
     """
     )
     assert outcome["bound"] is True
+
+
+LONG_TMPDIR_CHARS = 100
+UNIX_SOCKET_TESTS = (
+    "tests/test_guard.py::test_guard_leaves_unix_socket_bind_allowed",
+    "tests/test_gpu_host.py::"
+    "test_the_hook_denies_an_internet_bind_and_logs_it_but_allows_unix_and_loopback",
+    "tests/test_gpu_host.py::test_a_guarded_server_starts_workers_that_stay_guarded",
+)
+UNIX_SOCKET_TEST_CASES = 6
+
+
+@pytest.mark.slow
+def test_unix_socket_tests_pass_with_a_long_tmpdir(tmp_path: Path) -> None:
+    # With TMPDIR this long, a socket in `tmp_path` passes the 107-byte limit of Linux (#196).
+    long_tmpdir = tmp_path / ("d" * max(1, LONG_TMPDIR_CHARS - len(str(tmp_path)) - 1))
+    long_tmpdir.mkdir()
+    assert len(str(long_tmpdir)) >= LONG_TMPDIR_CHARS
+    env = {k: v for k, v in os.environ.items() if k not in conftest.TEMP_DIR_VARIABLES}
+    env.pop("PYTEST_ADDOPTS", None)
+    env["TMPDIR"] = str(long_tmpdir)
+    socket_parent = Path(
+        tempfile.mkdtemp(prefix=conftest.SHORT_SOCKET_PREFIX, dir=conftest.SHORT_SOCKET_PARENT)
+    )
+    env[conftest.SHORT_SOCKET_PARENT_VARIABLE] = str(socket_parent)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *UNIX_SOCKET_TESTS],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        left = list(socket_parent.iterdir())
+    finally:
+        shutil.rmtree(socket_parent, ignore_errors=True)
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    assert f"{UNIX_SOCKET_TEST_CASES} passed" in result.stdout
+    assert not left
 
 
 def test_guard_is_installed_once_for_repeated_calls() -> None:

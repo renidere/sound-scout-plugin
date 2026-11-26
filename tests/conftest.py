@@ -88,6 +88,21 @@ def reset_process_globals() -> Iterator[None]:
     os.chdir(cwd)
 
 
+SHORT_SOCKET_PARENT = "/tmp"
+SHORT_SOCKET_PARENT_VARIABLE = "SOUND_SCOUT_TEST_SOCKET_PARENT"
+SHORT_SOCKET_PREFIX = "sst-"
+
+
+@pytest.fixture
+def short_socket_dir() -> Iterator[Path]:
+    """A directory with a short path for `AF_UNIX` sockets (#196). Linux takes at most 107 bytes
+    for a socket path, and `tmp_path` under a long TMPDIR is longer. The test removes it after."""
+    parent = os.environ.get(SHORT_SOCKET_PARENT_VARIABLE, SHORT_SOCKET_PARENT)
+    path = Path(tempfile.mkdtemp(prefix=SHORT_SOCKET_PREFIX, dir=parent))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.fixture(scope="session")
 def node() -> str:
     """The `node` binary for the Desktop plugin suites in `tests/js/`; CI fails without it."""

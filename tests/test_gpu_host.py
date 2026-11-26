@@ -60,7 +60,7 @@ def test_selftest_allows_loopback_and_denies_outside_lookup_children_and_native(
 
 
 def test_the_hook_denies_an_internet_bind_and_logs_it_but_allows_unix_and_loopback(
-    tmp_path,
+    tmp_path, short_socket_dir
 ) -> None:
     code = """
 import socket
@@ -71,7 +71,8 @@ try:
 except PermissionError:
     print("denied")
 """
-    assert _guarded_python(tmp_path, code.replace("{unix}", str(tmp_path / "s"))) == "denied"
+    code = code.replace("{unix}", str(short_socket_dir / "s"))
+    assert _guarded_python(tmp_path, code) == "denied"
     line = json.loads((tmp_path / "guard.log").read_text().splitlines()[-1])
     assert line["event"] == "socket.bind" and line["target"] == "'0.0.0.0'"
 
@@ -373,7 +374,7 @@ def probe(port, unix_path):
 if __name__ == "__main__":
     if sys.argv[1] == "worker":
         probe(int(sys.argv[2]), sys.argv[3]); sys.exit(0)
-    method, workdir = sys.argv[1], sys.argv[2]
+    method, workdir, socket_dir = sys.argv[1], sys.argv[2], sys.argv[3]
     reports = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -392,7 +393,7 @@ if __name__ == "__main__":
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
-    unix_path = os.path.join(workdir, "worker.sock")
+    unix_path = os.path.join(socket_dir, "worker.sock")
     unix = socket.socket(socket.AF_UNIX); unix.bind(unix_path); unix.listen(1)
     if method == "exec":
         worker = subprocess.Popen([sys.executable, __file__, "worker", str(port), unix_path])
@@ -444,10 +445,13 @@ def _health(port: int) -> dict | None:
 
 
 @pytest.mark.parametrize("method", ["fork", "spawn", "forkserver", "exec"])
-def test_a_guarded_server_starts_workers_that_stay_guarded(tmp_path, method) -> None:
+def test_a_guarded_server_starts_workers_that_stay_guarded(
+    tmp_path, short_socket_dir, method
+) -> None:
     script = tmp_path / "server.py"
     script.write_text(hostrun.GUARDED_PRELUDE + WORKER_SERVER)
-    serve = _start_serve(tmp_path, [sys.executable, str(script), method, str(tmp_path)])
+    argv = [sys.executable, str(script), method, str(tmp_path), str(short_socket_dir)]
+    serve = _start_serve(tmp_path, argv)
     try:
         port = int(
             _wait_for(lambda: (tmp_path / "port").is_file() and (tmp_path / "port").read_text())
