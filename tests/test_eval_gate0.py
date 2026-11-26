@@ -242,6 +242,16 @@ def test_server_argv_is_local_with_the_protocol_settings_and_no_download_flag() 
     assert not gate0.DOWNLOAD_FLAGS.intersection(argv) and pairs
 
 
+@pytest.mark.parametrize("runtime", sorted(gate0.LLAMA_RUNTIMES))
+def test_every_llama_runtime_starts_its_server_without_the_ram_prompt_cache(runtime) -> None:
+    context = gate0.RUNTIME_CONTEXT_TOKENS.get(runtime, gate0.CONTEXT_TOKENS)
+    argv = gate0.server_argv(
+        Path("/opt/llama-server"), Path("/models"), 4321, 12, gate0.LLAMA_RUNTIMES[runtime], context
+    )
+    assert argv.count("--cache-ram") == 1 and "-cram" not in argv
+    assert argv[argv.index("--cache-ram") + 1] == "0"
+
+
 def test_dependencies_runtime_section_describes_the_llama_server_route_gate0_uses() -> None:
     dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
     runtime = dependencies.split("### 3.2. Runtime", 1)[1].split("\n### ", 1)[0]
@@ -2103,20 +2113,13 @@ def test_qolda_server_argv_has_its_files_context_and_flags() -> None:
     assert argv[argv.index("-m") + 1] == f"/models/{gate0.QOLDA_MODEL_FILE}"
     assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.QOLDA_MMPROJ_FILE}"
     assert argv[argv.index("-c") + 1] == "8192"
-    assert argv[-6:] == [
-        "--load-mode",
-        "none",
-        "--cache-ram",
-        "0",
-        "--reasoning-format",
-        "deepseek",
-    ]
+    assert argv[-4:] == ["--load-mode", "none", "--reasoning-format", "deepseek"]
     assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
     for runtime in ("llama", "gemma12b"):
         other = gate0.server_argv(
             Path("/opt/llama-server"), Path("/models"), 4321, 12, gate0.LLAMA_RUNTIMES[runtime]
         )
-        assert other[other.index("-c") + 1] == "4096" and "--cache-ram" not in other
+        assert other[other.index("-c") + 1] == "4096"
     assert set(gate0.RUNTIME_CONTEXT_TOKENS) == {"qolda"}
 
 

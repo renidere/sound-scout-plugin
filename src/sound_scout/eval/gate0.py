@@ -213,17 +213,17 @@ RUNTIMES = (
 # (`sound_scout.eval.vast`, docs/decisions/0026-gpu-stack.md); the run never starts it
 VLLM_MODELS = ("qwen25omni", "qwen3omni")
 # runtime -> (model file, mmproj file, extra llama-server flags); without mmap the server's RSS
-# is its own memory, not 8e9 of mapped weights on top (0023 section 1, smoke)
+# is its own memory, not 8e9 of mapped weights on top (0023 section 1, smoke); every runtime gets
+# `--cache-ram 0` from `server_argv`
 LLAMA_RUNTIMES = {
     "llama": (MODEL_FILE, MMPROJ_FILE, ()),
     "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE, ("--load-mode", "none")),
     "qwen25omni": (QWEN25OMNI_MODEL_FILE, QWEN25OMNI_MMPROJ_FILE, ("--load-mode", "none")),
     "gemma12b": (GEMMA12B_MODEL_FILE, GEMMA12B_MMPROJ_FILE, ("--load-mode", "none")),
-    # no prompt cache in RAM: it is 8192 MiB by default and RSS grew per request in 0031
     "qolda": (
         QOLDA_MODEL_FILE,
         QOLDA_MMPROJ_FILE,
-        ("--load-mode", "none", "--cache-ram", "0", "--reasoning-format", "deepseek"),
+        ("--load-mode", "none", "--reasoning-format", "deepseek"),
     ),
 }
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -1088,6 +1088,9 @@ def server_argv(
         "--parallel",
         "1",
         "--no-webui",
+        # no prompt cache in RAM: 8192 MiB by default, it grew RSS per new clip in 0031 (0033)
+        "--cache-ram",
+        "0",
         "-t",
         str(threads),
         *extra,

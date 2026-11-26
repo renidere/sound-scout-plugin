@@ -361,6 +361,10 @@ llama.cpp v1.0.0 — последний стабильный релиз на 202
 Мультимодальность `llama-server` помечена в документации llama.cpp как experimental.
 
 Сервер слушает только `127.0.0.1` на свободном порту, один анализ за раз (`--parallel 1`).
+Кэш промптов в RAM выключен у всех runtime `gate0` на `llama-server` (`--cache-ram 0`; по
+умолчанию в b12359 — 8 192 MiB): с кэшем RSS сервера рос на каждом новом клипе
+(`docs/decisions/0033-gemma12b-prompt-cache-rss.md`). Прогоны 0007, 0023, 0024 и 0031 шли без
+этого флага, 0032 — с ним.
 
 Тот же `llama-server` b12359 запускает Qwen3-Omni-30B-A3B-Instruct (`gate0 run --runtime
 qwen3omni`, #144): тот же argv с файлами этой модели и флагом `--load-mode none` (без mmap),
@@ -406,8 +410,8 @@ Stock llama.cpp b12359 аудио этой модели не запускает,
 `file(DOWNLOAD`, `FetchContent` и `ExternalProject`. Без OpenSSL у сервера нет HTTPS-клиента.
 Бинарник скопирован в каталог выше и сделан read-only. `gate0 run --runtime qolda` до старта
 сервера сверяет его SHA-256 с константой `QOLDA_SERVER_SHA256` и строку `--version` с коммитом
-`ea63b4d`; расхождение — отказ `precondition_failed`. Argv — как у `gemma12b`, плюс `-c 8192`,
-`--cache-ram 0` и `--reasoning-format deepseek`. Запуск возможен только внутри cgroup
+`ea63b4d`; расхождение — отказ `precondition_failed`. Argv — как у `gemma12b` (с `--cache-ram 0`), плюс
+`-c 8192` и `--reasoning-format deepseek`. Запуск возможен только внутри cgroup
 `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ до
 попытки) и когда у хоста `MemAvailable` ≥ 14e9 байт; сторож RSS сервера — 17,5e9 байт.
 
