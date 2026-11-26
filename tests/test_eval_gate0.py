@@ -2381,6 +2381,96 @@ def test_qolda_run_without_the_cap_or_the_free_memory_is_refused_before_any_atte
     assert not spike["marker"].exists()
 
 
+def test_qolda_decision_records_verdict_p1_p3_c_s_thinking_rss_latency_and_run_time() -> None:
+    flat_doc = re.sub(r"\s+", " ", (REPO / QOLDA_DOC).read_text(encoding="utf-8"))
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    for precondition in ("**P1:**", "**P2:**", "**P3: выполнено.**"):
+        assert precondition in results, precondition
+    assert "**50,13–50,20 аудиотокена на секунду клипа**" in results
+    assert "Наклон по K1 — **50,1 токена/с**" in results
+    assert "`version: 1 (ea63b4d)`" in results and "`checks.server_binary: true`" in results
+    thinking = results.split("**Рассуждение**", 1)[1].split("**Память**", 1)[0]
+    assert "Бюджет исчерпан в **10 из 30**" in thinking
+    assert "исчерпан в **7 из 12**" in thinking
+    assert "**Пустой ответ после рассуждения — 4 из 42:**" in thinking
+    assert "ответов с незакрытым `<think>` нет" in thinking
+    peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
+    assert peak < gate0.RUNTIME_LIMITS["qolda"][1] < gate0.RSS_LIMIT_BYTES
+    assert "`stop_reason: null`" in results and "`oom_kill 0`" in results
+    assert "`memory.peak` scope" in results and "без `--cache-ram 0`" in results
+    assert "**Задержка на клип**" in results and "**медиана 101,8 с" in results
+    assert "**медиана 435,8 с**" in results
+    assert "**2 ч 17 мин 1 с** wall time" in results
+    numbers = re.findall(r"\| (\d+) \| (?:K1|K2|P|P-text|A|A-text) \|", results)
+    assert [int(n) for n in numbers] == list(range(1, 43))
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("## 6.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-19 --attempt 6`" in verdict
+    answer = json.dumps(
+        {
+            "verdict": "NOT READY",
+            "reason": "C: не прошли 3 из 12 пунктов контролей: ['A(S0)', 'A(N1)', 'A(T1)']",
+        },
+        ensure_ascii=False,
+    )
+    assert f"`{answer}`" in verdict
+    assert "**C не проходит: прошли 9 из 12 пунктов, не прошли 3.**" in verdict
+    assert "**S не проходит (0 из 3 пар)**" in verdict
+    assert not re.search(r"/(home|Users)/", flat_doc)
+
+
+def test_qolda_record_compares_each_criterion_with_earlier_runs() -> None:
+    document = (REPO / QOLDA_DOC).read_text(encoding="utf-8")
+    compared = document.split("### 5.1. Сравнение по критериям", 1)[1].split("\n## 6.", 1)[0]
+    header = next(line for line in compared.splitlines() if line.startswith("| Критерий |"))
+    runs = ("0007", "0010", "0011", "0023", "0024", "0031", "0032")
+    for run in runs:
+        assert run in header, run
+    rows = {
+        line.split("|")[1].strip(): line
+        for line in compared.splitlines()
+        if line.startswith("| ") and not line.startswith("| Критерий |")
+    }
+    for criterion in (
+        "P3, аудиотокенов на с",
+        "C1: K1, K2 на контролях",
+        "C2: P на контролях",
+        "C3: A на контролях",
+        "C, прошло пунктов",
+        "S: пар различено",
+        "Пиковый RSS сервера",
+        "Закрытый вопрос, с на клип",
+        "A со звуком, с на клип",
+        "Wall time прогона",
+    ):
+        assert criterion in rows, criterion
+        assert rows[criterion].count("|") == len(runs) + 2, criterion
+    assert "**9 из 12**" in rows["C, прошло пунктов"]
+    assert "**0 из 3**" in rows["S: пар различено"]
+    headings = ("**P3 —", "**C1 —", "**C2 —", "**C3 —", "**S —", "**Рассуждение.", "**Память —")
+    for heading in (*headings, "**Задержка —"):
+        assert heading in compared, heading
+
+
+def test_qolda_not_ready_packages_nothing_and_bounds_the_conclusion() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    example = (REPO / "sound-scout.example.toml").read_text(encoding="utf-8").lower()
+    assert "qolda" not in example and "qwen3avl" not in example
+    document = (REPO / QOLDA_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", document)
+    assert "**Вердикт: NOT READY**" in document
+    assert "ничего не упаковывается, `backend` остаётся `none`" in flat_doc
+    limits = flat_doc.split("## 6. Ограничения", 1)[1].split("## 7.", 1)[0]
+    assert "**Квантование и runtime.**" in limits and "Q8_0" in limits and "`ea63b4d`" in limits
+    assert "Вывод NOT READY относится к этой модели в этом runtime" in limits
+    assert "**Рассуждение с бюджетом.**" in limits
+    assert "`--cache-ram 0`" in limits and "не доказательство" in limits
+    owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    assert re.search(r"^1\. \*\*Решить судьбу Qolda-AVL-5B\*\*", owner, re.M)
+    flat_owner = re.sub(r"\s+", " ", owner)
+    assert "веса (6,47 GB)" in flat_owner and "ea63b4d-qwen3avl" in flat_owner
+    assert "Повтор этого прогона вердикт не меняет" in flat_owner
+
+
 # --- the vllm runtime and the controls-only prepare (#147) ---------------------------------
 
 

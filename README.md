@@ -65,6 +65,7 @@ Python 3.13 и `uv`, системный FFmpeg, `faster-whisper` (ASR), `onnxrun
 | Qwen3-Omni-30B-A3B-Instruct, GGUF и bf16 на GPU | `docs/decisions/0023-gate0-qwen3-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
 | Qwen2.5-Omni-7B, GGUF и bf16 на GPU | `docs/decisions/0024-gate0-qwen25-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
 | Gemma 4 12B-it, GGUF (сторож памяти остановил прогон на запросе 32 из 42; вердикт от остановки не зависит) | `docs/decisions/0031-gate0-gemma4-12b.md` |
+| Qolda-AVL-5B, GGUF на своей сборке llama.cpp | `docs/decisions/0032-gate0-qolda-avl-5b.md` |
 | MOSS-Audio-8B-Thinking-ru, диагностический прогон | [#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195) |
 
 ## Чем можно заменить
