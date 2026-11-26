@@ -1,0 +1,19 @@
+# Пример конфигурации для прогонов просодии: серии 1–3 `python -m sound_scout.eval.prosody` и
+# подтверждающий прогон `python -m sound_scout.eval.prosody_confirm` (решения 0019 и 0034).
+# Порядок работы — `docs/eval/PROSODY-CONFIG.md`. Скопируйте файл вне дерева, например в
+# `~/.cache/sst/<имя>/sound-scout.toml`, замените пути и укажите файл в `SOUND_SCOUT_CONFIG`.
+# Пути ниже — иллюстрация: загрузчик принимает только абсолютные существующие каталоги.
+
+# Обязательное поле загрузчика. Команды просодии вход через него не читают. Подходит любой
+# существующий пустой каталог вне `data_root`.
+allowed_roots = ["/path/to/empty-input-dir"]
+
+# Каталог `data/` основного checkout репозитория: там лежат источники корпуса
+# (`corpus/sources/`), `corpus/pilot-1/`, клипы Gate 0 и каталоги серий. Не `data/` дерева задачи
+# и не data root оператора.
+data_root = "/path/to/sound-scout-plugin/data"
+
+backend = "none"
+
+[network]
+allow = false
