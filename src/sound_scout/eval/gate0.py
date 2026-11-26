@@ -16,19 +16,21 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   questions. The audio backend is not touched.
 - `prepare --date D --reuse D0` copies the clips and words of the prepare of D0 under the rule
   of `--decision`, each clip checked against D0's manifest (`reuse_clips`, #144).
-- `run --date D [--runtime llama|borealis|gigachat|qwen3omni|qwen25omni|gemma12b]` checks the
-  weights, the prompt, the rule and the clips against what was recorded, starts the local server —
-  `llama-server` with local `-m`/`--mmproj` only (Gemma 4 E4B-it, or for `qwen3omni`
+- `run --date D [--runtime llama|borealis|gigachat|qwen3omni|qwen25omni|gemma12b|qolda]` checks
+  the weights, the prompt, the rule and the clips against what was recorded, starts the local
+  server — `llama-server` with local `-m`/`--mmproj` only (Gemma 4 E4B-it, or for `qwen3omni`
   Qwen3-Omni-30B-A3B-Instruct of #144, capped at 26e9 bytes without swap, or for `qwen25omni`
-  Qwen2.5-Omni-7B of #145, or for `gemma12b` Gemma 4 12B-it of #193, both capped at 18e9 bytes
-  without swap), or for `borealis` the
+  Qwen2.5-Omni-7B of #145, or for `gemma12b` Gemma 4 12B-it of #193, or for `qolda`
+  Qolda-AVL-5B of #194 on its own pinned build of llama.cpp ea63b4d with the authors' `qwen3avl`
+  patch, thinking within a token budget and answering after `</think>`, all three capped at 18e9
+  bytes without swap), or for `borealis` the
   `gate0_borealis` module
   with the local weights directory (#68), which must run inside a cgroup capped at 20e9 bytes
   without swap, or for `gigachat` the `gate0_gigachat` module (#85), capped at 26e9 bytes
-  without swap; `gigachat`, `qwen3omni`, `qwen25omni` and `gemma12b` start only when the host has
-  `MIN_AVAILABLE_BYTES` of their runtime available — on
-  127.0.0.1 and a free port, sends the fixed list of requests one at a time and once each, and
-  stops the server whatever happens. The empty input `E0` goes through the same
+  without swap; `gigachat`, `qwen3omni`, `qwen25omni`, `gemma12b` and `qolda` start only when the
+  host has `MIN_AVAILABLE_BYTES` of their runtime available — on 127.0.0.1 and a free port,
+  sends the fixed list of requests one at a time and once each, and stops the server whatever
+  happens. The empty input `E0` goes through the same
   `review.check_payload` as every audio request and is refused before any HTTP call. Every
   request leaves a trace line with the SHA-256 of the WAV and of the PCM actually sent, the
   server's token counts and timings, the client wall time and the server's RSS; the raw answer
@@ -182,7 +184,31 @@ GEMMA12B_WEIGHTS = {
 GEMMA12B_MODEL_DIR = (
     Path.home() / ".cache/sound-scout/models/ggml-org--gemma-4-12B-it-GGUF" / GEMMA12B_REVISION
 )
-RUNTIMES = ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "gemma12b", "vllm")
+QOLDA_REPO = "issai/Qolda-AVL-5B-GGUF"
+QOLDA_REVISION = "e2c55b47e6dfcc224718e466691aeaa49ec56bd9"
+QOLDA_MODEL_FILE = "Q8_0/Qolda-AVL-5B-Q8_0.gguf"
+QOLDA_MMPROJ_FILE = "mmproj/mmproj-Qolda-AVL-5B-F16.gguf"
+QOLDA_WEIGHTS = {
+    QOLDA_MODEL_FILE: "613406fad8ab6969cffd9991826f52b6889b4bd38fd6ae493d946b6a7ab67083",
+    QOLDA_MMPROJ_FILE: "041aa58d1d39d2e0c3f4555c7dc8bf2e64798fb9328567c10fb7a9bf4bc96116",
+}
+QOLDA_MODEL_DIR = (
+    Path.home() / ".cache/sound-scout/models/issai--Qolda-AVL-5B-GGUF" / QOLDA_REVISION
+)
+# llama.cpp ea63b4d with the authors' qwen3avl patch, built on the station (0032 section 1)
+QOLDA_LLAMA_DIR = Path.home() / ".local/opt/llama.cpp/ea63b4d-qwen3avl"
+QOLDA_LLAMA_COMMIT = "ea63b4d"
+QOLDA_SERVER_SHA256 = "ddf8a43459d68da28a403fcd1469c8d31982feb52f106122e1a2acf1d0ee6809"
+RUNTIMES = (
+    "llama",
+    "borealis",
+    "gigachat",
+    "qwen3omni",
+    "qwen25omni",
+    "gemma12b",
+    "qolda",
+    "vllm",
+)
 # served models of the `vllm` runtime: a vLLM server on a rented GPU host behind an SSH tunnel
 # (`sound_scout.eval.vast`, docs/decisions/0026-gpu-stack.md); the run never starts it
 VLLM_MODELS = ("qwen25omni", "qwen3omni")
@@ -193,6 +219,12 @@ LLAMA_RUNTIMES = {
     "qwen3omni": (QWEN3OMNI_MODEL_FILE, QWEN3OMNI_MMPROJ_FILE, ("--load-mode", "none")),
     "qwen25omni": (QWEN25OMNI_MODEL_FILE, QWEN25OMNI_MMPROJ_FILE, ("--load-mode", "none")),
     "gemma12b": (GEMMA12B_MODEL_FILE, GEMMA12B_MMPROJ_FILE, ("--load-mode", "none")),
+    # no prompt cache in RAM: it is 8192 MiB by default and RSS grew per request in 0031
+    "qolda": (
+        QOLDA_MODEL_FILE,
+        QOLDA_MMPROJ_FILE,
+        ("--load-mode", "none", "--cache-ram", "0", "--reasoning-format", "deepseek"),
+    ),
 }
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 MEMINFO = Path("/proc/meminfo")
@@ -205,11 +237,13 @@ QWEN25OMNI_MEMORY_CAP_BYTES = 18 * 10**9
 QWEN25OMNI_RSS_LIMIT_BYTES = 17_500_000_000
 QWEN25OMNI_MIN_AVAILABLE_BYTES = 14 * 10**9
 GEMMA12B_MIN_AVAILABLE_BYTES = 18 * 10**9
+QOLDA_MIN_AVAILABLE_BYTES = 14 * 10**9
 MIN_AVAILABLE_BYTES = {
     "gigachat": GIGACHAT_MIN_AVAILABLE_BYTES,
     "qwen3omni": QWEN3OMNI_MIN_AVAILABLE_BYTES,
     "qwen25omni": QWEN25OMNI_MIN_AVAILABLE_BYTES,
     "gemma12b": GEMMA12B_MIN_AVAILABLE_BYTES,
+    "qolda": QOLDA_MIN_AVAILABLE_BYTES,
 }
 PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917ca"
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
@@ -254,6 +288,8 @@ CONTROLS = ("S0", "N1", "T1")
 HOST = "127.0.0.1"
 CHAT_ROUTE = "/v1/chat/completions"
 CONTEXT_TOKENS = 4096
+# A of a thinking runtime: up to ≈ 2 630 tokens in and up to 2 064 out (0032 section 1)
+RUNTIME_CONTEXT_TOKENS = {"qolda": 8192}
 THREADS_IDLE = 12
 THREADS_BUSY = 8
 LOAD_TIMEOUT_S = 300.0
@@ -269,6 +305,7 @@ RUNTIME_LIMITS = {
     "qwen3omni": (GIGACHAT_MEMORY_CAP_BYTES, GIGACHAT_RSS_LIMIT_BYTES),
     "qwen25omni": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
     "gemma12b": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
+    "qolda": (QWEN25OMNI_MEMORY_CAP_BYTES, QWEN25OMNI_RSS_LIMIT_BYTES),
     "vllm": (None, None),
 }
 STOP_GRACE_S = 10.0
@@ -285,12 +322,23 @@ SAMPLING = {
 }
 # llama.cpp fields vLLM v0.34.0 ignores; its caches go off by server flags (`vast.vllm_argv`, #161)
 LLAMA_ONLY_FIELDS = frozenset({"cache_prompt"})
+# runtimes whose template always opens `<think>`: kind -> (reasoning_budget_tokens or None,
+# max_tokens); the answer is the text after `</think>` (0032 section 2)
+THINKING = {"qolda": {"closed": (512, 528), "review": (1024, 2064)}}
+THINK_END = "</think>"
+# the server trims the ends of the reasoning: re-tokenized, a reasoning stopped by its budget came
+# out 1 token short of it in the preflight (0032 section 1)
+REASONING_SLACK_TOKENS = 2
+THINK_START = "<think>"
+REVIEW_VARIANTS = ("A", "A-text")
 
 
 def sampling(runtime: str) -> dict:
     """The SAMPLING fields this runtime's server reads."""
     if runtime == "vllm":
         return {key: value for key, value in SAMPLING.items() if key not in LLAMA_ONLY_FIELDS}
+    if runtime in THINKING:
+        return {**SAMPLING, "chat_template_kwargs": {"enable_thinking": True}}
     return SAMPLING
 
 
@@ -847,8 +895,11 @@ def _scratch_run(prep_dir: Path, name: str, config_) -> runs.Run:
 # --- the request list ----------------------------------------------------------------------
 
 
-def plan(manifest: Mapping, words: Mapping, prompt: review.Prompt) -> list[dict]:
-    """The fixed, ordered request list of the spike (E0 is separate and comes first)."""
+def plan(
+    manifest: Mapping, words: Mapping, prompt: review.Prompt, runtime: str = "llama"
+) -> list[dict]:
+    """The fixed, ordered request list of the spike (E0 is separate and comes first); a
+    `THINKING` runtime gets the same requests with its token limits and reasoning budget."""
     clips = manifest["clips"]
     by_id = {clip["id"]: clip for clip in clips}
     closed = []
@@ -939,6 +990,12 @@ def plan(manifest: Mapping, words: Mapping, prompt: review.Prompt) -> list[dict]
         entries.append(entry)
     for number, entry in enumerate(entries, 1):
         entry["n"] = number
+        if runtime in THINKING:
+            kind = "review" if entry["variant"] in REVIEW_VARIANTS else "closed"
+            budget, entry["max_tokens"] = THINKING[runtime][kind]
+            entry["thinking"] = True
+            if budget is not None:
+                entry["reasoning_budget_tokens"] = budget
     return entries
 
 
@@ -959,6 +1016,8 @@ def _entry(variant, clip, text, max_tokens, *, json_response=False, pair=None, t
 def answer_of(entry: Mapping, body: object) -> object:
     """The parsed answer of one saved response body: an option, `INVALID`, or the A summary."""
     content = _content(body)
+    if entry.get("thinking"):
+        content = thinking_answer(content)
     if entry["variant"] in ("K1", "K2"):
         return INVALID if content is None else parse_closed(content, K_OPTIONS)
     if entry["variant"] in ("P", "P-text", "Q-S"):
@@ -981,6 +1040,18 @@ def answer_of(entry: Mapping, body: object) -> object:
     }
 
 
+def thinking_answer(content: str | None) -> str | None:
+    """The answer of a thinking runtime: the text after the last `</think>` the server left in
+    `content`; None for an empty answer or a reasoning that was never closed."""
+    if content is None:
+        return None
+    if THINK_END in content:
+        content = content.rpartition(THINK_END)[2]
+    elif THINK_START in content:
+        return None
+    return content if content.strip() else None
+
+
 def _content(body: object) -> str | None:
     try:
         content = body["choices"][0]["message"]["content"]
@@ -998,6 +1069,7 @@ def server_argv(
     port: int,
     threads: int,
     files: tuple[str, str, tuple[str, ...]] = LLAMA_RUNTIMES["llama"],
+    context: int = CONTEXT_TOKENS,
 ) -> list[str]:
     model_file, mmproj_file, extra = files
     argv = [
@@ -1012,7 +1084,7 @@ def server_argv(
         str(port),
         "--jinja",
         "-c",
-        str(CONTEXT_TOKENS),
+        str(context),
         "--parallel",
         "1",
         "--no-webui",
@@ -1115,9 +1187,14 @@ class Client:
     """HTTP to the local server only, without proxies; `calls` counts every request made and
     `last_status` keeps the status of the last one (None: no HTTP answer)."""
 
-    def __init__(self, port: int, model: str | None = None) -> None:
+    def __init__(
+        self, port: int, model: str | None = None, template_kwargs: Mapping | None = None
+    ) -> None:
         self.base = f"http://{HOST}:{port}"
         self.model = model
+        self.template_kwargs = dict(
+            SAMPLING["chat_template_kwargs"] if template_kwargs is None else template_kwargs
+        )
         self.calls = 0
         self.last_status: int | None = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -1157,7 +1234,7 @@ class Client:
             return self._vllm_tokens(message)
         status, raw, _ = self.request(
             "/apply-template",
-            {"messages": [message], "chat_template_kwargs": SAMPLING["chat_template_kwargs"]},
+            {"messages": [message], "chat_template_kwargs": self.template_kwargs},
         )
         try:
             prompt = json.loads(raw)["prompt"] if status == 200 else None
@@ -1171,6 +1248,17 @@ class Client:
             return None
         return len(tokens) if isinstance(tokens, list) else None
 
+    def count_tokens(self, text: str) -> int | None:
+        """Tokens of a plain text without special tokens: the length of a saved reasoning."""
+        status, raw, _ = self.request(
+            "/tokenize", {"content": text, "add_special": False, "parse_special": False}
+        )
+        try:
+            tokens = json.loads(raw)["tokens"] if status == 200 else None
+        except (ValueError, KeyError, TypeError):
+            return None
+        return len(tokens) if isinstance(tokens, list) else None
+
     def _vllm_tokens(self, message: dict) -> int | None:
         """vLLM applies the chat template itself: `/tokenize` takes the messages."""
         status, raw, _ = self.request(
@@ -1179,7 +1267,7 @@ class Client:
                 "model": self.model,
                 "messages": [message],
                 "add_generation_prompt": True,
-                "chat_template_kwargs": SAMPLING["chat_template_kwargs"],
+                "chat_template_kwargs": self.template_kwargs,
             },
         )
         try:
@@ -1324,9 +1412,12 @@ def run_spike(
         "qwen3omni": (QWEN3OMNI_MODEL_DIR, QWEN3OMNI_WEIGHTS),
         "qwen25omni": (QWEN25OMNI_MODEL_DIR, QWEN25OMNI_WEIGHTS),
         "gemma12b": (GEMMA12B_MODEL_DIR, GEMMA12B_WEIGHTS),
+        "qolda": (QOLDA_MODEL_DIR, QOLDA_WEIGHTS),
         "vllm": (None, None),
     }
     model_dir = model_dir or defaults[runtime][0]
+    if runtime == "qolda" and llama_dir == DEFAULT_LLAMA_DIR:
+        llama_dir = QOLDA_LLAMA_DIR
     if weights is None:
         weights = defaults[runtime][1]
     cap_limit, runtime_rss_limit = RUNTIME_LIMITS[runtime]
@@ -1386,6 +1477,17 @@ def run_spike(
         "questions": questions_sha256() == manifest["questions_sha256"],
         "clips": all(clips_found.values()),
     }
+    binary = llama_dir / SERVER_BINARY
+    server_version = None
+    if runtime == "qolda":
+        # the own build runs only as the pinned file of its pinned commit (a launch check, not P2)
+        binary_sha256 = _sha256_file(binary)
+        if binary_sha256 == QOLDA_SERVER_SHA256:
+            server_version = _server_version([str(binary), "--version"])
+        checks["server_binary"] = binary_sha256 == QOLDA_SERVER_SHA256 and (
+            QOLDA_LLAMA_COMMIT in (server_version or "")
+        )
+        record["server_binary"] = {"sha256": binary_sha256, "version": server_version}
     record["preconditions"] = {
         "checks": checks,
         "weights_sha256": found,
@@ -1399,17 +1501,21 @@ def run_spike(
         failed = [name for name, passed in checks.items() if not passed]
         raise Gate0Error(f"run refused before the server start: {failed} do not match")
 
-    entries = plan(manifest, words, prompt)
+    entries = plan(manifest, words, prompt, runtime)
     others = _other_inference()
     threads = threads or (THREADS_BUSY if others else THREADS_IDLE)
     port = server_port if runtime == "vllm" else _free_port()
-    client = Client(port, served_model if runtime == "vllm" else None)
+    client = Client(
+        port,
+        served_model if runtime == "vllm" else None,
+        sampling(runtime)["chat_template_kwargs"],
+    )
     if runtime == "vllm":
         argv, version_argv = None, None
     elif runtime in LLAMA_RUNTIMES:
-        binary = llama_dir / SERVER_BINARY
-        argv = server_argv(binary, model_dir, port, threads, LLAMA_RUNTIMES[runtime])
-        version_argv = [str(binary), "--version"]
+        context = RUNTIME_CONTEXT_TOKENS.get(runtime, CONTEXT_TOKENS)
+        argv = server_argv(binary, model_dir, port, threads, LLAMA_RUNTIMES[runtime], context)
+        version_argv = None if server_version else [str(binary), "--version"]
     elif runtime == "borealis":
         argv = borealis_argv(model_dir, port, threads)
         version_argv = [sys.executable, "-m", BOREALIS_MODULE, "--version"]
@@ -1419,7 +1525,9 @@ def run_spike(
     record.update(
         {
             "argv": argv,
-            "server_version": None if version_argv is None else _server_version(version_argv),
+            "server_version": (
+                server_version if version_argv is None else _server_version(version_argv)
+            ),
             "threads": threads,
             "other_inference": others,
             "cpu": _cpu_model(),
@@ -1642,6 +1750,8 @@ def _send(
         body["model"] = client.model
     if entry["json_response"]:
         body["response_format"] = {"type": "json_object"}
+    if "reasoning_budget_tokens" in entry:
+        body["reasoning_budget_tokens"] = entry["reasoning_budget_tokens"]
     if write_request:
         _write_json(
             attempt / REQUESTS_DIR,
@@ -1683,6 +1793,14 @@ def _send(
                 "reasoning_content_present": bool(message.get("reasoning_content")),
             }
         )
+        reasoning = message.get("reasoning_content")
+        if entry.get("thinking") and isinstance(reasoning, str) and reasoning:
+            # a service call after the answer: the reasoning's length, not a protocol request
+            line["reasoning_tokens"] = client.count_tokens(reasoning)
+            budget = entry.get("reasoning_budget_tokens")
+            if budget is not None and line["reasoning_tokens"] is not None:
+                exhausted = line["reasoning_tokens"] >= budget - REASONING_SLACK_TOKENS
+                line["reasoning_budget_exhausted"] = exhausted
     if entry["modality"] == "audio" and line.get("text_tokens") is not None:
         prompt_tokens = line.get("prompt_tokens")
         if isinstance(prompt_tokens, int):
@@ -1698,8 +1816,9 @@ def _send(
 def _trace_keys(entry: Mapping) -> dict:
     keys = ("n", "variant", "clip", "modality", "pair", "take", "duration_s", "max_tokens")
     line = {key: entry[key] for key in keys}
-    if "about" in entry:
-        line["about"] = entry["about"]
+    for key in ("about", "thinking", "reasoning_budget_tokens"):
+        if key in entry:
+            line[key] = entry[key]
     return line
 
 

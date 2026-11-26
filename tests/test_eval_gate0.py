@@ -2046,6 +2046,341 @@ def test_gemma12b_not_ready_packages_nothing_and_bounds_the_conclusion() -> None
     assert "Повтор этого прогона вердикт не меняет" in re.sub(r"\s+", " ", owner)
 
 
+# --- the qolda runtime of #194 under GATE0-RULE v1 (docs/decisions/0032-gate0-qolda-avl-5b.md) --
+
+QOLDA_DOC = Path("docs/decisions/0032-gate0-qolda-avl-5b.md")
+QOLDA_DAY = "2026-11-26"
+QOLDA_FAKE_SERVER = (
+    FAKE_SERVER.replace(
+        "pdeathsig = ctypes.c_int()",
+        'if "--version" in sys.argv:\n'
+        '    print("version: 1 (ea63b4d)", file=sys.stderr)\n'
+        "    sys.exit(0)\n"
+        "pdeathsig = ctypes.c_int()",
+    )
+    .replace("audio_tokens = 25 * len(pcm)", "audio_tokens = 50 * len(pcm)")
+    .replace(
+        '"choices": [{"message": {"content": content}',
+        '"choices": [{"message": {"content": content, "reasoning_content": "думаю"}',
+    )
+)
+
+
+def test_qolda_decision_holds_rule_v1_unchanged() -> None:
+    document = (REPO / QOLDA_DOC).read_text(encoding="utf-8")
+    recorded = re.search(r"SHA-256 блока: `([0-9a-f]{64})`", document).group(1)
+    assert gate0.rule_sha256(document) == recorded == DECISION_RULE_SHA256
+    assert gate0.rule_name(gate0.rule_sha256(document)) == gate0.RULE_V1
+    assert _rule_lines(QOLDA_DOC) == _rule_lines(gate0.DECISION_DOC)
+    assert not re.search(r"/(home|Users)/", document)
+
+
+def test_qolda_weights_are_the_table_of_dependencies_section_3_1() -> None:
+    dependencies = (REPO / "docs/dependencies.md").read_text(encoding="utf-8")
+    weights = dependencies.split("### 3.1.", 1)[1].split("\n### 3.2.", 1)[0]
+    qolda = weights[weights.index("#### Qolda-AVL-5B") :].split("\n#### ", 1)[0]
+    rows = re.findall(r"^\| `([^`]+)` \| ([\d ]+) \| `([0-9a-f]{64})` \|", qolda, re.M)
+    assert {name: sha for name, _, sha in rows} == gate0.QOLDA_WEIGHTS
+    assert sum(int(size.replace(" ", "")) for _, size, _ in rows) == 6_474_153_024
+    assert gate0.QOLDA_REVISION in qolda and gate0.QOLDA_REPO in qolda
+    assert gate0.QOLDA_REVISION in str(gate0.QOLDA_MODEL_DIR)
+    runtime = dependencies.split("### 3.2. Runtime", 1)[1].split("\n### ", 1)[0]
+    own = runtime[runtime.index("#### Runtime Qolda-AVL-5B") :].split("\n#### ", 1)[0]
+    for pinned in (
+        "bb27de1efd5b546d74b834395570f49d5e017db872f0586a771edf59d0f89bf3",  # the patch
+        "ea63b4d32ea1b66bdbe369be7f9443f6c00f8b31",  # llama.cpp
+        "85625a9b6d5e88ff99c7eb79123d85570844e77ac076366cf75c609cc0b1b579",  # cmake 4.4.5
+        gate0.QOLDA_SERVER_SHA256,
+    ):
+        assert pinned in own, pinned
+    assert re.fullmatch(r"[0-9a-f]{64}", gate0.QOLDA_SERVER_SHA256)
+
+
+def test_qolda_server_argv_has_its_files_context_and_flags() -> None:
+    files = gate0.LLAMA_RUNTIMES["qolda"]
+    context = gate0.RUNTIME_CONTEXT_TOKENS["qolda"]
+    argv = gate0.server_argv(Path("/opt/llama-server"), Path("/models"), 4321, 12, files, context)
+    assert argv[argv.index("-m") + 1] == f"/models/{gate0.QOLDA_MODEL_FILE}"
+    assert argv[argv.index("--mmproj") + 1] == f"/models/{gate0.QOLDA_MMPROJ_FILE}"
+    assert argv[argv.index("-c") + 1] == "8192"
+    assert argv[-6:] == [
+        "--load-mode",
+        "none",
+        "--cache-ram",
+        "0",
+        "--reasoning-format",
+        "deepseek",
+    ]
+    assert not gate0.DOWNLOAD_FLAGS.intersection(argv)
+    for runtime in ("llama", "gemma12b"):
+        other = gate0.server_argv(
+            Path("/opt/llama-server"), Path("/models"), 4321, 12, gate0.LLAMA_RUNTIMES[runtime]
+        )
+        assert other[other.index("-c") + 1] == "4096" and "--cache-ram" not in other
+    assert set(gate0.RUNTIME_CONTEXT_TOKENS) == {"qolda"}
+
+
+def test_qolda_plan_sets_the_thinking_budget_and_keeps_the_42_requests(spike) -> None:
+    words = json.loads((spike["out"] / gate0.WORDS_FILE).read_text(encoding="utf-8"))
+    prompt = review.load_prompt()
+    plain = gate0.plan(spike["manifest"], words, prompt)
+    thinking = gate0.plan(spike["manifest"], words, prompt, "qolda")
+    assert len(thinking) == 42
+    keys = ("n", "variant", "clip", "text", "json_response", "pair", "take")
+    assert [[e[k] for k in keys] for e in thinking] == [[e[k] for k in keys] for e in plain]
+    for entry in thinking:
+        review_ = entry["variant"] in ("A", "A-text")
+        assert entry["max_tokens"] == (2064 if review_ else 528)
+        assert entry["reasoning_budget_tokens"] == (1024 if review_ else 512)
+        assert entry["thinking"] is True
+    for entry in plain:
+        assert entry["max_tokens"] == (1024 if entry["variant"] in ("A", "A-text") else 8)
+        assert "reasoning_budget_tokens" not in entry and "thinking" not in entry
+
+
+def _body(content, reasoning=None, finish="stop"):
+    message = {"content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
+    return {"choices": [{"message": message, "finish_reason": finish}]}
+
+
+EMPTY_A = (
+    '{"observations": [], "unlocalized_observations": [], "uncertainties": [], "limitations": []}'
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "reasoning", "closed", "valid"),
+    [
+        ("Тишина.", "думаю", "тишина", True),
+        ("думаю</think>Тишина.", None, "тишина", True),
+        ("а</think>б</think>\nТишина.", None, "тишина", True),
+        ("", "думаю и не заканчиваю", gate0.INVALID, False),
+        ("<think>думаю без конца", None, gate0.INVALID, False),
+        ("думаю</think>  \n", None, gate0.INVALID, False),
+        (None, "думаю", gate0.INVALID, False),
+    ],
+)
+def test_qolda_answer_is_the_text_after_think(content, reasoning, closed, valid) -> None:
+    k1 = {"variant": "K1", "thinking": True}
+    answer = gate0.answer_of(k1, _body(content, reasoning))
+    assert answer == closed
+    review_text = None if content is None else content.replace("Тишина.", EMPTY_A)
+    entry = {"variant": "A", "thinking": True, "duration_s": 10.0}
+    summary = gate0.answer_of(entry, _body(review_text, reasoning))
+    assert summary["valid"] is valid
+    if valid:
+        assert summary["observations"] == 0 and summary["unlocalized_observations"] == 0
+
+
+def test_qolda_cut_answer_fails_its_item_and_think_is_read_only_for_thinking_entries() -> None:
+    line = {"sent": True, "http_status": 200, "finish_reason": "length", "answer": "тишина"}
+    assert not gate0._passed(line)
+    assert gate0._passed({**line, "finish_reason": "stop"})
+    # a runtime without thinking keeps the whole content, `</think>` and all
+    body = _body("Не речь ли это?</think>Тишина.")
+    assert gate0.answer_of({"variant": "K1"}, body) == gate0.INVALID
+    assert gate0.answer_of({"variant": "K1", "thinking": True}, body) == "тишина"
+
+
+class _ThinkingClient:
+    model = None
+
+    def __init__(self, reasoning_tokens):
+        self.reasoning_tokens = reasoning_tokens
+        self.sent = []
+
+    def request(self, path, body=None, timeout=None):
+        self.sent.append(body)
+        message = {"content": "Нет.", "reasoning_content": "думаю"}
+        answer = {"choices": [{"message": message, "finish_reason": "stop"}]}
+        return 200, json.dumps(answer).encode(), None
+
+    def count_tokens(self, text):
+        return self.reasoning_tokens
+
+
+@pytest.mark.parametrize(("tokens", "exhausted"), [(511, True), (510, True), (509, False)])
+def test_qolda_trace_records_the_reasoning_length_and_the_spent_budget(
+    tmp_path, tokens, exhausted
+) -> None:
+    cfg = config.Config(allowed_roots=(tmp_path.resolve(),), data_root=tmp_path.resolve())
+    for name in (gate0.REQUESTS_DIR, gate0.RESPONSES_DIR):
+        (tmp_path / name).mkdir()
+    entry = {
+        **gate0._entry("P-text", None, "Вопрос", 528, pair=1),
+        "n": 1,
+        "thinking": True,
+        "reasoning_budget_tokens": 512,
+    }
+    client = _ThinkingClient(tokens)
+    line = gate0._send(
+        entry, tmp_path, {}, client, gate0.NoWatch(), tmp_path, cfg, 600.0,
+        gate0.sampling("qolda"),
+    )  # fmt: skip
+    assert line["answer"] == "нет" and line["thinking"] is True
+    assert line["reasoning_tokens"] == tokens
+    assert line["reasoning_budget_exhausted"] is exhausted
+    assert client.sent[0]["reasoning_budget_tokens"] == 512
+    assert client.sent[0]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def _qolda_run(
+    spike,
+    tmp_path,
+    monkeypatch,
+    memory_max=QWEN25OMNI_CAP,
+    swap_max="0",
+    available=16 * 10**9,
+    broken=None,
+    default_dir=False,
+):
+    """The fake spike prepared again under the real GATE0-RULE v1 block of 0032, Qolda files
+    and a fake server binary pinned in place of the built `llama-server`; with `default_dir`
+    the binary sits in a patched `QOLDA_LLAMA_DIR` and `run_spike` gets no `llama_dir`."""
+    gate0.prepare_clips(
+        QOLDA_DAY, spike["config"], decision=REPO / QOLDA_DOC, transcribe=_fake_transcribe
+    )
+    models = spike["kwargs"]["model_dir"]
+    weights = {}
+    for name in gate0.QOLDA_WEIGHTS:
+        (models / name).parent.mkdir(parents=True, exist_ok=True)
+        (models / name).write_bytes(name.encode())
+        weights[name] = "0" * 64 if name == broken else hashlib.sha256(name.encode()).hexdigest()
+    llama = tmp_path / "qolda-llama"
+    llama.mkdir()
+    server = llama / gate0.SERVER_BINARY
+    server.write_text(QOLDA_FAKE_SERVER.replace("{python}", sys.executable), encoding="utf-8")
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
+    pinned = hashlib.sha256(server.read_bytes()).hexdigest()
+    monkeypatch.setattr(gate0, "QOLDA_SERVER_SHA256", "0" * 64 if broken == "binary" else pinned)
+    kwargs = {**spike["kwargs"], "decision": REPO / QOLDA_DOC, "weights": weights}
+    if default_dir:
+        monkeypatch.setattr(gate0, "QOLDA_LLAMA_DIR", llama)
+        del kwargs["llama_dir"]
+    else:
+        kwargs["llama_dir"] = llama
+    return gate0.run_spike(
+        QOLDA_DAY,
+        spike["config"],
+        runtime="qolda",
+        cgroup_root=_cgroup(tmp_path / "cgroup", memory_max, swap_max),
+        meminfo=_meminfo(tmp_path / "meminfo", available),
+        **kwargs,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_qolda_run_under_the_18e9_cap_uses_rule_v1_and_the_tokenize_p3(
+    spike, tmp_path, monkeypatch
+) -> None:
+    bodies = tmp_path / "bodies.jsonl"
+    monkeypatch.setenv("GATE0_FAKE_BODIES", str(bodies))
+    result = _qolda_run(spike, tmp_path, monkeypatch)
+    attempt = spike["out"].parent / QOLDA_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    argv = record["argv"]
+    assert argv[argv.index("-m") + 1].endswith(gate0.QOLDA_MODEL_FILE)
+    assert argv[argv.index("-c") + 1] == "8192" and "--cache-ram" in argv
+    assert record["runtime"] == "qolda" and record["rule"] == gate0.RULE_V1
+    assert record["server_version"] == "version: 1 (ea63b4d)"
+    assert record["preconditions"]["checks"]["server_binary"] is True
+    assert record["limits"]["rss_limit_bytes"] == 17_500_000_000
+    assert record["cgroup"]["memory_max"] == QWEN25OMNI_CAP
+    assert record["requests_planned"] == 42
+    assert record["sampling"]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert result["rule"] == gate0.RULE_V1 and result["audio_route"]["min_rate"] == 20.0
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True}
+    assert result["audio_route"]["min_tokens_per_s"] >= 49
+    sent = [json.loads(line) for line in bodies.read_text().splitlines()]
+    assert len(sent) == 42
+    assert all(body["chat_template_kwargs"] == {"enable_thinking": True} for body in sent)
+    assert {(b["max_tokens"], b["reasoning_budget_tokens"]) for b in sent} == {
+        (528, 512),
+        (2064, 1024),
+    }
+    saved = json.loads((attempt / gate0.REQUESTS_DIR / "1.json").read_text())
+    assert saved["reasoning_budget_tokens"] == 512
+    trace = [json.loads(line) for line in (attempt / gate0.TRACE_FILE).read_text().splitlines()]
+    answered = [line for line in trace if line.get("sent")]
+    assert all(line["thinking"] and line["reasoning_tokens"] == 30 for line in answered)
+    assert not any(line["reasoning_budget_exhausted"] for line in answered)
+    assert gate0.RUNTIME_LIMITS["qolda"] == (18 * 10**9, 17_500_000_000)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("broken", "check"),
+    [
+        ("binary", "server_binary"),
+        (gate0.QOLDA_MODEL_FILE, "weights"),
+        (gate0.QOLDA_MMPROJ_FILE, "weights"),
+    ],
+)
+def test_qolda_wrong_server_binary_or_weights_are_refused_before_the_server_start(
+    spike, tmp_path, monkeypatch, broken, check
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        _qolda_run(spike, tmp_path, monkeypatch, broken=broken)
+    assert not spike["marker"].exists() and not spike["received"].exists()
+    attempt = spike["out"].parent / QOLDA_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["stop_reason"] == "precondition_failed"
+    assert record["preconditions"]["checks"][check] is False
+    assert "http_calls" not in record
+    verdict = json.loads((attempt / gate0.VERDICT_FILE).read_text())
+    assert verdict["verdict"] == "NOT READY"
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_qolda_run_without_llama_dir_takes_the_pinned_ea63b4d_build(
+    spike, tmp_path, monkeypatch
+) -> None:
+    calls = []
+    version = gate0._server_version
+    monkeypatch.setattr(gate0, "_server_version", lambda argv: calls.append(argv) or version(argv))
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        _qolda_run(spike, tmp_path, monkeypatch, broken=gate0.QOLDA_MODEL_FILE, default_dir=True)
+    assert [Path(argv[0]).parent for argv in calls] == [tmp_path / "qolda-llama"]
+    attempt = spike["out"].parent / QOLDA_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["preconditions"]["checks"]["server_binary"] is True
+    assert record["server_binary"]["version"] == "version: 1 (ea63b4d)"
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+def test_qolda_server_binary_of_another_commit_is_refused(spike, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(gate0, "_server_version", lambda argv: "version: 1 (b1b770d90)")
+    with pytest.raises(gate0.Gate0Error, match="server_binary"):
+        _qolda_run(spike, tmp_path, monkeypatch)
+    assert not spike["marker"].exists()
+    attempt = spike["out"].parent / QOLDA_DAY / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["server_binary"]["version"] == "version: 1 (b1b770d90)"
+    assert record["preconditions"]["checks"]["server_binary"] is False
+
+
+@pytest.mark.skipif(not Path("/proc/self/cgroup").is_file(), reason="needs Linux cgroup v2")
+@pytest.mark.parametrize(
+    ("memory_max", "swap_max", "available", "message"),
+    [
+        ("max", "0", 16 * 10**9, "MemoryMax=18000000000"),
+        (GIGACHAT_CAP, "0", 16 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "max", 16 * 10**9, "MemoryMax=18000000000"),
+        (QWEN25OMNI_CAP, "0", 14 * 10**9 - 4096, "MemAvailable"),
+    ],
+)
+def test_qolda_run_without_the_cap_or_the_free_memory_is_refused_before_any_attempt(
+    spike, tmp_path, monkeypatch, memory_max, swap_max, available, message
+) -> None:
+    with pytest.raises(gate0.Gate0Error, match=message):
+        _qolda_run(spike, tmp_path, monkeypatch, memory_max, swap_max, available)
+    assert not (spike["out"].parent / QOLDA_DAY / gate0.ATTEMPTS_DIR).exists()
+    assert not spike["marker"].exists()
+
+
 # --- the vllm runtime and the controls-only prepare (#147) ---------------------------------
 
 
@@ -2142,6 +2477,11 @@ def test_vllm_run_starts_no_server_sends_model_and_tokenizes_messages(controls) 
 def test_sampling_drops_llama_only_fields_for_vllm_and_keeps_them_for_local_runtimes() -> None:
     for runtime in ("llama", "borealis", "gigachat", "qwen3omni", "qwen25omni", "gemma12b"):
         assert gate0.sampling(runtime) is gate0.SAMPLING
+    assert gate0.sampling("qolda") == {
+        **gate0.SAMPLING,
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    assert gate0.SAMPLING["chat_template_kwargs"] == {"enable_thinking": False}
     assert gate0.SAMPLING["cache_prompt"] is False
     assert gate0.sampling("vllm") == {
         "temperature": 0,

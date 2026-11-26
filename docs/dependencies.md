@@ -224,6 +224,30 @@ sha256 из API Hugging Face. `gate0 run --runtime qwen25omni` пересчит�
 стартом сервера (предусловие P2) по константе `GEMMA12B_WEIGHTS`, равной этой таблице. Не
 используются: `BF16` LLM (23,8 GB), `Q4_0`, `mmproj-…-Q8_0`, `mtp-*`.
 
+#### Qolda-AVL-5B — Gate 0 #194 (решение владельца 7173265163)
+
+Решение владельца — [комментарий 7173265163](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7173265163)
+(2026-11-25): загрузка весов `issai/Qolda-AVL-5B` и закреплённого кода runtime, один локальный
+прогон Gate 0 на CPU по `GATE0-RULE v1`. Репозиторий `issai/Qolda-AVL-5B-GGUF` на Hugging Face,
+ревизия `e2c55b47e6dfcc224718e466691aeaa49ec56bd9` (lastModified 2026-08-19), не gated. Исходная
+модель — `issai/Qolda-AVL-5B` @ `e09b9c23faee8429b4d503636176edfc4ce061a6` (не скачивается).
+Лицензия Apache-2.0 (карточка GGUF `license: apache-2.0`). Каталог по умолчанию:
+`~/.cache/sound-scout/models/issai--Qolda-AVL-5B-GGUF/<ревизия>/`, пути файлов — как в
+репозитории. Решение — `docs/decisions/0032-gate0-qolda-avl-5b.md`.
+
+| Файл | Байт | SHA-256 | Назначение |
+|---|---|---|---|
+| `Q8_0/Qolda-AVL-5B-Q8_0.gguf` | 4 280 406 368 | `613406fad8ab6969cffd9991826f52b6889b4bd38fd6ae493d946b6a7ab67083` | языковая модель (архитектура `qwen3vl`), Q8_0 |
+| `mmproj/mmproj-Qolda-AVL-5B-F16.gguf` | 2 193 746 656 | `041aa58d1d39d2e0c3f4555c7dc8bf2e64798fb9328567c10fb7a9bf4bc96116` | аудио- и визуальный проектор (тип аудио `qwen3avl`), F16 |
+
+Всего 6 474 153 024 байт. Загрузка — только по прямому URL
+`https://huggingface.co/issai/Qolda-AVL-5B-GGUF/resolve/<ревизия>/<файл>`
+(`curl --proto =https --proto-redir =https`) в файл `.part`; после загрузки размер и SHA-256 на
+диске сверяются с LFS sha256 из `GET /api/models/issai/Qolda-AVL-5B-GGUF/tree/<ревизия>`, и только
+затем `.part` переименовывается. `gate0 run --runtime qolda` пересчитывает SHA-256 перед стартом
+сервера (предусловие P2) по константе `QOLDA_WEIGHTS`, равной этой таблице. Не используются:
+`BF16`, `Q6_K`, `Q5_K_M`, `Q4_K_M`, `mmproj-…-vision-only-F16.gguf`, `imatrix`.
+
 #### GigaChat3.1-Audio-10B-A1.8B — кандидат Gate 0 #85 (разрешение владельца 2026-11-19)
 
 Разрешение владельца — тело [#85](https://github.com/renidere/sound-scout-plugin/issues/85)
@@ -348,6 +372,36 @@ cgroup `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -
 cgroup `systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ
 до попытки) и когда у хоста `MemAvailable` ≥ 18e9 байт; сторож RSS сервера — 17,5e9 байт.
 Подробности и измерения — `docs/decisions/0031-gate0-gemma4-12b.md`.
+
+#### Runtime Qolda-AVL-5B (Gate 0 #194)
+
+Stock llama.cpp b12359 аудио этой модели не запускает, а патч авторов к b12359 не применяется
+(`docs/decisions/0032-gate0-qolda-avl-5b.md` §1). Runtime `qolda` — `llama-server`, собранный на
+станции из llama.cpp `ea63b4d` с патчем `qwen3avl` авторов; каталог
+`~/.local/opt/llama.cpp/ea63b4d-qwen3avl/` (исходники — `src/`, бинарник — `llama-server`).
+
+| Что | Закрепление | Лицензия |
+|---|---|---|
+| llama.cpp | коммит `ea63b4d32ea1b66bdbe369be7f9443f6c00f8b31` (2026-07-30), дерево `817854c32aa6667e3a4a74b9d6be41bab472c85c`; `git archive --format=tar` коммита — 165 949 440 байт, SHA-256 `2a437542bd3727502a4dfca62fc9200b4714844f455e274a99ad8d604c57fc5b` | MIT |
+| `llama.cpp-patch/qwen3avl-support.patch` из `issai/Qolda-AVL-5B-GGUF` @ `e2c55b47e6dfcc224718e466691aeaa49ec56bd9` | 23 627 байт, git blob `a0b01da76b4042109d10cf863c33fb01063bd235`, SHA-256 `bb27de1efd5b546d74b834395570f49d5e017db872f0586a771edf59d0f89bf3`; 8 файлов, +228/−8 | Apache-2.0 |
+| `cmake` 4.4.5 (только сборка) | `cmake-4.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl` с PyPI, 30 246 479 байт, SHA-256 `85625a9b6d5e88ff99c7eb79123d85570844e77ac076366cf75c609cc0b1b579`; каталог `~/.cache/sound-scout/build-tools/cmake-4.4.5/`, запуск `uv tool run --offline --from <wheel> cmake` | BSD-3-Clause (CMake), Apache-2.0 (обёртка PyPI) |
+| собранный `llama-server` | 14 820 096 байт, SHA-256 `ddf8a43459d68da28a403fcd1469c8d31982feb52f106122e1a2acf1d0ee6809`, `--version`: `version: 1 (ea63b4d)`, `built with GNU 15.2.0 for Linux x86_64` | MIT |
+
+Загрузка: исходники — `git fetch --depth 1 https://github.com/ggml-org/llama.cpp <коммит>` в
+пустой каталог и `git checkout FETCH_HEAD` (`git rev-parse HEAD` равен коммиту); патч и wheel — по
+прямому URL в `.part`, сверка размера, SHA-256 (у патча и git blob), затем переименование. Патч —
+`git apply --check`, затем `git apply`. Сборка — системный `g++` 15.2.0 (раздел 2), без сети:
+`cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
+-DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_TESTS=OFF
+-DLLAMA_BUILD_EXAMPLES=OFF -DFETCHCONTENT_FULLY_DISCONNECTED=ON` и
+`cmake --build build --target llama-server -j 8`; в `build/` нет `_deps`, в журналах сборки нет
+`file(DOWNLOAD`, `FetchContent` и `ExternalProject`. Без OpenSSL у сервера нет HTTPS-клиента.
+Бинарник скопирован в каталог выше и сделан read-only. `gate0 run --runtime qolda` до старта
+сервера сверяет его SHA-256 с константой `QOLDA_SERVER_SHA256` и строку `--version` с коммитом
+`ea63b4d`; расхождение — отказ `precondition_failed`. Argv — как у `gemma12b`, плюс `-c 8192`,
+`--cache-ram 0` и `--reasoning-format deepseek`. Запуск возможен только внутри cgroup
+`systemd-run --user --scope -p MemoryMax=18000000000 -p MemorySwapMax=0 -- …` (иначе отказ до
+попытки) и когда у хоста `MemAvailable` ≥ 14e9 байт; сторож RSS сервера — 17,5e9 байт.
 
 #### Runtime Borealis-5b-it (Gate 0 spike #68)
 
