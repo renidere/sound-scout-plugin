@@ -64,6 +64,7 @@ Python 3.13 и `uv`, системный FFmpeg, `faster-whisper` (ASR), `onnxrun
 | GigaChat3.1-Audio-10B-A1.8B (не выполнено предусловие P3, о слухе модели вердикт не говорит) | `docs/decisions/0011-gate0-gigachat-audio.md` |
 | Qwen3-Omni-30B-A3B-Instruct, GGUF и bf16 на GPU | `docs/decisions/0023-gate0-qwen3-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
 | Qwen2.5-Omni-7B, GGUF и bf16 на GPU | `docs/decisions/0024-gate0-qwen25-omni.md`, `docs/decisions/0028-gpu-reference-gate0.md` |
+| Gemma 4 12B-it, GGUF (сторож памяти остановил прогон на запросе 32 из 42; вердикт от остановки не зависит) | `docs/decisions/0031-gate0-gemma4-12b.md` |
 | MOSS-Audio-8B-Thinking-ru, диагностический прогон | [#90](https://github.com/renidere/sound-scout-plugin/issues/90#issuecomment-7024154195) |
 
 ## Чем можно заменить
@@ -77,7 +78,6 @@ Python 3.13 и `uv`, системный FFmpeg, `faster-whisper` (ASR), `onnxrun
 | ASR | T-one | Apache-2.0 | https://huggingface.co/t-tech/T-one |
 | ASR | Parakeet-TDT-0.6B-v3 | CC-BY-4.0 | https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 |
 | ASR | Canary-1B-v2 | CC-BY-4.0 | https://huggingface.co/nvidia/canary-1b-v2 |
-| Audio backend | Gemma 4 12B, запасной кандидат `docs/decisions/0022-gate0-next-candidate.md` | Apache-2.0 | https://huggingface.co/google/gemma-4-12B-it |
 
 ## Документы
 

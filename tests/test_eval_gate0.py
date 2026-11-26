@@ -1842,10 +1842,35 @@ def test_gemma12b_weights_are_the_table_of_dependencies_section_3_1() -> None:
     gemma = weights[weights.index("#### Gemma 4 12B") :].split("\n#### ", 1)[0]
     rows = re.findall(r"^\| `([^`]+)` \| ([\d ]+) \| `([0-9a-f]{64})` \|", gemma, re.M)
     assert {name: sha for name, _, sha in rows} == gate0.GEMMA12B_WEIGHTS
-    assert sum(int(size.replace(" ", "")) for _, size, _ in rows) == 12_844_757_568
+    sizes = {name: int(size.replace(" ", "")) for name, size, _ in rows}
+    assert sizes == {
+        gate0.GEMMA12B_MODEL_FILE: 12_669_641_920,
+        gate0.GEMMA12B_MMPROJ_FILE: 175_115_648,
+    }
+    assert sum(sizes.values()) == 12_844_757_568
+    assert "Лицензия Apache-2.0" in gemma
     assert gate0.GEMMA12B_REVISION in gemma and gate0.GEMMA12B_REPO in gemma
     assert str(gate0.GEMMA12B_REVISION) in str(gate0.GEMMA12B_MODEL_DIR)
     assert gate0.WEIGHTS != gate0.GEMMA12B_WEIGHTS  # the llama runtime stays pinned to E4B
+
+
+def _clip_pins(name: Path) -> dict[str, str]:
+    """The first PCM SHA-256 of each Gate 0 clip id in the clip table of a decision."""
+    pins: dict[str, str] = {}
+    text = (REPO / name).read_text(encoding="utf-8")
+    for clip, sha in re.findall(r"^\| `([BVSNT]\d)` \|[^\n]*?`([0-9a-f]{64})`", text, re.M):
+        pins.setdefault(clip, sha)
+    return pins
+
+
+def test_gemma12b_decision_pins_the_0007_questions_prompt_and_the_clips_of_2026_11_19() -> None:
+    document = (REPO / GEMMA12B_DOC).read_text(encoding="utf-8")
+    assert QUESTIONS_SHA256_0007 in document and gate0.PROMPT_SHA256 in document
+    clips = _clip_pins(GEMMA12B_DOC)
+    assert set(clips) == {"B1", "V1", "B2", "V2", "B3", "V3", "S0", "N1", "T1"}
+    assert clips == _clip_pins(BOREALIS_DOC) == _clip_pins(QWEN25OMNI_DOC)
+    first = _clip_pins(gate0.DECISION_DOC)
+    assert {c for c in clips if clips[c] != first[c]} == {"V2", "V3"}
 
 
 def test_gemma12b_server_argv_is_the_llama_argv_with_its_local_files() -> None:
@@ -1940,6 +1965,85 @@ def test_gemma12b_wrong_weights_are_refused_before_the_server_start(
     assert verdict["verdict"] == "NOT READY"
     assert verdict["reason"].startswith("протокол не выполнен")
     assert verdict["preconditions"]["P2"] is False
+
+
+def test_gemma12b_decision_records_verdict_p1_p3_c_s_rss_latency_and_run_time() -> None:
+    flat_doc = re.sub(r"\s+", " ", (REPO / GEMMA12B_DOC).read_text(encoding="utf-8"))
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    for precondition in ("**P1:**", "**P2:**", "**P3: выполнено.**"):
+        assert precondition in results, precondition
+    assert "**25,16–25,20 аудиотокена на секунду клипа**" in results
+    assert "наклон по K1 — **25,1 токена/с**" in results
+    peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
+    assert gate0.RUNTIME_LIMITS["gemma12b"][1] < peak < gate0.RSS_LIMIT_BYTES
+    assert "`stop_reason: rss_limit`" in results and "`VmHWM` в `run.json` — `null`" in results
+    assert "`memory.peak` scope" in results and "`oom_kill 0`" in results
+    assert "**Задержка на клип**" in results and "медиана 37,9 с" in results
+    assert "**31 мин 24 с** wall time" in results
+    numbers = re.findall(r"\| (\d+) \| (?:K1|K2|P|P-text|A|A-text) \|", results)
+    assert [int(n) for n in numbers] == list(range(1, 43))
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("## 6.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-19 --attempt 5`" in verdict
+    answer = json.dumps(
+        {
+            "verdict": "NOT READY",
+            "reason": "C: не прошли 5 из 12 пунктов контролей: "
+            "['A(S0)', 'A(N1)', 'K1(T1)', 'K2(T1)', 'A(T1)']",
+        },
+        ensure_ascii=False,
+    )
+    assert f"`{answer}`" in verdict
+    assert "**C не проходит: прошли 7 из 12 пунктов, не прошли 5.**" in verdict
+    assert "**S не проходит (0 из 3 пар)**" in verdict
+    assert not re.search(r"/(home|Users)/", flat_doc)
+
+
+def test_gemma12b_record_compares_each_criterion_with_earlier_runs() -> None:
+    document = (REPO / GEMMA12B_DOC).read_text(encoding="utf-8")
+    compared = document.split("### 5.1. Сравнение по критериям", 1)[1].split("\n## 6.", 1)[0]
+    header = next(line for line in compared.splitlines() if line.startswith("| Критерий |"))
+    runs = ("0007", "0010", "0011", "0023", "0024", "0031")
+    for run in runs:
+        assert run in header, run
+    rows = {
+        line.split("|")[1].strip(): line
+        for line in compared.splitlines()
+        if line.startswith("| ") and not line.startswith("| Критерий |")
+    }
+    for criterion in (
+        "P3, аудиотокенов на с",
+        "C1: K1, K2 на контролях",
+        "C2: P на контролях",
+        "C3: A на контролях",
+        "C, прошло пунктов",
+        "S: пар различено",
+        "Пиковый RSS сервера",
+        "Закрытый вопрос, с на клип",
+        "A со звуком, с на клип",
+        "Wall time прогона",
+    ):
+        assert criterion in rows, criterion
+        assert rows[criterion].count("|") == len(runs) + 2, criterion
+    assert "**7 из 12**" in rows["C, прошло пунктов"]
+    assert "**0 из 3**" in rows["S: пар различено"]
+    for heading in ("**P3 —", "**C1 —", "**C2 —", "**C3 —", "**S —", "**Память —", "**Задержка."):
+        assert heading in compared, heading
+
+
+def test_gemma12b_not_ready_packages_nothing_and_bounds_the_conclusion() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    example = (REPO / "sound-scout.example.toml").read_text(encoding="utf-8").lower()
+    assert "gemma-4-12b" not in example and "12b" not in example
+    document = (REPO / GEMMA12B_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", document)
+    assert "**Вердикт: NOT READY**" in document
+    assert "ничего не упаковывается, `backend` остаётся `none`" in flat_doc
+    limits = flat_doc.split("## 6. Ограничения", 1)[1].split("## 7.", 1)[0]
+    assert "**Квантование и runtime.**" in limits and "Q8_0" in limits and "b12359" in limits
+    assert "Вывод NOT READY относится к этой модели в этом runtime" in limits
+    owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    assert re.search(r"^1\. \*\*Решить судьбу Gemma 4 12B-it\*\*", owner, re.M)
+    assert "Повтор этого прогона вердикт не меняет" in re.sub(r"\s+", " ", owner)
 
 
 # --- the vllm runtime and the controls-only prepare (#147) ---------------------------------
