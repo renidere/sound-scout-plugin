@@ -1,5 +1,6 @@
 """Acceptance checks of issue #9 that are about repository files, not the CLI."""
 
+import argparse
 import re
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from sound_scout import mcp_server
+from sound_scout.cli import build_parser
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MEDIA_SUFFIXES = {
@@ -347,6 +349,32 @@ def test_readme_what_works_now_links_existing_code() -> None:
         assert readme_paths(row), row
     for path in readme_paths(section):
         assert (REPO_ROOT / path).exists(), path
+
+
+INSTALL_AND_RUN = "Установка и запуск"
+README_JOBS_USAGE = re.compile(r"^uv run sound-scout jobs ([\w|-]+)", re.MULTILINE)
+
+
+def subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    (action,) = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    return action.choices
+
+
+def test_readme_shows_a_usage_line_of_each_jobs_subcommand() -> None:
+    """#195: a new `jobs` subcommand without a README usage line fails here."""
+    in_parser = set(subcommands(subcommands(build_parser())["jobs"]))
+    section = readme_section(INSTALL_AND_RUN)
+    in_readme = {name for group in README_JOBS_USAGE.findall(section) for name in group.split("|")}
+    assert in_readme == in_parser
+
+
+def test_readme_install_and_run_links_existing_decisions() -> None:
+    section = readme_section(INSTALL_AND_RUN)
+    decisions = [path for path in readme_paths(section) if path.startswith("docs/decisions/")]
+    for name in ("0013-", "0025-", "0030-"):
+        assert any(name in path for path in decisions), name
+    for path in decisions:
+        assert (REPO_ROOT / path).is_file(), path
 
 
 def test_readme_integration_marks_untested_hosts_and_hermes_only_parts() -> None:

@@ -175,13 +175,35 @@ API скачивает вложения до 20 МБ; нужен `terminal.backe
 ```sh
 uv run sound-scout analyze <файл> [--request-id ID] [--layers content,measurements,sound] [--task ТЕКСТ] [--intent ТЕКСТ] [--json]
 uv run sound-scout compare <run_id A> <run_id B> --criterion emphasis_on:<слово> [--json]
-uv run sound-scout jobs submit <файл> [--request-id ID] [--mode quick|targeted|full|auto] [--layers …] [--task ТЕКСТ] [--intent ТЕКСТ] [--connection …] [--profile …] [--session-id …] [--submitter cli] [--json]
-uv run sound-scout jobs status|result|cancel|retry <job_id> [--json]
+uv run sound-scout jobs submit <файл> [--request-id ID] [--mode quick|targeted|full|auto] [--previous-run-id RUN_ID --criterion emphasis_on:<слово>] [--layers …] [--task ТЕКСТ] [--intent ТЕКСТ] [--connection …] [--profile …] [--session-id …] [--submitter cli] [--json]
+uv run sound-scout jobs status|result|report|cancel|retry <job_id> [--json]
 uv run sound-scout jobs run [--exit-when-idle]
-uv run sound-scout jobs start|recover [--json]
+uv run sound-scout jobs start|recover|limits [--json]
+uv run sound-scout jobs redeliver <job_id> [--json]
+uv run sound-scout jobs seen --session-id SESSION_ID --attempt ATTEMPT <job_id> [--json]
+uv run sound-scout jobs bind --session-id SESSION_ID [--profile PROFILE] [--connection CONNECTION] <job_id> [--json]
+uv run sound-scout jobs deliver-next --profile PROFILE --loop LOOP [--idle-chat IDLE_CHAT] [--busy-chat BUSY_CHAT] [--json]
+uv run sound-scout jobs deliver-end --outcome OUTCOME [--error ERROR] <job_id> [--json]
 ```
 
 `jobs` — файловая очередь заданий (`sound_scout.jobs`, решение 0013 § 3.6): `submit` за доли секунды пишет `<data_root>/jobs/<job_id>/job.json` и печатает `job_id`; проверка входа (ffprobe) — первая стадия runner, не `submit`. Повтор `--request-id` с тем же запросом возвращает то же задание, с другим — `request_mismatch`. Сверх `jobs.max_queued_jobs` или `jobs.max_staging_bytes` — отказ `queue_full` или `staging_full`. `cancel` переводит задание из `queued` в `cancelled` сразу, у `running` оставляет маркер отмены. Состояние задания (`queued/running/finished/cancelled/failed`) отдельно от `status` результата: `result` печатает compact-ответ run последней попытки, у которой есть результат, с полями `job_state` и `attempt` (номер этой попытки); новая попытка без результата не скрывает результат прежней. Задания исполняет один runner: `jobs run` — в текущем процессе (для тестов и хостов без systemd; `--exit-when-idle` — выйти, когда очередь пуста), `jobs start` — через `systemd-run --user` как transient unit `sound-scout-jobs-runner` вне cgroup вызывающего (у unit gateway `KillMode=mixed`, его дочерние процессы гибнут при перезапуске). Runner единственный по `<data_root>/jobs/runner.lock` (второй — `runner_running`), берёт задания по порядку постановки в очередь (`queued_at`: `submit` или `retry`) и вызывает `app.analyze` с `request_id` попытки `<job_id>-a<n>`; `analyze.lock` берёт сам `app.analyze`, и при `busy` (идёт синхронный анализ) задание возвращается в очередь на своё место. Маркер отмены у `running` runner переводит в `CancelToken`, задание заканчивается `cancelled`. Отказ анализа — `failed` с кодом причины. Попытка хранит lease (boot_id, pid, время старта процесса, номер); после остановленного runner (перезагрузка, `kill`, `systemctl --user stop`) задание остаётся `running`, пока `jobs recover` не отметит попытку `interrupted` и не вернёт задание в очередь — следующая попытка видна как `<job_id>-a<n+1>`; сами повторы не происходят. `submit --mode` — режим плана: `quick` (слои `content` и `measurements`), `targeted` (названные `--layers`), `full` (все три слоя, audio backend только из конфигурации), `auto` (по умолчанию: `targeted` с `--layers`, иначе `full`); план с `capability_version` пишется в `job.json`, runner перед запуском сверяет его с текущей конфигурацией и отказывает (`plan_refused`) плану, который расширил бы корни, сеть или backend; бюджеты плана шире конфигурации не отклоняются, а сужаются до значений конфигурации. `retry` по явной команде ставит задание из `failed` или `cancelled` обратно в конец очереди с теми же `job_id` и `request_id`, следующая попытка — `<job_id>-a<n+1>`; другое состояние — `not_retryable` (решение `docs/decisions/0018-job-modes-and-retry.md`).
+
+Остальные подкоманды `jobs`:
+
+- `report` печатает `report.md` той попытки, которую возвращает `result`, до 256 KiB
+  ([#108](https://github.com/renidere/sound-scout-plugin/issues/108)).
+- `limits` печатает бюджеты, лимиты очереди и `jobs.staging_root` для плагина Hermes
+  (`docs/decisions/0013-voice-note-integration.md` § 3.3, § 3.5).
+- `redeliver` запрашивает повторную доставку заметки задания `delivery_unconfirmed`. Цикл
+  плагина отправит её, только если метки задания нет в истории чата и историю удалось прочитать
+  (`docs/decisions/0013-voice-note-integration.md` § 3.7,
+  `docs/decisions/0018-job-modes-and-retry.md` «Повтор и доставка»).
+- `seen` отмечает, что ход привязанного чата прочитал итог последней попытки; заметка этой
+  попытке не идёт (`docs/decisions/0030-seen-attempt-no-note.md`).
+- `bind` один раз привязывает задание `submitter = "mcp"` к чату итоговой заметки
+  (`docs/decisions/0025-mcp-chat-binding.md`).
+- `deliver-next` и `deliver-end` — внутренние команды цикла доставки плагина Hermes; оператор их
+  не вызывает (`docs/decisions/0013-voice-note-integration.md` § 3.7).
 
 `--task` — формулировка упражнения, `--intent` — замысел говорящего (что он хотел выразить),
 если пользователь его назвал; текст из записи или транскрипта в них не подставляется. Оба поля —
