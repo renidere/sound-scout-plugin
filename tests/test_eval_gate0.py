@@ -2177,6 +2177,21 @@ def test_qolda_answer_is_the_text_after_think(content, reasoning, closed, valid)
         assert summary["observations"] == 0 and summary["unlocalized_observations"] == 0
 
 
+@pytest.mark.parametrize(
+    ("content", "answer"),
+    [
+        ("нет\n</think>\nнет", "нет"),
+        ("да\n</think>\nнет", "нет"),
+        ("нет\n</think>\n", gate0.INVALID),
+    ],
+)
+def test_qolda_p_answer_is_the_text_after_an_inner_think_end(content, answer) -> None:
+    # 0032 §4, request 21 (P on B2): `content` holds an inner `</think>`
+    for variant in ("P", "P-text"):
+        entry = {"variant": variant, "thinking": True}
+        assert gate0.answer_of(entry, _body(content, "думаю")) == answer
+
+
 def test_qolda_cut_answer_fails_its_item_and_think_is_read_only_for_thinking_entries() -> None:
     line = {"sent": True, "http_status": 200, "finish_reason": "length", "answer": "тишина"}
     assert not gate0._passed(line)
@@ -2397,6 +2412,9 @@ def test_qolda_decision_records_verdict_p1_p3_c_s_thinking_rss_latency_and_run_t
     assert "исчерпан в **7 из 12**" in thinking
     assert "**Пустой ответ после рассуждения — 4 из 42:**" in thinking
     assert "ответов с незакрытым `<think>` нет" in thinking
+    assert "`</think>` есть в 1 `content` из 42 — у запроса 21 (P на `B2`)" in thinking
+    assert "**Исправление (2026-11-27, #202).**" in thinking
+    assert "нет: в `content` нет ни `<think>`" not in thinking
     peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
     assert peak < gate0.RUNTIME_LIMITS["qolda"][1] < gate0.RSS_LIMIT_BYTES
     assert "`stop_reason: null`" in results and "`oom_kill 0`" in results
