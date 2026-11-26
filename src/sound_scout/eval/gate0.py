@@ -45,10 +45,18 @@ the Decision comment of #23 it copies. Three commands, `python -m sound_scout.ev
   `model` in every request), and its weights precondition is the host's receipt against the
   pinned files (docs/decisions/0026-gpu-stack.md).
 - `verdict --date D` recomputes the verdict from the saved answers alone (`decide`).
+- `prepare --date D --reuse D0 --gate-controls DIR --decision 0035` adds the gate controls
+  `G1`–`G4` (`GATE_CONTROLS`) to the copied clips and records the outcome of the VAD gate
+  (`vad_gate`) of every clip; `run --gate vad` asks the system "Silero VAD gate + closed
+  questions" (#200): no A, a clip without speech gets the gate's own answer and never reaches the
+  server.
 
 The rule is GATE0-RULE v1 (0007 section 3) or, only for the block `RULE_V2_SHA256` pins,
 GATE0-RULE v2 (0023 section 3): v2 asks P3 for max(0.8 F, 10) audio tokens per second of clip,
-where F is the runtime's `ENCODER_TOKENS_PER_S`, instead of v1's 20.
+where F is the runtime's `ENCODER_TOKENS_PER_S`, instead of v1's 20. GATE0-VAD-RULE v1 (0035
+section 2, only the block `RULE_VAD_SHA256` pins) judges the system "gate + model": C on the
+controls the gate closes, G on the gate controls it lets through, R on speech, S as in v1; it
+has no natural pairs and no READY.
 
 A test with a fake server proves this contract only, never what the model hears (CLAUDE.md).
 """
@@ -78,7 +86,20 @@ from pathlib import Path
 
 import numpy as np
 
-from sound_scout import asr, channels, config, guard, ingest, paths, prepare, proc, review, runs
+from sound_scout import (
+    acoustics,
+    asr,
+    channels,
+    config,
+    guard,
+    ingest,
+    paths,
+    prepare,
+    proc,
+    review,
+    runs,
+    smoke,
+)
 from sound_scout.eval import gate0_borealis, gate0_gigachat
 
 MODEL_REPO = "ggml-org/gemma-4-E4B-it-GGUF"
@@ -249,11 +270,18 @@ PROMPT_SHA256 = "53b9fd53bfeb1eb78b2b3a837824807563a84561b0bccc2e9cd1b1157a0917c
 DECISION_DOC = Path("docs/decisions/0007-gate0-result.md")
 RULE_BEGIN = "<!-- gate0-rule:begin -->"
 RULE_END = "<!-- gate0-rule:end -->"
-RULE_HEADERS = ("```text\nGATE0-RULE v1 ", "```text\nGATE0-RULE v2 ")
+RULE_HEADERS = (
+    "```text\nGATE0-RULE v1 ",
+    "```text\nGATE0-RULE v2 ",
+    "```text\nGATE0-VAD-RULE v1 ",
+)
 RULE_V1 = "GATE0-RULE v1"
 RULE_V2 = "GATE0-RULE v2"
+RULE_VAD = "GATE0-VAD-RULE v1"
 # the one GATE0-RULE v2 block, docs/decisions/0023-gate0-qwen3-omni.md section 3 (#144)
 RULE_V2_SHA256 = "3970b51359fa6d06973b7355b5d36042de7d2033d3ccb8190280d83cc92b9412"
+# the one GATE0-VAD-RULE v1 block, docs/decisions/0035-gate0-vad-qolda.md section 2 (#200)
+RULE_VAD_SHA256 = "6f37e11f0322de098a11b5c7bc6e8a43c233006a45c2bba78ac75bcbec476f95"
 
 SAMPLE_RATE = 16_000
 MAX_CLIPS = 10
@@ -284,6 +312,14 @@ NATURAL_PAIRS = 3
 NATURAL_TAKES = ("a", "b")
 PAIRS_FILE = "pairs.json"
 CONTROLS = ("S0", "N1", "T1")
+GATES = ("vad",)
+GATE_ANSWER = "gate:no_speech"
+# the system's answer when the gate keeps a clip from the model (GATE0-VAD-RULE v1)
+GATE_SYSTEM_ANSWERS = {"K1": "не речь", "K2": "не речь", "P": "нет речи"}
+GATE_CONTROLS = ("G1", "G2", "G3", "G4")
+GATE_SET_ROLES = {"G1": "rv-1", "G2": "rv-2"}
+GATE_KLATT_F0 = {"G3": 130.0, "G4": 180.0}
+SPEECH_ROLES = ("base", "variant")
 
 HOST = "127.0.0.1"
 CHAT_ROUTE = "/v1/chat/completions"
@@ -403,9 +439,13 @@ def rule_block(document: str) -> str:
     end = document.index(RULE_END)
     block = document[begin:end].strip()
     if end < begin or not block.startswith(RULE_HEADERS):
-        raise Gate0Error("the rule block does not start with GATE0-RULE v1 or v2")
+        raise Gate0Error(
+            "the rule block does not start with GATE0-RULE v1, v2 or GATE0-VAD-RULE v1"
+        )
     if block.startswith(RULE_HEADERS[1]) and _sha256_text(block) != RULE_V2_SHA256:
         raise Gate0Error("a GATE0-RULE v2 block must be the one of 0023 (RULE_V2_SHA256)")
+    if block.startswith(RULE_HEADERS[2]) and _sha256_text(block) != RULE_VAD_SHA256:
+        raise Gate0Error("a GATE0-VAD-RULE v1 block must be the one of 0035 (RULE_VAD_SHA256)")
     return block
 
 
@@ -418,14 +458,15 @@ def _sha256_text(text: str) -> str:
 
 
 def rule_name(rule_sha: str | None) -> str:
-    """GATE0-RULE v2 only for its one pinned block; every other block `rule_block` let in is v1."""
-    return RULE_V2 if rule_sha == RULE_V2_SHA256 else RULE_V1
+    """GATE0-RULE v2 and GATE0-VAD-RULE v1 only for their one pinned block each; every other
+    block `rule_block` let in is v1."""
+    return {RULE_V2_SHA256: RULE_V2, RULE_VAD_SHA256: RULE_VAD}.get(rule_sha, RULE_V1)
 
 
 def p3_rate(rule_sha: str | None, encoder_rate: float | None) -> float | None:
-    """Audio tokens per second of clip P3 asks for: 20 under v1, max(0.8 F, 10) under v2;
-    None under v2 without F."""
-    if rule_name(rule_sha) == RULE_V1:
+    """Audio tokens per second of clip P3 asks for: 20 under v1 and the VAD rule, max(0.8 F, 10)
+    under v2; None under v2 without F."""
+    if rule_name(rule_sha) != RULE_V2:
         return MIN_AUDIO_TOKENS_PER_S
     if encoder_rate is None:
         return None
@@ -524,6 +565,31 @@ def wav_pcm(data: bytes) -> bytes:
         if layout != (1, 2, SAMPLE_RATE):
             raise Gate0Error(f"clip WAV is {layout}, expected (1, 2, {SAMPLE_RATE})")
         return source.readframes(source.getnframes())
+
+
+def wav_samples(data: bytes) -> np.ndarray:
+    """The float samples of a clip WAV, as the model would get them."""
+    return np.frombuffer(wav_pcm(data), dtype="<i2").astype(np.float32) / 32768.0
+
+
+# --- the VAD gate (GATE0-VAD-RULE v1) ------------------------------------------------------
+
+
+def vad_gate(samples: np.ndarray) -> dict:
+    """Silero VAD over a 16 kHz clip with the settings of the `acoustics` stage: the clip goes to
+    the model when the detector finds at least `asr.MIN_VAD_SPEECH_S` of speech in all.
+    `acoustics.VadUnavailable` goes up: the gate fails closed and the run stops before the
+    server (#200)."""
+    started = time.monotonic()
+    spans = acoustics.speech_activity(samples, SAMPLE_RATE)
+    elapsed = time.monotonic() - started
+    speech_s = sum(span["end"] - span["start"] for span in spans)
+    return {
+        "spans": [{"start": span["start"], "end": span["end"]} for span in spans],
+        "speech_s": round(speech_s, 4),
+        "passed": speech_s >= asr.MIN_VAD_SPEECH_S,
+        "ms": round(1000 * elapsed, 1),
+    }
 
 
 def f0_medians(samples: np.ndarray, words: list[dict]) -> list[float | None]:
@@ -643,6 +709,8 @@ def prepare_clips(
     if controls_only and (sources is not None or natural is not None):
         raise Gate0Error("--controls-only takes no --sources or --natural")
     rule, prompt, out = _new_prepare(day, config_, decision)
+    if rule_name(rule) == RULE_VAD:
+        raise Gate0Error(f"{RULE_VAD} takes the clips of an earlier day: --reuse --gate-controls")
     prep_dir = _mkdir(out / PREP_DIR, config_)
     transcribe = transcribe or transcribe_source
     if controls_only:
@@ -693,18 +761,35 @@ def prepare_clips(
     return manifest
 
 
-def reuse_clips(day: str, config_: config.Config, *, source: str, decision: Path) -> dict:
+def reuse_clips(
+    day: str,
+    config_: config.Config,
+    *,
+    source: str,
+    decision: Path,
+    gate_controls: Path | None = None,
+) -> dict:
     """The clips and words of the prepare of day `source` under the rule of `decision`, in
     `<data_root>/<day>/`: each clip copied byte for byte after its SHA-256 matched that manifest.
     A new rule gets its own manifest, and the run sends exactly the stimuli an earlier run sent
-    (#144: `V2`, `V3` of 2026-11-19 came from an unseeded resynthesis, 0010 section 2.1)."""
+    (#144: `V2`, `V3` of 2026-11-19 came from an unseeded resynthesis, 0010 section 2.1).
+
+    `gate_controls` (the set directory of `gpu_ext`, under the data root) is for
+    GATE0-VAD-RULE v1 only, and that rule needs it: `G1`, `G2` are its reversed Piper phrases
+    `rv-1`, `rv-2` checked against the set's manifest, `G3`, `G4` KlattGrid vowels without words;
+    the manifest records the gate outcome of every clip (#200). Nothing is written when a check
+    fails."""
     rule, prompt, out = _new_prepare(day, config_, decision)
+    if (gate_controls is not None) != (rule_name(rule) == RULE_VAD):
+        raise Gate0Error(f"--gate-controls goes with {RULE_VAD} and only with it")
     origin = output_dir(source, config_)
     old = _read_json(origin / MANIFEST_FILE)
     if old["prompt"]["sha256"] != prompt.sha256 or old["questions_sha256"] != questions_sha256():
         raise Gate0Error(f"{source}/{MANIFEST_FILE} holds another prompt A or other questions")
     if old["rule_sha256"] == rule:
         raise Gate0Error(f"{source} already has this rule; --reuse is for a new rule (--decision)")
+    if gate_controls is not None and old.get("mode") != "synthetic":
+        raise Gate0Error(f"{RULE_VAD} has no natural pairs: reuse a synthetic day")
     words = _read_json(origin / WORDS_FILE)
     copies = []
     for clip in old["clips"]:
@@ -712,6 +797,17 @@ def reuse_clips(day: str, config_: config.Config, *, source: str, decision: Path
         if hashlib.sha256(data).hexdigest() != clip["wav_sha256"]:
             raise Gate0Error(f"{source}/{clip['file']} does not match its manifest; nothing copied")
         copies.append((clip["file"], data))
+    clips = old["clips"]
+    extra: dict = {}
+    if gate_controls is not None:
+        added, extra["gate_controls"] = _gate_controls(gate_controls, config_, old, words)
+        for clip_id, data, fields in added:
+            words[clip_id] = {"word": fields.pop("word")}
+            copies.append((f"{CLIPS_DIR}/{clip_id}.wav", data))
+            clips = [*clips, _clip_record(clip_id, data, fields)]
+        extra["gate"] = _gate_outcomes(clips, dict(copies))
+        extra["limits"] = {"max_model_clips": MAX_CLIPS, "max_clip_seconds": MAX_CLIP_SECONDS}
+        _check_gate_limits(clips, extra["gate"]["clips"])
     clips_dir = _mkdir(out / CLIPS_DIR, config_)
     for file, data in copies:
         with paths.open_output(clips_dir, Path(file).name, config_) as target:
@@ -722,6 +818,8 @@ def reuse_clips(day: str, config_: config.Config, *, source: str, decision: Path
         "created_at": _now(),
         "code": _code_identity(),
         "rule_sha256": rule,
+        "clips": clips,
+        **extra,
         "reused_from": {
             "date": source,
             "manifest_sha256": _sha256_file(origin / MANIFEST_FILE),
@@ -733,6 +831,83 @@ def reuse_clips(day: str, config_: config.Config, *, source: str, decision: Path
     _write_json(out, WORDS_FILE, words, config_)
     _write_json(out, MANIFEST_FILE, manifest, config_)
     return manifest
+
+
+def _gate_controls(directory: Path, config_, old: Mapping, words: Mapping) -> tuple[list, dict]:
+    """`G1`–`G4` as (id, WAV bytes, manifest fields with the word of P) and their provenance."""
+    directory = Path(directory).resolve()
+    if not directory.is_relative_to(config_.data_root):
+        raise Gate0Error("--gate-controls must be a set directory under the data root")
+    set_manifest = directory / MANIFEST_FILE
+    try:
+        by_role = {clip.get("role"): clip for clip in _read_json(set_manifest)["clips"]}
+    except (OSError, KeyError, AttributeError, TypeError, ValueError) as error:
+        raise Gate0Error(f"the set {directory.name} has no readable manifest: {error!r}") from None
+    added, provenance = [], {}
+    for clip_id, role in GATE_SET_ROLES.items():
+        clip = by_role.get(role)
+        if clip is None:
+            raise Gate0Error(f"the set {directory.name} has no clip {role}; nothing copied")
+        try:
+            data = (directory / clip["file"]).read_bytes()
+            if hashlib.sha256(data).hexdigest() != clip["wav_sha256"]:
+                raise Gate0Error(f"{directory.name}/{clip['file']} does not match its manifest")
+            fields = {"role": "gate_control", "origin": role, "word": clip["word"]}
+            provenance[clip_id] = {
+                "set_clip": clip["id"],
+                "role": role,
+                "wav_sha256": clip["wav_sha256"],
+            }
+        except (OSError, KeyError) as error:
+            raise Gate0Error(
+                f"the set {directory.name}, clip {role}: {error!r}; nothing copied"
+            ) from None
+        added.append((clip_id, data, fields))
+    pairs = [pair for pair in old["pairs"] if pair.get("target") is not None]
+    if not pairs:
+        raise Gate0Error("the reused day has no pair with a target word for P on G3 and G4")
+    control_word = words[pairs[0]["source"]]["target_word"]
+    for clip_id, f0 in GATE_KLATT_F0.items():
+        samples = smoke.speech_like_control(CONTROL_SECONDS, SAMPLE_RATE, f0=f0)
+        fields = {"role": "gate_control", "origin": "klattgrid", "word": control_word}
+        added.append((clip_id, wav_bytes(pcm16(samples)), fields))
+        provenance[clip_id] = {
+            "generator": "smoke.speech_like_control",
+            "seconds": CONTROL_SECONDS,
+            "f0_hz": f0,
+        }
+    return added, {
+        "set": directory.name,
+        "manifest_sha256": _sha256_file(set_manifest),
+        "clips": provenance,
+    }
+
+
+def _gate_outcomes(clips: list[Mapping], data_of: Mapping[str, bytes]) -> dict:
+    """The gate over every clip of the day, before any clip is written."""
+    outcomes = {}
+    for clip in clips:
+        try:
+            gate = vad_gate(wav_samples(data_of[clip["file"]]))
+        except acoustics.VadUnavailable as error:
+            raise Gate0Error(f"the VAD gate cannot run: {error.reason}") from None
+        outcomes[clip["id"]] = {key: gate[key] for key in ("spans", "speech_s", "passed")}
+    return {
+        "method": "acoustics.speech_activity",
+        "min_speech_s": asr.MIN_VAD_SPEECH_S,
+        "clips": outcomes,
+    }
+
+
+def _check_gate_limits(clips: list[Mapping], outcomes: Mapping[str, Mapping]) -> list[str]:
+    """The clips that reach the model, or `Gate0Error` over the owner's limit (P4)."""
+    passing = [clip for clip in clips if outcomes[clip["id"]]["passed"]]
+    if len(passing) > MAX_CLIPS:
+        raise Gate0Error(f"{len(passing)} clips pass the gate, the owner's limit is {MAX_CLIPS}")
+    too_long = [clip["id"] for clip in passing if clip["duration_s"] > MAX_CLIP_SECONDS]
+    if too_long:
+        raise Gate0Error(f"clips over {MAX_CLIP_SECONDS} s pass the gate: {too_long}")
+    return [clip["id"] for clip in passing]
 
 
 def _new_prepare(day: str, config_: config.Config, decision: Path) -> tuple:
@@ -869,16 +1044,19 @@ def _natural(natural: Path, prep_dir, config_) -> tuple:
 
 
 def _write_clip(clips_dir: Path, clip_id: str, samples, config_, **fields) -> dict:
-    pcm = pcm16(samples)
-    data = wav_bytes(pcm)
-    name = f"{clip_id}.wav"
-    with paths.open_output(clips_dir, name, config_) as out:
+    data = wav_bytes(pcm16(samples))
+    with paths.open_output(clips_dir, f"{clip_id}.wav", config_) as out:
         out.write(data)
+    return _clip_record(clip_id, data, fields)
+
+
+def _clip_record(clip_id: str, data: bytes, fields: Mapping) -> dict:
+    pcm = wav_pcm(data)
     frames = len(pcm) // 2
     return {
         "id": clip_id,
         **{key: value for key, value in fields.items() if value is not None},
-        "file": f"{CLIPS_DIR}/{name}",
+        "file": f"{CLIPS_DIR}/{clip_id}.wav",
         "sample_rate": SAMPLE_RATE,
         "frames": frames,
         "duration_s": frames / SAMPLE_RATE,
@@ -896,10 +1074,16 @@ def _scratch_run(prep_dir: Path, name: str, config_) -> runs.Run:
 
 
 def plan(
-    manifest: Mapping, words: Mapping, prompt: review.Prompt, runtime: str = "llama"
+    manifest: Mapping,
+    words: Mapping,
+    prompt: review.Prompt,
+    runtime: str = "llama",
+    gated: bool = False,
 ) -> list[dict]:
     """The fixed, ordered request list of the spike (E0 is separate and comes first); a
-    `THINKING` runtime gets the same requests with its token limits and reasoning budget."""
+    `THINKING` runtime gets the same requests with its token limits and reasoning budget.
+    `gated` (GATE0-VAD-RULE v1) asks closed questions only: P on the gate controls too, no A and
+    no A-text; the gate answers a clip without speech in place of the model at run time."""
     clips = manifest["clips"]
     by_id = {clip["id"]: clip for clip in clips}
     closed = []
@@ -936,6 +1120,11 @@ def plan(
     if control_word is not None:
         for clip_id in CONTROLS:
             closed.append(("P", clip_id, control_word[0], control_word[1], control_word[2], None))
+    if gated:
+        for clip_id in GATE_CONTROLS:
+            if clip_id in by_id:
+                closed.append(("P", clip_id, None, None, words[clip_id]["word"], None))
+        reviews = []
     entries = []
     for variant in ("K1", "K2"):
         entries += [_entry(variant, clip, QUESTIONS[variant], CLOSED_MAX_TOKENS) for clip in clips]
@@ -965,7 +1154,7 @@ def plan(
                         take=take,
                     )
                 )
-    for clip in clips:
+    for clip in [] if gated else clips:
         entries.append(
             _entry(
                 "A",
@@ -1386,8 +1575,14 @@ def run_spike(
     stop_check: Callable[[], str | None] | None = None,
     transport_check: Callable[[], str] | None = None,
     timeout_cap: Callable[[], float] | None = None,
+    gate: str | None = None,
 ) -> dict:
     """One attempt of the spike under `<data_root>/<day>/attempts/<k>/`; returns the verdict.
+
+    `gate="vad"` runs the system of GATE0-VAD-RULE v1 and needs a day of that rule: the gate runs
+    over every clip before the server starts (its outcome must match the manifest, at most
+    `MAX_CLIPS` clips reach the model, a VAD that cannot run stops the run), and a clip the gate
+    closes gets the trace line `gated` with the answer `GATE_ANSWER` and no HTTP call.
 
     The `vllm` runtime starts nothing: it talks to the server already listening on
     `server_port` (the SSH tunnel of `sound_scout.eval.vast`), and its weights precondition is
@@ -1399,6 +1594,9 @@ def run_spike(
     (the stack keeps a request from running far past its soft end)."""
     if runtime not in RUNTIMES:
         raise Gate0Error(f"--runtime must be one of {RUNTIMES}, got {runtime!r}")
+    if gate is not None and gate not in GATES:
+        raise Gate0Error(f"--gate must be one of {GATES}, got {gate!r}")
+    gated = gate == "vad"
     if runtime == "vllm":
         if served_model not in VLLM_MODELS:
             raise Gate0Error(f"--served-model must be one of {VLLM_MODELS}, got {served_model!r}")
@@ -1435,6 +1633,8 @@ def run_spike(
     except (OSError, UnicodeDecodeError) as error:
         reason = getattr(error, "strerror", None) or error
         raise Gate0Error(f"cannot read the decision document {decision.name}: {reason}") from None
+    if gated != (rule_name(manifest.get("rule_sha256")) == RULE_VAD):
+        raise Gate0Error(f"--gate vad goes with a day of {RULE_VAD} and only with it")
     encoder_rate = ENCODER_TOKENS_PER_S.get(served_model if runtime == "vllm" else runtime)
     if p3_rate(rule, encoder_rate) is None:
         raise Gate0Error(
@@ -1459,6 +1659,7 @@ def run_spike(
         "served_model": served_model,
         "remote": None if remote is None else dict(remote),
         "rule": rule_name(rule),
+        "gate_mode": gate,
         "encoder_tokens_per_s": encoder_rate,
         "cgroup": cgroup,
         "host_memory": host,
@@ -1491,6 +1692,9 @@ def run_spike(
             QOLDA_LLAMA_COMMIT in (server_version or "")
         )
         record["server_binary"] = {"sha256": binary_sha256, "version": server_version}
+    gates: dict = {}
+    if gated:
+        gates = _run_gate(out, manifest, checks, record)
     record["preconditions"] = {
         "checks": checks,
         "weights_sha256": found,
@@ -1504,7 +1708,7 @@ def run_spike(
         failed = [name for name, passed in checks.items() if not passed]
         raise Gate0Error(f"run refused before the server start: {failed} do not match")
 
-    entries = plan(manifest, words, prompt, runtime)
+    entries = plan(manifest, words, prompt, runtime, gated=gated)
     others = _other_inference()
     threads = threads or (THREADS_BUSY if others else THREADS_IDLE)
     port = server_port if runtime == "vllm" else _free_port()
@@ -1544,6 +1748,7 @@ def run_spike(
             },
             "sampling": sampling(runtime),
             "requests_planned": len(entries),
+            "requests_to_model": sum(not _gated(entry, gates) for entry in entries),
         }
     )
     _mkdir(attempt / REQUESTS_DIR, config_)
@@ -1567,6 +1772,12 @@ def run_spike(
                     record["server_version"] = _vllm_version(client)
                 _trace(trace, _empty_input(client))
                 for entry in entries:
+                    if _gated(entry, gates):
+                        # the system answers without the model: no request file, no HTTP call
+                        gate_line = {"sent": False, "gated": True, "answer": GATE_ANSWER}
+                        gate_line["gate"] = _gate_trace(gates[entry["clip"]])
+                        _trace(trace, {**_trace_keys(entry), **gate_line})
+                        continue
                     if stop_reason is None and stop_check is not None:
                         stop_reason = stop_check()
                     if stop_reason is not None:
@@ -1597,6 +1808,8 @@ def run_spike(
                         return line
 
                     line, transport_stop = send_checked(send, transport_check)
+                    if entry["clip"] in gates:
+                        line["gate"] = _gate_trace(gates[entry["clip"]])
                     _trace(trace, line)
                     exited = process is not None and process.poll() is not None
                     stop_reason = (
@@ -1634,6 +1847,52 @@ def run_spike(
     result = evaluate(attempt)
     _write_json(attempt, VERDICT_FILE, result, config_)
     return result
+
+
+def _run_gate(out: Path, manifest: Mapping, checks: dict, record: dict) -> dict:
+    """The gate over every clip before the server starts, into `record["gate"]` and the checks
+    P4 reads: `vad` (the detector ran), `gate_manifest` (each outcome is the manifest's),
+    `gate_limit` (at most `MAX_CLIPS` clips reach the model, each within `MAX_CLIP_SECONDS`)."""
+    gates, reason = {}, None
+    if checks["clips"]:
+        try:
+            for clip in manifest["clips"]:
+                gates[clip["id"]] = vad_gate(wav_samples((out / clip["file"]).read_bytes()))
+        except acoustics.VadUnavailable as error:
+            gates, reason = {}, error.reason
+    else:
+        reason = "the clips do not match the manifest; the gate did not run"
+    recorded = (manifest.get("gate") or {}).get("clips") or {}
+    checks["vad"] = bool(gates)
+    checks["gate_manifest"] = (
+        bool(gates)
+        and set(recorded) == set(gates)
+        and all(
+            recorded[clip_id].get("passed") is gate["passed"] for clip_id, gate in gates.items()
+        )
+    )
+    model_clips = [clip for clip in manifest["clips"] if gates.get(clip["id"], {}).get("passed")]
+    checks["gate_limit"] = (
+        bool(gates)
+        and len(model_clips) <= MAX_CLIPS
+        and all(clip["duration_s"] <= MAX_CLIP_SECONDS for clip in model_clips)
+    )
+    record["gate"] = {
+        "method": "acoustics.speech_activity",
+        "min_speech_s": asr.MIN_VAD_SPEECH_S,
+        "reason": reason,
+        "clips": gates,
+        "model_clips": [clip["id"] for clip in model_clips],
+    }
+    return gates
+
+
+def _gated(entry: Mapping, gates: Mapping[str, Mapping]) -> bool:
+    return entry["clip"] in gates and not gates[entry["clip"]]["passed"]
+
+
+def _gate_trace(gate: Mapping) -> dict:
+    return {key: gate[key] for key in ("speech_s", "spans", "ms")}
 
 
 def _wait_ready(client: Client, process, watch, timeout: float) -> str | None:
@@ -1856,7 +2115,8 @@ def evaluate(attempt: Path) -> dict:
 
 def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
     """The rule the manifest names over the trace of one attempt: GATE0-RULE v1
-    (docs/decisions/0007, section 3) or v2 (docs/decisions/0023, section 3), which differ in P3."""
+    (docs/decisions/0007, section 3) or v2 (docs/decisions/0023, section 3), which differ in P3,
+    or GATE0-VAD-RULE v1 (docs/decisions/0035, section 2: `_decide_vad`)."""
     by_key = {(line["variant"], line["clip"], line.get("take")): line for line in lines}
     e0 = by_key.get(("E0", "E0", None))
     checks = (record.get("preconditions") or {}).get("checks") or {}
@@ -1868,6 +2128,9 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
         "P2": checks.get("weights") is True and checks.get("prompt") is True,
         "P3": route["passed"],
     }
+    if rule_name(rule) == RULE_VAD:
+        result = _decide_vad(manifest, record, lines, preconditions, route)
+        return _incomplete(result, record, lines)
     take = "a" if manifest["mode"] == "natural" else None
     controls = []
     for clip in CONTROLS:
@@ -1948,6 +2211,118 @@ def decide(manifest: Mapping, record: Mapping, lines: list[Mapping]) -> dict:
     else:
         result["verdict"], result["reason"] = outcome, held_reason
     return _incomplete(result, record, lines)
+
+
+def _decide_vad(
+    manifest: Mapping, record: Mapping, lines: list[Mapping], preconditions: dict, route: dict
+) -> dict:
+    """GATE0-VAD-RULE v1: the answer of the system (the gate's own on a clip it closed, the
+    model's otherwise) over C (9 items), G (4), R (12) and S; P4 adds the gate to P1–P3. The rule
+    has no natural pairs: its best verdict is HELD (0035 section 1.4)."""
+    if manifest["mode"] != "synthetic":
+        raise Gate0Error(f"{RULE_VAD} has no natural pairs; this day is {manifest['mode']}")
+    by_key = {(line["variant"], line["clip"], line.get("take")): line for line in lines}
+    checks = (record.get("preconditions") or {}).get("checks") or {}
+    closed = {
+        clip_id
+        for clip_id, gate in ((record.get("gate") or {}).get("clips") or {}).items()
+        if not gate.get("passed")
+    }
+    sent_closed = [line["n"] for line in lines if line.get("clip") in closed and line.get("sent")]
+    preconditions["P4"] = (
+        all(checks.get(name) is True for name in ("vad", "gate_manifest", "gate_limit"))
+        and not sent_closed
+    )
+
+    def system(variant: str, clip: str, take_: str | None = None) -> tuple[str, bool]:
+        line = by_key.get((variant, clip, take_))
+        if line is not None and line.get("gated") and not line.get("sent"):
+            return GATE_SYSTEM_ANSWERS[variant], True
+        return _closed(line), False
+
+    controls = []
+    for clip in CONTROLS:
+        for variant in ("K1", "K2", "P"):
+            answer, gated = system(variant, clip)
+            passed = (
+                answer not in ("речь", INVALID) if variant != "P" else answer in ("нет", "нет речи")
+            )
+            controls.append(
+                {
+                    "clip": clip,
+                    "variant": variant,
+                    "answer": answer,
+                    "gated": gated,
+                    "passed": passed,
+                }
+            )
+    gate_controls = []
+    for clip in GATE_CONTROLS:
+        answer, gated = system("P", clip)
+        passed = not gated and answer in ("нет", "нет речи")
+        gate_controls.append({"clip": clip, "answer": answer, "gated": gated, "passed": passed})
+    speech = []
+    for clip in [clip["id"] for clip in manifest["clips"] if clip.get("role") in SPEECH_ROLES]:
+        for variant in ("K1", "K2"):
+            answer, gated = system(variant, clip)
+            passed = not gated and answer == "речь"
+            speech.append(
+                {
+                    "clip": clip,
+                    "variant": variant,
+                    "answer": answer,
+                    "gated": gated,
+                    "passed": passed,
+                }
+            )
+    result: dict = {
+        "rule": RULE_VAD,
+        "mode": manifest["mode"],
+        "preconditions": preconditions,
+        "audio_route": route,
+        "gate": record.get("gate"),
+        "controls": controls,
+        "C": all(item["passed"] for item in controls),
+        "gate_controls": gate_controls,
+        "G": all(item["passed"] for item in gate_controls),
+        "speech": speech,
+        "R": bool(speech) and all(item["passed"] for item in speech),
+        "stop_reason": record.get("stop_reason"),
+    }
+    pairs = []
+    for pair in manifest["pairs"]:
+        answers = {
+            "base": system("P", pair["base"])[0],
+            "variant": system("P", pair["variant"])[0],
+        }
+        distinguished = (
+            pair["target"] is not None and answers["variant"] == "да" and answers["base"] == "нет"
+        )
+        pairs.append({"pair": pair["pair"], **answers, "distinguished": distinguished})
+    result["synthetic_pairs"] = pairs
+    result["S"] = sum(item["distinguished"] for item in pairs) >= 2
+    reasons = []
+    for name, items in (("C", controls), ("G", gate_controls), ("R", speech)):
+        if not result[name]:
+            failed = [
+                f"{item.get('variant', 'P')}({item['clip']})"
+                for item in items
+                if not item["passed"]
+            ]
+            reasons.append(f"{name}: не прошли {len(failed)} из {len(items)} пунктов: {failed}")
+    if not result["S"]:
+        reasons.append("S: различено меньше 2 из 3 синтетических пар")
+    if manifest.get("controls_only"):
+        result["verdict"], result["reason"] = "not_applicable", "controls_only"
+    elif not all(preconditions.values()):
+        failed = [name for name, passed in preconditions.items() if not passed]
+        result["verdict"], result["reason"] = "NOT READY", f"протокол не выполнен: {failed}"
+    elif reasons:
+        result["verdict"], result["reason"] = "NOT READY", "; ".join(reasons)
+    else:
+        result["verdict"] = "HELD"
+        result["reason"] = "C, G, R и S проходят: нет вердикта без естественных пар"
+    return result
 
 
 RULE_STOPS = frozenset({"request_timeout", "rss_limit", "precondition_failed"})
@@ -2191,6 +2566,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.choices["prepare"].add_argument("--natural", type=Path)
     commands.choices["prepare"].add_argument("--reuse", metavar="DATE")
     commands.choices["prepare"].add_argument("--controls-only", action="store_true")
+    commands.choices["prepare"].add_argument("--gate-controls", type=Path, metavar="DIR")
     commands.choices["run"].add_argument("--runtime", choices=RUNTIMES, default="llama")
     commands.choices["run"].add_argument("--model-dir", type=Path)
     commands.choices["run"].add_argument("--llama-dir", type=Path, default=DEFAULT_LLAMA_DIR)
@@ -2198,6 +2574,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.choices["run"].add_argument("--server-port", type=int)
     commands.choices["run"].add_argument("--served-model", choices=VLLM_MODELS)
     commands.choices["run"].add_argument("--weights-receipt", type=Path)
+    commands.choices["run"].add_argument("--gate", choices=GATES)
     commands.choices["verdict"].add_argument("--attempt")
     args = parser.parse_args(argv)
     try:
@@ -2208,9 +2585,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise Gate0Error(
                     "--reuse copies clips; it takes no --sources, --natural or --controls-only"
                 )
+            if args.gate_controls is not None and args.reuse is None:
+                raise Gate0Error("--gate-controls adds clips to a reused day: it needs --reuse")
             if args.reuse is not None:
                 manifest = reuse_clips(
-                    args.date, config_, source=args.reuse, decision=args.decision
+                    args.date,
+                    config_,
+                    source=args.reuse,
+                    decision=args.decision,
+                    gate_controls=args.gate_controls,
                 )
             else:
                 manifest = prepare_clips(
@@ -2221,8 +2604,12 @@ def main(argv: list[str] | None = None) -> int:
                     decision=args.decision,
                     controls_only=args.controls_only,
                 )
+            gate = (manifest.get("gate") or {}).get("clips") or {}
             for clip in manifest["clips"]:
-                print(json.dumps({k: clip[k] for k in ("id", "duration_s", "pcm_sha256")}))
+                shown = {k: clip[k] for k in ("id", "duration_s", "pcm_sha256")}
+                if clip["id"] in gate:
+                    shown.update({k: gate[clip["id"]][k] for k in ("passed", "speech_s")})
+                print(json.dumps(shown))
             for pair in manifest["pairs"]:
                 print(json.dumps({k: v for k, v in pair.items() if k != "f0_median_hz"}))
             return 0
@@ -2238,6 +2625,7 @@ def main(argv: list[str] | None = None) -> int:
                 server_port=args.server_port,
                 served_model=args.served_model,
                 weights_receipt=args.weights_receipt,
+                gate=args.gate,
             )
         else:
             guard.install_network_guard(config_)

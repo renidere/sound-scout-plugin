@@ -2876,3 +2876,417 @@ def test_a_broken_http_answer_is_no_answer_for_the_transport_check(reply, kind) 
         listener.close()
     assert (status, raw) == (None, None) and kind in error
     assert gate0.transport_error({"sent": True, "http_status": status, "error": error})
+
+
+# --- GATE0-VAD-RULE v1: the VAD gate in front of the model (#200) ---------------------------
+
+VAD_DOC = Path("docs/decisions/0035-gate0-vad-qolda.md")
+VAD_DAY = "2026-11-26"
+
+
+@pytest.mark.parametrize(
+    ("make", "passed"),
+    [
+        (gate0.silence, False),
+        (gate0.pink_noise, False),
+        (gate0.tone, False),
+        (lambda: speech_like_control(10.0, gate0.SAMPLE_RATE, f0=130.0), True),
+    ],
+    ids=["silence", "noise", "tone", "klattgrid"],
+)
+def test_vad_gate_closes_silence_noise_and_tone_and_opens_on_a_voice(make, passed) -> None:
+    # the real Silero VAD of the acoustics stage, not a mock
+    gate = gate0.vad_gate(make())
+    assert gate["passed"] is passed
+    assert (gate["speech_s"] >= gate0.asr.MIN_VAD_SPEECH_S) is passed
+    assert gate["spans"] == [] if not passed else gate["spans"]
+    assert gate["ms"] >= 0
+
+
+def test_vad_rule_block_of_0035_is_pinned_and_says_the_owner_must_accept_it() -> None:
+    document = (REPO / VAD_DOC).read_text(encoding="utf-8")
+    recorded = re.search(r"SHA-256 блока: `([0-9a-f]{64})`", document).group(1)
+    assert gate0.rule_sha256(document) == recorded == gate0.RULE_VAD_SHA256
+    assert gate0.rule_name(gate0.RULE_VAD_SHA256) == gate0.RULE_VAD
+    assert gate0.p3_rate(gate0.RULE_VAD_SHA256, None) == 20.0
+    block = gate0.rule_block(document)
+    assert "только после принятия владельцем" in block and "\nA нет." in block
+    assert "только после принятия правила владельцем" in document
+    assert "не чинит слух просодии" in document
+    assert not re.search(r"/(home|Users)/", document)
+
+
+def test_a_vad_rule_block_other_than_the_pinned_one_is_refused() -> None:
+    document = (REPO / VAD_DOC).read_text(encoding="utf-8")
+    edited = document.replace("(9 пунктов, проходят все 9)", "(9 пунктов, проходят 8)")
+    assert edited != document
+    with pytest.raises(gate0.Gate0Error, match="RULE_VAD_SHA256"):
+        gate0.rule_block(edited)
+
+
+def _gate_set(data_root: Path) -> Path:
+    """A gpu_ext-like set under the data root with the two reversed phrases G1 and G2 copy."""
+    directory = data_root / "gpu-ext-test"
+    (directory / gate0.CLIPS_DIR).mkdir(parents=True)
+    clips = []
+    for number, (role, f0) in enumerate((("rv-1", 150.0), ("rv-2", 200.0)), 1):
+        voice = speech_like_control(3.0, gate0.SAMPLE_RATE, f0=f0)[::-1]
+        data = gate0.wav_bytes(gate0.pcm16(voice))
+        name = f"{gate0.CLIPS_DIR}/E-{number}.wav"
+        (directory / name).write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
+        clips.append(
+            {
+                "id": f"E-{number}",
+                "role": role,
+                "file": name,
+                "wav_sha256": sha,
+                "word": f"слово{number}",
+            }
+        )
+    clips.append({"id": "E-9", "role": "silence-3", "file": "clips/none.wav", "wav_sha256": "0"})
+    (directory / gate0.MANIFEST_FILE).write_text(json.dumps({"clips": clips}), encoding="utf-8")
+    return directory
+
+
+@pytest.fixture
+def vad_day(spike) -> dict:
+    """The fake spike day reused under the real GATE0-VAD-RULE v1 block with G1–G4."""
+    gate_set = _gate_set(spike["config"].data_root)
+    manifest = gate0.reuse_clips(
+        VAD_DAY,
+        spike["config"],
+        source="2026-11-18",
+        decision=REPO / VAD_DOC,
+        gate_controls=gate_set,
+    )
+    out = spike["config"].data_root / VAD_DAY
+    kwargs = {**spike["kwargs"], "decision": REPO / VAD_DOC}
+    return {**spike, "manifest": manifest, "out": out, "kwargs": kwargs, "set": gate_set}
+
+
+def test_reuse_with_gate_controls_adds_g1_to_g4_and_records_the_gate_of_every_clip(
+    vad_day,
+) -> None:
+    manifest, out = vad_day["manifest"], vad_day["out"]
+    ids = [clip["id"] for clip in manifest["clips"]]
+    assert ids == ["B1", "V1", "B2", "V2", "B3", "V3", "S0", "N1", "T1", "G1", "G2", "G3", "G4"]
+    assert manifest["rule_sha256"] == gate0.RULE_VAD_SHA256
+    gate = manifest["gate"]["clips"]
+    assert {clip_id for clip_id, item in gate.items() if not item["passed"]} == set(gate0.CONTROLS)
+    assert all(gate[clip_id]["speech_s"] == 0 for clip_id in gate0.CONTROLS)
+    set_clips = json.loads((vad_day["set"] / gate0.MANIFEST_FILE).read_text())["clips"]
+    for clip_id, source in (("G1", set_clips[0]), ("G2", set_clips[1])):
+        data = (out / gate0.CLIPS_DIR / f"{clip_id}.wav").read_bytes()
+        assert data == (vad_day["set"] / source["file"]).read_bytes()
+        assert manifest["gate_controls"]["clips"][clip_id]["set_clip"] == source["id"]
+    assert manifest["gate_controls"]["clips"]["G4"]["f0_hz"] == 180.0
+    for clip in manifest["clips"]:
+        data = (out / clip["file"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == clip["wav_sha256"]
+        assert "word" not in clip
+    words = json.loads((out / gate0.WORDS_FILE).read_text(encoding="utf-8"))
+    assert words["G1"] == {"word": "слово1"} and words["G3"] == {"word": "два"}
+
+
+def test_reuse_refuses_a_gate_control_that_does_not_match_its_set_and_writes_nothing(
+    spike,
+) -> None:
+    gate_set = _gate_set(spike["config"].data_root)
+    (gate_set / gate0.CLIPS_DIR / "E-2.wav").write_bytes(b"edited")
+    with pytest.raises(gate0.Gate0Error, match="does not match its manifest"):
+        gate0.reuse_clips(
+            VAD_DAY, spike["config"], source="2026-11-18", decision=REPO / VAD_DOC,
+            gate_controls=gate_set,
+        )  # fmt: skip
+    assert not (spike["config"].data_root / VAD_DAY / gate0.CLIPS_DIR).exists()
+
+
+def test_gate_controls_go_with_the_vad_rule_and_only_with_it(spike) -> None:
+    gate_set = _gate_set(spike["config"].data_root)
+    with pytest.raises(gate0.Gate0Error, match="--gate-controls goes with"):
+        gate0.reuse_clips(VAD_DAY, spike["config"], source="2026-11-18", decision=REPO / VAD_DOC)
+    with pytest.raises(gate0.Gate0Error, match="--gate-controls goes with"):
+        gate0.reuse_clips(
+            "2026-11-27", spike["config"], source="2026-11-18", decision=REPO / QOLDA_DOC,
+            gate_controls=gate_set,
+        )  # fmt: skip
+    with pytest.raises(gate0.Gate0Error, match="--reuse --gate-controls"):
+        gate0.prepare_clips("2026-11-28", spike["config"], decision=REPO / VAD_DOC)
+
+
+def test_reuse_with_gate_controls_refuses_a_natural_day(spike) -> None:
+    gate_set = _gate_set(spike["config"].data_root)
+    path = spike["config"].data_root / "2026-11-18" / gate0.MANIFEST_FILE
+    path.write_text(json.dumps({**json.loads(path.read_text()), "mode": "natural"}))
+    with pytest.raises(gate0.Gate0Error, match="has no natural pairs"):
+        gate0.reuse_clips(
+            VAD_DAY, spike["config"], source="2026-11-18", decision=REPO / VAD_DOC,
+            gate_controls=gate_set,
+        )  # fmt: skip
+    assert not (spike["config"].data_root / VAD_DAY / gate0.CLIPS_DIR).exists()
+
+
+def test_reuse_with_gate_controls_fails_closed_without_the_vad(spike, monkeypatch) -> None:
+    gate_set = _gate_set(spike["config"].data_root)
+    monkeypatch.setattr(gate0.acoustics, "speech_activity", _no_vad)
+    with pytest.raises(gate0.Gate0Error, match="the VAD gate cannot run: onnxruntime"):
+        gate0.reuse_clips(
+            VAD_DAY, spike["config"], source="2026-11-18", decision=REPO / VAD_DOC,
+            gate_controls=gate_set,
+        )  # fmt: skip
+    assert not (spike["config"].data_root / VAD_DAY / gate0.CLIPS_DIR).exists()
+
+
+@pytest.mark.parametrize("break_it", ["missing-wav", "missing-key", "no-manifest", "bad-manifest"])
+def test_reuse_refuses_a_broken_gate_set_without_a_traceback(spike, break_it) -> None:
+    gate_set = _gate_set(spike["config"].data_root)
+    path = gate_set / gate0.MANIFEST_FILE
+    manifest = json.loads(path.read_text())
+    if break_it == "missing-wav":
+        (gate_set / manifest["clips"][1]["file"]).unlink()
+    elif break_it == "missing-key":
+        del manifest["clips"][0]["word"]
+        path.write_text(json.dumps(manifest))
+    elif break_it == "no-manifest":
+        path.unlink()
+    else:
+        path.write_text(json.dumps({"files": []}))
+    match = "is missing" if break_it == "no-manifest" else f"the set {gate_set.name}"
+    with pytest.raises(gate0.Gate0Error, match=match):
+        gate0.reuse_clips(
+            VAD_DAY, spike["config"], source="2026-11-18", decision=REPO / VAD_DOC,
+            gate_controls=gate_set,
+        )  # fmt: skip
+    assert not (spike["config"].data_root / VAD_DAY / gate0.CLIPS_DIR).exists()
+
+
+def test_gated_plan_asks_closed_questions_only_with_p_on_the_gate_controls(vad_day) -> None:
+    words = json.loads((vad_day["out"] / gate0.WORDS_FILE).read_text(encoding="utf-8"))
+    entries = gate0.plan(vad_day["manifest"], words, review.load_prompt(), "qolda", gated=True)
+    order = [e["variant"] for e in entries]
+    assert order == ["K1"] * 13 + ["K2"] * 13 + ["P"] * 13 + ["P-text"] * 3
+    assert [e["n"] for e in entries] == list(range(1, 43))
+    p_on_g = {e["clip"]: e["text"] for e in entries if e["variant"] == "P" and e["clip"][0] == "G"}
+    assert "«слово1»" in p_on_g["G1"] and "«слово2»" in p_on_g["G2"]
+    assert "«два»" in p_on_g["G3"] and "«два»" in p_on_g["G4"]
+    assert all(e["max_tokens"] == 528 and e["reasoning_budget_tokens"] == 512 for e in entries)
+    assert not any(e["json_response"] for e in entries)
+    ungated = gate0.plan(vad_day["manifest"], words, review.load_prompt())
+    assert {"A", "A-text"} <= {e["variant"] for e in ungated}
+
+
+@pytest.mark.slow
+def test_gated_run_sends_no_clip_without_speech_and_the_gate_answers_for_it(vad_day) -> None:
+    result = gate0.run_spike(VAD_DAY, vad_day["config"], gate="vad", **vad_day["kwargs"])
+    attempt = vad_day["out"] / gate0.ATTEMPTS_DIR / "1"
+    lines = [json.loads(t) for t in (attempt / gate0.TRACE_FILE).read_text().splitlines()]
+    assert len(lines) == 43
+    gated = [line for line in lines if line.get("gated")]
+    assert sorted((line["variant"], line["clip"]) for line in gated) == sorted(
+        (variant, clip) for clip in gate0.CONTROLS for variant in ("K1", "K2", "P")
+    )
+    assert all(line["sent"] is False and line["answer"] == gate0.GATE_ANSWER for line in gated)
+    assert all(line["gate"]["speech_s"] == 0 for line in gated)
+    by_id = {clip["id"]: clip for clip in vad_day["manifest"]["clips"]}
+    received = vad_day["received"].read_text().split()
+    assert len(received) == 30
+    assert not {by_id[clip]["pcm_sha256"] for clip in gate0.CONTROLS} & set(received)
+    sent_audio = [line for line in lines if line.get("sent") and line["modality"] == "audio"]
+    assert all(line["gate"]["speech_s"] > 0 for line in sent_audio)
+    requests = {path.name for path in (attempt / gate0.REQUESTS_DIR).iterdir()}
+    assert len(requests) == 33 and not {f"{line['n']}.json" for line in gated} & requests
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    assert record["requests_planned"] == 42 and record["requests_to_model"] == 33
+    assert record["http_calls"] >= 33 and record["gate_mode"] == "vad"
+    assert sorted(record["gate"]["model_clips"]) == sorted(set(by_id) - set(gate0.CONTROLS))
+    # the fake server answers «Речь.» to everything: the gate keeps C, P on G is invalid
+    assert result["rule"] == gate0.RULE_VAD and result["C"] and result["R"]
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True, "P4": True}
+    assert not result["G"] and not result["S"] and result["verdict"] == "NOT READY"
+    assert result["reason"].startswith("G: не прошли 4 из 4 пунктов") and "S:" in result["reason"]
+    assert gate0.evaluate(attempt) == json.loads((attempt / gate0.VERDICT_FILE).read_text())
+
+
+def _no_vad(samples, rate):
+    raise gate0.acoustics.VadUnavailable("onnxruntime is not installed")
+
+
+@pytest.mark.parametrize(
+    ("break_it", "failed"),
+    [
+        ("vad", ["vad", "gate_manifest", "gate_limit"]),
+        ("manifest", ["gate_manifest"]),
+        ("limit", ["gate_limit"]),
+    ],
+)
+def test_a_broken_gate_stops_the_run_before_the_server_and_fails_p4(
+    vad_day, monkeypatch, break_it, failed
+) -> None:
+    if break_it == "vad":
+        monkeypatch.setattr(gate0.acoustics, "speech_activity", _no_vad)
+    elif break_it == "manifest":
+        path = vad_day["out"] / gate0.MANIFEST_FILE
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["gate"]["clips"]["N1"]["passed"] = True
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        # ten clips pass the gate: a limit of nine is the eleventh clip of the owner's ten
+        monkeypatch.setattr(gate0, "MAX_CLIPS", 9)
+    with pytest.raises(gate0.Gate0Error, match="before the server start"):
+        gate0.run_spike(VAD_DAY, vad_day["config"], gate="vad", **vad_day["kwargs"])
+    assert not vad_day["marker"].exists()
+    attempt = vad_day["out"] / gate0.ATTEMPTS_DIR / "1"
+    record = json.loads((attempt / gate0.RUN_FILE).read_text())
+    checks = record["preconditions"]["checks"]
+    assert record["stop_reason"] == "precondition_failed"
+    assert {name for name, passed in checks.items() if not passed} == set(failed)
+    verdict = json.loads((attempt / gate0.VERDICT_FILE).read_text())
+    assert verdict["verdict"] == "NOT READY" and verdict["preconditions"]["P4"] is False
+
+
+def test_gate_vad_needs_a_vad_day_and_a_vad_day_needs_gate_vad(vad_day, spike) -> None:
+    with pytest.raises(gate0.Gate0Error, match="--gate vad goes with"):
+        gate0.run_spike("2026-11-18", spike["config"], gate="vad", **spike["kwargs"])
+    with pytest.raises(gate0.Gate0Error, match="--gate vad goes with"):
+        gate0.run_spike(VAD_DAY, vad_day["config"], **vad_day["kwargs"])
+    with pytest.raises(gate0.Gate0Error, match="--gate must be one of"):
+        gate0.run_spike(VAD_DAY, vad_day["config"], gate="energy", **vad_day["kwargs"])
+    for day in ("2026-11-18", VAD_DAY):
+        assert not (spike["config"].data_root / day / gate0.ATTEMPTS_DIR).exists()
+
+
+def test_cli_refuses_gate_controls_without_reuse(spike, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(gate0.config, "load", lambda: spike["config"])
+    monkeypatch.setattr(gate0.guard, "install_network_guard", lambda config_: None)
+    argv = ["prepare", "--date", VAD_DAY, "--gate-controls", "x", "--decision", str(REPO / VAD_DOC)]
+    assert gate0.main(argv) == 2
+    assert "needs --reuse" in capsys.readouterr().err
+
+
+def _vad_manifest() -> dict:
+    manifest = _synthetic_manifest()
+    for clip in manifest["clips"]:
+        if clip["id"] not in gate0.CONTROLS:
+            clip["role"] = "base"
+    manifest["clips"] += [{"id": clip, "role": "gate_control"} for clip in gate0.GATE_CONTROLS]
+    manifest["rule_sha256"] = gate0.RULE_VAD_SHA256
+    return manifest
+
+
+def _vad_record(manifest: dict) -> dict:
+    gate = {clip["id"]: {"passed": clip["id"] not in gate0.CONTROLS} for clip in manifest["clips"]}
+    checks = {"weights": True, "prompt": True, "vad": True, "gate_manifest": True}
+    return {"preconditions": {"checks": {**checks, "gate_limit": True}}, "gate": {"clips": gate}}
+
+
+def _gated(variant, clip, take=None):
+    return {"n": 1, "variant": variant, "clip": clip, "take": take, "modality": "audio",
+            "sent": False, "gated": True, "answer": gate0.GATE_ANSWER}  # fmt: skip
+
+
+def _vad_lines(manifest: dict) -> list[dict]:
+    lines = [{"variant": "E0", "clip": "E0", "rejected": True, "server_calls": 0, "sent": False}]
+    for clip in gate0.CONTROLS:
+        lines += [_gated("K1", clip), _gated("K2", clip), _gated("P", clip)]
+    for clip in gate0.GATE_CONTROLS:
+        lines += [_line("K1", clip, "шум"), _line("P", clip, "нет речи")]
+    for clip in manifest["clips"]:
+        if clip.get("role") in gate0.SPEECH_ROLES:
+            lines += [_line("K1", clip["id"], "речь"), _line("K2", clip["id"], "речь")]
+    for i in (1, 2, 3):
+        lines += [_line("P", f"B{i}", "нет"), _line("P", f"V{i}", "да")]
+    return lines
+
+
+def _vad_decide(lines, manifest=None, record=None) -> dict:
+    manifest = manifest or _vad_manifest()
+    return gate0.decide(manifest, record or _vad_record(manifest), lines)
+
+
+def _replace(lines, variant, clip, line):
+    return [line if (old["variant"], old["clip"]) == (variant, clip) else old for old in lines]
+
+
+def test_vad_rule_with_c_g_r_and_s_passing_is_held_and_never_ready() -> None:
+    result = _vad_decide(_vad_lines(_vad_manifest()))
+    assert (result["verdict"], result["rule"]) == ("HELD", gate0.RULE_VAD)
+    assert result["preconditions"] == {"P1": True, "P2": True, "P3": True, "P4": True}
+    assert len(result["controls"]) == 9 and len(result["gate_controls"]) == 4
+    assert len(result["speech"]) == 12
+    assert all(item["answer"] in ("не речь", "нет речи") for item in result["controls"])
+    assert "A" not in {item["variant"] for item in result["controls"]}
+    assert "N" not in result and "natural_pairs" not in result
+    block = gate0.rule_block((REPO / VAD_DOC).read_text(encoding="utf-8"))
+    assert "-> READY" not in block and "\nN. " not in block
+
+
+def test_vad_rule_refuses_a_natural_day() -> None:
+    manifest = {**_natural_manifest(), "rule_sha256": gate0.RULE_VAD_SHA256}
+    with pytest.raises(gate0.Gate0Error, match="has no natural pairs"):
+        gate0.decide(manifest, _vad_record(manifest), _natural_lines())
+
+
+@pytest.mark.parametrize(
+    ("variant", "clip", "line", "reason"),
+    [
+        ("P", "G2", _line("P", "G2", "да"), "G: не прошли 1 из 4 пунктов: ['P(G2)']"),
+        ("P", "G3", _gated("P", "G3"), "G: не прошли 1 из 4 пунктов: ['P(G3)']"),
+        ("K2", "V2", _line("K2", "V2", gate0.INVALID), "R: не прошли 1 из 12 пунктов: ['K2(V2)']"),
+        ("K1", "B1", _line("K1", "B1", "речь", finish_reason="length"), "R: не прошли 1 из 12"),
+        ("K1", "B3", _gated("K1", "B3"), "R: не прошли 1 из 12 пунктов: ['K1(B3)']"),
+        ("K1", "N1", _line("K1", "N1", "речь"), "C: не прошли 1 из 9 пунктов: ['K1(N1)']"),
+        ("P", "T1", _line("P", "T1", "да"), "C: не прошли 1 из 9 пунктов: ['P(T1)']"),
+    ],
+    ids=[
+        "p-yes-on-g",
+        "gate-closed-on-g",
+        "invalid-in-r",
+        "cut-in-r",
+        "gate-closed-on-speech",
+        "control-through-gate-says-speech",
+        "control-p-yes",
+    ],  # fmt: skip
+)
+def test_each_vad_criterion_fails_on_its_own(variant, clip, line, reason) -> None:
+    manifest = _vad_manifest()
+    record = _vad_record(manifest)
+    if clip in gate0.CONTROLS:
+        # a gate that let the control through: the model's own answer is the system's
+        record["gate"]["clips"][clip]["passed"] = True
+    lines = _replace(_vad_lines(manifest), variant, clip, line)
+    result = _vad_decide(lines, manifest, record)
+    assert result["preconditions"]["P4"] is True
+    assert result["verdict"] == "NOT READY" and result["reason"].startswith(reason)
+    assert "S:" not in result["reason"]
+
+
+def test_vad_rule_without_distinguished_pairs_is_not_ready_on_s() -> None:
+    lines = _vad_lines(_vad_manifest())
+    for i in (1, 2):
+        lines = _replace(lines, "P", f"V{i}", _line("P", f"V{i}", "нет"))
+    result = _vad_decide(lines)
+    assert not result["S"] and result["verdict"] == "NOT READY"
+    assert result["reason"] == "S: различено меньше 2 из 3 синтетических пар"
+
+
+@pytest.mark.parametrize("broken", ["sent-closed-clip", "vad", "gate_limit"])
+def test_vad_rule_p4_fails_on_a_closed_clip_sent_or_a_gate_check(broken) -> None:
+    manifest = _vad_manifest()
+    record = _vad_record(manifest)
+    lines = _vad_lines(manifest)
+    if broken == "sent-closed-clip":
+        lines = _replace(lines, "K1", "S0", _line("K1", "S0", "тишина"))
+    else:
+        record["preconditions"]["checks"][broken] = False
+    result = _vad_decide(lines, manifest, record)
+    assert result["preconditions"]["P4"] is False
+    assert result["verdict"] == "NOT READY" and result["reason"].startswith("протокол не выполнен")
+
+
+def test_rules_v1_and_v2_keep_their_names_plan_and_verdict() -> None:
+    assert gate0.rule_name(DECISION_RULE_SHA256) == gate0.RULE_V1
+    assert gate0.rule_name(gate0.RULE_V2_SHA256) == gate0.RULE_V2
+    result = gate0.decide(_synthetic_manifest(), RECORD, _held_lines())
+    assert result["verdict"] == "HELD" and "P4" not in result["preconditions"]
+    assert "G" not in result and len(result["controls"]) == 12
