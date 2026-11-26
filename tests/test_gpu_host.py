@@ -422,14 +422,36 @@ def _start_serve(tmp_path: Path, argv: list[str]) -> subprocess.Popen:
     return subprocess.Popen([*command, "--", *argv], cwd=tmp_path)
 
 
-def _wait_for(condition, seconds: float = 60.0):
+def _wait_for(condition, seconds: float = 60.0, describe=None):
     ends = time.monotonic() + seconds
     while time.monotonic() < ends:
         value = condition()
         if value:
             return value
         time.sleep(0.1)
-    raise AssertionError("condition not met in time")
+    raise AssertionError("condition not met in time" + (f"; {describe()}" if describe else ""))
+
+
+def _server_log_tail(tmp_path: Path) -> str:
+    log = tmp_path / "server.log"
+    return log.read_text(errors="replace")[-2000:] if log.is_file() else "no server log"
+
+
+def _port_of(tmp_path: Path, serve: subprocess.Popen) -> int:
+    """The port the server writes to `port`. A server that exits first, as on an `AF_UNIX` bind
+    error, fails the wait at once with its log (#192)."""
+
+    def port() -> str:
+        written = (tmp_path / "port").is_file() and (tmp_path / "port").read_text()
+        if not written and serve.poll() is not None:
+            raise AssertionError(
+                f"hostrun serve exited (code {serve.returncode}) before the server wrote its port; "
+                f"server log:\n{_server_log_tail(tmp_path)}"
+            )
+        return written
+
+    describe = lambda: f"no port file; server log:\n{_server_log_tail(tmp_path)}"  # noqa: E731
+    return int(_wait_for(port, describe=describe))
 
 
 def _stats(tmp_path: Path) -> list[dict]:
@@ -453,9 +475,7 @@ def test_a_guarded_server_starts_workers_that_stay_guarded(
     argv = [sys.executable, str(script), method, str(tmp_path), str(short_socket_dir)]
     serve = _start_serve(tmp_path, argv)
     try:
-        port = int(
-            _wait_for(lambda: (tmp_path / "port").is_file() and (tmp_path / "port").read_text())
-        )
+        port = _port_of(tmp_path, serve)
         report = _wait_for(lambda: _health(port))
         assert report["results"] == {
             "guarded": True,
@@ -480,6 +500,24 @@ def test_a_guarded_server_starts_workers_that_stay_guarded(
         last = _stats(tmp_path)[-1]
         assert last["event"] == "exit" and last["reason"] == "stopped"
         assert not hostrun._alive(worker) and hostrun.session_pids(server_pid) == []
+    finally:
+        if serve.poll() is None:
+            serve.send_signal(signal.SIGTERM)
+            serve.wait(30)
+
+
+def test_the_port_wait_fails_at_once_with_the_bind_error_of_a_server_that_exits(
+    tmp_path,
+) -> None:
+    script = tmp_path / "server.py"
+    script.write_text("import socket\nsocket.socket(socket.AF_UNIX).bind('/' + 'x' * 120)\n")
+    serve = _start_serve(tmp_path, [sys.executable, str(script)])
+    try:
+        started = time.monotonic()
+        expected = r"(?s)hostrun serve exited \(code .*AF_UNIX path too long"
+        with pytest.raises(AssertionError, match=expected):
+            _port_of(tmp_path, serve)
+        assert time.monotonic() - started < 30
     finally:
         if serve.poll() is None:
             serve.send_signal(signal.SIGTERM)
