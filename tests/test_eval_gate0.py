@@ -3290,3 +3290,104 @@ def test_rules_v1_and_v2_keep_their_names_plan_and_verdict() -> None:
     result = gate0.decide(_synthetic_manifest(), RECORD, _held_lines())
     assert result["verdict"] == "HELD" and "P4" not in result["preconditions"]
     assert "G" not in result and len(result["controls"]) == 12
+
+
+def test_vad_decision_records_verdict_preconditions_g_r_s_thinking_rss_latency_and_run_time() -> (
+    None
+):
+    flat_doc = re.sub(r"\s+", " ", (REPO / VAD_DOC).read_text(encoding="utf-8"))
+    results = flat_doc.split("## 4. Результаты", 1)[1].split("## 5. Вердикт", 1)[0]
+    for precondition in ("**P1:**", "**P2:**", "**P3: выполнено.**", "**P4: выполнено.**"):
+        assert precondition in results, precondition
+    assert "**50,13–50,80 аудиотокена на секунду клипа**" in results
+    assert "**Обращений к серверу по закрытым клипам — 0.**" in results
+    assert "`requests_to_model` = 33" in results and "`requests_planned` = 42" in results
+    assert "`7ca3b94e1a9826a85ecfbfb3ff87182ede476199d03e5dcf1e32b26abaae0322`" in results
+    thinking = results.split("**Рассуждение**", 1)[1].split("**Память**", 1)[0]
+    assert "**Бюджет 512 исчерпан в 15 из 33:**" in thinking
+    assert "**Пустой ответ после рассуждения — 7 из 33:**" in thinking
+    peak = int(re.search(r"сторожа — \*\*([\d ]+)\*\* байт", results).group(1).replace(" ", ""))
+    assert peak < gate0.RUNTIME_LIMITS["qolda"][1] < gate0.RSS_LIMIT_BYTES
+    assert "`stop_reason: null`" in results and "`oom_kill 0`" in results
+    assert "**медиана 102,4 с**" in results and "**медиана 81,0 с**" in results
+    assert "**50 мин 16 с** wall time" in results
+    numbers = re.findall(r"\| (\d+) \| (?:K1|K2|P|P-text) \|", results)
+    assert [int(n) for n in numbers] == list(range(1, 43))
+    gated = re.findall(r"\| (\d+) \| (?:K1|K2|P) \| (?:S0|N1|T1) \| закрыт, [^|]*\|", results)
+    assert [int(n) for n in gated] == [7, 8, 9, 20, 21, 22, 33, 34, 35]
+    verdict = flat_doc.split("## 5. Вердикт", 1)[1].split("### 5.1.", 1)[0]
+    assert "`python -m sound_scout.eval.gate0 verdict --date 2026-11-26 --attempt 1`" in verdict
+    answer = json.dumps(
+        {
+            "verdict": "NOT READY",
+            "reason": "G: не прошли 2 из 4 пунктов: ['P(G1)', 'P(G4)']; R: не прошли 1 из 12"
+            " пунктов: ['K2(V2)']; S: различено меньше 2 из 3 синтетических пар",
+        },
+        ensure_ascii=False,
+    )
+    assert f"`{answer}`" in verdict
+    for line in (
+        "**C проходит: 9 из 9.**",
+        "**G не проходит: 2 из 4.**",
+        "**R не проходит: 11 из 12.**",
+        "**S не проходит: 0 из 3 пар.**",
+    ):
+        assert line in verdict, line
+    assert not re.search(r"/(home|Users)/", flat_doc)
+
+
+def test_vad_record_compares_with_0032_and_says_the_shared_answers_are_identical() -> None:
+    document = (REPO / VAD_DOC).read_text(encoding="utf-8")
+    compared = document.split("### 5.1. Сравнение с 0032", 1)[1].split("\n## 6.", 1)[0]
+    header = next(line for line in compared.splitlines() if line.startswith("| Критерий |"))
+    assert "0032" in header and "0035" in header
+    rows = {
+        line.split("|")[1].strip(): line
+        for line in compared.splitlines()
+        if line.startswith("| ") and not line.startswith("| Критерий |")
+    }
+    for criterion in (
+        "Вердикт",
+        "P3, аудиотокенов на с",
+        "C, прошло пунктов",
+        "G: P на клипах без слов",
+        "R: K на речи, `речь`",
+        "S: пар различено",
+        "Ответы на общих запросах",
+        "Пиковый RSS сервера",
+        "Закрытый audio-вопрос, с",
+        "Закрытый вопрос системы, с",
+        "Wall time прогона",
+    ):
+        assert criterion in rows, criterion
+        assert rows[criterion].count("|") == 4, criterion
+    assert "**21 из 21 побайтно те же**" in rows["Ответы на общих запросах"]
+    assert "**9 из 9**" in rows["C, прошло пунктов"]
+    assert "**0 из 3**" in rows["S: пар различено"]
+    for heading in ("**Ответы на общих запросах — те же (факт).**", "**Что изменил гейт (факт).**"):
+        assert heading in compared, heading
+    assert "**Задержка (факт и оценка).**" in compared and "гипотеза" in compared
+
+
+def test_vad_not_ready_packages_nothing_bounds_the_conclusion_and_answers_the_combination() -> None:
+    assert config.KNOWN_BACKENDS == ("none",)
+    document = (REPO / VAD_DOC).read_text(encoding="utf-8")
+    flat_doc = re.sub(r"\s+", " ", document)
+    assert "**Вердикт: NOT READY**" in document
+    assert "ничего не упаковывается, `backend` остаётся `none`" in flat_doc
+    limits = flat_doc.split("## 6. Ограничения", 1)[1].split("## 7.", 1)[0]
+    assert "**Модель и runtime — ровно 0032.**" in limits and "`ea63b4d`" in limits
+    assert "Вывод NOT READY относится к системе" in limits
+    assert "**Бюджет рассуждения.**" in limits and "**Гейт проверен на малом наборе.**" in limits
+    combination = flat_doc.split("## 7. Сочетание с `word_prominence` (#199)", 1)[1]
+    combination = combination.split("## 8.", 1)[0]
+    assert "**Что сочетание может дать.**" in combination
+    assert "**Что сочетание не может дать (по этому прогону).**" in combination
+    assert "**Рекомендация.** Сочетание с этой моделью не строить." in combination
+    owner = document.split("## 8. Что нужно от владельца", 1)[1].split("\n## ", 1)[0]
+    flat_owner = re.sub(r"\s+", " ", owner)
+    assert re.search(
+        r"^1\. \*\*Принять или отклонить `GATE0-VAD-RULE v1` — не нужно\.\*\*", owner, re.M
+    )
+    assert "**Нового решения о файлах нет.**" in flat_owner
+    assert "Повтор этого прогона вердикт не меняет" in flat_owner
