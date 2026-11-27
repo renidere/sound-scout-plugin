@@ -5,7 +5,10 @@
 - серии 1–3 `prosody-measure-1`: `python -m sound_scout.eval.prosody prepare|sanity|run
   [--series N]` (решение 0019);
 - подтверждающий прогон `prosody-confirm-1`: `python -m sound_scout.eval.prosody_confirm
-  <команда>` (решение 0034).
+  <команда>` (решение 0034);
+- подтверждающий прогон `prosody-rupro-1`: `python -m sound_scout.eval.prosody_rupro <команда>`
+  (решение 0037). Источники RuPro лежат в `data/prosody-rupro-1/sources/`. `prepare`, `sanity` и
+  `run` идут только из замороженного дерева `local/frozen/prosody-rupro-1`.
 
 ## Что нужно
 
@@ -16,7 +19,8 @@
   основного checkout.
 - `allowed_roots` загрузчик требует всегда. Команды просодии вход через него не читают. Подходит
   любой существующий пустой каталог вне `data_root`.
-- `[network] allow = false`. Сеть закрыта, это часть Q1.
+- `[network] allow = false`. Сеть закрыта, это часть Q1. Исключение — `prosody_rupro fetch`: ему
+  нужна своя конфигурация с `[network] allow = true`, без неё команда отказывает.
 
 Пример — `docs/examples/eval-config.example.toml`.
 

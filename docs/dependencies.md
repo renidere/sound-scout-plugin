@@ -7,7 +7,7 @@
 конкретной станции сюда не пишутся; ниже — пути по умолчанию относительно домашнего каталога
 оператора.
 
-Обновлено: 2026-11-22.
+Обновлено: 2026-11-28.
 
 ## 1. Python-пакеты
 
@@ -655,3 +655,28 @@ CC BY-NC 4.0, поле Zenodo — CC BY 4.0; принята более стро�
 | `preprocessor_config.json` | 603 | `git-blob-sha1:7df5b45379044a680218cb2b7ed4d01a6633f537` |
 | `tokenizer_config.json` | 7344 | `git-blob-sha1:6ff9fd60cc623bb54bbd603cbd418c97a11528d7` |
 | `vocab.json` | 2776833 | `git-blob-sha1:4783fe10ac3adce15ac8f358ef5462739852c569` |
+
+## 8. Данные подтверждающего прогона `prosody-rupro-1` (#199)
+
+Разметка pitch accent RuPro и звук RUEG 1.0 для подтверждающего прогона `word_prominence`.
+Загрузку ровно этих файлов разрешил владелец 2026-11-27
+([план](https://github.com/renidere/sound-scout-plugin/issues/199#issuecomment-7228019900),
+[Decision](https://github.com/renidere/sound-scout-plugin/issues/199#issuecomment-7228283735)).
+Файлы лежат в `data/prosody-rupro-1/sources/` вне git. Их скачивает
+`python -m sound_scout.eval.prosody_rupro fetch`: таблицу OSF целиком, из ZIP Zenodo — только
+члены ниже через HTTP range. `verify` перехэширует файлы на месте. Пины — константы
+`sound_scout.eval.prosody_rupro`; расхождение с этим разделом ловит
+`tests/test_eval_prosody_rupro.py`. Использование — только локальная проверка индекса. Таблица OSF
+и метки по словам не публикуются. Правила — `docs/decisions/0037-word-prominence-rupro.md`.
+
+| Набор | Версия | Файл | Источник (URL) | Лицензия | Байт | Сумма издателя | SHA-256 |
+|---|---|---|---|---|---|---|---|
+| RuPro, таблица `ip_pos.csv` | OSF `rfyde`, файл `fpma5`, версия 1 (2023-11-27) | `ip_pos.csv` | https://osf.io/download/fpma5/?version=1 | не указана (поле OSF `node_license` пустое); не публикуется | 2556687 | `sha256:f4fc22629c93fb702bc509d0beb07705c428fcc5459659ea50ee2e9a8391eea7` (OSF) | `f4fc22629c93fb702bc509d0beb07705c428fcc5459659ea50ee2e9a8391eea7` |
+| RUEG 1.0 | 1.0, DOI 10.5281/zenodo.11234583 | `RUEG-1.0_corpora.zip` (целиком не скачивается) | https://zenodo.org/records/11234583/files/RUEG-1.0_corpora.zip?download=1 | CC0 1.0 | 4390834445 | `md5:7bfc43c230144ffbfa444f085867b1b6` | — |
+| RUEG 1.0, член ZIP | 1.0 | `RUEG-1.0_corpora/LICENSE` | член ZIP выше | CC0 1.0 | 7048 | — | `a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499` |
+| RUEG 1.0, член ZIP | 1.0 | `RUEG-1.0_corpora/prosody/ru/RUEG-RuPro.zip` (граф ANNIS RuPro и 186 MP3) | член ZIP выше | CC0 1.0 | 117338883 | — | `9e3839e581998e2067bdab3566bcd38b7a89268a1d8c872179151d5e9942a758` |
+| RUEG 1.0, члены ZIP | 1.0 | 80 пар `RUEG-1.0_corpora/core/ru/exb/RUEG/RU/MONOLINGUAL/{doc}.exb` и `.meta` | член ZIP выше | CC0 1.0 | 4729983 (EXB) | — | список строк `<член> <SHA-256>` по имени: `84a071a351237dafd77f834c6a41f5f9278452e25ba5eb4d89726ff73c7ffaf0` |
+
+Список 80 монолингвальных записей таблицы (строки имён по порядку) — SHA-256
+`2289dd65704362d325dcca36125fed9486ce7a19313f0e53c609cdfc5a436b3c`. SHA-256 каждого файла EXB и
+meta пишется в `survey/*.json` и `prepare.json` вне git.
