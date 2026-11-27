@@ -586,8 +586,11 @@ def test_the_source_pins_are_written_in_dependencies() -> None:
 
 
 class Response:
-    def __init__(self, data: bytes, status: int = 200):
-        self.data, self.status, self.at = data, status, 0
+    def __init__(self, data: bytes, status: int = 200, url: str = "https://example.invalid/x"):
+        self.data, self.status, self.at, self.url = data, status, 0, url
+
+    def geturl(self) -> str:
+        return self.url
 
     def read(self, size: int = -1) -> bytes:
         size = len(self.data) - self.at if size < 0 else size
@@ -602,14 +605,15 @@ class Response:
         return False
 
 
-def fake_opener(table: bytes, archive: bytes, log: list):
+def fake_opener(table: bytes, archive: bytes, log: list, plain: str = ""):
     def opener(request, timeout):
         if isinstance(request, str):
             log.append("table")
-            return Response(table)
+            return Response(table, url="http://osf.invalid/x" if plain == "table" else request)
         first, last = map(int, request.headers["Range"].removeprefix("bytes=").split("-"))
         log.append((first, last))
-        return Response(archive[first : last + 1], 206)
+        url = "http://zenodo.invalid/x" if plain == "range" else request.full_url
+        return Response(archive[first : last + 1], 206, url)
 
     return opener
 
@@ -656,6 +660,65 @@ def test_fetch_refuses_a_member_with_another_sha256_and_keeps_no_part(tmp_path, 
         pr.fetch(target, fake_opener((origin / pr.TABLE_FILE).read_bytes(), archive, []))
     licence = pr.member_path(target, pr.LICENSE_MEMBER)
     assert not licence.exists() and not list(licence.parent.glob(".*part"))
+
+
+def test_fetch_makes_directories_0700_and_files_0600_whatever_the_umask(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    station_sources(origin)
+    pin_sources(monkeypatch, origin)
+    archive = remote_archive(origin)
+    monkeypatch.setattr(pr, "RUEG_BYTES", len(archive))
+    target = tmp_path / "sources"
+    previous = os.umask(0)
+    try:
+        pr.fetch(target, fake_opener((origin / pr.TABLE_FILE).read_bytes(), archive, []))
+    finally:
+        os.umask(previous)
+    made = [target, *(p for p in target.rglob("*"))]
+    assert {p.stat().st_mode & 0o777 for p in made if p.is_dir()} == {0o700}
+    assert {p.stat().st_mode & 0o777 for p in made if p.is_file()} == {0o600}
+
+
+@pytest.mark.parametrize("plain", ["table", "range"])
+def test_fetch_refuses_an_answer_that_left_https_and_keeps_no_file(
+    tmp_path, monkeypatch, plain
+) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    station_sources(origin)
+    pin_sources(monkeypatch, origin)
+    archive = remote_archive(origin)
+    monkeypatch.setattr(pr, "RUEG_BYTES", len(archive))
+    target = tmp_path / "sources"
+    opener = fake_opener((origin / pr.TABLE_FILE).read_bytes(), archive, [], plain)
+    with pytest.raises(pr.RuproError, match="not HTTPS"):
+        pr.fetch(target, opener)
+    kept = [p.name for p in target.rglob("*") if p.is_file()] if target.exists() else []
+    assert kept == ([pr.TABLE_FILE] if plain == "range" else [])
+
+
+def test_the_cli_fetch_makes_the_experiment_directory_0700_through_the_data_root(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    settings = make_config(tmp_path)
+    settings = config.Config(
+        allowed_roots=settings.allowed_roots,
+        data_root=settings.data_root,
+        network=config.Network(allow=True),
+    )
+    monkeypatch.setattr(config, "load", lambda: settings)
+    called = []
+    monkeypatch.setattr(pr, "fetch", lambda sources: called.append(sources) or {"fetched": 0})
+    previous = os.umask(0)
+    try:
+        assert pr.main(["fetch"]) == 0
+    finally:
+        os.umask(previous)
+    out = settings.data_root / pr.OUTPUT_DIR
+    assert called == [out / pr.SOURCES_DIR]
+    assert (out.stat().st_mode & 0o777, called[0].stat().st_mode & 0o777) == (0o700, 0o700)
+    capsys.readouterr()
 
 
 def test_a_range_answer_without_206_is_refused() -> None:
@@ -975,6 +1038,53 @@ def test_wrong_frozen_pins_make_prepare_invalid_before_any_clip(station, monkeyp
     assert not (out / pr.CLIPS_DIR).exists()
     with pytest.raises(pr.RuproError, match="verdict is out"):
         pr.run_main(station, REPO / pr.DECISION_DOC)
+
+
+OTHER_FROZEN = {"commit": "d" * 40, "manifest_sha256": "n" * 64}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("changed", ["code", "frozen"])
+def test_a_sanity_attempt_after_prepare_by_other_code_or_tree_is_invalid_and_not_started(
+    station, monkeypatch, changed
+) -> None:
+    decision = REPO / pr.DECISION_DOC
+    monkeypatch.setattr(pr, "code_sha256", lambda: "a" * 64)
+    pr.prepare(station, decision)
+    if changed == "code":
+        monkeypatch.setattr(pr, "code_sha256", lambda: "b" * 64)
+    else:
+        monkeypatch.setattr(pr, "frozen_state", lambda tree=None: ([], dict(OTHER_FROZEN)))
+    passed_sanity(monkeypatch)
+    result = pr.run_sanity(station, decision)
+    wording = "by other code" if changed == "code" else "from another frozen tree"
+    assert result["verdict"] == pr.INVALID and f"was written {wording}" in result["reason"]
+    assert not list((station.data_root / pr.OUTPUT_DIR / pr.SANITY_DIR).iterdir())
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("changed", ["code", "frozen"])
+def test_a_main_run_after_prepare_by_other_code_or_tree_is_invalid_and_not_started(
+    station, monkeypatch, changed
+) -> None:
+    decision = REPO / pr.DECISION_DOC
+    monkeypatch.setattr(pr, "code_sha256", lambda: "a" * 64)
+    pr.prepare(station, decision)
+    passed_sanity(monkeypatch)
+    pr.run_sanity(station, decision)
+    out = station.data_root / pr.OUTPUT_DIR
+    if changed == "code":
+        # a passed attempt of the new code, as a sanity step without this check would leave it
+        monkeypatch.setattr(pr, "code_sha256", lambda: "b" * 64)
+        attempt = json.loads((out / pr.SANITY_DIR / "attempt-1.json").read_text())
+        attempt |= {"attempt": 2, "code_sha256": "b" * 64}
+        (out / pr.SANITY_DIR / "attempt-2.json").write_text(json.dumps(attempt))
+    else:
+        monkeypatch.setattr(pr, "frozen_state", lambda tree=None: ([], dict(OTHER_FROZEN)))
+    result = pr.run_main(station, decision, transcribe=run_transcriber)
+    wording = "by other code" if changed == "code" else "from another frozen tree"
+    assert result["verdict"] == pr.INVALID and f"was written {wording}" in result["reason"]
+    assert not (out / pr.MAIN_DIR).exists()
 
 
 @needs_ffmpeg

@@ -23,6 +23,8 @@
 Файлы лежат в `data/prosody-rupro-1/sources/` вне git. Пины — `docs/dependencies.md` § 8 и
 константы `sound_scout.eval.prosody_rupro`. Команда `fetch` читает из ZIP Zenodo только
 закреплённые члены через HTTP range. Весь многоязычный корпус не скачивается.
+Каталоги `fetch` создаёт с правами 0700, файлы — 0600. Ответ не с адреса HTTPS `fetch`
+отклоняет.
 
 - `ip_pos.csv` — OSF `rfyde`, файл `fpma5`, версия 1. TSV, одна строка — пересечение IP, спана
   `word_pa`, токена `dipl` и токена POS в выгрузке ANNIS.
@@ -142,6 +144,8 @@ PROSODY-RUPRO-RULE v1 (sound-scout #199, записано до индекса н
         пином;
      check-fresh нашёл пересечение;
      prepare.json или файл среза изменён после prepare;
+     prepare.json записан другим кодом или из другого замороженного дерева: code_sha256
+        или frozen в нём не равны значениям sanity или run;
      санитарная стадия не пройдена за 2 попытки;
      основной прогон прерван ошибкой.
   2. INCONCLUSIVE, если прогон остановлен потолком ресурсов, coverage < 0,70, пар < 1 200,
@@ -156,7 +160,7 @@ PROSODY-RUPRO-RULE v1 (sound-scout #199, записано до индекса н
 ```
 <!-- prosody-rupro-rule:end -->
 
-SHA-256 блока: `572b48eb24f21c1b81c3c2c26bd3c3d223e6ea7b6a04826e5451b029ef0d58c4`.
+SHA-256 блока: `6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77df68c`.
 
 ## 4. Заморозка
 

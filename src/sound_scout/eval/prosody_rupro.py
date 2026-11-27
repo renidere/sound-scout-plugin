@@ -55,7 +55,7 @@ RULE_BEGIN = "<!-- prosody-rupro-rule:begin -->"
 RULE_END = "<!-- prosody-rupro-rule:end -->"
 RULE_VERSION = "PROSODY-RUPRO-RULE v1"
 RULE_HEADER = f"```text\n{RULE_VERSION} "
-RULE_SHA256 = "572b48eb24f21c1b81c3c2c26bd3c3d223e6ea7b6a04826e5451b029ef0d58c4"
+RULE_SHA256 = "6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77df68c"
 OWNER_DECISION = "https://github.com/renidere/sound-scout-plugin/issues/199#issuecomment-7228019900"
 SPEC = "https://github.com/renidere/sound-scout-plugin/issues/199#issuecomment-7228283735"
 
@@ -136,6 +136,7 @@ CLIPS_LOG = "clips.jsonl"
 RESULT_FILE = "result.json"
 FROZEN_FILE = "FROZEN.json"
 DIR_MODE = 0o700
+FILE_MODE = 0o600
 FORMAT_VERSION = 1
 SAMPLE_RATE = prosody.SAMPLE_RATE
 MAX_SANITY_ATTEMPTS = 2
@@ -1051,6 +1052,7 @@ class RangeReader(io.RawIOBase):
         span = f"bytes={self.position}-{last}"
         request = urllib.request.Request(self.url, headers={"Range": span})
         with self.opener(request, timeout=FETCH_TIMEOUT_S) as response:
+            _refuse_plain_http(response)
             if response.status != 206:
                 raise RuproError(f"range request answered {response.status}, expected 206")
             data = response.read(last - self.position + 2)
@@ -1061,13 +1063,31 @@ class RangeReader(io.RawIOBase):
         return len(data)
 
 
+def _refuse_plain_http(response) -> None:
+    """A redirect may leave HTTPS; the sources are read only over HTTPS."""
+    if not response.geturl().startswith("https://"):
+        raise RuproError("the source answered from a URL that is not HTTPS")
+
+
+def _mkdirs(path: Path) -> Path:
+    missing = []
+    for parent in (path, *path.parents):
+        if parent.is_dir():
+            break
+        missing.append(parent)
+    for parent in reversed(missing):
+        _mkdir(parent)
+    return path
+
+
 def _store(target: Path, chunks, size: int, sha256: str | None) -> str:
     """Write the chunks to `target` through a temporary file; refuse a wrong size or SHA-256."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _mkdirs(target.parent)
     staged = target.with_name(f".{target.name}.{os.getpid()}.part")
     digest, written = hashlib.sha256(), 0
     try:
-        with open(staged, "xb") as out:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open(staged, flags, FILE_MODE), "wb") as out:
             for chunk in chunks:
                 written += len(chunk)
                 if written > size:
@@ -1095,6 +1115,7 @@ def fetch(sources: Path, opener: Opener = urllib.request.urlopen) -> dict:
     table = sources / TABLE_FILE
     if not (table.is_file() and sha256_file(table) == TABLE_SHA256):
         with opener(OSF_URL, timeout=FETCH_TIMEOUT_S) as response:
+            _refuse_plain_http(response)
             _store(table, _chunks(response), TABLE_BYTES, TABLE_SHA256)
         fetched.append(TABLE_FILE)
     docs, _ = read_table(table.read_bytes())
@@ -1189,6 +1210,16 @@ def _prepare_problems(out: Path, prepared: dict) -> list[str]:
         path = out / CLIPS_DIR / f"{clip['id']}.wav"
         if not path.is_file() or sha256_file(path) != clip["wav_sha256"]:
             problems.append(f"clip {clip['id']}: SHA-256 differs from {PREPARE_FILE}")
+    return problems
+
+
+def _prepared_elsewhere(prepared: dict, header: dict) -> list[str]:
+    """`prepare.json` written by other code or from another frozen tree than this step's."""
+    problems = []
+    if prepared["code_sha256"] != header["code_sha256"]:
+        problems.append(f"{PREPARE_FILE} was written by other code")
+    if prepared["frozen"] != header["frozen"]:
+        problems.append(f"{PREPARE_FILE} was written from another frozen tree")
     return problems
 
 
@@ -1335,7 +1366,7 @@ def run_sanity(
     header = _header(decision, frozen)
     out = output_dir(config_)
     _refuse_if_decided(out)
-    _prepared(out)
+    prepared = _prepared(out)
     attempts = _mkdir(out / SANITY_DIR)
     if any(
         a["passed"] and a["code_sha256"] == header["code_sha256"] for a in _sanity_attempts(out)
@@ -1348,6 +1379,7 @@ def run_sanity(
     scope = prosody._checked_scope(scope)
     cpus = prosody.pin_cpus()
     reasons = [f"frozen: {p}" for p in frozen_problems] + _invalid_reasons(config_)
+    reasons += _prepared_elsewhere(prepared, header)
     if reasons:
         return _result(out, header, INVALID, "; ".join(reasons))
     number = started + 1
@@ -1440,7 +1472,7 @@ def run_main(
         raise RuproError("no passed sanity attempt of this code; run `sanity` first")
     scope = prosody._checked_scope(scope)
     reasons = [f"frozen: {p}" for p in frozen_problems] + _invalid_reasons(config_)
-    reasons += _prepare_problems(out, prepared)
+    reasons += _prepare_problems(out, prepared) + _prepared_elsewhere(prepared, header)
     if prepared["rule_sha256"] != header["rule_sha256"]:
         reasons.append(f"{PREPARE_FILE} was written under another rule")
     if not prepared["fresh_check"]["fresh"]:
@@ -1504,7 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
         elif not config_.network.allow:
             raise RuproError("fetch needs the network: [network] allow = true in its own config")
         if args.command == "fetch":
-            result = fetch(sources_dir(config_))
+            result = fetch(_mkdir(output_dir(config_) / SOURCES_DIR))
         elif args.command == "verify":
             problems, _ = verify(sources_dir(config_))
             result = {"verified": not problems, "problems": problems}
