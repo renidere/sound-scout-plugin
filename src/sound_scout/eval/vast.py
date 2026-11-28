@@ -67,6 +67,7 @@ import numpy as np
 
 from sound_scout import config, paths, proc
 from sound_scout.eval import gate0, gpu_ext, vast_fake
+from sound_scout.eval.gpu_host import hostrun
 
 API_BASE = "https://console.vast.ai"
 KEY_PATH = Path.home() / ".config/vastai/vast_api_key"
@@ -1478,6 +1479,7 @@ class LocalHost(RemoteHost):
         self.failing: list[list[str]] = []
         self.reopen_delay_s = 0.0
         self._binding = threading.Event()  # a slow reopen in flight: its `ssh -N` still lives
+        self.sessions_stopped = True  # False once a `close` left a process of a host session
 
     def _map(self, text: str) -> str:
         return text.replace(WORKSPACE, str(self.root))
@@ -1569,6 +1571,20 @@ class LocalHost(RemoteHost):
             copier.join(5)
             handle.close()
         self._spawned.clear()
+        self.sessions_stopped = stop_local_sessions(self.root) and self.sessions_stopped
+
+
+def stop_local_sessions(root: Path, timeout: float = 2 * hostrun.GRACE_S) -> bool:
+    """`hostrun.py stop` of every `serve` of a dry run's host directory: SIGTERM to a live
+    `serve`, SIGKILL to what is left of its server session once `serve` is gone; True when no
+    process of either lives. `stop_server` SIGKILLs a `serve` after `STOP_GRACE_S`, before its
+    own `GRACE_S` ends, and a server that ignores SIGTERM lives on in its own session (#203)."""
+    stopped = True
+    for pid_file in sorted(Path(root).glob("out/*/serve.pid")):
+        stats = pid_file.with_name("server-stats.jsonl")
+        args = argparse.Namespace(pid_file=pid_file, stats=stats, timeout=timeout)
+        stopped = hostrun.stop_command(args) == 0 and stopped
+    return stopped
 
 
 # --- the steps -----------------------------------------------------------------------------
@@ -3683,12 +3699,17 @@ def dry_run(out: Path | None, config_: config.Config, *, scenario: Mapping | Non
         scenario["fake"](fake)
     fake.start()
     started = time.monotonic()
-    journal, failure = None, None
+    journal, failure, hosts = None, None, []
+
+    def make_host(instance: Mapping, attempt: Path) -> LocalHost:
+        hosts.append(LocalHost(root, env))
+        return hosts[-1]
+
     try:
         journal = run_attempt(
             package_path,
             api=Api(fake.url, key),
-            make_host=lambda instance, attempt: LocalHost(root, env),
+            make_host=make_host,
             config_=dry_config,
             runner=_refuse_system,
             intervals={**DRY_INTERVALS, **scenario.get("intervals", {})},
@@ -3704,6 +3725,8 @@ def dry_run(out: Path | None, config_: config.Config, *, scenario: Mapping | Non
         (out / "fake-api.jsonl").write_text(log)
         remaining = sorted(i for i, inst in fake.instances.items() if fake._visible(inst))
         fake.stop()
+    if not all(host.sessions_stopped for host in hosts):
+        failure = failure or VastError("a process of the fake host's sessions outlived the dry run")
     found_journals = sorted((out / GPU_DIR).glob(f"*/{JOURNAL_FILE}"))
     if journal is None and found_journals:
         journal = Journal(found_journals[-1])

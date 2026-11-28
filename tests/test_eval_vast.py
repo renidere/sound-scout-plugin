@@ -3130,6 +3130,7 @@ def _signal_in_lock_window(tmp_path: Path, window: str, when: str) -> tuple[int,
         os.killpg(child.pid, signal.SIGKILL)
         child.wait()
         code = None
+    assert vast.stop_local_sessions(out / "host-root"), "a host session outlived the dry run"
     assert code is not None, "the signal handler blocked on the journal lock"
     assert (tmp_path / "fired").read_text() == window
     (journal_path,) = (out / "gpu").glob("*/journal.jsonl")
@@ -4170,3 +4171,111 @@ def test_a_dry_run_leaves_no_process_of_its_fake_host_however_it_ends(
         for pid in _processes_naming(out):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+
+
+# A server that ignores SIGTERM; it says so in the file `argv[1]`.
+_IGNORES_SIGTERM = """
+import signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(sys.argv[1], "w").close()
+time.sleep(120)
+"""
+
+
+def _dry_host_with_serve(tmp_path: Path, server: list[str]) -> tuple[vast.LocalHost, Path]:
+    """A dry host directory with the host files, its `hostrun serve` of `server` spawned; the
+    host and the model's out directory."""
+    root = tmp_path / "root"
+    host = vast.LocalHost(root, vast._fake_host_root(root))
+    (root / "ss" / "guard").mkdir(parents=True)
+    (root / "ss" / "hostrun.py").write_bytes((vast.HOST_FILES_DIR / "hostrun.py").read_bytes())
+    guard = vast.HOST_FILES_DIR / "sitecustomize.py"
+    (root / "ss" / "guard" / "sitecustomize.py").write_bytes(guard.read_bytes())
+    (root / "out" / "m").mkdir(parents=True)
+    out = f"{vast.WORKSPACE}/out/m"
+    serve = ["python3", vast.HOSTRUN, "serve", "--deadline", str(time.time() + 120)]
+    serve += ["--rss-limit", str(1 << 40), "--stats", f"{out}/server-stats.jsonl"]
+    serve += ["--log", f"{out}/server.log", "--pid-file", f"{out}/serve.pid", "--", *server]
+    host.spawn(serve, f"{out}/hostrun.log")
+    return host, root / "out" / "m"
+
+
+def _session_alive(out: Path) -> list[int]:
+    """Live processes of the server session `serve` recorded in `out`."""
+    records = hostrun._records(out / "server-stats.jsonl")
+    started = next(r for r in records if r["event"] == "started")
+    return [pid for pid in hostrun.session_pids(started["pid"]) if hostrun._alive(pid)]
+
+
+def _kill_recorded(out: Path) -> None:
+    """SIGKILL to what is left of the test's own `serve` and server session, by identity."""
+    identity = hostrun._serve_identity(out / "serve.pid")
+    if identity is not None:
+        hostrun._signal(*identity, signal.SIGKILL)
+    for pid, start in hostrun._session_survivors(out / "server-stats.jsonl", set()) or []:
+        hostrun._signal(pid, start, signal.SIGKILL)
+
+
+@pytest.mark.slow
+def test_close_of_the_dry_host_ends_a_server_that_ignores_sigterm(tmp_path, monkeypatch) -> None:
+    """#203: `close` SIGKILLed `hostrun serve` after `STOP_GRACE_S`, before the `GRACE_S` of
+    `serve` ended, and a server that ignores SIGTERM lived on in its own session."""
+    ready = tmp_path / "ready"
+    host, out = _dry_host_with_serve(tmp_path, [sys.executable, "-c", _IGNORES_SIGTERM, str(ready)])
+    try:
+        ends = time.monotonic() + 60
+        while not (ready.exists() and (out / "serve.pid").exists()) and time.monotonic() < ends:
+            time.sleep(0.05)
+        assert _session_alive(out), "the server did not start"
+        serve_ = hostrun._serve_identity(out / "serve.pid")
+        monkeypatch.setattr(gate0, "STOP_GRACE_S", 1.0)  # `serve` is SIGKILLed inside its grace
+        host.close()
+        assert _session_alive(out) == []
+        assert not hostrun._is_running(*serve_)
+    finally:
+        _kill_recorded(out)
+        host.close()
+
+
+def test_close_of_the_dry_host_keeps_a_session_that_outlived_it(tmp_path, monkeypatch) -> None:
+    host = vast.LocalHost(tmp_path, {})
+    host.close()
+    assert host.sessions_stopped is True
+    monkeypatch.setattr(vast, "stop_local_sessions", lambda root: False)
+    host.close()
+    monkeypatch.setattr(vast, "stop_local_sessions", lambda root: True)
+    host.close()
+    assert host.sessions_stopped is False  # a later clean close does not hide it
+
+
+@pytest.mark.slow
+def test_a_dry_run_fails_when_a_host_session_outlives_its_close(tmp_path, monkeypatch) -> None:
+    """#203: `close` runs in deploy's `finally` and must not raise there; the dry run reports."""
+    monkeypatch.setattr(vast, "stop_local_sessions", lambda root: False)
+    out = tmp_path / "data" / "dry"
+    with pytest.raises(vast.VastError, match="outlived the dry run"):
+        vast.dry_run(out, _dry_config(tmp_path))
+    timeline = json.loads((out / "timeline.json").read_text())
+    assert "outlived the dry run" in timeline["failure"]
+    assert timeline["steps"][-1]["name"] == "destroy"
+
+
+def test_stop_local_sessions_fails_while_a_serve_does_not_exit(tmp_path) -> None:
+    """A `serve` that outlives its SIGTERM is reported, not killed: only `stop` decides."""
+    assert vast.stop_local_sessions(tmp_path) is True  # no `serve` at all
+    ready = tmp_path / "ready"
+    stuck = subprocess.Popen(
+        [sys.executable, "-c", _IGNORES_SIGTERM, str(ready)], start_new_session=True
+    )
+    try:
+        ends = time.monotonic() + 30
+        while not ready.exists() and time.monotonic() < ends:
+            time.sleep(0.02)
+        (tmp_path / "out" / "m").mkdir(parents=True)
+        pid_file = tmp_path / "out" / "m" / "serve.pid"
+        pid_file.write_text(f"{stuck.pid} {hostrun.start_ticks(stuck.pid)}")
+        assert vast.stop_local_sessions(tmp_path, timeout=0.3) is False
+        assert stuck.poll() is None
+    finally:
+        stuck.kill()
+        stuck.wait(30)

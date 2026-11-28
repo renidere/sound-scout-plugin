@@ -9,16 +9,19 @@ CI runs the scenarios and the units in the `rehearsal` job, one shard per runner
 `REHEARSAL_SHARD=k/n` keeps every n-th name from the k-th; without it all of them run.
 """
 
+import dataclasses
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from sound_scout.eval import rehearsal
+from sound_scout.eval import rehearsal, vast
+from sound_scout.eval.gpu_host import hostrun
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REHEARSED = [s.name for s in rehearsal.SCENARIOS] + sorted(rehearsal.UNITS)
@@ -221,3 +224,81 @@ def test_the_shard_env_selects_the_collected_scenarios(tmp_path) -> None:
     assert refused.returncode != 0 and "REHEARSAL_SHARD must be k/n" in refused.stdout + (
         refused.stderr
     )
+
+
+def _serving(out: Path) -> bool:
+    """Holds until a `serve` of the dry run recorded its server session; never signals."""
+    ends = time.monotonic() + 120
+    while time.monotonic() < ends:
+        for pid_file in out.glob("host-root/out/*/serve.pid"):
+            records = hostrun._records(pid_file.with_name("server-stats.jsonl"))
+            if any(r.get("event") == "started" for r in records):
+                return False
+        time.sleep(0.05)
+    raise AssertionError("no `serve` of the dry run started")
+
+
+@pytest.mark.slow
+def test_a_timed_out_signalled_child_leaves_no_process_of_its_host_sessions(
+    tmp_path, monkeypatch
+) -> None:
+    """#203: on a timeout `_signalled` SIGKILLed the child group only; `serve` and the server
+    live in sessions of their own."""
+    scenario = next(s for s in rehearsal.SCENARIOS if s.name == "sigterm_mid_gate0")
+    scenario = dataclasses.replace(scenario, signal_when=_serving)
+    monkeypatch.setattr(rehearsal, "CHILD_WAIT_S", 1.0)
+    out = tmp_path / "dry"
+    try:
+        assert rehearsal._signalled(scenario, out) is None
+        pid_files = list(out.glob("host-root/out/*/serve.pid"))
+        assert pid_files
+        for pid_file in pid_files:
+            serve_ = hostrun._serve_identity(pid_file)
+            assert serve_ is not None and not hostrun._is_running(*serve_)
+            stats = pid_file.with_name("server-stats.jsonl")
+            assert hostrun._session_survivors(stats, set()) == []
+    finally:
+        vast.stop_local_sessions(out / "host-root")
+
+
+def test_signalled_fails_when_a_host_session_outlives_the_child(tmp_path, monkeypatch) -> None:
+    scenario = next(s for s in rehearsal.SCENARIOS if s.name == "sigterm_mid_gate0")
+    scenario = dataclasses.replace(scenario, signal_when=lambda out: False)
+    monkeypatch.setattr(rehearsal, "CHILD_WAIT_S", 0.2)
+    monkeypatch.setattr(vast, "stop_local_sessions", lambda root: False)
+    with pytest.raises(RuntimeError, match="outlived the dry run"):
+        rehearsal._signalled(scenario, tmp_path / "dry")
+
+
+@pytest.mark.slow
+def test_signalled_kills_the_child_and_its_host_sessions_when_signal_when_raises(
+    tmp_path, monkeypatch
+) -> None:
+    """The child and the sessions of its fake host do not outlive an error of `signal_when`."""
+    children = []
+    real_popen = rehearsal.subprocess.Popen
+    monkeypatch.setattr(
+        rehearsal.subprocess,
+        "Popen",
+        lambda *a, **k: children.append(real_popen(*a, **k)) or children[-1],
+    )
+
+    def broken(out: Path) -> bool:
+        _serving(out)
+        raise ValueError("signal_when broke")
+
+    scenario = next(s for s in rehearsal.SCENARIOS if s.name == "sigterm_mid_gate0")
+    scenario = dataclasses.replace(scenario, signal_when=broken)
+    out = tmp_path / "dry"
+    try:
+        with pytest.raises(ValueError, match="signal_when broke"):
+            rehearsal._signalled(scenario, out)
+        (child,) = children
+        assert child.poll() is not None
+        for pid_file in out.glob("host-root/out/*/serve.pid"):
+            serve_ = hostrun._serve_identity(pid_file)
+            assert serve_ is not None and not hostrun._is_running(*serve_)
+            stats = pid_file.with_name("server-stats.jsonl")
+            assert hostrun._session_survivors(stats, set()) == []
+    finally:
+        vast.stop_local_sessions(out / "host-root")

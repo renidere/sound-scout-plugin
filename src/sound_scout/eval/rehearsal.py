@@ -1968,16 +1968,21 @@ def _descendants(pid: int) -> list[int]:
     return found
 
 
+CHILD_WAIT_S = 300.0
+
+
 def _signalled(scenario: Scenario, out: Path) -> int | None:
     """The dry run in a child process (`--child`), sent SIGTERM once `signal_when(out)` holds,
-    as `systemctl stop` would signal `deploy`; returns its exit code."""
+    as `systemctl stop` would signal `deploy`; returns its exit code, None when it timed out.
+    However the child ends, no process of its fake host's sessions outlives it (#203)."""
     log = open(out.parent / f"{scenario.name}.child.log", "wb")  # noqa: SIM115
     child = subprocess.Popen(
         [sys.executable, "-m", "sound_scout.eval.rehearsal", "--child", scenario.name,
          "--out", str(out)],
         stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
     )  # fmt: skip
-    ends = time.monotonic() + 300
+    ends = time.monotonic() + CHILD_WAIT_S
+    code = None
     try:
         while child.poll() is None and time.monotonic() < ends:
             if scenario.signal_when(out):
@@ -1989,13 +1994,19 @@ def _signalled(scenario: Scenario, out: Path) -> int | None:
                     child.send_signal(signal.SIGTERM)
                 break
             time.sleep(0.05)
-        return child.wait(300)
+        code = child.wait(CHILD_WAIT_S)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(child.pid, signal.SIGKILL)
-        return None
+        pass
     finally:
+        if child.poll() is None:  # timed out, or `signal_when` raised
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
         log.close()
+        stopped = vast.stop_local_sessions(out / "host-root")
+    if not stopped:
+        raise RuntimeError("a process of the fake host's sessions outlived the dry run")
+    return code
 
 
 def run_scenario(scenario: Scenario, out: Path) -> dict:
