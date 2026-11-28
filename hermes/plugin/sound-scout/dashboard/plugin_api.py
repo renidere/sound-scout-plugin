@@ -11,11 +11,14 @@ HTTP 200: a refusal is `{"ok": false, "error": <code>, "detail": <text>}`, becau
 `ctx.rest` drops the body of an HTTP error. The job card of the Desktop half (#108) reads
 `GET /jobs/{job_id}/report` (`jobs report`, its larger output cap `REPORT_CLI_OUTPUT`) and acts by
 `POST /jobs/{job_id}/cancel` and `POST /jobs/{job_id}/retry` on the one job of the path; their
-bodies are not read. Runs on the Hermes interpreter (Python >= 3.11):
-stdlib, FastAPI.
+bodies are not read. `GET /recordings/{name}` answers one sent recording `sound-scout-<12 hex>.wav`
+of `<hermes home>/attachments` as a `data_url` for the player of the Desktop half (#214); it is the
+one place that reads `attachments/` (0013 § 9 item 2, owner's change of 2026-11-28). Runs on the
+Hermes interpreter (Python >= 3.11): stdlib, FastAPI.
 """
 
 import asyncio
+import base64
 import binascii
 import contextlib
 import errno
@@ -33,7 +36,7 @@ from fastapi import APIRouter, Request
 router = APIRouter()
 
 PLUGIN = "sound-scout"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BIN_ENV = "SOUND_SCOUT_BIN"
 CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 CHILD_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
@@ -47,6 +50,9 @@ SUBMITTER = "hermes-plugin"
 UPLOAD_SUFFIX = ".upload"
 HERMES_DIR = ".hermes"
 JOB_ID = re.compile(r"[0-9a-f]{32}")
+RECORDING_NAME = re.compile(r"sound-scout-[0-9a-f]{12}\.wav")
+ATTACHMENTS_DIR = "attachments"
+READ_CHUNK = 1024 * 1024
 CLI_REFUSAL = re.compile(r"sound-scout jobs: ([a-z_]+): (.*)")
 JOB_OPTIONS = {
     "session_id": "--session-id",
@@ -457,3 +463,86 @@ async def cancel_job(job_id: str):
 @router.post("/jobs/{job_id}/retry")
 async def retry_job(job_id: str):
     return await _act("retry", job_id)
+
+
+def _read_recording(home: str, name: str, cap: int) -> bytes:
+    """The bytes of `<home>/attachments/<name>`: a regular file of this user with one link and
+    1..`cap` bytes, opened without following a symlink and checked before any read. Blocks."""
+    missing = Refused("recording_missing", f"no such recording in {ATTACHMENTS_DIR}/")
+    try:
+        dirfd = os.open(
+            os.path.join(home, ATTACHMENTS_DIR),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        raise missing from None
+    except OSError as error:
+        detail = f"cannot open {ATTACHMENTS_DIR}/: {error.strerror}"
+        raise Refused("attachments_unavailable", detail) from None
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC  # a FIFO never blocks
+        try:
+            fd = os.open(name, flags, dir_fd=dirfd)
+        except FileNotFoundError:
+            raise missing from None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise Refused("recording_refused", "the recording is a symlink") from None
+            detail = f"cannot open the recording: {error.strerror}"
+            raise Refused("recording_unreadable", detail) from None
+        try:
+            return _read_checked(fd, cap)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def _read_checked(fd: int, cap: int) -> bytes:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or info.st_size == 0
+    ):
+        raise Refused("recording_refused", "not a regular file of the gateway user")
+    too_large = Refused("recording_too_large", f"larger than {cap} bytes")
+    if info.st_size > cap:
+        raise too_large
+    chunks, size = [], 0
+    try:
+        while chunk := os.read(fd, min(READ_CHUNK, cap + 1 - size)):
+            size += len(chunk)
+            if size > cap:  # the file grew after fstat
+                raise too_large
+            chunks.append(chunk)
+    except OSError as error:
+        detail = f"cannot read the recording: {error.strerror}"
+        raise Refused("recording_unreadable", detail) from None
+    return b"".join(chunks)
+
+
+def _recording_answer(home: str, name: str, cap: int) -> dict:
+    wav = _read_recording(home, name, cap)
+    return {
+        "ok": True,
+        "name": name,
+        "size_bytes": len(wav),
+        "sha256": hashlib.sha256(wav).hexdigest(),
+        "data_url": DATA_URL_PREFIX + base64.b64encode(wav).decode("ascii"),
+    }
+
+
+@router.get("/recordings/{name}")
+async def recording(name: str):
+    try:
+        if not RECORDING_NAME.fullmatch(name):
+            raise Refused("bad_recording_name", "a recording name is sound-scout-<12 hex>.wav")
+        home = _home()
+        if home is None:
+            raise Refused("attachments_unavailable", "the Hermes home is unknown")
+        cap = (await _limits())["max_input_bytes"]
+        return await asyncio.to_thread(_recording_answer, os.fspath(home), name, cap)
+    except Refused as refusal:
+        return refusal.answer()

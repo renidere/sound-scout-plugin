@@ -111,6 +111,14 @@ Desktop 0.23.3 при входе паролем (`basic`) шлёт `ctx.rest` ч
 
 Копирование, SHA-256 и вызов CLI выполняются вне event loop gateway (`asyncio.to_thread`).
 
+Правка 2026-11-28 (#214, [Decision](https://github.com/renidere/sound-scout-plugin/issues/214#issuecomment-7238679289)).
+Решение владельца 2026-11-28: `plugin_api` читает `attachments/sound-scout-<12 hex>.wav` только для
+прослушивания в Desktop. Маршрут — `GET /recordings/{name}`. Он берёт имя по шаблону, а не путь из
+`file.attach`. Каталог — `<get_hermes_home()>/attachments`, он открывается с `O_DIRECTORY|O_NOFOLLOW`.
+Файл открывается от дескриптора каталога с `O_NOFOLLOW|O_NONBLOCK`. До чтения `fstat` проверяет:
+обычный файл gateway-пользователя, одна ссылка, от 1 байта до `max_input_bytes`. Ответ — JSON с
+`data_url`, отказ — `ok: false` и код. Копии в staging и анализа приложенного файла по-прежнему нет.
+
 ### 3.6. Задания на сервере
 
 Новый модуль `src/sound_scout/jobs.py`, хранилище — файлы `<data_root>/jobs/<job_id>/`: `job.json`
@@ -265,6 +273,9 @@ Unit-тесты и моки не заменяют её; мок модели не
    `<profile>/attachments` (только абсолютный `path`, обычный файл без symlink, в бюджете) и
    копировать в staging? Это обходит смысл решения A (#66), хотя guard не меняется. По умолчанию —
    нет: анализ только для записей, загруженных через «Отправить и разобрать».
+   Правка 2026-11-28 (#214, [Decision](https://github.com/renidere/sound-scout-plugin/issues/214#issuecomment-7238679289)): владелец разрешил читать
+   `attachments/sound-scout-<12 hex>.wav` только для прослушивания в Desktop (§ 3.5). Копия в
+   staging и анализ приложенных файлов по-прежнему запрещены.
 3. **Доставка во внутреннюю функцию gateway** `deliver_to_local_chat` (без вызова модели) или запасной
    путь `ctx.inject_message` (ход агента).
 4. **Репозиторий Voice Note.** Пометить README, Windows-клиент и релизы 0.4.1–0.4.2 как

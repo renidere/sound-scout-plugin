@@ -21,6 +21,12 @@ const posted = post => Buffer.from(post.opts.body.data_url.split(',')[1], 'base6
 const IPC_FAILURE = "Error invoking remote method 'hermes:api': Error: File uploads are not supported against OAuth-gated remote backends yet."
 const DESKTOP_TEXT = 'File uploads are not supported against OAuth-gated remote backends yet.'
 const notices = calls => named(calls, 'notify').map(call => call[1])
+// The copy of a sent recording on the station: other bytes than the recorder buffer, so a test
+// tells "from the station" from "from the buffer".
+const STATION_WAV = Buffer.concat([Buffer.from('RIFF\x24\x00\x00\x00WAVE', 'latin1'), Buffer.from('station copy of the sent recording')])
+const stationAnswer = (name, bytes = STATION_WAV, extra = {}) => ({
+  ok: true, name, size_bytes: bytes.length, sha256: 'f'.repeat(64), data_url: `data:audio/wav;base64,${bytes.toString('base64')}`, ...extra
+})
 
 function textContent(node) {
   if (node == null || typeof node === 'boolean') return ''
@@ -128,11 +134,13 @@ function fakeCtx(order) {
     post: { ok: true, job_id: JOB, request_id: `sound-scout-desktop-${RECORDING_ID}`, state: 'queued', reused: false },
     statuses: [],
     actions: [],
+    recordings: [],
     async rest(path, opts = {}) {
       ctx.rests.push({ path, opts })
       order.push(`rest ${opts.method || 'GET'} ${path.split('?')[0]}`)
       const answer = path === '/health' ? ctx.health
         : path.startsWith('/jobs?') ? ctx.post
+          : path.startsWith('/recordings/') ? (ctx.recordings.shift() ?? stationAnswer(path.slice('/recordings/'.length)))
           : /^\/jobs\/[^/]+\/(report|cancel|retry)$/.test(path) ? (ctx.actions.shift() ?? { ok: false, error: 'job_not_found' })
             : path.startsWith('/jobs/') ? (ctx.statuses.shift() ?? { ok: false, error: 'job_not_found' })
               : new Error(`Unexpected rest path: ${path}`)
@@ -214,7 +222,8 @@ async function setup({ globals = {}, options = {} } = {}) {
   })
   const card = () => renderTree({ type: plugin.JobCard, props: { recorder } })
   const press = label => findButton(card(), label).props.onClick()
-  return { plugin, ...fake, ctx, recorder, env, capture, sleeps, order, composer, card, press }
+  const controls = () => renderTree({ type: plugin.RecorderControls, props: { recorder } })
+  return { plugin, ...fake, ctx, recorder, env, capture, sleeps, order, composer, card, press, controls }
 }
 
 async function setupRegistered({ globals = {}, host: patch, sdk: extra = {} } = {}) {
@@ -1065,7 +1074,7 @@ test('the Sound Scout: health command puts the backend version of GET /health fi
     return notices(calls)
   }
   const line = version => `version=${version} pid=4242 session_owner=owner; до 180 с, до ${64 * MIB} байт; приём записей готов`
-  same(await runHealth({ version: '0.2.0' }), [{ kind: 'info', title: 'Sound Scout: health', message: line('0.2.0') }])
+  same(await runHealth({ version: '0.3.0' }), [{ kind: 'info', title: 'Sound Scout: health', message: line('0.3.0') }])
   for (const old of [{}, { version: null }, { version: 2 }, { version: '' }]) {
     same(await runHealth(old), [{ kind: 'info', title: 'Sound Scout: health', message: line('недоступна') }])
   }
@@ -1541,11 +1550,11 @@ test('criterion 3: retry keeps the job_id, shows the attempt and reads the repor
 test('a refused retry names why in Russian after one status request, and a removed input hides the retry button', async () => {
   const removed = { staging_removed_at: '2026-11-23T10:00:00Z' }
   for (const [error, after, expected, buttons] of [
-    ['not_retryable', view('failed', { state_reason: 'x', ...removed }), 'Повтор невозможен: исходная запись уже удалена. Запиши заново.', ['Скрыть']],
-    ['not_retryable', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: not_retryable', ['Повторить разбор', 'Скрыть']],
-    ['queue_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Повторить разбор', 'Скрыть']],
-    ['staging_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Повторить разбор', 'Скрыть']],
-    ['cli_timeout', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: cli_timeout', ['Повторить разбор', 'Скрыть']]
+    ['not_retryable', view('failed', { state_reason: 'x', ...removed }), 'Повтор невозможен: исходная запись уже удалена. Запиши заново.', ['Прослушать', 'Скрыть']],
+    ['not_retryable', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: not_retryable', ['Прослушать', 'Повторить разбор', 'Скрыть']],
+    ['queue_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Прослушать', 'Повторить разбор', 'Скрыть']],
+    ['staging_full', view('failed', { state_reason: 'x' }), 'Очередь занята, повтори позже.', ['Прослушать', 'Повторить разбор', 'Скрыть']],
+    ['cli_timeout', view('failed', { state_reason: 'x' }), 'Повторить разбор не удалось: cli_timeout', ['Прослушать', 'Повторить разбор', 'Скрыть']]
   ]) {
     const context = await setup()
     context.ctx.statuses = [view('failed', { state_reason: 'x' })]
@@ -1564,7 +1573,7 @@ test('a refused retry names why in Russian after one status request, and a remov
   context.ctx.statuses = [view('cancelled', { staging_removed_at: '2026-11-23T10:00:00Z' })]
   await analyzed(context)
   await context.recorder.polling
-  same(buttonLabels(context.card()), ['Скрыть'])
+  same(buttonLabels(context.card()), ['Прослушать', 'Скрыть'])
 })
 
 test('a failed retry follows the state the job has now, or shows Refresh when the status request fails too', async () => {
@@ -1593,7 +1602,7 @@ test('a failed retry follows the state the job has now, or shows Refresh when th
   await press('Повторить разбор')
   assert.equal(getRests(ctx).length, before + 1)
   assert.equal(recorder.job.get().stopped, true)
-  same(buttonLabels(card()), ['Повторить разбор', 'Обновить', 'Скрыть'])
+  same(buttonLabels(card()), ['Прослушать', 'Повторить разбор', 'Обновить', 'Скрыть'])
   ctx.statuses = [view('failed', { attempts: 2, state_reason: 'y' })]
   await press('Обновить')
   await recorder.polling
@@ -1633,7 +1642,7 @@ test('a poll answer about another job is bad_answer and changes nothing', async 
   await recorder.polling
   const job = recorder.job.get()
   same([job.view, job.result, job.final, job.stopped, job.text], [null, null, false, true, 'Статус разбора недоступен: bad_answer'])
-  same(buttonLabels(card()), ['Обновить', 'Скрыть'])
+  same(buttonLabels(card()), ['Прослушать', 'Обновить', 'Скрыть'])
   await context.press('Обновить')
   await recorder.polling
   assert.match(textContent(card()), /Разбор готов: partial/)
@@ -1737,4 +1746,239 @@ test('register leaves the transcript directive out, and an SDK without useCompos
     same(notices(calls), [])
     ctx.disposers.forEach(fn => fn())
   }
+})
+
+// --- the player of a sent recording (#214) -------------------------------------------------------
+
+const NAME_1 = `sound-scout-${RECORDING_ID}.wav`
+const NAME_2 = 'sound-scout-020304050607.wav'
+const recordingRests = ctx => ctx.rests.filter(r => r.path.startsWith('/recordings/'))
+const dialogs = tree => nodes(tree, 'Dialog')
+const alertsOf = tree => [...walk(tree)].filter(node => node.props?.role === 'alert').map(textContent)
+
+// A new token for each recording: 010203040506, then 020304050607.
+function counting() {
+  let n = 0
+  return length => { n++; return Uint8Array.from({ length }, (_, i) => (i + n) % 256) }
+}
+
+// URL.createObjectURL, the release timer and the hidden download link of the renderer.
+function fakeBrowser() {
+  const blobs = new Map()
+  const revoked = []
+  const links = []
+  const timers = []
+  let next = 0
+  const env = {
+    URL: {
+      createObjectURL: blob => { const url = `blob:player-${++next}`; blobs.set(url, blob); return url },
+      revokeObjectURL: url => revoked.push(url)
+    },
+    document: {
+      body: { appendChild: link => { link.appended = true } },
+      createElement: type => {
+        const link = { type, style: {}, clicks: 0, appended: false, removed: false, click() { this.clicks++ }, remove() { this.removed = true } }
+        links.push(link)
+        return link
+      }
+    },
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} } },
+    clearTimeout: () => {}
+  }
+  const bytesOf = async url => Buffer.from(await blobs.get(url).arrayBuffer())
+  const release = () => { for (const timer of timers.splice(0).filter(t => t.ms === 30000)) timer.fn() }
+  return { env, blobs, revoked, links, timers, bytesOf, release }
+}
+
+async function playerSetup(options = {}) {
+  const browser = fakeBrowser()
+  const context = await setup({ globals: browser.env, options: { random: counting(), ...options } })
+  return { ...context, browser }
+}
+
+async function sent(context, { analyze = false } = {}) {
+  await context.recorder.start()
+  feed(context.capture)
+  await context.recorder.send({ analyze })
+}
+
+test('criterion 1: the recorder of a chat offers Listen for the last recording sent there', async () => {
+  const context = await playerSetup()
+  const { recorder, composer, controls } = context
+  same(buttonLabels(controls()), ['Записать'])
+  await sent(context)
+  same(buttonLabels(controls()), ['Записать', 'Прослушать'])
+  same(Object.entries(recorder.sent.get()).map(([chat, item]) => [chat, item.name]), [['stored-a', NAME_1]])
+  composer.stored = 'stored-b'
+  same(buttonLabels(controls()), ['Записать'])
+  composer.stored = 'stored-a'
+  context.ctx.statuses = [finishedView()]
+  await sent(context, { analyze: true })
+  await recorder.polling
+  same(Object.entries(recorder.sent.get()).map(([chat, item]) => [chat, item.name]), [['stored-a', NAME_2]])
+  same(buttonLabels(controls()), ['Записать', 'Прослушать'])
+  await findButton(controls(), 'Прослушать').props.onClick()
+  same(recordingRests(context.ctx).map(r => r.path), [`/recordings/${NAME_2}`])
+
+  const failed = await playerSetup()
+  const request = failed.host.requestProfile
+  failed.host.requestProfile = (...args) => args[1] === 'prompt.submit' ? Promise.reject(new Error('private')) : request(...args)
+  await assert.rejects(sent(failed))
+  same(failed.recorder.sent.get(), {})
+  failed.recorder.cancel()
+  same(buttonLabels(failed.controls()), ['Записать'])
+})
+
+test('criterion 2: the job card offers Listen for the recording of its job', async () => {
+  const context = await playerSetup()
+  const { recorder, ctx, card, press } = context
+  ctx.statuses = [view('failed', { state_reason: 'x' })]
+  await sent(context, { analyze: true })
+  await recorder.polling
+  assert.equal(recorder.job.get().recording, NAME_1)
+  ctx.statuses = [view('failed', { state_reason: 'x' })]
+  await sent(context, { analyze: true })
+  await recorder.polling
+  assert.equal(recorder.job.get().recording, NAME_2)
+  assert.ok(findButton(card(), 'Прослушать'))
+  ctx.actions = [{ ok: true, job: { ...view('queued', { attempts: 1 }).job, retry: 'queued' } }]
+  ctx.statuses = [view('failed', { attempts: 2, state_reason: 'y' })]
+  await press('Повторить разбор')
+  await recorder.polling
+  assert.equal(recorder.job.get().recording, NAME_2)
+  await press('Прослушать')
+  same(recordingRests(ctx).map(r => r.path), [`/recordings/${NAME_2}`])
+  assert.equal(recorder.player.get().origin, 'card')
+})
+
+test('criterion 3: Listen fetches the station copy each time and plays it with native controls', async () => {
+  const context = await playerSetup()
+  const { recorder, ctx, controls, calls, browser, focus } = context
+  await sent(context)
+  const buffer = attached(calls)
+  let finish
+  ctx.recordings = [() => new Promise(resolve => { finish = resolve })]
+  const opening = findButton(controls(), 'Прослушать').props.onClick()
+  await tick()
+  assert.equal(findButton(controls(), 'Прослушать').props.disabled, true)
+  assert.match(textContent(controls()), /Загрузка записи…/)
+  await recorder.openPlayer({ sessionId: 'stored-a', name: NAME_1, owner: recorder.sent.get()['stored-a'].owner, origin: 'recorder' })
+  assert.equal(recordingRests(ctx).length, 1)
+  finish(stationAnswer(NAME_1))
+  await opening
+  same(recordingRests(ctx).map(r => [r.path, r.opts.timeoutMs]), [[`/recordings/${NAME_1}`, 120000]])
+  const [audio] = nodes(controls(), 'audio')
+  assert.equal(audio.props.controls, true)
+  assert.equal(audio.props.autoPlay, undefined)
+  assert.equal(audio.props.loop, undefined)
+  assert.equal(audio.props.preload, 'metadata')
+  assert.deepEqual(await browser.bytesOf(audio.props.src), STATION_WAV)
+  assert.notDeepEqual(await browser.bytesOf(audio.props.src), buffer)
+  assert.equal(textContent(nodes(controls(), 'DialogDescription')[0]), `Файл ${NAME_1} со станции`)
+  const first = audio.props.src
+  dialogs(controls())[0].props.onOpenChange(false)
+  assert.equal(dialogs(controls()).length, 0)
+  same(browser.revoked, [])
+  browser.release()
+  same(browser.revoked, [first])
+  await findButton(controls(), 'Прослушать').props.onClick()
+  assert.equal(recordingRests(ctx).length, 2)
+  assert.notEqual(nodes(controls(), 'audio')[0].props.src, first)
+  recorder.closePlayer()
+  browser.release()
+
+  focus.connectionId = 'conn-local'
+  await findButton(controls(), 'Прослушать').props.onClick()
+  assert.equal(recordingRests(ctx).length, 2)
+  same(alertsOf(controls()), [WRONG_CONNECTION_TEXT])
+  focus.connectionId = 'conn-remote'
+
+  ctx.recordings = [() => new Promise(resolve => { finish = resolve })]
+  const late = findButton(controls(), 'Прослушать').props.onClick()
+  await tick()
+  recorder.dispose()
+  finish(stationAnswer(NAME_1))
+  await late
+  assert.equal(recorder.player.get(), null)
+  assert.equal(dialogs(controls()).length, 0)
+  assert.equal(browser.blobs.size, browser.revoked.length, 'no object URL stays alive')
+})
+
+const WRONG_CONNECTION_TEXT = 'Окно подключено к другому серверу. Переключись на подключение этого чата.'
+
+test('criterion 4: Download saves the bytes the player plays under the recording name', async () => {
+  const context = await playerSetup()
+  const { recorder, controls, browser } = context
+  await sent(context)
+  await findButton(controls(), 'Прослушать').props.onClick()
+  const url = recorder.player.get().url
+  await findButton(controls(), 'Скачать').props.onClick()
+  assert.equal(browser.links.length, 1)
+  const [link] = browser.links
+  same([link.type, link.href, link.download, link.rel, link.style.display], ['a', url, NAME_1, 'noopener noreferrer', 'none'])
+  same([link.appended, link.clicks, link.removed], [true, 1, true])
+  assert.deepEqual(await browser.bytesOf(link.href), STATION_WAV)
+  same(alertsOf(controls()), [])
+
+  browser.env.document.createElement = () => { throw new Error('private-dom-failure') }
+  await findButton(controls(), 'Скачать').props.onClick()
+  same(alertsOf(controls()), ['Не удалось сохранить запись: private-dom-failure'])
+})
+
+test('criterion 6: a missing recording shows a plain message in the recorder and on the card', async () => {
+  const missing = 'Запись не найдена на станции: файла больше нет. Hermes мог его удалить.'
+  const context = await playerSetup()
+  const { recorder, ctx, controls, card, press, browser } = context
+  ctx.statuses = [finishedView()]
+  await sent(context, { analyze: true })
+  await recorder.polling
+  ctx.recordings = [{ ok: false, error: 'recording_missing', detail: 'no such recording' }]
+  await findButton(controls(), 'Прослушать').props.onClick()
+  assert.equal(recorder.state.get().error, missing)
+  same(alertsOf(controls()), [missing])
+  assert.equal(dialogs(controls()).length, 0)
+  ctx.recordings = [{ ok: false, error: 'recording_missing', detail: 'no such recording' }]
+  await press('Прослушать')
+  assert.equal(recorder.job.get().error, missing)
+  same(alertsOf(card()), [missing])
+  assert.equal(recorder.player.get(), null)
+  assert.equal(browser.blobs.size, 0)
+
+  for (const [answer, text] of [
+    [{ ok: false, error: 'recording_too_large' }, 'Запись больше лимита станции, прослушать её здесь нельзя.'],
+    [{ ok: false, error: 'recording_refused' }, 'Не удалось получить запись: recording_refused'],
+    [new Error("Error invoking remote method 'hermes:api': Error: socket hang up"), 'Не удалось получить запись: no_answer — socket hang up'],
+    [stationAnswer(NAME_2), 'Не удалось получить запись: bad_answer'],
+    [stationAnswer(NAME_1, STATION_WAV, { data_url: `data:audio/mpeg;base64,${STATION_WAV.toString('base64')}` }), 'Не удалось получить запись: bad_answer'],
+    [stationAnswer(NAME_1, STATION_WAV, { size_bytes: STATION_WAV.length + 1 }), 'Не удалось получить запись: bad_answer'],
+    [stationAnswer(NAME_1, STATION_WAV, { data_url: 'data:audio/wav;base64,%%%' }), 'Не удалось получить запись: bad_answer']
+  ]) {
+    ctx.recordings = [answer]
+    await press('Прослушать')
+    same(alertsOf(card()), [text])
+    assert.equal(dialogs(controls()).length, 0)
+  }
+  assert.equal(browser.blobs.size, 0)
+})
+
+test('the player dialog renders once, in the composer of its chat, with SDK components and the recorder sheet', async () => {
+  const context = await playerSetup()
+  const { recorder, controls, composer } = context
+  await sent(context)
+  await findButton(controls(), 'Прослушать').props.onClick()
+  assert.equal(dialogs(controls()).length, 1)
+  composer.stored = 'stored-b'
+  assert.equal(dialogs(controls()).length, 0)
+  composer.stored = 'stored-a'
+  recorder.player.set({ ...recorder.player.get(), error: 'Не удалось сохранить запись: x' })
+  const tree = controls()
+  const [content] = nodes(tree, 'DialogContent')
+  assert.equal(content.props.className, 'sound-scout-player')
+  same(nodes(tree, 'DialogTitle').map(textContent), ['Запись Sound Scout'])
+  assert.equal(nodes(tree, 'audio')[0].props['aria-label'], 'Голосовое сообщение')
+  assertCriterion4(tree, 'player')
+  const [css] = nodes(tree, 'style').map(node => node.props.children)
+  assert.match(css, /\.sound-scout-player \{[^}]*color:var\(--ui-text-primary\);/)
+  assert.match(css, /\.sound-scout-player__error \{ color:var\(--ui-red\); \}/)
+  assert.match(css.match(REDUCED_MOTION)[0], /\.sound-scout-player, \.sound-scout-player \*/)
 })

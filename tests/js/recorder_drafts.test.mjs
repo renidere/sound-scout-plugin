@@ -515,3 +515,25 @@ test('a slow /health does not hold back the restored draft: it is offered at onc
   same(idb.rows(), [])
   second.recorder.dispose()
 })
+
+test('criterion 2 (#214): a job of a restored draft gets the recording name of the draft for Listen', async () => {
+  const idb = fakeIndexedDB()
+  const first = await load(idb)
+  await record(first)
+  first.ctx.post = { ok: false, error: 'queue_full' }
+  await assert.rejects(first.recorder.send({ analyze: true }))
+  await first.recorder.draftWrites
+  first.recorder.dispose()
+
+  const second = await load(idb)
+  second.focus.stored = 'stored-b'
+  await second.recorder.restore()
+  await second.recorder.send({ analyze: true })
+  same(named(second.calls, 'file.attach'), [])
+  same(named(second.calls, 'prompt.submit'), [])
+  const name = `sound-scout-${DRAFT_ID}.wav`
+  same([second.recorder.job.get().jobId, second.recorder.job.get().recording], [JOB, name])
+  same(Object.entries(second.recorder.sent.get()).map(([chat, item]) => [chat, item.name]), [['stored-a', name]])
+  await second.recorder.polling
+  second.recorder.dispose()
+})

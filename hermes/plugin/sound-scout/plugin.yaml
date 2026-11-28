@@ -1,5 +1,5 @@
 name: sound-scout
-version: 0.2.0
+version: 0.3.0
 description: Sound Scout - send a voice recording for speech analysis and follow the job
 author: renidere
 requires_env:

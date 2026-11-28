@@ -2,11 +2,17 @@
 // composer (#103), the job card above the input of the job's chat (#108) and the health command of
 // the palette. The recorder sends by the stock path Spike A chose (decision 0016). The card follows
 // the job by polling GET /jobs/{job_id} and shows its report as plain text: it holds the transcript,
-// untrusted data, so it is never rendered as Markdown.
+// untrusted data, so it is never rendered as Markdown. "Прослушать" reads the sent WAV from the station
+// again at each open (GET /recordings/{name}) and plays it in a native <audio controls> (#214).
 import { atom, host, Button, Codicon, COMPOSER_AREAS, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, PALETTE_AREA, useComposerSession, useValue } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const JOB_ID = /^[0-9a-f]{32}$/
+const RECORDING_NAME = /^sound-scout-[0-9a-f]{12}\.wav$/
+const DATA_URL_PREFIX = 'data:audio/wav;base64,'
+const RECORDING_TIMEOUT_MS = 120000
+// Ссылка blob: живёт после закрытия плеера, чтобы начатое скачивание успело забрать байты.
+const URL_RELEASE_MS = 30000
 const FOREGROUND = { spawnPriority: 'foreground' }
 const ATTACH_TIMEOUT_MS = 120000
 const UPLOAD_TIMEOUT_MS = 120000
@@ -197,6 +203,29 @@ function actionError(name, error, view) {
   return `${ACTION_FAILED[name]}: ${code}${detail}`
 }
 
+function playerError(error) {
+  const code = error?.code || 'no_answer'
+  if (code === 'recording_missing') return 'Запись не найдена на станции: файла больше нет. Hermes мог его удалить.'
+  if (code === 'recording_too_large') return 'Запись больше лимита станции, прослушать её здесь нельзя.'
+  if (code === 'wrong_connection') return WRONG_CONNECTION
+  if (code === 'no_answer') return `Не удалось получить запись: no_answer — ${error?.message || 'нет ответа сервера'}`
+  return `Не удалось получить запись: ${code}`
+}
+
+// The WAV bytes of a GET /recordings/{name} answer about that very name, or bad_answer.
+function recordingBytes(answer, name) {
+  const dataUrl = answer.data_url
+  if (answer.name !== name || typeof dataUrl !== 'string' || !dataUrl.startsWith(DATA_URL_PREFIX)) {
+    throw new RecorderError('bad_answer')
+  }
+  let binary
+  try { binary = atob(dataUrl.slice(DATA_URL_PREFIX.length)) } catch { throw new RecorderError('bad_answer') }
+  if (!binary.length || binary.length !== answer.size_bytes) throw new RecorderError('bad_answer')
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
 async function checked(request) {
   let answer
   try {
@@ -230,6 +259,10 @@ export class Recorder {
     this.elapsed = atom(0)
     this.level = atom(0)
     this.job = atom(null)
+    // stored chat → { name, owner } of the last recording sent there, in the memory of this window
+    this.sent = atom({})
+    this.player = atom(null)
+    this.playerGeneration = 0
     this.levelAt = -Infinity
     this.chunks = []
     this.generation = 0
@@ -469,6 +502,7 @@ export class Recorder {
 
   dispose() {
     this.pollGeneration++
+    this.closePlayer()
     this.discard()
   }
 
@@ -559,6 +593,9 @@ export class Recorder {
           if (analyze) this.saveDraft(pending, target)
         } finally { release?.() }
       }
+      if (RECORDING_NAME.test(pending.attach.name)) {
+        this.sent.set({ ...this.sent.get(), [target.stored]: { name: pending.attach.name, owner: pending.owner } })
+      }
       if (analyze && !pending.job) {
         message = null
         await this.submitJob(pending, target, generation)
@@ -605,7 +642,7 @@ export class Recorder {
     if (answer?.ok !== true) throw new RecorderError(String(answer?.error || 'bad_answer'))
     if (typeof answer.job_id !== 'string' || !JOB_ID.test(answer.job_id)) throw new RecorderError('bad_answer')
     pending.job = { job_id: answer.job_id }
-    this.track(answer.job_id, owner, target.stored)
+    this.track(answer.job_id, owner, target.stored, pending.attach.name)
   }
 
   onRoute(owner) {
@@ -613,9 +650,9 @@ export class Recorder {
     return state.connectionId?.get?.() === owner.connectionId && state.profile?.get?.() === owner.profile
   }
 
-  track(jobId, owner, sessionId) {
+  track(jobId, owner, sessionId, recording) {
     this.job.set({
-      jobId, sessionId, owner, view: null, result: null, text: 'Разбор: принят',
+      jobId, sessionId, owner, recording, view: null, result: null, text: 'Разбор: принят',
       final: false, stopped: false, busy: null, error: '', report: null
     })
     this.follow(false)
@@ -805,6 +842,69 @@ export class Recorder {
     this.pollGeneration++
     this.job.set(null)
   }
+
+  // Each open reads the file of the station again: no cache, the recorder buffer is never played.
+  async openPlayer({ sessionId, name, owner, origin }) {
+    if (this.player.get()?.loading) return
+    if (this.player.get()) this.closePlayer()
+    const jobId = origin === 'card' ? this.job.get()?.jobId : null
+    const show = error => {
+      if (origin === 'recorder') this.update({ error })
+      else if (this.job.get()?.jobId === jobId) this.setJob({ error })
+    }
+    if (!this.onRoute(owner)) {
+      show(WRONG_CONNECTION)
+      return
+    }
+    show('')
+    const generation = ++this.playerGeneration
+    this.player.set({ sessionId, name, owner, origin, loading: true, url: null, error: '' })
+    let bytes
+    try {
+      const answer = await checked(() => this.ctx.rest(`/recordings/${name}`, { timeoutMs: RECORDING_TIMEOUT_MS }))
+      bytes = recordingBytes(answer, name)
+    } catch (error) {
+      if (generation !== this.playerGeneration) return
+      this.player.set(null)
+      show(playerError(error))
+      return
+    }
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }))
+    if (generation !== this.playerGeneration) {
+      URL.revokeObjectURL(url)
+      return
+    }
+    this.player.set({ ...this.player.get(), loading: false, url })
+  }
+
+  closePlayer() {
+    this.playerGeneration++
+    const url = this.player.get()?.url
+    this.player.set(null)
+    if (!url) return
+    const timer = setTimeout(() => URL.revokeObjectURL(url), URL_RELEASE_MS)
+    timer?.unref?.()
+  }
+
+  // The same Blob the player plays, saved by the download of the renderer under the recording name.
+  downloadRecording() {
+    const player = this.player.get()
+    if (!player?.url) return
+    let link
+    try {
+      link = document.createElement('a')
+      link.href = player.url
+      link.download = player.name
+      link.rel = 'noopener noreferrer'
+      link.style.display = 'none'
+      document.body.appendChild(link)
+      link.click()
+    } catch (error) {
+      if (this.player.get() === player) this.player.set({ ...player, error: `Не удалось сохранить запись: ${desktopErrorText(error)}` })
+    } finally {
+      link?.remove()
+    }
+  }
 }
 
 function SignalMeter({ recorder }) {
@@ -836,8 +936,11 @@ const STYLE = `
   .sound-scout-recorder__meter { display:inline-flex; align-items:center; gap:2px; width:14px; height:12px; color:var(--ui-text-secondary); }
   .sound-scout-recorder__meter span { display:block; width:2px; border-radius:1px; background:var(--ui-text-secondary); }
   .sound-scout-recorder__label { display:inline-flex; align-items:center; gap:5px; }
+  .sound-scout-player { display:flex; flex-direction:column; gap:8px; color:var(--ui-text-primary); }
+  .sound-scout-player__audio { display:block; width:100%; }
+  .sound-scout-player__error { color:var(--ui-red); }
   .sound-scout-recorder__error { position:absolute; bottom:calc(100% + 6px); left:0; z-index:10; width:max-content; max-width:min(260px,80vw); padding:6px 8px; border:1px solid var(--ui-stroke-secondary); border-radius:4px; background:var(--ui-bg-quaternary); color:var(--ui-text-secondary); font-size:12px; }
-  @media (prefers-reduced-motion: reduce) { .sound-scout-recorder * { transition: none !important; animation: none !important; } }
+  @media (prefers-reduced-motion: reduce) { .sound-scout-recorder *, .sound-scout-player, .sound-scout-player * { transition: none !important; animation: none !important; } }
 `
 
 const CARD_STYLE = `
@@ -884,8 +987,32 @@ function ReportDialog({ recorder, job }) {
   }, 'report')
 }
 
+function PlayerDialog({ recorder, player }) {
+  const body = [
+    jsx('audio', {
+      controls: true, preload: 'metadata', src: player.url, 'aria-label': 'Голосовое сообщение', className: 'sound-scout-player__audio'
+    }, 'audio'),
+    jsx('div', { children: action({
+      label: 'Скачать', icon: 'cloud-download', title: 'Сохранить этот WAV на компьютер', onClick: () => recorder.downloadRecording()
+    }) }, 'actions')
+  ]
+  if (player.error) body.push(jsx('p', { role: 'alert', className: 'sound-scout-player__error', children: player.error }, 'error'))
+  return jsx(Dialog, {
+    open: true,
+    onOpenChange: open => { if (!open) recorder.closePlayer() },
+    children: jsxs(DialogContent, { className: 'sound-scout-player', children: [
+      jsxs(DialogHeader, { children: [
+        jsx(DialogTitle, { children: 'Запись Sound Scout' }),
+        jsx(DialogDescription, { children: `Файл ${player.name} со станции` })
+      ] }, 'header'),
+      ...body
+    ] })
+  }, 'player')
+}
+
 export function JobCard({ recorder }) {
   const job = useValue(recorder.job)
+  const player = useValue(recorder.player)
   const composer = useComposerSession()
   if (!job || composer?.storedSessionId !== job.sessionId) return null
   const view = job.view
@@ -896,6 +1023,9 @@ export function JobCard({ recorder }) {
   if (attempt > 1) head.push(jsx('span', { className: 'sound-scout-card__meta', children: `Попытка ${attempt}` }, 'attempt'))
   if (job.result?.status && state !== 'finished') {
     head.push(jsx('span', { className: 'sound-scout-card__meta', children: `Результат: ${job.result.status}` }, 'result'))
+  }
+  if (player?.loading && player.origin === 'card') {
+    head.push(jsx('span', { className: 'sound-scout-card__meta', children: 'Загрузка записи…' }, 'player'))
   }
   const children = [
     jsx('style', { children: CARD_STYLE }, 'style'),
@@ -913,6 +1043,12 @@ export function JobCard({ recorder }) {
   }
   if (job.error) children.push(jsx('p', { role: 'alert', className: 'sound-scout-card__error', children: job.error }, 'error'))
   const buttons = []
+  if (RECORDING_NAME.test(job.recording ?? '')) {
+    buttons.push(action({
+      label: 'Прослушать', icon: 'play', title: 'Прослушать запись этого разбора', disabled: disabled || player?.loading === true,
+      onClick: () => recorder.openPlayer({ sessionId: job.sessionId, name: job.recording, owner: job.owner, origin: 'card' })
+    }))
+  }
   if ((state === 'queued' || state === 'running') && view.cancel_requested !== true) {
     buttons.push(action({ label: 'Отменить разбор', icon: 'stop-circle', title: 'Отменить разбор этой записи', disabled, onClick: () => recorder.cancelJob() }))
   }
@@ -933,17 +1069,35 @@ export function JobCard({ recorder }) {
   return jsxs('section', { className: 'sound-scout-card', 'aria-label': 'Разбор Sound Scout', children })
 }
 
-function RecorderControls({ recorder }) {
+// Without useComposerSession the recorder cannot tell its chat, so it offers no Listen.
+const composerSession = () => typeof useComposerSession === 'function' ? useComposerSession() : null
+
+export function RecorderControls({ recorder }) {
   const state = useValue(recorder.state)
   const elapsed = useValue(recorder.elapsed)
+  const sent = useValue(recorder.sent)
+  const player = useValue(recorder.player)
+  const stored = composerSession()?.storedSessionId ?? null
   const { phase } = state
   const busy = phase === 'sending' || phase === 'starting'
   const children = [jsx('style', { children: STYLE }, 'style')]
   if (state.error) {
     children.push(jsx('span', { role: 'alert', title: state.error, className: 'sound-scout-recorder__error', children: state.error }, 'error'))
   }
+  // One dialog per window: only the composer of the chat of the player renders it.
+  if (player?.url && stored !== null && stored === player.sessionId) children.push(jsx(PlayerDialog, { recorder, player }, 'player'))
   if (phase === 'idle') {
     children.push(action({ label: 'Записать', icon: 'mic', title: 'Записать голосовое сообщение', onClick: () => recorder.start() }))
+    const last = stored === null ? null : sent[stored]
+    if (last) {
+      children.push(action({
+        label: 'Прослушать', icon: 'play', title: 'Прослушать последнюю отправленную запись этого чата', disabled: player?.loading === true,
+        onClick: () => recorder.openPlayer({ sessionId: stored, name: last.name, owner: last.owner, origin: 'recorder' })
+      }))
+      if (player?.loading && player.origin === 'recorder') {
+        children.push(jsx('span', { role: 'status', className: 'sound-scout-recorder__status', children: 'Загрузка записи…' }, 'loading'))
+      }
+    }
     return jsxs('div', { className: 'sound-scout-recorder', 'data-phase': phase, children })
   }
   const status = phase === 'recording' ? `${clock(elapsed)} / ${clock(state.limitSeconds)}`

@@ -39,7 +39,7 @@ const element = (type, props) => ({ type, props })
 
 export async function loadPlugin({ path = PROBE_PATH, sdk = {}, globals = {}, modules = {} } = {}) {
   const context = vm.createContext({
-    Blob, FileReader, TextEncoder, URLSearchParams, ArrayBuffer, Uint8Array, Int16Array, Float32Array,
+    Blob, FileReader, TextEncoder, URL, URLSearchParams, atob, ArrayBuffer, Uint8Array, Int16Array, Float32Array,
     DataView, crypto: globalThis.crypto, console, setTimeout, clearTimeout, setInterval, clearInterval,
     navigator: {},
     ...globals
