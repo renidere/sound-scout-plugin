@@ -188,6 +188,27 @@ def pin_sources(monkeypatch, sources: Path) -> None:
     monkeypatch.setattr(pr, "EXB_LIST_SHA256", pr.list_sha256(lines))
 
 
+def with_corpus_sources(settings: config.Config) -> config.Config:
+    sources = settings.data_root / prosody.CORPUS_DIR / "sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    (sources / "placeholder").write_bytes(b"")
+    return settings
+
+
+def eval_config(tmp_path: Path, data_root: Path, network: bool = False) -> Path:
+    """An eval config file as `docs/eval/PROSODY-CONFIG.md` says, for `config.load`."""
+    (tmp_path / "in").mkdir(exist_ok=True)
+    data_root.mkdir(exist_ok=True)
+    path = tmp_path / "eval.toml"
+    lines = [
+        f"allowed_roots = [{json.dumps(str(tmp_path / 'in'))}]",
+        f"data_root = {json.dumps(str(data_root))}",
+        f"[network]\nallow = {'true' if network else 'false'}",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def make_config(tmp_path: Path) -> config.Config:
     (tmp_path / "in").mkdir(exist_ok=True)
     (tmp_path / "data").mkdir(exist_ok=True)
@@ -707,6 +728,7 @@ def test_the_cli_fetch_makes_the_experiment_directory_0700_through_the_data_root
         data_root=settings.data_root,
         network=config.Network(allow=True),
     )
+    with_corpus_sources(settings)
     monkeypatch.setattr(config, "load", lambda: settings)
     called = []
     monkeypatch.setattr(pr, "fetch", lambda sources: called.append(sources) or {"fetched": 0})
@@ -923,10 +945,12 @@ def test_freeze_refuses_a_tree_at_another_commit_or_with_changes(tmp_path, monke
         pr.freeze(tree, OLD, tmp_path, probe_=fake_probe())
 
 
-def test_the_pins_are_those_of_0034_and_hold_in_this_tree() -> None:
+def test_the_pins_are_those_of_0034_and_the_series_3_files_hold_in_this_tree() -> None:
+    # prosody_confirm.py of this tree may change: its pin holds in the frozen trees (0037 § 4).
     assert {k: v for k, v in pr.PINNED_FILES.items() if k != pr.CONFIRM_PATH} == pc.FROZEN_SHA256
     assert pr.CONFIRM_SHA256 in (REPO / pr.CONFIRM_DECISION).read_text(encoding="utf-8")
-    for name, sha in pr.PINNED_FILES.items():
+    assert pr.CONFIRM_SHA256 in (REPO / pr.DECISION_DOC).read_text(encoding="utf-8")
+    for name, sha in pc.FROZEN_SHA256.items():
         assert hashlib.sha256((REPO / name).read_bytes()).hexdigest() == sha, name
     assert pr.EXPERIMENTS[OLD]["commit"] == "f37df5a395be79b8a52c105fa2ea891c99bcc052"
 
@@ -1175,12 +1199,59 @@ def test_a_main_run_out_of_memory_is_inconclusive_and_not_rerun(station, monkeyp
 def test_the_cli_refuses_fetch_without_the_network_and_prints_no_text(
     tmp_path, monkeypatch, capsys
 ) -> None:
-    settings = make_config(tmp_path)
+    settings = with_corpus_sources(make_config(tmp_path))
     monkeypatch.setattr(config, "load", lambda: settings)
     assert pr.main(["fetch"]) == 2
     assert "needs the network" in capsys.readouterr().err
     assert pr.main(["verify-frozen", str(tmp_path)]) == 2
     assert f"not a frozen tree: {pr.FROZEN_FILE} is missing" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["fetch"],
+        ["verify"],
+        ["survey"],
+        ["prepare"],
+        ["check-fresh"],
+        ["sanity"],
+        ["run"],
+        ["freeze", "TREE", "--experiment", "prosody-rupro-1"],
+        ["verify-frozen", "TREE"],
+    ],
+)
+@pytest.mark.parametrize("sources", ["missing", "empty"])
+def test_the_cli_refuses_a_data_root_without_corpus_sources_and_writes_nothing(
+    tmp_path, monkeypatch, capsys, argv, sources
+) -> None:
+    data_root, tree = tmp_path / "data", tmp_path / "tree"
+    tree.mkdir()
+    if sources == "empty":
+        (data_root / prosody.CORPUS_DIR / "sources").mkdir(parents=True)
+    path = eval_config(tmp_path, data_root, network=argv[0] == "fetch")
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    before = sorted(p for p in tmp_path.rglob("*"))
+    assert pr.main([str(tree) if a == "TREE" else a for a in argv]) == 2
+    err = capsys.readouterr().err
+    assert f"ConfigError: {path}: data_root has no corpus sources" in err
+    assert config.CONFIG_PATH_ENV in err
+    assert sorted(p for p in tmp_path.rglob("*")) == before
+
+
+def test_the_cli_goes_past_the_check_when_the_data_root_has_corpus_sources(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    data_root, tree = tmp_path / "data", tmp_path / "tree"
+    tree.mkdir()
+    with_corpus_sources(config.Config(allowed_roots=(), data_root=data_root))
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(eval_config(tmp_path, data_root)))
+    before = sorted(tmp_path.rglob("*"))
+    assert pr.main(["verify-frozen", str(tree)]) == 2
+    err = capsys.readouterr().err
+    assert f"not a frozen tree: {pr.FROZEN_FILE} is missing" in err
+    assert "corpus sources" not in err
+    assert sorted(tmp_path.rglob("*")) == before
 
 
 # --- stage-1 criteria of #199 --------------------------------------------------------------
@@ -1258,6 +1329,9 @@ def test_criterion_6_frozen_state_accepts_the_loaded_tree_and_refuses_a_wrong_pi
     tmp_path, monkeypatch
 ) -> None:
     assert sys.modules["sound_scout.asr"] and sys.modules["sound_scout.acoustics"]
+    # prosody_confirm.py of this tree is no longer the 0034 pin; the frozen trees keep it.
+    loaded = pr.sha256_file(REPO / pr.CONFIRM_PATH)
+    monkeypatch.setitem(pr.PINNED_FILES, pr.CONFIRM_PATH, loaded)
     tree = linked_tree(tmp_path)
     problems, info = REAL_FROZEN_STATE(tree)
     assert problems == [] and info["commit"] == git(tree, "rev-parse", "HEAD").strip()

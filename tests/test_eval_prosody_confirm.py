@@ -753,6 +753,8 @@ def test_the_cli_names_the_refusal_code_and_prints_no_sheet_text(
     tmp_path, monkeypatch, capsys
 ) -> None:
     settings = make_config(tmp_path)
+    (settings.data_root / prosody.CORPUS_DIR / "sources").mkdir(parents=True)
+    (settings.data_root / prosody.CORPUS_DIR / "sources" / "placeholder").write_bytes(b"")
     monkeypatch.setattr(config, "load", lambda: settings)
     out = settings.data_root / pc.OUTPUT_DIR
     out.mkdir()
@@ -849,3 +851,65 @@ def test_a_q1_violation_at_the_main_run_is_invalid_without_a_transcription(
     result = pc.run_main(settings, decision, script_transcriber(calls=calls))
     assert result["verdict"] == pc.INVALID and "Q1" in result["reason"]
     assert calls == [] and not (out / pc.MAIN_DIR).exists()
+
+
+def eval_config(tmp_path: Path) -> Path:
+    """An eval config file as `docs/eval/PROSODY-CONFIG.md` says, for the real `config.load`."""
+    (tmp_path / "in").mkdir(exist_ok=True)
+    (tmp_path / "data").mkdir(exist_ok=True)
+    path = tmp_path / "eval.toml"
+    path.write_text(
+        f"allowed_roots = [{json.dumps(str(tmp_path / 'in'))}]\n"
+        f"data_root = {json.dumps(str(tmp_path / 'data'))}\n[network]\nallow = false\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("command", ["prepare", "check-fresh", "sanity", "run", "import"])
+@pytest.mark.parametrize("sources", ["missing", "empty"])
+def test_the_cli_refuses_a_data_root_without_corpus_sources_and_writes_nothing(
+    tmp_path, monkeypatch, capsys, command, sources
+) -> None:
+    path = eval_config(tmp_path)
+    if sources == "empty":
+        (tmp_path / "data" / prosody.CORPUS_DIR / "sources").mkdir(parents=True)
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    argv = [command, str(tmp_path / "sheet.csv")] if command == "import" else [command]
+    before = sorted(tmp_path.rglob("*"))
+    assert pc.main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"prosody-confirm: {path}: data_root has no corpus sources" in err
+    assert config.CONFIG_PATH_ENV in err and "docs/eval/PROSODY-CONFIG.md" in err
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_the_cli_goes_past_the_check_when_the_data_root_has_corpus_sources(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = eval_config(tmp_path)
+    sources = tmp_path / "data" / prosody.CORPUS_DIR / "sources"
+    sources.mkdir(parents=True)
+    (sources / "placeholder").write_bytes(b"")
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    assert pc.main(["check-fresh"]) == 2
+    err = capsys.readouterr().err
+    assert "run `prepare` first" in err and "corpus sources" not in err
+    assert not (tmp_path / "data" / pc.OUTPUT_DIR / pc.RESULT_FILE).exists()
+
+
+def test_the_cli_refuses_a_write_into_a_read_only_archive_with_exit_2(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = eval_config(tmp_path)
+    sources = tmp_path / "data" / prosody.CORPUS_DIR / "sources"
+    sources.mkdir(parents=True)
+    (sources / "placeholder").write_bytes(b"")
+    monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+
+    def read_only(*_args):
+        raise PermissionError(13, "Permission denied", "result.json")
+
+    monkeypatch.setattr(pc, "run_sanity", read_only)
+    assert pc.main(["sanity"]) == 2
+    assert "prosody-confirm: [Errno 13] Permission denied: 'result.json'" in capsys.readouterr().err

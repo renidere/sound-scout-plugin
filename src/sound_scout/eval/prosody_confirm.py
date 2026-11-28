@@ -189,6 +189,20 @@ def open_stt_path(config_: config.Config) -> Path:
     return config_.data_root / prosody.CORPUS_DIR / open_stt_source().relative_path
 
 
+def require_corpus_sources(config_: config.Config) -> None:
+    """Refuse a config whose `data_root` has no corpus sources, before a command writes (#201)."""
+    sources = config_.data_root / prosody.CORPUS_DIR / "sources"
+    try:
+        found = any(sources.iterdir())
+    except OSError:
+        found = False
+    if not found:
+        raise config.ConfigError(
+            f"{config.config_path()}: data_root has no corpus sources ({sources}); point "
+            f"{config.CONFIG_PATH_ENV} at the eval config of docs/eval/PROSODY-CONFIG.md"
+        )
+
+
 def q1(config_: config.Config) -> list[str]:
     """`prosody.q1` (guard, ASR weights, RINCO) and the Open STT archive against its pin."""
     source = open_stt_source()
@@ -1057,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config_ = config.load()
+        require_corpus_sources(config_)
         guard.install_network_guard(config_)
         if args.command == "import":
             result = import_sheet(config_, args.sheet, args.decision)
@@ -1071,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
         openstt.OpenSttError,
         config.ConfigError,
         paths.PathDenied,
+        OSError,  # a read-only archive, such as a frozen data directory (#201)
     ) as error:
         print(f"prosody-confirm: {error}", file=sys.stderr)
         return 2

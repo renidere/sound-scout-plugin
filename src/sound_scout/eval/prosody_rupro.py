@@ -1531,6 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config_ = config.load()
+        prosody_confirm.require_corpus_sources(config_)
         if args.command != "fetch":
             guard.install_network_guard(config_)
         elif not config_.network.allow:
