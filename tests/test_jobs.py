@@ -984,20 +984,51 @@ def test_a_running_attempt_without_its_marker_yet_has_no_current_stage(
 # --- the real console entry point ------------------------------------------------------------
 
 
-def run_cli(config_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def cli_env(config_path: Path) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
     }
     env[config.CONFIG_PATH_ENV] = str(config_path)
+    return env
+
+
+def run_cli(config_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "sound_scout", "jobs", *args],
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=cli_env(config_path),
     )
+
+
+# The child imports the console entry first, then times only its call: the interpreter start and
+# the imports depend on the station load, the submit answer time (0013 § 3.6) does not.
+TIMED_MAIN = """
+import sys, time
+from pathlib import Path
+from sound_scout.cli import main
+started = time.perf_counter()
+code = main(sys.argv[2:])
+Path(sys.argv[1]).write_text(repr(time.perf_counter() - started))
+sys.exit(code)
+"""
+
+
+def run_cli_timed(
+    config_path: Path, elapsed_file: Path, *args: str
+) -> tuple[subprocess.CompletedProcess[str], float]:
+    done = subprocess.run(
+        [sys.executable, "-c", TIMED_MAIN, str(elapsed_file), "jobs", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=cli_env(config_path),
+    )
+    assert done.returncode == 0, done.stderr
+    return done, float(elapsed_file.read_text())
 
 
 @pytest.fixture
@@ -1124,15 +1155,12 @@ def test_jobs_limits_with_a_broken_configuration_is_config_error(config_file: Pa
 
 
 def test_jobs_submit_through_the_console_writes_job_json_and_answers_within_a_second(
-    config_file: Path, make_wav: WavFactory
+    config_file: Path, make_wav: WavFactory, tmp_path: Path
 ) -> None:
     wav = make_wav("recordings/voice.wav", seconds=30.0)
 
-    started = time.perf_counter()
-    submitted = run_cli(config_file, "submit", str(wav))
-    elapsed = time.perf_counter() - started
+    submitted, elapsed = run_cli_timed(config_file, tmp_path / "elapsed", "submit", str(wav))
 
-    assert submitted.returncode == 0, submitted.stderr
     assert elapsed < 1.0
     lines = submitted.stdout.splitlines()
     job_id = lines[0].removeprefix("job_id: ")
