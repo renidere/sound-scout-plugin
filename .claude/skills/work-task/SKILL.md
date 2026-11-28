@@ -24,8 +24,10 @@ again — except to wait for an agent it launched, whose result wakes it.
 
 You orchestrate; subagents read code, write it, test it, review it and land it. Run **one subagent
 at a time** — launch it, wait for its result, then go on: they share the task's tree, and each step
-builds on the previous one. Keep your own context small: don't read code yourself, and pass on
-what agents return rather than re-deriving it.
+builds on the previous one. Use agents' summaries to locate evidence, not as evidence themselves.
+Before reporting completion, read the relevant primary artifact and check its actual consumer:
+the tested entry point, saved result, installed file or running process that the claim concerns.
+If that check is unavailable, say what remains unverified; do not promote a summary into a fact.
 
 ## The flow
 
@@ -229,6 +231,10 @@ and a concrete spec, and returns whether code is needed. No code needed: go to *
 commits. A `spike` task often ends there: its deliverable is the decision document the Decision
 agent or the Executor writes under `docs/decisions/`, which still lands through steps **1**–**4**.
 
+Before proposing costly inference, name the product decision it can change, the existing evidence,
+finite request/time/resource/cost limits, and the action for each outcome (including inconclusive).
+If every outcome leaves the same action, do not propose the run just to keep the backlog moving.
+
 **Not doable here** — the work lives entirely outside this repo or needs only a person: file
 found problems (step 5), post an outcome comment `skipped` in the shape of **6**
 (`**Здесь не выполнимо.**` with the reason and a `**Нужен человек:**` line), move the card to
@@ -352,12 +358,16 @@ findings as they are, unjudged. Its RESULT:
 - `reviewed`, or `partial` — some sources degraded, the others reported: reviewed, as it is. The
   Lander gets the findings.
 - `could not run — <first error line>` — the round produced no review. Retry once with a new
-  Review agent, given the error; twice: the change is landed unreviewed, and the comment and the
-  log say "not reviewed".
+  Review agent only after changing the cause. Otherwise, or after a second failure, the change
+  is landed unreviewed, and the comment and the log say "not reviewed".
 - `missing` (revmux or a CLI its profile runs isn't installed) goes straight to **Failures**,
   without a retry.
 
 ## 4. Lander
+
+For the prose-only exception in CLAUDE.md, use the focused checks and review, add `[skip ci]`
+to the commit body, and report `CI intentionally skipped`, never green. Recheck that exception
+after any rebase; the CI wait below applies to all other changes.
 
 Before it starts, read main's newest finished CI run:
 `gh run list --repo renidere/sound-scout-plugin --workflow ci.yml --branch main --status completed -L 5 --json conclusion,url,headSha`,
@@ -422,6 +432,13 @@ and step 7 has nothing to work.
 A task with criteria that wait for another open issue isn't done, whatever landed: finish as
 **Partly done**. One with criteria that need the owner isn't done either: finish as **Held**.
 
+The reporter checks primary evidence before writing each completion claim. Separate implementation,
+deployment (installed version and active consumer), measured capability (material and limits), and
+qualification. Use `not checked` or `not applicable` where needed; CI and closed issues are not
+product readiness. Before asking for deployment, compare the target files and running version.
+Report the remaining product blockers even when this task's criteria all pass. A failed control
+limits the tested claim; it does not establish inability on untested inputs or tasks.
+
 - Comment on the issue (`gh issue comment <url> --body-file <file>`). This is an **outcome
   comment**: its first line is `<!-- work-task-outcome: done -->` (`held`, `failed`, `skipped`
   and `blocked` for the other kinds). The backlog agent reads that marker to tell a task left on
@@ -437,8 +454,9 @@ A task with criteria that wait for another open issue isn't done, whatever lande
   - <критерий> — без теста: <почему>; подтверждено `<файл или команда>`
   - <критерий> — не доказано: <почему>
 
-  **Коммит:** [<sha7>](https://github.com/renidere/sound-scout-plugin/commit/<sha>) ([CI](<run url>))
+  **Коммит:** [<sha7>](https://github.com/renidere/sound-scout-plugin/commit/<sha>) ([CI](<run url>) или CI намеренно пропущен: только текст)
   **Ревью:** <profile>, <n> замечаний: <n> исправлено, <n> пропущено (<почему, коротко>)
+  **Продукт:** <реализовано; установлено; способность проверена на …; квалификация; что ещё блокирует готовность>
   **Агенты решили:** <по строке на выбор, который владелец захотел бы знать>
   **Нужен человек:** <ручной шаг>
   **Решение:** <comment url>

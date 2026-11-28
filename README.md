@@ -5,15 +5,32 @@ Sound Scout разбирает запись русской речи. Резул�
 
 ## Что работает сейчас
 
-Состояние на 2026-11-25.
+Состояние на 2026-11-28.
 
 - Инструмент не готов: русская квалификация (Gate 1) не пройдена
   ([#29](https://github.com/renidere/sound-scout-plugin/issues/29)).
 - Audio backend не подключён (`backend = none`). Итог анализа со слоем `sound` — `partial`.
+- Подключение backend с READY — открытая [#90](https://github.com/renidere/sound-scout-plugin/issues/90).
+  Затем нужна квалификация [#30](https://github.com/renidere/sound-scout-plugin/issues/30).
+  Пакет из 52 клипов уже подготовлен в [#29](https://github.com/renidere/sound-scout-plugin/issues/29);
+  человеческая разметка отложена владельцем до подходящего backend. Её и квалификации пока нет.
+- `word_prominence` встроен в `measurements` ([#206](https://github.com/renidere/sound-scout-plugin/issues/206)).
+  Индекс различает слова с pitch accent на RuPro: AUC 0,763, 95 % CI 0,739–0,788,
+  coverage 0,831 ([отчёт #199](docs/eval/2026-11-28-prosody-rupro-1.md)). Это узкое
+  измерение, без проверенного порога; дикция, смысловой акцент и вся просодия им не проверены.
+- Диагностика [#205](https://github.com/renidere/sound-scout-plugin/issues/205) дала
+  `audio advantage shown`, но неречевые контроли не пройдены
+  ([отчёт](docs/eval/2026-11-28-forced-choice-205.md)). Это ограничение надёжности
+  ответов на контролях; оно не доказывает отсутствие восприятия признаков речевого сигнала.
+  Предложенный контроль — подстановка другой русской реплики, не иноязычное аудио; это
+  необязательный новый опыт, который сам по себе не даст READY или квалификацию.
+
+Закрытые задачи и зелёный CI подтверждают выполненные инженерные проверки. Установленная версия
+и работающий процесс проверяются отдельно: коммит в `main` сам по себе не обновляет Hermes.
 
 | Часть | Код |
 |---|---|
-| Транскрипт и измерения | `src/sound_scout/asr.py`, `src/sound_scout/acoustics.py` |
+| Транскрипт и измерения | `src/sound_scout/asr.py`, `src/sound_scout/acoustics.py`, `src/sound_scout/prominence.py` |
 | Отчёт и сравнение попыток | `src/sound_scout/report.py`, `src/sound_scout/comparison.py` |
 | Очередь заданий | `src/sound_scout/jobs.py` |
 | MCP stdio, 9 инструментов | `src/sound_scout/mcp_server.py`, `docs/mcp.md` |

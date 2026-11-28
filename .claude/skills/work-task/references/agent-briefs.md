@@ -33,6 +33,11 @@ Check commands: CLAUDE.md names them — `uv run ruff check .`, `uv run ruff for
 (about 3 min) plus the touched test files whole. Run the full suite (about 30 min) once, detached
 with a completion marker, on the finished tree. A check that fails: fix, then rerun.
 Every later fix before a commit — a review finding, a red CI fixed forward — gets the same.
+For prose-only changes, check the sources, affected links and `git diff --check`; run an existing
+focused check only where relevant. Do not rerun model inference or the full suite, or add tests
+that merely assert the new wording. Review changed instructions against the incident they address.
+Product runtime prompts, executable examples, pinned protocols, schemas and configuration are outside
+this exception: run the affected checks for changes to them.
 
 Hard limits — the spec's permission boundaries hold for you (docs/spec/REQUIREMENTS.md § R09,
 docs/spec/AGENT_PROMPT.md "Полномочия и запреты"):
@@ -108,6 +113,8 @@ main checkout's files — they may be behind or hold someone's work.
    decisions, the spec and the existing code. When options are close, prefer the smaller, more
    reversible one that follows patterns the code already uses. A spec threshold or limit is a
    decision already made: don't relax it.
+   An expensive experiment must name the product decision it changes, existing evidence, finite
+   limits, and actions for positive, negative and inconclusive outcomes before requesting a run.
 4. Post it: `gh issue comment <url> --body-file <file>`, in Russian. It starts with `Decision:` and
    a bold one-paragraph summary, then the options considered, the choice and why, and a concrete
    spec — modules, functions, fields, behaviour, tests — detailed enough for an engineer who
@@ -189,13 +196,16 @@ comment: criterion → test; otherwise none>. Keep them: fix or extend one rathe
 second test for the same criterion.
 
 1. Read CLAUDE.md's section on tests and the existing tests/ layout.
+   Read primary artifacts yourself and trace each claim to its consuming entry point or runtime;
+   the Executor's summary is a pointer, not proof. Keep deployment and qualification separate.
 2. For each criterion find the test that proves it among the Executor's; where none does, write
    one, named after the criterion, in the test file the layout suggests. A test checks what the
    criterion says — the behaviour a user of the CLI/MCP or a reader of the report sees — not
    implementation details. A criterion about a command (`doctor` prints …, `analyze` refuses …)
    may be proven by running the real command in the tree and quoting one line of its output, in
    addition to or instead of a test when a test can't run it.
-3. Run the tests you name (`uv run pytest <files>`) and then the full check commands.
+3. Run the tests you name (`uv run pytest <files>`) and then the check commands, with the
+   prose-only exception in the shared block.
 4. Classify each criterion:
    - pass — a named test or command proves it;
    - no test — not provable by a test (a document, a decision record); name what proves it;
@@ -235,6 +245,10 @@ repo.
    skill dir with `find ~/.claude/plugins -path '*cache*revmux*' -name preflight.sh`, highest
    version, not the codex sub-plugin; for profile `default` pass no argument). Not ok because
    something is missing — revmux itself or a CLI the profile runs: stop, RESULT `missing`.
+   Login success does not prove model availability. Do not retry a source/model already known
+   to be unsupported without changing the cause. Use an existing working profile or verified
+   direct-review fallback; report the missing source and fallback separately. If neither is
+   available, report the gap. Do not claim the original multi-source review was complete.
 2. `revmux new --task wip-<issue number> --run <NN>-<label>` prints JSON with the paths of
    scope.md and goal.md (and task_file). Write only those. If the run name is taken, use the next
    NN.
@@ -305,15 +319,18 @@ built in this task: skip a finding that asks for one with that reason, and keep 
    c. Commit. Conventional subject (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `refactor:`), in
       English, ending in `(#<number>)`; no "fixes"/"closes". A rejected hook: fix what it says
       and commit again; never --no-verify.
+      Only for the prose-only exception in CLAUDE.md, add `[skip ci]` to the commit body after
+      focused checks and review; report `CI intentionally skipped`, not green.
    d. `git pull --rebase origin main`. A conflict: resolve it keeping both sides' intent, rerun
       the tests of the conflicted files, `git rebase --continue`. If you can't, `git rebase
       --abort` and stop: report the commit as unpushed. When the rebase brought in main commits,
-      conflicted or not, run lint and the tests again on the rebased tree before the push: another
+      conflicted or not, rerun the applicable checks on the rebased tree before the push: another
       task's code may call what this one changed. A failure: fix it in a new commit (a–c), run
       them again.
    e. `git push origin HEAD:main`. A network or auth error: retry twice, a minute apart. Refused
       because origin moved — other tasks land on main too: back to d, up to three times.
-   f. Wait for that push's CI run to finish. Take the full 40-character sha of the pushed commit
+   f. If the final diff still meets the prose-only exception and carries `[skip ci]`, record the
+      deliberate skip and finish. Otherwise wait for that push's CI run. Take its full sha
       from `git rev-parse HEAD` — `--commit` doesn't expand a short sha, it just returns `[]` — then
       `gh run list --repo renidere/sound-scout-plugin --commit <full sha> --json databaseId,url,status,conclusion`
       (none yet: ask again every 20 seconds for up to three minutes), then poll its outcome once a
@@ -335,7 +352,7 @@ built in this task: skip a finding that asks for one with that reason, and keep 
 
 Reply format:
 RESULT: done | failed — <reason>
-COMMITS: <sha → CI green|red <run url> | unpushed (why)>
+COMMITS: <sha → CI green|red <run url> | CI intentionally skipped (prose only) | unpushed (why)>
 RED-BEFORE: <run url — the job and test that were red before your push; otherwise leave this line out>
 FIXED: <one line per finding>
 SKIPPED: <one line per finding: why>

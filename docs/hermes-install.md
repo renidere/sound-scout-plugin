@@ -172,12 +172,19 @@ Runner заданий — долгоживущий процесс. Он держ
 
    Прерванная попытка получит `interrupted`, задание встанет в очередь следующей попыткой.
 
-4. MCP-сервер `speech-review` тоже держит старый код. Примените обновление через `/reload-mcp`
-   или перезапуск gateway (раздел «Readback», пункт 2).
+4. MCP-сервер `speech-review` тоже держит старый код. `/reload-mcp` сверяет конфигурацию:
+   сообщение `reloaded` без изменения сервера не доказывает загрузку нового кода. Сверьте PID,
+   время запуска и версию процесса. Если сервер остался прежним, в разрешённое окно без активных
+   вызовов сохраните конфигурацию для отката, выполните
+   `hermes config set mcp_servers.speech-review.enabled false`, затем `/reload-mcp` и убедитесь,
+   что сервер отключён. Верните исходное значение `enabled` (для работающего сервера — `true`),
+   повторите `/reload-mcp` и проверьте новый процесс, состояние `connected` и девять инструментов
+   (раздел «Readback»). Перезапуск всего gateway для этого не требуется.
 
-5. Если обновление меняет плагин `sound-scout` или скил `speech-review`, скопируйте их в профиль
-   Hermes заново: `hermes/plugin/sound-scout/` в `~/.hermes/plugins/sound-scout`,
-   `hermes/skills/speech-review/` в `~/.hermes/skills/media/speech-review`. Затем перезапустите
+5. Сравните файлы плагина `sound-scout` и скила `speech-review` с установленными; сохраните копии
+   для отката и скопируйте только изменившиеся: `hermes/plugin/sound-scout/` в
+   `~/.hermes/plugins/sound-scout`, `hermes/skills/speech-review/` в
+   `~/.hermes/skills/media/speech-review`. При изменении кода плагина перезапустите
    `hermes-gateway.service`: хук плагина загружается только при старте gateway. Перед перезапуском
    выполните проверку из `docs/decisions/0017-session-authority-owner.md`, раздел «Проверка перед
    любым перезапуском», и сохраните копии старых файлов для отката.
