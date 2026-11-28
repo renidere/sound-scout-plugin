@@ -34,6 +34,7 @@ import pytest
 from starlette.requests import Request
 
 from sound_scout import app, config
+from sound_scout.jobs import WORKER_STAGES
 from tests.conftest import WavFactory, assert_node_suite_passes
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1132,6 +1133,73 @@ def test_desktop_plugin_uses_stock_calls_and_only_the_job_routes(api) -> None:
 def test_desktop_recorder_node_suite_passes(node: str) -> None:
     """The recorder against a fake stock SDK: its contract, not the real Windows Desktop (#105)."""
     assert assert_node_suite_passes(node, RECORDER_SUITE, REPO) >= 29
+
+
+def _card_fixture_stages(source: str) -> tuple[str, ...]:
+    found = re.findall(r"^const STAGES = \[([^\]]*)\]$", source, re.MULTILINE)
+    assert len(found) == 1, "the recorder suite must define the job card fixture STAGES once"
+    return tuple(re.findall(r"'([a-z_]+)'", found[0]))
+
+
+def test_card_fixture_stages_parse_a_differing_order() -> None:
+    source = "const X = 1\nconst STAGES = ['prepare', 'acoustics', 'asr', 'audio_review']\n"
+    assert _card_fixture_stages(source) == ("prepare", "acoustics", "asr", "audio_review")
+    assert _card_fixture_stages(source) != WORKER_STAGES
+
+
+def test_job_card_fixture_stages_follow_the_runner_order() -> None:
+    """The card tests model the stage order that `jobs status` sends (#209)."""
+    source = RECORDER_SUITE.read_text(encoding="utf-8")
+    assert _card_fixture_stages(source) == WORKER_STAGES
+
+
+CARD_SECTION_MARK = "// --- the job card (#108)"
+CARD_STAGE_LABELS = {"Распознавание речи": "asr", "Измерения": "acoustics"}
+
+
+def _card_poll_orders(source: str) -> list[tuple[str, ...]]:
+    """Per poll view and expected card line, the worker stages in the order the line names them."""
+    assert source.count(CARD_SECTION_MARK) == 1
+    stages, labels = "|".join(WORKER_STAGES), "|".join(CARD_STAGE_LABELS)
+    pattern = rf"stage: '({stages})'|'({labels}):"
+    orders = []
+    for line in source.split(CARD_SECTION_MARK, 1)[1].splitlines():
+        if "view(" not in line and not any(f"'{label}:" in line for label in CARD_STAGE_LABELS):
+            continue
+        names = [stage or CARD_STAGE_LABELS[label] for stage, label in re.findall(pattern, line)]
+        if names:
+            orders.append(tuple(dict.fromkeys(names)))
+    return orders
+
+
+def _poll_order_breaks(orders: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    def breaks(order: tuple[str, ...]) -> bool:
+        positions = [WORKER_STAGES.index(name) for name in order]
+        return positions != sorted(positions) or ("acoustics" in order and "asr" not in order)
+
+    return [order for order in orders if breaks(order)]
+
+
+def test_card_poll_order_check_finds_acoustics_before_asr() -> None:
+    old = (
+        f"{CARD_SECTION_MARK} ---\n"
+        "  view('running', { finished_stages: [{ stage: 'acoustics', status: 'unavailable' }],"
+        " current_stage: { stage: 'asr', started_at: 't' } }),\n"
+        "  view('running', { current_stage: { stage: 'acoustics', started_at: 't' } }),\n"
+        "  ['Подготовка: готово', 'Измерения: идёт', 'Распознавание речи: ждёт'],\n"
+    )
+    assert _poll_order_breaks(_card_poll_orders(old)) == [
+        ("acoustics", "asr"),
+        ("acoustics",),
+        ("acoustics", "asr"),
+    ]
+
+
+def test_job_card_poll_sequences_finish_asr_before_acoustics() -> None:
+    """Every job card poll view and card line has `asr` before `acoustics`, as the runner (#209)."""
+    orders = _card_poll_orders(RECORDER_SUITE.read_text(encoding="utf-8"))
+    assert ("asr", "acoustics") in orders
+    assert _poll_order_breaks(orders) == []
 
 
 def test_desktop_recorder_draft_node_suite_passes(node: str) -> None:

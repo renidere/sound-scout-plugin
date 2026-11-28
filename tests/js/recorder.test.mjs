@@ -1139,7 +1139,7 @@ test('the plugin source holds no non-stock call, no directive, no Markdown or HT
 // --- the job card (#108) -------------------------------------------------------------------------
 
 const SECOND = 'b'.repeat(32)
-const STAGES = ['prepare', 'acoustics', 'asr', 'audio_review']
+const STAGES = ['prepare', 'asr', 'acoustics', 'audio_review']
 const view = (state, extra = {}, jobId = JOB) => ({
   ok: true,
   job: {
@@ -1180,10 +1180,10 @@ test('criterion 1: the card shows the finished, current and waiting stages by po
   const { recorder, ctx, calls, card } = context
   const done = [{ stage: 'prepare', status: 'completed' }]
   ctx.statuses = [
-    view('queued', { attempts: 1, finished_stages: [{ stage: 'prepare', status: 'completed' }, { stage: 'acoustics', status: 'failed' }] }),
-    view('running', { attempts: 2, finished_stages: done, current_stage: { stage: 'acoustics', started_at: 't' } }),
-    view('running', { attempts: 2, finished_stages: [...done, { stage: 'acoustics', status: 'unavailable' }], current_stage: { stage: 'asr', started_at: 't' } }),
-    view('failed', { attempts: 2, finished_stages: [...done, { stage: 'acoustics', status: 'skipped' }, { stage: 'asr', status: 'failed' }], state_reason: 'analysis_failed' })
+    view('queued', { attempts: 1, finished_stages: [{ stage: 'prepare', status: 'completed' }, { stage: 'asr', status: 'failed' }] }),
+    view('running', { attempts: 2, finished_stages: done, current_stage: { stage: 'asr', started_at: 't' } }),
+    view('running', { attempts: 2, finished_stages: [...done, { stage: 'asr', status: 'unavailable' }], current_stage: { stage: 'acoustics', started_at: 't' } }),
+    view('failed', { attempts: 2, finished_stages: [...done, { stage: 'asr', status: 'skipped' }, { stage: 'acoustics', status: 'failed' }], state_reason: 'analysis_failed' })
   ]
   const seen = []
   recorder.job.subscribe(() => {
@@ -1194,10 +1194,10 @@ test('criterion 1: the card shows the finished, current and waiting stages by po
   await recorder.polling
   same(seen.map(item => item.stages), [
     [],
-    ['Подготовка: ждёт', 'Измерения: ждёт', 'Распознавание речи: ждёт', 'Слуховой анализ: ждёт'],
-    ['Подготовка: готово', 'Измерения: идёт', 'Распознавание речи: ждёт', 'Слуховой анализ: ждёт'],
-    ['Подготовка: готово', 'Измерения: недоступен', 'Распознавание речи: идёт', 'Слуховой анализ: ждёт'],
-    ['Подготовка: готово', 'Измерения: пропущен', 'Распознавание речи: ошибка', 'Слуховой анализ: не выполнен']
+    ['Подготовка: ждёт', 'Распознавание речи: ждёт', 'Измерения: ждёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Распознавание речи: идёт', 'Измерения: ждёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Распознавание речи: недоступен', 'Измерения: идёт', 'Слуховой анализ: ждёт'],
+    ['Подготовка: готово', 'Распознавание речи: пропущен', 'Измерения: ошибка', 'Слуховой анализ: не выполнен']
   ])
   assert.match(seen[1].text, /Разбор: в очереди/)
   assert.match(seen[1].text, /Попытка 2/)
