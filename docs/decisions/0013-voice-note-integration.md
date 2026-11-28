@@ -111,13 +111,11 @@ Desktop 0.23.3 при входе паролем (`basic`) шлёт `ctx.rest` ч
 
 Копирование, SHA-256 и вызов CLI выполняются вне event loop gateway (`asyncio.to_thread`).
 
-Правка 2026-11-28 (#214, [Decision](https://github.com/renidere/sound-scout-plugin/issues/214#issuecomment-7238679289)).
-Решение владельца 2026-11-28: `plugin_api` читает `attachments/sound-scout-<12 hex>.wav` только для
-прослушивания в Desktop. Маршрут — `GET /recordings/{name}`. Он берёт имя по шаблону, а не путь из
-`file.attach`. Каталог — `<get_hermes_home()>/attachments`, он открывается с `O_DIRECTORY|O_NOFOLLOW`.
-Файл открывается от дескриптора каталога с `O_NOFOLLOW|O_NONBLOCK`. До чтения `fstat` проверяет:
-обычный файл gateway-пользователя, одна ссылка, от 1 байта до `max_input_bytes`. Ответ — JSON с
-`data_url`, отказ — `ok: false` и код. Копии в staging и анализа приложенного файла по-прежнему нет.
+Правка 2026-11-28 (#214, отменена в #217). В 0.3.0–0.4.0 маршрут `GET /recordings/{name}`
+читал `attachments/sound-scout-<12 hex>.wav` для плеера плагина в Desktop. Решение владельца
+2026-11-28 ([проверка в #216](https://github.com/renidere/sound-scout-plugin/issues/216#issuecomment-7242200161),
+#217): плеер плагина удалён, маршрута нет, `plugin_api` не читает `attachments/`. Запись слушается
+встроенным плеером чата Desktop по строке `MEDIA:` в ответе хода записи (0039).
 
 ### 3.6. Задания на сервере
 
@@ -280,9 +278,11 @@ Unit-тесты и моки не заменяют её; мок модели не
    `<profile>/attachments` (только абсолютный `path`, обычный файл без symlink, в бюджете) и
    копировать в staging? Это обходит смысл решения A (#66), хотя guard не меняется. По умолчанию —
    нет: анализ только для записей, загруженных через «Отправить и разобрать».
-   Правка 2026-11-28 (#214, [Decision](https://github.com/renidere/sound-scout-plugin/issues/214#issuecomment-7238679289)): владелец разрешил читать
-   `attachments/sound-scout-<12 hex>.wav` только для прослушивания в Desktop (§ 3.5). Копия в
-   staging и анализ приложенных файлов по-прежнему запрещены.
+   Правка 2026-11-28 (#217, [проверка в #216](https://github.com/renidere/sound-scout-plugin/issues/216#issuecomment-7242200161)):
+   плеер плагина (#214) удалён по решению владельца, `plugin_api` снова не читает `attachments/`.
+   Запись слушается только встроенным плеером чата Desktop. Строку `MEDIA:` с путём
+   `<get_hermes_home()>/attachments/<имя>` добавляют хуки agent-половины; файл они только
+   проверяют `lstat`, не читают (0039). Копия в staging и анализ приложенных файлов запрещены.
 3. **Доставка во внутреннюю функцию gateway** `deliver_to_local_chat` (без вызова модели) или запасной
    путь `ctx.inject_message` (ход агента).
 4. **Репозиторий Voice Note.** Пометить README, Windows-клиент и релизы 0.4.1–0.4.2 как

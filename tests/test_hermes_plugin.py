@@ -52,7 +52,6 @@ ROUTES = {
     ("GET", "/jobs/{job_id}/report"),
     ("POST", "/jobs/{job_id}/cancel"),
     ("POST", "/jobs/{job_id}/retry"),
-    ("GET", "/recordings/{name}"),
 }
 DATA_URL_PREFIX = "data:audio/wav;base64,"
 MAX_INPUT = 20_000
@@ -291,7 +290,7 @@ def test_health_reports_the_budgets_of_the_configuration_and_a_ready_intake(
     answer = health(api)
 
     assert answer["ok"] is True
-    assert answer["plugin"] == "sound-scout" and answer["version"] == "0.4.0"
+    assert answer["plugin"] == "sound-scout" and answer["version"] == "0.5.0"
     assert isinstance(answer["pid"], int)
     assert answer["session_owner"] is None
     assert answer["budgets"] == {"max_duration_seconds": 30, "max_input_bytes": 12345}
@@ -1080,45 +1079,14 @@ def test_cli_runs_by_argv_with_an_allowlisted_environment(api, station: Station,
 # --- the package ----------------------------------------------------------------------------------
 
 
-def test_plugin_api_reads_attachments_only_in_the_recording_route() -> None:
-    """`attachments` is one constant, used only by `_read_recording` (0013 § 9 item 2, #214)."""
+def test_plugin_api_never_reads_hermes_attachments_or_paths_of_the_hermes_home() -> None:
     tree = ast.parse(API.read_text(encoding="utf-8"))
     strings = [
         node.value
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     ]
-    reader = next(f for f in tree.body if getattr(f, "name", "") == "_read_recording")
-    named = sorted(  # the refusal code names no path
-        text
-        for text in strings
-        if "attachments" in text.lower() and text != "attachments_unavailable"
-    )
-    docstrings = [ast.get_docstring(node, clean=False) for node in (tree, reader)]
-    assert named == sorted([*docstrings, "attachments"])
-    assert not [text for text in strings if "~" in text]
-    (constant,) = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
-        if node.value.value == "attachments"
-    ]
-    assert [target.id for target in constant.targets] == ["ATTACHMENTS_DIR"]
-    users = {
-        function.name
-        for function in tree.body
-        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
-        for node in ast.walk(function)
-        if isinstance(node, ast.Name) and node.id == "ATTACHMENTS_DIR"
-    }
-    assert users == {"_read_recording"}
-    loads = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id == "ATTACHMENTS_DIR"
-        if isinstance(node.ctx, ast.Load)
-    ]
-    assert all(node in set(ast.walk(reader)) for node in loads)
+    assert not [text for text in strings if "attachments" in text.lower() or "~" in text]
     attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     assert not attributes & {"expanduser", "home", "listdir", "scandir", "walk", "read_text"}
 
@@ -1142,14 +1110,9 @@ def _rest_calls(source: str) -> set[tuple[str, str]]:
         r"ctx\.rest\(\s*[`'](?P<path>[^`']+)[`'](?:\s*,\s*\{\s*method:\s*'(?P<m>\w+)')?"
     )
     return {
-        (match["m"] or "GET", re.sub(r"\$\{[^}]*\}", "{}", match["path"].split("?")[0]))
+        (match["m"] or "GET", re.sub(r"\$\{[^}]*\}", "{job_id}", match["path"].split("?")[0]))
         for match in pattern.finditer(source)
     }
-
-
-def _route_shapes(routes) -> set[tuple[str, str]]:
-    """Routes with every path parameter spelled `{}`, as `_rest_calls` spells them."""
-    return {(method, re.sub(r"\{[^}]*\}", "{}", path)) for method, path in routes}
 
 
 def test_desktop_plugin_uses_stock_calls_and_only_the_job_routes(api) -> None:
@@ -1160,11 +1123,37 @@ def test_desktop_plugin_uses_stock_calls_and_only_the_job_routes(api) -> None:
     assert source.count("import ") == 2
     assert "retainSession" not in source and "composer.submit" not in source
     assert "upload:" not in source  # the cookie leg of Desktop 0.23.3 refuses ctx.rest uploads
-    assert _rest_calls(source) == _route_shapes(ROUTES)
-    assert _rest_calls(source) <= _route_shapes(api.router.routes)
+    assert _rest_calls(source) == ROUTES
+    assert _rest_calls(source) <= set(api.router.routes)
     for gone in ("/spike/", "deliver", "runner", "lastToken", "sound-scout-report", "SPIKE_JOB"):
         assert gone not in source
     assert not hasattr(api, "DIRECTIVE")
+
+
+def test_217_the_plugin_player_and_its_recording_route_are_gone(api) -> None:
+    """#217 criteria 1, 2: the chat player of Desktop is the only player (decision 0039)."""
+    source = PLUGIN_JS.read_text(encoding="utf-8")
+    for gone in (
+        "Прослушать",
+        "openPlayer",
+        "PlayerDialog",
+        "downloadRecording",
+        "/recordings",
+        "<audio",
+        "recording:",
+        "this.sent",
+    ):
+        assert gone not in source, gone
+    assert not re.search(r"new Audio\(", source)  # the recorder keeps its AudioContext
+    assert not [route for route in api.router.routes if "/recordings" in route[1]]
+    assert not hasattr(api, "RECORDING_NAME") and not hasattr(api, "ATTACHMENTS_DIR")
+
+
+def test_217_the_package_version_is_0_5_0_in_its_three_places(api) -> None:
+    manifest = json.loads((PACKAGE / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
+    plugin_yaml = (PACKAGE / "plugin.yaml").read_text(encoding="utf-8")
+    assert api.VERSION == manifest["version"] == "0.5.0"
+    assert re.findall(r"^version: (\S+)$", plugin_yaml, re.MULTILINE) == ["0.5.0"]
 
 
 def test_desktop_recorder_node_suite_passes(node: str) -> None:
@@ -1248,11 +1237,9 @@ def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
     manifest = json.loads((PACKAGE / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "sound-scout"
     assert manifest["api"] == API.name
-    assert manifest["version"] == "0.4.0"
     assert manifest["tab"]["hidden"] is True
     plugin_yaml = (PACKAGE / "plugin.yaml").read_text(encoding="utf-8")
     assert re.search(r"^name: sound-scout$", plugin_yaml, re.MULTILINE)
-    assert re.search(r"^version: 0\.4\.0$", plugin_yaml, re.MULTILINE)
     assert "spike" not in plugin_yaml.lower()
     assert not re.search(r"^kind:", plugin_yaml, re.MULTILINE)
     required = re.findall(r"^  - name: (\w+)\n    description: \S", plugin_yaml, re.MULTILINE)
@@ -1444,240 +1431,3 @@ def test_criterion_1_post_jobs_takes_the_control_link_and_refuses_an_unsupported
     assert_refused(unsupported, "criterion_invalid")
     assert_refused(lonely.answer, "invalid_request")
     assert len(station.staged()) == 2
-
-
-# --- GET /recordings/{name} (#214) ---------------------------------------------------------------
-
-RECORDING = "sound-scout-0123456789ab.wav"
-
-
-def get_recording(api, name: str) -> dict:
-    return asyncio.run(api.router.routes[("GET", "/recordings/{name}")](name))
-
-
-@pytest.fixture
-def attachments(tmp_path: Path, station: Station, monkeypatch) -> Path:
-    """`attachments/` of a fake Hermes home in the test dir, as `file.attach` creates it."""
-    home = tmp_path / "hermes-home"
-    folder = home / "attachments"
-    folder.mkdir(parents=True)
-    folder.chmod(0o700)
-    with_hermes(monkeypatch, home=home, owner=None)
-    return folder
-
-
-def spy_recording_io(monkeypatch) -> dict[str, list]:
-    """Every `os.open` call, and the `os.read` calls on a file opened relative to a directory."""
-    seen: dict[str, list] = {"open": [], "read": []}
-    relative: set[int] = set()
-    real_open, real_read, real_close = os.open, os.read, os.close
-
-    def spy_open(path, flags, *args, **kwargs):
-        seen["open"].append(path)
-        fd = real_open(path, flags, *args, **kwargs)
-        if kwargs.get("dir_fd") is not None:
-            relative.add(fd)
-        return fd
-
-    def spy_read(fd, size):
-        if fd in relative:
-            seen["read"].append(size)
-        return real_read(fd, size)
-
-    def spy_close(fd):
-        relative.discard(fd)
-        return real_close(fd)
-
-    monkeypatch.setattr(os, "open", spy_open)
-    monkeypatch.setattr(os, "read", spy_read)
-    monkeypatch.setattr(os, "close", spy_close)
-    return seen
-
-
-def test_criterion_5_get_recording_answers_the_wav_of_attachments_as_a_data_url(
-    api, attachments: Path, audio, monkeypatch
-) -> None:
-    (attachments / RECORDING).write_bytes(audio)
-    calls = observe_cli(api, monkeypatch)
-
-    answer = get_recording(api, RECORDING)
-
-    assert set(answer) == {"ok", "name", "size_bytes", "sha256", "data_url"}
-    assert answer["ok"] is True and answer["name"] == RECORDING
-    assert answer["data_url"].startswith(DATA_URL_PREFIX)
-    decoded = base64.b64decode(answer["data_url"][len(DATA_URL_PREFIX) :], validate=True)
-    assert decoded == audio
-    assert answer["size_bytes"] == len(audio)
-    assert answer["sha256"] == hashlib.sha256(audio).hexdigest()
-    assert calls == [["limits", "--json"]]
-    assert (attachments / RECORDING).read_bytes() == audio
-    assert sorted(path.name for path in attachments.iterdir()) == [RECORDING]
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "../x",
-        "sound-scout-ABCDEF123456.wav",
-        "sound-scout-0123456789a.wav",
-        "sound-scout-0123456789abc.wav",
-        "sound-scout-0123456789ab.WAV",
-        "sound-scout-0123456789ab-2.wav",
-        "sound-scout-probe-a-0123456789ab.wav",
-        "x.wav",
-        f"../attachments/{RECORDING}",
-        f"{RECORDING}\n",
-    ],
-)
-def test_criterion_5_a_name_off_the_pattern_is_refused_before_anything_runs(
-    api, attachments: Path, audio, monkeypatch, name: str
-) -> None:
-    (attachments / RECORDING).write_bytes(audio)
-    refuse_cli(api, monkeypatch)
-    io_calls = spy_recording_io(monkeypatch)
-
-    assert_refused(get_recording(api, name), "bad_recording_name")
-    assert io_calls == {"open": [], "read": []}
-
-
-def _symlink(attachments: Path, audio: bytes) -> None:
-    outside = attachments.parent.parent / "outside.wav"
-    outside.write_bytes(audio)
-    (attachments / RECORDING).symlink_to(outside)
-
-
-def _directory(attachments: Path, audio: bytes) -> None:
-    (attachments / RECORDING).mkdir()
-
-
-def _fifo(attachments: Path, audio: bytes) -> None:
-    os.mkfifo(attachments / RECORDING)
-
-
-def _hard_link(attachments: Path, audio: bytes) -> None:
-    (attachments / RECORDING).write_bytes(audio)
-    os.link(attachments / RECORDING, attachments.parent.parent / "second-link.wav")
-
-
-def _empty(attachments: Path, audio: bytes) -> None:
-    (attachments / RECORDING).write_bytes(b"")
-
-
-@pytest.mark.parametrize(
-    "make", [_symlink, _directory, _fifo, _hard_link, _empty], ids=lambda make: make.__name__[1:]
-)
-def test_criterion_5_a_symlink_a_directory_a_fifo_or_a_hard_link_is_refused_unread(
-    api, attachments: Path, audio, monkeypatch, make
-) -> None:
-    make(attachments, audio)
-    io_calls = spy_recording_io(monkeypatch)
-
-    assert_refused(get_recording(api, RECORDING), "recording_refused")
-    assert io_calls["read"] == []
-
-
-def test_a_recording_of_another_user_is_refused_unread(
-    api, attachments: Path, audio, monkeypatch
-) -> None:
-    (attachments / RECORDING).write_bytes(audio)
-    other = os.geteuid() + 1
-    monkeypatch.setattr(os, "geteuid", lambda: other)
-    io_calls = spy_recording_io(monkeypatch)
-
-    assert_refused(get_recording(api, RECORDING), "recording_refused")
-    assert io_calls["read"] == []
-
-
-def test_criterion_5_a_recording_over_max_input_bytes_is_refused_unread(
-    api, attachments: Path, station: Station, monkeypatch
-) -> None:
-    (attachments / RECORDING).write_bytes(b"\x01" * (MAX_INPUT + 1))
-    io_calls = spy_recording_io(monkeypatch)
-
-    assert_refused(get_recording(api, RECORDING), "recording_too_large")
-    assert io_calls["read"] == []
-
-    (attachments / RECORDING).write_bytes(b"\x02" * MAX_INPUT)
-    answer = get_recording(api, RECORDING)
-    assert answer["ok"] is True and answer["size_bytes"] == MAX_INPUT
-    assert io_calls["read"], "the spy sees the reads of an accepted recording"
-    assert sum(io_calls["read"]) <= MAX_INPUT + 1 + api.READ_CHUNK
-
-
-def test_a_recording_that_grows_after_fstat_is_too_large(
-    api, attachments: Path, monkeypatch
-) -> None:
-    (attachments / RECORDING).write_bytes(b"\x01" * 100)
-    real_fstat = os.fstat
-
-    def grown(fd):
-        info = real_fstat(fd)
-        with open(attachments / RECORDING, "ab") as grow:
-            grow.write(b"\x01" * MAX_INPUT)
-        return info
-
-    monkeypatch.setattr(os, "fstat", grown)
-    assert_refused(get_recording(api, RECORDING), "recording_too_large")
-
-
-def test_attachments_that_is_a_symlink_or_no_hermes_home_is_attachments_unavailable(
-    api, attachments: Path, audio, monkeypatch
-) -> None:
-    real = attachments.parent / "real-attachments"
-    attachments.rename(real)
-    (real / RECORDING).write_bytes(audio)
-    attachments.symlink_to(real)
-    assert_refused(get_recording(api, RECORDING), "attachments_unavailable")
-
-    attachments.unlink()
-    attachments.write_bytes(b"not a directory")
-    assert_refused(get_recording(api, RECORDING), "attachments_unavailable")
-
-    without_hermes(monkeypatch)
-    refuse_cli(api, monkeypatch)
-    assert_refused(get_recording(api, RECORDING), "attachments_unavailable")
-
-
-def test_criterion_6_a_missing_recording_is_recording_missing(
-    api, attachments: Path, audio
-) -> None:
-    (attachments / "sound-scout-ffffffffffff.wav").write_bytes(audio)
-    assert_refused(get_recording(api, RECORDING), "recording_missing")
-
-    shutil.rmtree(attachments)
-    assert_refused(get_recording(api, RECORDING), "recording_missing")
-
-
-def test_a_recording_without_the_cli_budgets_passes_the_cli_refusal(
-    api, attachments: Path, audio, monkeypatch
-) -> None:
-    (attachments / RECORDING).write_bytes(audio)
-    monkeypatch.delenv("SOUND_SCOUT_BIN")
-    assert_refused(get_recording(api, RECORDING), "not_configured")
-
-
-def test_recording_refusals_name_no_path_of_the_station(
-    api, attachments: Path, audio, tmp_path: Path, monkeypatch
-) -> None:
-    details = []
-    for make in (_symlink, _directory, _fifo, _hard_link, _empty):
-        make(attachments, audio)
-        details.append(get_recording(api, RECORDING)["detail"])
-        for path in (
-            attachments / RECORDING,
-            tmp_path / "outside.wav",
-            tmp_path / "second-link.wav",
-        ):
-            if path.is_dir() and not path.is_symlink():
-                path.rmdir()
-            elif path.exists() or path.is_symlink():
-                path.unlink()
-    (attachments / RECORDING).write_bytes(b"\x01" * (MAX_INPUT + 1))
-    details.append(get_recording(api, RECORDING)["detail"])
-    (attachments / RECORDING).unlink()
-    details.append(get_recording(api, RECORDING)["detail"])
-    shutil.rmtree(attachments)
-    attachments.symlink_to(tmp_path)
-    details.append(get_recording(api, RECORDING)["detail"])
-    assert len(details) == 8 and all(details)
-    assert not [detail for detail in details if str(tmp_path) in detail or "/" in detail[:1]]

@@ -321,5 +321,5 @@ def test_criterion_6_decisions_0013_0018_and_a01_a14_carry_the_rule_and_the_owne
     assert "`sound-scout jobs seen`" in delivery_section
     assert "`-a<n>`" in retry_section
     assert "O10" in a09 and "0030" in a09
-    assert "0.4.0" in o10 and "0.5.6" in o10 and "`sound-scout-job:<job_id>-a2`" in o10
+    assert "0.5.0" in o10 and "0.5.6" in o10 and "`sound-scout-job:<job_id>-a2`" in o10
     assert "Заметки Sound Scout об этом задании в X быть не должно" in o10

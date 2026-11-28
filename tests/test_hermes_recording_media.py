@@ -10,11 +10,8 @@ Hermes home is a temporary directory with a synthesized WAV. No live Hermes is t
 """
 
 import ast
-import asyncio
-import base64
 import contextvars
 import logging
-import os
 import sys
 import threading
 import types
@@ -22,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import test_hermes_binding, test_hermes_plugin
+from tests import test_hermes_binding
 from tests.conftest import WavFactory
 from tests.test_hermes_binding import TURN, local_turn
 
@@ -32,8 +29,6 @@ OTHER = "sound-scout-ba9876543210.wav"
 TURN_ID = "segment-of-chat-a:task-1:0a1b2c3d"
 REPLY = "Голосовое получил. Что разобрать?"
 plugin = test_hermes_binding.plugin
-api = test_hermes_plugin.api
-station = test_hermes_plugin.station
 
 
 @pytest.fixture
@@ -314,24 +309,6 @@ def test_hook_errors_never_break_the_reply(plugin, wav: Path, monkeypatch, caplo
     assert str(wav) not in caplog.text
 
 
-# --- criterion 4: the line names the file the recording route reads ---------------------------
-
-
-def test_criterion_4_the_media_line_names_the_file_the_recording_route_reads(
-    plugin, api, station, home: Path, wav: Path, monkeypatch
-) -> None:
-    reply = reply_of_turn(plugin, f"@file:attachments/{NAME}")
-    path = Path(reply.splitlines()[-1].removeprefix("MEDIA:"))
-    test_hermes_plugin.with_hermes(monkeypatch, home=home, owner=None)
-
-    answer = asyncio.run(api.router.routes[("GET", "/recordings/{name}")](NAME))
-
-    assert answer["ok"] is True and answer["name"] == path.name
-    assert os.path.isabs(path) and path.parent == home / "attachments"
-    data = base64.b64decode(answer["data_url"].removeprefix("data:audio/wav;base64,"))
-    assert data == path.read_bytes() == wav.read_bytes()
-
-
 # --- the package -----------------------------------------------------------------------------
 
 
@@ -412,8 +389,24 @@ def test_criterion_1_the_decision_names_the_paths_the_sources_and_the_version() 
         "`MEDIA:",
         "`pre_llm_call`",
         "`transform_llm_output`",
-        "`new Audio()`",
-        "ecce230",
         "O11",
     ):
         assert words in record, words
+
+
+def test_217_the_decision_records_the_removed_plugin_player_and_its_limitation() -> None:
+    record = (
+        test_hermes_binding.REPO / "docs/decisions/0039-chat-recording-playback.md"
+    ).read_text(encoding="utf-8")
+    change = record.split("## Правка 2026-11-28 (#217)", 1)[1].split("\n## ", 1)[0]
+    for words in (
+        "issues/216#issuecomment-7242200161",
+        "плеер плагина удаляется, запись\nслушается только в чате",
+        "нет маршрута `GET /recordings/{name}`",
+        "Хуки `recording_media.py` не меняются",
+        "0.5.0",
+    ):
+        assert words in change, words
+    limits = record.split("## Ограничения", 1)[1].split("\n## ", 1)[0]
+    assert "У такой записи плеера нет нигде" in limits and "Владелец принял это" in limits
+    assert "Для такой записи остаётся «Прослушать»" not in record
