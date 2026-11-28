@@ -1053,6 +1053,24 @@ test('register adds health, the recorder to composer actions and the job card ab
   same(calls.filter(call => ['retainSession', 'composer.submit'].includes(call[0])), [])
 })
 
+test('the Sound Scout: health command puts the backend version of GET /health first in its line', async () => {
+  const runHealth = async health => {
+    const { ctx, calls } = await setupRegistered()
+    Object.assign(ctx.health, { pid: 4242, session_owner: 'owner' }, health)
+    const command = ctx.registered.find(c => c.id === 'health')
+    assert.equal(command.data.label, 'Sound Scout: health')
+    command.data.run()
+    await tick()
+    ctx.disposers.forEach(fn => fn())
+    return notices(calls)
+  }
+  const line = version => `version=${version} pid=4242 session_owner=owner; до 180 с, до ${64 * MIB} байт; приём записей готов`
+  same(await runHealth({ version: '0.2.0' }), [{ kind: 'info', title: 'Sound Scout: health', message: line('0.2.0') }])
+  for (const old of [{}, { version: null }, { version: 2 }, { version: '' }]) {
+    same(await runHealth(old), [{ kind: 'info', title: 'Sound Scout: health', message: line('недоступна') }])
+  }
+})
+
 test('an SDK without the stock route calls is refused visibly and keeps health', async () => {
   for (const remove of [
     host => { delete host.requestProfile },

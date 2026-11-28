@@ -17,13 +17,15 @@ const R02_BUDGET = { max_duration_seconds: 180, max_input_bytes: 104857600 }
 const WAV_HEADER_BYTES = 44
 
 function describeHealth(answer) {
+  // An answer without a version string says so; the line never shows a guessed version.
+  const version = typeof answer.version === 'string' && answer.version ? answer.version : 'недоступна'
   const budgets = answer.budgets
     ? `до ${answer.budgets.max_duration_seconds} с, до ${answer.budgets.max_input_bytes} байт`
     : 'бюджеты недоступны'
   const intake = answer.intake.ready
     ? 'приём записей готов'
     : `приём записей: ${answer.intake.error}: ${answer.intake.detail}`
-  return `pid=${answer.pid} session_owner=${answer.session_owner}; ${budgets}; ${intake}`
+  return `version=${version} pid=${answer.pid} session_owner=${answer.session_owner}; ${budgets}; ${intake}`
 }
 
 // From renidere/hermes-voice-note v0.4.2 ced69ea, MIT.
