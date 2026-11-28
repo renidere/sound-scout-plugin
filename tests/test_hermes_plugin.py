@@ -291,7 +291,7 @@ def test_health_reports_the_budgets_of_the_configuration_and_a_ready_intake(
     answer = health(api)
 
     assert answer["ok"] is True
-    assert answer["plugin"] == "sound-scout" and answer["version"] == "0.3.0"
+    assert answer["plugin"] == "sound-scout" and answer["version"] == "0.4.0"
     assert isinstance(answer["pid"], int)
     assert answer["session_owner"] is None
     assert answer["budgets"] == {"max_duration_seconds": 30, "max_input_bytes": 12345}
@@ -1248,18 +1248,18 @@ def test_package_manifests_name_the_plugin_its_api_and_its_settings() -> None:
     manifest = json.loads((PACKAGE / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "sound-scout"
     assert manifest["api"] == API.name
-    assert manifest["version"] == "0.3.0"
+    assert manifest["version"] == "0.4.0"
     assert manifest["tab"]["hidden"] is True
     plugin_yaml = (PACKAGE / "plugin.yaml").read_text(encoding="utf-8")
     assert re.search(r"^name: sound-scout$", plugin_yaml, re.MULTILINE)
-    assert re.search(r"^version: 0\.3\.0$", plugin_yaml, re.MULTILINE)
+    assert re.search(r"^version: 0\.4\.0$", plugin_yaml, re.MULTILINE)
     assert "spike" not in plugin_yaml.lower()
     assert not re.search(r"^kind:", plugin_yaml, re.MULTILINE)
     required = re.findall(r"^  - name: (\w+)\n    description: \S", plugin_yaml, re.MULTILINE)
     assert required == ["SOUND_SCOUT_BIN", "SOUND_SCOUT_CONFIG"]
 
 
-def test_agent_half_registers_the_binding_and_seen_hooks(monkeypatch) -> None:
+def test_agent_half_registers_the_binding_seen_and_recording_hooks(monkeypatch) -> None:
     spec = importlib.util.spec_from_file_location(
         "sound_scout_plugin_agent",
         PACKAGE / "__init__.py",
@@ -1276,7 +1276,7 @@ def test_agent_half_registers_the_binding_and_seen_hooks(monkeypatch) -> None:
             hooks.append(name)
 
     assert module.register(Ctx()) is None
-    assert hooks == ["post_tool_call", "post_tool_call"]
+    assert hooks == ["post_tool_call", "post_tool_call", "pre_llm_call", "transform_llm_output"]
 
 
 def _section(text: str, heading: str) -> str:

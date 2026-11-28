@@ -48,7 +48,7 @@ def plugin(monkeypatch: pytest.MonkeyPatch):
         submodule_search_locations=[str(PACKAGE)],
     )
     package = importlib.util.module_from_spec(spec)
-    for name in ("binding", "delivery", "seen"):
+    for name in ("binding", "delivery", "recording_media", "seen"):
         monkeypatch.delitem(sys.modules, f"{spec.name}.{name}", raising=False)
     monkeypatch.setitem(sys.modules, spec.name, package)
     spec.loader.exec_module(package)
@@ -481,6 +481,8 @@ def test_register_adds_the_binding_and_seen_hooks_and_starts_the_delivery_loop(
     assert ctx.hooks == [
         ("post_tool_call", plugin.binding.post_tool_call),
         ("post_tool_call", plugin.seen.post_tool_call),
+        ("pre_llm_call", plugin.recording_media.pre_llm_call),
+        ("transform_llm_output", plugin.recording_media.transform_llm_output),
     ]
     assert started == [True]
 

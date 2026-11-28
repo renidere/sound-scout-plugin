@@ -293,3 +293,27 @@ def test_acceptance_dates_the_owner_run_with_its_stand_versions() -> None:
     assert "пройдено 0, частично 12" in section
     assert "O2 (проверен владельцем ранее, стенд не назван)" in section
     assert "Не выполнен шаг O6" in section
+
+
+def test_o10_and_o11_install_0_4_0_and_check_the_player_in_the_chat_and_in_the_plugin() -> None:
+    """#216 criterion 5: the owner's Windows steps for the recording player."""
+    steps = TABLE_DOC.read_text(encoding="utf-8").split("## Шаги владельца", 1)[1]
+    o10 = steps.split("- **O10.**", 1)[1].split("\n- **", 1)[0]
+    o11 = steps.split("- **O11.**", 1)[1].split("\n", 1)[0]
+    assert "`sound-scout` 0.4.0" in o10 and "`version=0.4.0 pid=…`" in o10
+    assert "0.3.0" not in o10 + o11
+    for words in (
+        "`sound-scout` 0.4.0",
+        "0039",
+        "Под ответом — блок с именем `sound-scout-….wav` и плеером",
+        "⋮ плеера → «Скачать»",
+        "`certutil -hashfile <файл> SHA256`",
+        "Вернись к первой и включи её: звучит первая запись",
+        "Закрой и снова открой Desktop",
+        "На карточке задания нажми «Прослушать», затем «Пуск»",
+        "время растёт и не сбрасывается, пока карточка обновляется",
+        "«Пауза», «−5 с», «+5 с», «В начало»",
+        "Если плеера под ответом нет, запиши, что видно",
+        "Если плеер плагина не играет, запиши текст ошибки у плеера",
+    ):
+        assert words in o11, words

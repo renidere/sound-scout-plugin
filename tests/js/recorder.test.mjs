@@ -72,9 +72,21 @@ function fakeHost(order) {
     profile: 'default'
   }
   const calls = []
+  const focusListeners = new Set()
+  // A chat switch of Desktop: the nanostores listen callback gets the new value.
+  const refocus = stored => {
+    focus.stored = stored
+    for (const listener of [...focusListeners]) listener(stored)
+  }
   const host = {
     state: {
-      focusedStoredSessionId: { get: () => focus.stored },
+      focusedStoredSessionId: {
+        get: () => focus.stored,
+        listen: listener => {
+          focusListeners.add(listener)
+          return () => focusListeners.delete(listener)
+        }
+      },
       focusedSessionOwner: { get: () => focus.owner },
       connectionId: { get: () => focus.connectionId },
       profile: { get: () => focus.profile }
@@ -117,7 +129,7 @@ function fakeHost(order) {
     },
     notify: value => calls.push(['notify', structuredClone(value)])
   }
-  return { host, focus, calls, local, remote }
+  return { host, focus, refocus, focusListeners, calls, local, remote }
 }
 
 function fakeCtx(order) {
@@ -1656,7 +1668,7 @@ const REDUCED_MOTION = /@media \(prefers-reduced-motion: reduce\) \{[^{}]*\{ tra
 
 function assertCriterion4(tree, where) {
   for (const node of walk(tree)) {
-    assert.ok(!['button', 'dialog', 'input', 'a', 'img', 'svg'].includes(node.type), `${where}: raw <${node.type}>`)
+    assert.ok(!['button', 'dialog', 'input', 'audio', 'a', 'img', 'svg'].includes(node.type), `${where}: raw <${node.type}>`)
     assert.equal(node.props?.dangerouslySetInnerHTML, undefined, where)
     for (const key of Object.keys(node.props?.style ?? {})) assert.doesNotMatch(key, /transition|animation/i, where)
     if (node.type === 'Button') {
@@ -1762,14 +1774,63 @@ function counting() {
   return length => { n++; return Uint8Array.from({ length }, (_, i) => (i + n) % 256) }
 }
 
-// URL.createObjectURL, the release timer and the hidden download link of the renderer.
+// HTMLAudioElement of the renderer: counts its constructor, load, play, pause and the writes of src and
+// currentTime, and fires the events a test asks for.
+function fakeMedia() {
+  const media = { created: [], refusePlay: null }
+  class Audio {
+    constructor() {
+      media.created.push(this)
+      this.listeners = new Map()
+      this.counts = { load: 0, play: 0, pause: 0, src: 0, currentTime: 0 }
+      this.paused = true
+      this.ended = false
+      this.duration = NaN
+      this.error = null
+      this.preload = ''
+      this.time = 0
+      this.source = ''
+    }
+    get src() { return this.source }
+    set src(value) { this.source = value; this.counts.src++ }
+    get currentTime() { return this.time }
+    set currentTime(value) { this.time = value; this.counts.currentTime++ }
+    addEventListener(type, fn) { if (!this.listeners.has(type)) this.listeners.set(type, new Set()); this.listeners.get(type).add(fn) }
+    removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn) }
+    listening() { return [...this.listeners.values()].reduce((n, set) => n + set.size, 0) }
+    emit(type) { for (const fn of [...(this.listeners.get(type) ?? [])]) fn({ type }) }
+    play() {
+      this.counts.play++
+      if (media.refusePlay) return Promise.reject(media.refusePlay)
+      this.paused = false
+      this.emit('play')
+      return Promise.resolve()
+    }
+    pause() {
+      this.counts.pause++
+      if (this.paused) return
+      this.paused = true
+      this.emit('pause')
+    }
+    load() { this.counts.load++ }
+    removeAttribute(name) { if (name === 'src') this.source = '' }
+    // The metadata and the clock of a loaded file.
+    loaded(duration) { this.duration = duration; this.emit('loadedmetadata') }
+    advance(seconds) { this.time += seconds; this.emit('timeupdate') }
+  }
+  return { media, Audio }
+}
+
+// URL.createObjectURL, the release timer, the hidden download link and the media element of the renderer.
 function fakeBrowser() {
   const blobs = new Map()
   const revoked = []
   const links = []
   const timers = []
+  const { media, Audio } = fakeMedia()
   let next = 0
   const env = {
+    Audio,
     URL: {
       createObjectURL: blob => { const url = `blob:player-${++next}`; blobs.set(url, blob); return url },
       revokeObjectURL: url => revoked.push(url)
@@ -1787,7 +1848,7 @@ function fakeBrowser() {
   }
   const bytesOf = async url => Buffer.from(await blobs.get(url).arrayBuffer())
   const release = () => { for (const timer of timers.splice(0).filter(t => t.ms === 30000)) timer.fn() }
-  return { env, blobs, revoked, links, timers, bytesOf, release }
+  return { env, blobs, revoked, links, timers, bytesOf, release, media }
 }
 
 async function playerSetup(options = {}) {
@@ -1851,7 +1912,7 @@ test('criterion 2: the job card offers Listen for the recording of its job', asy
   assert.equal(recorder.player.get().origin, 'card')
 })
 
-test('criterion 3: Listen fetches the station copy each time and plays it with native controls', async () => {
+test('Listen fetches the station copy each time and plays it in one detached element', async () => {
   const context = await playerSetup()
   const { recorder, ctx, controls, calls, browser, focus } = context
   await sent(context)
@@ -1867,15 +1928,13 @@ test('criterion 3: Listen fetches the station copy each time and plays it with n
   finish(stationAnswer(NAME_1))
   await opening
   same(recordingRests(ctx).map(r => [r.path, r.opts.timeoutMs]), [[`/recordings/${NAME_1}`, 120000]])
-  const [audio] = nodes(controls(), 'audio')
-  assert.equal(audio.props.controls, true)
-  assert.equal(audio.props.autoPlay, undefined)
-  assert.equal(audio.props.loop, undefined)
-  assert.equal(audio.props.preload, 'metadata')
-  assert.deepEqual(await browser.bytesOf(audio.props.src), STATION_WAV)
-  assert.notDeepEqual(await browser.bytesOf(audio.props.src), buffer)
+  assert.equal(nodes(controls(), 'audio').length, 0)
+  const [audio] = browser.media.created
+  same([browser.media.created.length, audio.preload, audio.paused, audio.counts.play], [1, 'auto', true, 0])
+  assert.deepEqual(await browser.bytesOf(audio.src), STATION_WAV)
+  assert.notDeepEqual(await browser.bytesOf(audio.src), buffer)
   assert.equal(textContent(nodes(controls(), 'DialogDescription')[0]), `Файл ${NAME_1} со станции`)
-  const first = audio.props.src
+  const first = audio.src
   dialogs(controls())[0].props.onOpenChange(false)
   assert.equal(dialogs(controls()).length, 0)
   same(browser.revoked, [])
@@ -1883,7 +1942,8 @@ test('criterion 3: Listen fetches the station copy each time and plays it with n
   same(browser.revoked, [first])
   await findButton(controls(), 'Прослушать').props.onClick()
   assert.equal(recordingRests(ctx).length, 2)
-  assert.notEqual(nodes(controls(), 'audio')[0].props.src, first)
+  assert.equal(browser.media.created.length, 2)
+  assert.notEqual(browser.media.created[1].src, first)
   recorder.closePlayer()
   browser.release()
 
@@ -1916,6 +1976,7 @@ test('criterion 4: Download saves the bytes the player plays under the recording
   assert.equal(browser.links.length, 1)
   const [link] = browser.links
   same([link.type, link.href, link.download, link.rel, link.style.display], ['a', url, NAME_1, 'noopener noreferrer', 'none'])
+  assert.equal(link.href, browser.media.created[0].src, 'the download is the source of the player')
   same([link.appended, link.clicks, link.removed], [true, 1, true])
   assert.deepEqual(await browser.bytesOf(link.href), STATION_WAV)
   same(alertsOf(controls()), [])
@@ -1975,10 +2036,180 @@ test('the player dialog renders once, in the composer of its chat, with SDK comp
   const [content] = nodes(tree, 'DialogContent')
   assert.equal(content.props.className, 'sound-scout-player')
   same(nodes(tree, 'DialogTitle').map(textContent), ['Запись Sound Scout'])
-  assert.equal(nodes(tree, 'audio')[0].props['aria-label'], 'Голосовое сообщение')
+  assert.equal(nodes(tree, 'audio').length, 0)
+  same(buttonLabels(dialogs(tree)[0]), ['Пуск', '−5 с', '+5 с', 'В начало', 'Скачать'])
+  same(nodes(tree, 'p').filter(node => node.props.role === 'status').map(textContent), ['0:00 / 0:00'])
   assertCriterion4(tree, 'player')
   const [css] = nodes(tree, 'style').map(node => node.props.children)
   assert.match(css, /\.sound-scout-player \{[^}]*color:var\(--ui-text-primary\);/)
   assert.match(css, /\.sound-scout-player__error \{ color:var\(--ui-red\); \}/)
   assert.match(css.match(REDUCED_MOTION)[0], /\.sound-scout-player, \.sound-scout-player \*/)
+})
+
+// --- the player keeps its position while the card polls (#216) -----------------------------------
+
+// The card opens the player of its job, which then plays from 0:42, while the card polls a running job.
+async function playingFromCard() {
+  const poll = gate()
+  const context = await playerSetup({ sleep: poll.sleep })
+  const { recorder, ctx, press } = context
+  await sent(context, { analyze: true })
+  await press('Прослушать')
+  return { ...context, poll }
+}
+
+test('criterion 3: the plugin player keeps its position while the job card polls', async () => {
+  const { recorder, ctx, card, controls, press, browser, poll } = await playingFromCard()
+  const audio = browser.media.created[0]
+  audio?.loaded(180)
+  if (audio) audio.currentTime = 42
+  const start = audio ? { ...audio.counts } : null
+  const playing = findButton(controls(), 'Пуск')
+  await playing?.props.onClick()
+  let audioInTree = 0
+  let dialogsPerTick = 0
+  for (let n = 0; n < 5; n++) {
+    ctx.statuses = [view('running', { current_stage: { stage: 'asr', started_at: 't' } })]
+    await poll.wake()
+    audio?.advance(0.5)
+    // Two composers of the chat (the main and the pop-out one) and the card render on each tick.
+    const trees = [controls(), controls(), card()]
+    audioInTree += trees.reduce((count, tree) => count + nodes(tree, 'audio').length, 0)
+    dialogsPerTick = trees.reduce((count, tree) => count + dialogs(tree).length, 0)
+  }
+  same({
+    created: browser.media.created.length,
+    audioInTree,
+    loadsAfterStart: audio ? audio.counts.load - start.load : null,
+    srcAfterStart: audio ? audio.counts.src - start.src : null,
+    currentTime: audio?.currentTime,
+    paused: audio?.paused
+  }, { created: 1, audioInTree: 0, loadsAfterStart: 0, srcAfterStart: 0, currentTime: 44.5, paused: false })
+  assert.equal(getRests(ctx).length, 5)
+  assert.equal(dialogsPerTick, 2, 'both composers of the chat show the one player')
+  same(nodes(controls(), 'p').filter(node => node.props.role === 'status').map(textContent), ['0:44 / 3:00'])
+  same(buttonLabels(dialogs(controls())[0]), ['Пауза', '−5 с', '+5 с', 'В начало', 'Скачать'])
+  recorder.dispose()
+})
+
+test('criterion 3: the plugin player plays and pauses one element with SDK buttons', async () => {
+  const { recorder, controls, browser } = await playingFromCard()
+  const [audio] = browser.media.created
+  const press = label => findButton(dialogs(controls())[0], label).props.onClick()
+  const time = () => nodes(controls(), 'p').filter(node => node.props.role === 'status').map(textContent)[0]
+  audio.loaded(12.6)
+  assert.equal(time(), '0:00 / 0:12')
+  await press('Пуск')
+  same([audio.paused, audio.counts.play], [false, 1])
+  assert.ok(findButton(controls(), 'Пауза'))
+  await press('Пауза')
+  same([audio.paused, audio.counts.pause], [true, 1])
+  await press('+5 с')
+  await press('+5 с')
+  await press('+5 с')
+  assert.equal(audio.currentTime, 12.6, 'seek stops at the end')
+  assert.equal(time(), '0:12 / 0:12')
+  await press('−5 с')
+  assert.equal(audio.currentTime, 7.6)
+  await press('−5 с')
+  await press('−5 с')
+  assert.equal(audio.currentTime, 0, 'seek stops at the start')
+  audio.currentTime = 9
+  await press('В начало')
+  assert.equal(audio.currentTime, 0)
+  same(alertsOf(controls()), [])
+
+  // atom writes only on a new whole second or play state
+  let writes = 0
+  const stop = recorder.player.subscribe(() => writes++)
+  writes = 0
+  audio.advance(0.2)
+  audio.advance(0.2)
+  assert.equal(writes, 0)
+  audio.advance(0.7)
+  assert.equal(writes, 1)
+  stop()
+
+  browser.media.refusePlay = Object.assign(new Error('private'), { name: 'NotAllowedError' })
+  await press('Пуск')
+  same(alertsOf(controls()), ['Не удалось начать воспроизведение: NotAllowedError'])
+  assert.ok(findButton(controls(), 'Пуск'))
+  browser.media.refusePlay = null
+  await press('Пуск')
+  same(alertsOf(controls()), [])
+  audio.error = { code: 4 }
+  audio.emit('error')
+  same(alertsOf(controls()), ['Плеер не может прочитать запись: MEDIA_ERR_SRC_NOT_SUPPORTED'])
+  audio.error = { code: 3 }
+  audio.emit('error')
+  same(alertsOf(controls()), ['Плеер не может прочитать запись: MEDIA_ERR_DECODE'])
+  assert.equal(browser.media.created.length, 1)
+  recorder.dispose()
+})
+
+test('criterion 3: a switch to another chat stops and closes the player', async () => {
+  const { recorder, controls, browser, refocus, focusListeners } = await playingFromCard()
+  const [audio] = browser.media.created
+  await findButton(controls(), 'Пуск').props.onClick()
+  assert.equal(audio.paused, false)
+  refocus('stored-a')
+  same([audio.paused, dialogs(controls()).length], [false, 1], 'the same chat keeps the player')
+  refocus('stored-b')
+  same([audio.paused, audio.src, audio.listening(), recorder.audio, recorder.player.get()], [true, '', 0, null, null])
+  refocus('stored-a')
+  same([dialogs(controls()).length, browser.media.created.length], [0, 1], 'no player comes back on return')
+  assert.equal(focusListeners.size, 1)
+  recorder.dispose()
+  assert.equal(focusListeners.size, 0, 'dispose stops the watch')
+})
+
+test('criterion 3: a chat switch while the recording loads drops the player', async () => {
+  const context = await playerSetup()
+  const { recorder, ctx, controls, browser, refocus } = context
+  await sent(context)
+  const rest = ctx.rest
+  let release
+  ctx.rest = (path, options) => path.startsWith('/recordings/')
+    ? new Promise(resolve => { release = () => resolve(rest(path, options)) })
+    : rest(path, options)
+  const opening = findButton(controls(), 'Прослушать').props.onClick()
+  await tick()
+  assert.equal(recorder.player.get()?.loading, true)
+  refocus('stored-b')
+  assert.equal(recorder.player.get(), null)
+  release()
+  await opening
+  same([recorder.player.get(), recorder.audio, browser.media.created.length], [null, null, 0])
+  recorder.dispose()
+})
+
+test('criterion 3: closing the player stops the element and releases the URL', async () => {
+  const { recorder, controls, browser } = await playingFromCard()
+  const [audio] = browser.media.created
+  const url = audio.src
+  await findButton(controls(), 'Пуск').props.onClick()
+  assert.ok(audio.listening() > 0)
+  dialogs(controls())[0].props.onOpenChange(false)
+  same([audio.paused, audio.src, audio.counts.load, audio.listening()], [true, '', 1, 0])
+  assert.equal(recorder.audio, null)
+  assert.equal(dialogs(controls()).length, 0)
+  // a late event of the closed element changes nothing
+  audio.emit('play')
+  audio.error = { code: 2 }
+  audio.emit('error')
+  assert.equal(recorder.player.get(), null)
+  await recorder.togglePlay()
+  recorder.seek(5)
+  recorder.restart()
+  same(browser.revoked, [])
+  browser.release()
+  same(browser.revoked, [url])
+
+  // a second open makes a new element and stops the first one
+  await findButton(controls(), 'Прослушать').props.onClick()
+  const second = browser.media.created[1]
+  await findButton(controls(), 'Прослушать').props.onClick()
+  same([browser.media.created.length, second.src, second.listening()], [3, '', 0])
+  recorder.dispose()
+  same([browser.media.created[2].src, recorder.audio], ['', null])
 })

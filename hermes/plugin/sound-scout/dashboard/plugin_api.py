@@ -36,7 +36,7 @@ from fastapi import APIRouter, Request
 router = APIRouter()
 
 PLUGIN = "sound-scout"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 BIN_ENV = "SOUND_SCOUT_BIN"
 CONFIG_ENV = "SOUND_SCOUT_CONFIG"
 CHILD_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")

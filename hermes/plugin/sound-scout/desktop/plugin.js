@@ -3,7 +3,8 @@
 // the palette. The recorder sends by the stock path Spike A chose (decision 0016). The card follows
 // the job by polling GET /jobs/{job_id} and shows its report as plain text: it holds the transcript,
 // untrusted data, so it is never rendered as Markdown. "Прослушать" reads the sent WAV from the station
-// again at each open (GET /recordings/{name}) and plays it in a native <audio controls> (#214).
+// again at each open (GET /recordings/{name}) (#214) and plays it in one detached new Audio() driven by
+// SDK buttons, as the stock radio plugin of Desktop 0.23.3 does, so no render touches playback (#216).
 import { atom, host, Button, Codicon, COMPOSER_AREAS, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, PALETTE_AREA, useComposerSession, useValue } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -18,6 +19,9 @@ const ATTACH_TIMEOUT_MS = 120000
 const UPLOAD_TIMEOUT_MS = 120000
 const STATUS_TIMEOUT_MS = 10000
 const HEALTH_TIMEOUT_MS = 10000
+const SEEK_STEP_S = 5
+const PLAYER_EVENTS = ['loadedmetadata', 'durationchange', 'timeupdate', 'play', 'pause', 'ended', 'seeked']
+const MEDIA_ERRORS = { 1: 'MEDIA_ERR_ABORTED', 2: 'MEDIA_ERR_NETWORK', 3: 'MEDIA_ERR_DECODE', 4: 'MEDIA_ERR_SRC_NOT_SUPPORTED' }
 // Границы версии R02: лимит записи, когда `GET /health` не дал бюджетов (#174).
 const R02_BUDGET = { max_duration_seconds: 180, max_input_bytes: 104857600 }
 const WAV_HEADER_BYTES = 44
@@ -137,6 +141,8 @@ function validDraft(draft) {
 }
 
 const positive = value => Number.isInteger(value) && value > 0
+const wholeSeconds = value => Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+const playerClock = seconds => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
 
 function describeJob(job, result) {
@@ -263,6 +269,12 @@ export class Recorder {
     this.sent = atom({})
     this.player = atom(null)
     this.playerGeneration = 0
+    // The one media element of this window, outside React: a render never creates or resets it.
+    this.audio = null
+    this.audioListeners = []
+    // The dialog shows only in the composer of the player's chat: a chat switch closes the player.
+    const focused = host.state?.focusedStoredSessionId
+    this.unwatchFocus = typeof focused?.listen === 'function' ? focused.listen(() => this.focusChanged()) : null
     this.levelAt = -Infinity
     this.chunks = []
     this.generation = 0
@@ -502,6 +514,8 @@ export class Recorder {
 
   dispose() {
     this.pollGeneration++
+    this.unwatchFocus?.()
+    this.unwatchFocus = null
     this.closePlayer()
     this.discard()
   }
@@ -874,11 +888,89 @@ export class Recorder {
       URL.revokeObjectURL(url)
       return
     }
-    this.player.set({ ...this.player.get(), loading: false, url })
+    const audio = new Audio()
+    audio.preload = 'auto'
+    this.audio = audio
+    this.audioListeners = [
+      ...PLAYER_EVENTS.map(type => [type, () => this.syncPlayer(audio)]),
+      ['error', () => this.playerFailed(audio)]
+    ]
+    for (const [type, listener] of this.audioListeners) audio.addEventListener(type, listener)
+    audio.src = url
+    this.player.set({ ...this.player.get(), loading: false, url, playing: false, position: 0, duration: 0 })
+  }
+
+  focusChanged() {
+    const player = this.player.get()
+    if (player && this.host.state.focusedStoredSessionId.get() !== player.sessionId) this.closePlayer()
+  }
+
+  // The atom changes only when a whole second or the play state changes.
+  syncPlayer(audio) {
+    const player = this.player.get()
+    if (audio !== this.audio || !player?.url) return
+    const playing = !audio.paused && !audio.ended
+    const position = wholeSeconds(audio.currentTime)
+    const duration = wholeSeconds(audio.duration)
+    if (player.playing === playing && player.position === position && player.duration === duration) return
+    this.player.set({ ...player, playing, position, duration })
+  }
+
+  playerFailed(audio) {
+    const player = this.player.get()
+    if (audio !== this.audio || !player?.url) return
+    const code = MEDIA_ERRORS[audio.error?.code] ?? 'MEDIA_ERR_UNKNOWN'
+    this.player.set({ ...player, playing: false, error: `Плеер не может прочитать запись: ${code}` })
+  }
+
+  async togglePlay() {
+    const audio = this.audio
+    if (!audio) return
+    if (!audio.paused && !audio.ended) {
+      audio.pause()
+      this.syncPlayer(audio)
+      return
+    }
+    const player = this.player.get()
+    if (player?.error) this.player.set({ ...player, error: '' })
+    try {
+      await audio.play()
+    } catch (error) {
+      const current = this.player.get()
+      if (audio === this.audio && current) {
+        this.player.set({ ...current, playing: false, error: `Не удалось начать воспроизведение: ${error?.name || 'Error'}` })
+      }
+      return
+    }
+    this.syncPlayer(audio)
+  }
+
+  seek(delta) {
+    const audio = this.audio
+    if (!audio) return
+    const end = Number.isFinite(audio.duration) ? audio.duration : Infinity
+    audio.currentTime = Math.min(Math.max(audio.currentTime + delta, 0), end)
+    this.syncPlayer(audio)
+  }
+
+  restart() {
+    const audio = this.audio
+    if (!audio) return
+    audio.currentTime = 0
+    this.syncPlayer(audio)
   }
 
   closePlayer() {
     this.playerGeneration++
+    const audio = this.audio
+    this.audio = null
+    if (audio) {
+      for (const [type, listener] of this.audioListeners) audio.removeEventListener(type, listener)
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
+    }
+    this.audioListeners = []
     const url = this.player.get()?.url
     this.player.set(null)
     if (!url) return
@@ -937,7 +1029,8 @@ const STYLE = `
   .sound-scout-recorder__meter span { display:block; width:2px; border-radius:1px; background:var(--ui-text-secondary); }
   .sound-scout-recorder__label { display:inline-flex; align-items:center; gap:5px; }
   .sound-scout-player { display:flex; flex-direction:column; gap:8px; color:var(--ui-text-primary); }
-  .sound-scout-player__audio { display:block; width:100%; }
+  .sound-scout-player__time { color:var(--ui-text-secondary); font-variant-numeric:tabular-nums; }
+  .sound-scout-player__actions { display:flex; flex-wrap:wrap; gap:4px; }
   .sound-scout-player__error { color:var(--ui-red); }
   .sound-scout-recorder__error { position:absolute; bottom:calc(100% + 6px); left:0; z-index:10; width:max-content; max-width:min(260px,80vw); padding:6px 8px; border:1px solid var(--ui-stroke-secondary); border-radius:4px; background:var(--ui-bg-quaternary); color:var(--ui-text-secondary); font-size:12px; }
   @media (prefers-reduced-motion: reduce) { .sound-scout-recorder *, .sound-scout-player, .sound-scout-player * { transition: none !important; animation: none !important; } }
@@ -987,14 +1080,23 @@ function ReportDialog({ recorder, job }) {
   }, 'report')
 }
 
+// Reads the player atom only: the element lives in recorder.audio, so a poll or a second composer of
+// the chat re-renders the buttons and never the playback.
 function PlayerDialog({ recorder, player }) {
   const body = [
-    jsx('audio', {
-      controls: true, preload: 'metadata', src: player.url, 'aria-label': 'Голосовое сообщение', className: 'sound-scout-player__audio'
-    }, 'audio'),
-    jsx('div', { children: action({
-      label: 'Скачать', icon: 'cloud-download', title: 'Сохранить этот WAV на компьютер', onClick: () => recorder.downloadRecording()
-    }) }, 'actions')
+    jsx('p', {
+      role: 'status', className: 'sound-scout-player__time', 'aria-label': 'Позиция записи',
+      children: `${playerClock(player.position ?? 0)} / ${playerClock(player.duration ?? 0)}`
+    }, 'time'),
+    jsx('div', { className: 'sound-scout-player__actions', children: [
+      player.playing
+        ? action({ label: 'Пауза', icon: 'debug-pause', title: 'Приостановить запись', onClick: () => recorder.togglePlay() })
+        : action({ label: 'Пуск', icon: 'play', title: 'Воспроизвести запись', onClick: () => recorder.togglePlay() }),
+      action({ label: '−5 с', icon: 'arrow-left', title: 'Назад на 5 секунд', onClick: () => recorder.seek(-SEEK_STEP_S) }),
+      action({ label: '+5 с', icon: 'arrow-right', title: 'Вперёд на 5 секунд', onClick: () => recorder.seek(SEEK_STEP_S) }),
+      action({ label: 'В начало', icon: 'debug-step-back', title: 'Перемотать запись в начало', onClick: () => recorder.restart() }),
+      action({ label: 'Скачать', icon: 'cloud-download', title: 'Сохранить этот WAV на компьютер', onClick: () => recorder.downloadRecording() })
+    ] }, 'actions')
   ]
   if (player.error) body.push(jsx('p', { role: 'alert', className: 'sound-scout-player__error', children: player.error }, 'error'))
   return jsx(Dialog, {
