@@ -166,6 +166,21 @@ CRITERION_RULE = (
 QUEUE_AS_FACT = re.compile(r"(?<!не утверждать, что )задание (?:уже )?в очереди")
 OPERATOR_SETTING = re.compile(r"(?<!не )настройка оператора")
 SEND_ONLY = re.compile(r"«Отправить»")
+# Issue #208: `word_prominence` (decision 0038) is a measurement of pitch accent presence only; the
+# interpretation rule keeps Hermes from calling it more and from ranking words by it.
+PROMINENCE_RULE = "- **`word_prominence`**"
+PROMINENCE_TERMS = (
+    "измерение наличия pitch accent",
+    "Не называть его дикцией, просодией, интонацией, фокусом или смысловым (логическим) ударением",
+    "Не выдавать его за находку",
+    "Значения сравнимы только между словами одного сегмента ASR",
+    "Порога нет",
+    "Не ранжировать слова",
+    "Если пользователь спрашивает о выделенности слов или о `word_prominence`",
+    "Если записи нет, а в `limitations` есть строка `word_prominence не посчитан: <причина>`",
+    "назвать эту причину по правилу «`limitations` и `errors`»",
+    "Без такой строки причину не придумывать",
+)
 
 
 def frontmatter(text: str) -> dict[str, str]:
@@ -189,6 +204,7 @@ def skill_problems(text: str, directory: str = "speech-review") -> list[str]:
     problems += desktop_attachment_problems(text)
     problems += plain_send_problems(text)
     problems += compare_step_problems(text)
+    problems += prominence_problems(text)
     if str(Path.home()) in text:
         problems.append("home directory in the text")
     if not SKILL_NAME.fullmatch(name) or name != directory:
@@ -292,6 +308,17 @@ def compare_step_problems(text: str) -> list[str]:
     ):
         problems.append("criterion rule comes before the case of existing jobs")
     return problems
+
+
+def prominence_problems(text: str) -> list[str]:
+    """The interpretation section has the `word_prominence` rule with every term (#208)."""
+    if "\n## Трактовка результата\n" not in text:
+        return []
+    interpretation = section(text, "## Трактовка результата")
+    if PROMINENCE_RULE not in interpretation:
+        return ["interpretation lacks the word_prominence rule"]
+    rule = flat(interpretation.split(PROMINENCE_RULE, 1)[1].split("\n- ", 1)[0])
+    return [f"word_prominence rule lacks: {t}" for t in PROMINENCE_TERMS if t not in rule]
 
 
 def json_block(text: str, lead: str) -> object:
@@ -892,3 +919,36 @@ def test_the_skill_says_a_retried_attempt_gets_its_own_note_with_the_attempt_tag
     )
     assert delivery.tag("J") == "sound-scout-job:J"
     assert delivery.tag("J", 2) == "sound-scout-job:J-a2"
+
+
+def test_the_word_prominence_rule_agrees_with_the_measurement_and_its_absence_line() -> None:
+    from sound_scout import app, prominence
+
+    text = SKILL.read_text(encoding="utf-8")
+    assert prominence_problems(text) == []
+    rule = section(text, "## Трактовка результата").split(PROMINENCE_RULE, 1)[1]
+    rule = flat(rule.split("\n- ", 1)[0])
+    assert f"`{prominence.RULE}`" in rule and "0038" in rule
+    assert "\n- **`limitations` и `errors`**" in section(text, "## Трактовка результата")
+    assert "Порога нет" in " ".join(prominence.LIMITATIONS)
+    assert "сравнимы только между словами одного сегмента ASR" in " ".join(prominence.LIMITATIONS)
+    source = Path(app.__file__).read_text(encoding="utf-8")
+    assert 'f"{prominence.NAME} не посчитан: {reason}"' in source
+    assert prominence.NAME == "word_prominence"
+    assert "в compact-ответе `speech_job_result` значений нет" in rule
+    result = json.loads(SYNTHETIC_RESULT.read_text(encoding="utf-8"))
+    assert "measurements" not in report.compact(result, run_dir="runs/x")
+
+
+def test_lint_reports_a_missing_or_incomplete_word_prominence_rule() -> None:
+    text = SKILL.read_text(encoding="utf-8")
+    interpretation = section(text, "## Трактовка результата")
+    rule = interpretation.split(PROMINENCE_RULE, 1)[1].split("\n- ", 1)[0]
+    without = text.replace(PROMINENCE_RULE + rule, "", 1)
+    assert "word_prominence" not in section(without, "## Трактовка результата")
+    assert skill_problems(without) == ["interpretation lacks the word_prominence rule"]
+    old = "Порога нет:"
+    assert old in rule
+    assert skill_problems(text.replace(old, "Порог есть:", 1)) == [
+        "word_prominence rule lacks: Порога нет"
+    ]
