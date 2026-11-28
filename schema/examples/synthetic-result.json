@@ -45,7 +45,7 @@
     "input_modalities": ["text"],
     "audio_payload_sha256": null,
     "prompt_sha256": null,
-    "schema_sha256": "2bc104be234ab220d00e77015cdd4350aaf1423970c1b054c757e5fc224e116e",
+    "schema_sha256": "611834e6af0ce91dc0c412bcf886690512a0650297632840b783d6276440407a",
     "transformations": [
       { "name": "resample", "settings": { "sample_rate": 16000, "channels": 1 } }
     ],
@@ -94,6 +94,52 @@
       "settings": { "pitch_floor_hz": 75, "pitch_ceiling_hz": 500 },
       "limitations": ["synthetic: octave errors are possible; F0 is not expressiveness"],
       "reason": "synthetic: no voiced frames inside speech spans"
+    },
+    {
+      "name": "word_prominence",
+      "value": [
+        {
+          "start": 3.2,
+          "end": 3.55,
+          "transcript_ref": { "artifact_ref": "transcript-raw", "pointer": "$.segments[0].words[0]" },
+          "value": 1.84,
+          "reason": null
+        },
+        {
+          "start": 3.55,
+          "end": 3.9,
+          "transcript_ref": { "artifact_ref": "transcript-raw", "pointer": "$.segments[0].words[1]" },
+          "value": -1.84,
+          "reason": null
+        },
+        {
+          "start": 3.9,
+          "end": 3.9,
+          "transcript_ref": { "artifact_ref": "transcript-raw", "pointer": "$.segments[0].words[2]" },
+          "value": null,
+          "reason": "no_frames"
+        }
+      ],
+      "unit": "z_sum",
+      "method": "prosody_rule_v1_word_index",
+      "settings": {
+        "rule": "PROSODY-RULE v1",
+        "normalization_unit": "trusted_asr_segment",
+        "counts": { "segments": 1, "words": 3, "with_value": 2, "without_value": { "no_frames": 1 } }
+      },
+      "validation": {
+        "decision": "docs/decisions/0037-word-prominence-rupro.md",
+        "report": "docs/eval/2026-11-28-prosody-rupro-1.md",
+        "rule": "PROSODY-RUPRO-RULE v1",
+        "rule_sha256": "6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77df68c",
+        "target": "pitch accent presence (RuPro word_pa) within one intonation phrase",
+        "verdict": "PASS",
+        "auc": 0.763,
+        "ci95": [0.739, 0.788],
+        "coverage": 0.831
+      },
+      "limitations": ["synthetic: pitch accent presence only; values compare within one ASR segment"],
+      "reason": null
     }
   ],
   "findings": [

@@ -261,6 +261,8 @@ def test_note_of_a_partial_result_lists_each_requested_layer_with_its_status(
     assert not any(phrase in text.lower() for phrase in ALL_DONE)
     for private in (str(wav), str(setup.data_root), str(setup.allowed_roots[0])):
         assert private not in text
+    assert any(t.startswith("word_prominence") for t in result["limitations"])
+    assert "word_prominence" not in text and "pitch accent" not in text  # no measurements (0038)
 
 
 @needs_ffmpeg

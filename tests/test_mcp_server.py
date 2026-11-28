@@ -900,7 +900,7 @@ def test_the_job_mode_reaches_the_plan_and_a_mode_with_layers_is_invalid_request
         (loaded.data_root / "jobs" / answer["job_id"] / "job.json").read_text(encoding="utf-8")
     )["plan"]
     assert plan["mode"] == plan["resolved_mode"] == "quick"
-    assert plan["stages"] == ["prepare", "acoustics", "asr"]
+    assert plan["stages"] == ["prepare", "asr", "acoustics"]
     assert refused_error is True and refused["error"]["code"] == "invalid_request"
     assert retry_error is True and retried["error"]["code"] == "not_retryable"
 

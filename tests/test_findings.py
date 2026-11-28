@@ -133,6 +133,8 @@ def document(run: Run, built: Built, outcome: review.ReviewOutcome) -> dict:
     doc = deepcopy(EXAMPLE_DOC)
     doc["run_id"] = run.run_id
     doc["source"]["duration_s"] = SOURCE_DURATION
+    # its words point into the example's own transcript artifact and 12 s source
+    doc["measurements"] = [m for m in doc["measurements"] if m["name"] != "word_prominence"]
     doc["findings"] = deepcopy(built.findings)
     doc["unlocalized"] = deepcopy(built.unlocalized)
     doc["artifacts"] = deepcopy(built.artifacts)
@@ -422,6 +424,78 @@ def test_a_flagged_segment_is_never_quoted_as_a_disagreement(
         {"start": 1.1, "end": 1.2, "signals": ["silent_span"], "certainty": "uncertain"}
     ]
     findings.validate(doc, run=run)
+
+
+WORDS = [
+    {"start": 1.1, "end": 1.2, "word": " раз", "probability": 0.9},
+    {"start": 1.2, "end": 1.4, "word": " два", "probability": 0.9},
+]
+
+
+def with_word_prominence(run: Run, doc: dict, pointers: list[str]) -> tuple[dict, int]:
+    """`doc` with a `word_prominence` entry whose words point into the run's raw transcript."""
+    entry = deepcopy(next(m for m in EXAMPLE_DOC["measurements"] if m["name"] == "word_prominence"))
+    entry["value"] = [
+        {
+            "start": 1.1 + 0.1 * j,
+            "end": 1.2 + 0.1 * j,
+            "transcript_ref": {"artifact_ref": "transcript-raw", "pointer": pointer},
+            "value": 1.0 - 2 * j,
+            "reason": None,
+        }
+        for j, pointer in enumerate(pointers)
+    ]
+    doc["measurements"].append(entry)
+    return doc, len(doc["measurements"]) - 1
+
+
+def test_word_prominence_pointers_must_name_words_of_the_hashed_raw_transcript(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    transcript = write_raw(run, WORDS)
+    outcome = reviewed(run, config, clip)
+    result = build(run, [outcome], [], transcript, config=config)
+    pointers = ["$.segments[0].words[0]", "$.segments[0].words[1]"]
+    doc, _ = with_word_prominence(run, document(run, result, outcome), pointers)
+    findings.validate(doc, run=run)
+
+    doc, index = with_word_prominence(
+        run,
+        document(run, result, outcome),
+        ["$.segments[0].words[1]", "$.segments[0].words[2]", "$.segments[999].words[0]"],
+    )
+    errors = assert_rejected(doc, "is not a word of the raw transcript", run)
+    assert errors == [
+        f"$.measurements[{index}].value[{j}].transcript_ref.pointer: {pointer} is not a word "
+        "of the raw transcript"
+        for j, pointer in ((1, "$.segments[0].words[2]"), (2, "$.segments[999].words[0]"))
+    ]
+
+
+def test_word_prominence_checks_its_raw_transcript_file_even_when_nothing_else_cites_it(
+    run: Run, config: Config, clip: Clip
+) -> None:
+    transcript = write_raw(run, WORDS)
+    response = {**RESPONSE, "observations": [{**NEGATIVE, "correction": None}]}
+    outcome = reviewed(run, config, clip, response)
+    result = build(run, [outcome], [], transcript, config=config)
+    assert not result.corrections and "transcript-raw" not in {a["id"] for a in result.artifacts}
+    doc = with_raw_artifact(run, document(run, result, outcome), transcript)
+    doc["transcript"].update(raw=None, suspect_segments=[])
+    doc, index = with_word_prominence(run, doc, ["$.segments[0].words[0]"])
+    findings.validate(doc, run=run)
+
+    (run.path / "asr" / "raw.json").unlink()
+    [artifact] = [i for i, a in enumerate(doc["artifacts"]) if a["id"] == "transcript-raw"]
+    assert assert_rejected(doc, "file is missing", run) == [
+        f"$.artifacts[{artifact}]: file is missing"
+    ]
+    doc["artifacts"][artifact]["sha256"] = None
+    assert_rejected(
+        doc,
+        f"$.measurements[{index}].value[0].transcript_ref.artifact_ref: 'transcript-raw' must "
+        "carry a sha256",
+    )
 
 
 def test_a_transcript_without_the_flag_is_refused_by_build(

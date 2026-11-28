@@ -45,6 +45,7 @@ SOUND_CATEGORIES = (
     "completeness",
 )
 MEASUREMENT_CATEGORIES = ("tempo", "level", "pitch_range", "pause_length")
+WORD_MEASUREMENT = "word_prominence"
 TRANSCRIPT_CATEGORIES = ("filler_words", "content")
 CATEGORY_BASES = {
     **dict.fromkeys(SOUND_CATEGORIES, ("audio_model_observation", "human_verified")),
@@ -191,13 +192,17 @@ def _timecode_errors(result: dict) -> list[str]:
         (f"$.transcript.corrections[{i}]", c["start"], c["end"])
         for i, c in enumerate(result["transcript"]["corrections"])
     ]
-    for i, measurement in enumerate(result["measurements"]):
-        if isinstance(measurement["value"], list):
-            spans += [
-                (f"$.measurements[{i}].value[{j}]", r["start"], r["end"])
-                for j, r in enumerate(measurement["value"])
-            ]
     errors = []
+    for i, measurement in enumerate(result["measurements"]):
+        if not isinstance(measurement["value"], list):
+            continue
+        for j, item in enumerate(measurement["value"]):
+            path = f"$.measurements[{i}].value[{j}]"
+            if "transcript_ref" in item and item["value"] is None and item["start"] == item["end"]:
+                # an ASR word of zero length is listed without a value (no_frames), never dropped
+                errors += _span_errors(path, item["start"], item["end"], duration, empty=True)
+            else:
+                spans.append((path, item["start"], item["end"]))
     for i, artifact in enumerate(result["artifacts"]):
         start, end = artifact["source_start"], artifact["source_end"]
         if start is None and end is None:
@@ -207,12 +212,18 @@ def _timecode_errors(result: dict) -> list[str]:
             continue
         spans.append((f"$.artifacts[{i}]", start, end))
     for path, start, end in spans:
-        if start < 0:
-            errors.append(f"{path}.start: must be >= 0, got {start}")
-        if start >= end:
-            errors.append(f"{path}: start must be less than end, got {start} >= {end}")
-        if end > duration:
-            errors.append(f"{path}.end: exceeds source duration {duration}, got {end}")
+        errors += _span_errors(path, start, end, duration)
+    return errors
+
+
+def _span_errors(path: str, start, end, duration: float, empty: bool = False) -> list[str]:
+    errors = []
+    if start < 0:
+        errors.append(f"{path}.start: must be >= 0, got {start}")
+    if start >= end and not (empty and start == end):
+        errors.append(f"{path}: start must be less than end, got {start} >= {end}")
+    if end > duration:
+        errors.append(f"{path}.end: exceeds source duration {duration}, got {end}")
     return errors
 
 
@@ -497,12 +508,39 @@ def _artifact_errors(result: dict) -> list[str]:
 
 
 def _measurement_errors(result: dict) -> list[str]:
-    """A value not obtained is null with a reason, never a bare null (spec § 4, R11)."""
-    return [
+    """A value not obtained is null with a reason, never a bare null (spec § 4, R11); a value
+    per word names its word in the raw transcript artifact and gets a reason only when null."""
+    errors = [
         f"$.measurements[{i}].reason: a reason is required when value is null"
         for i, measurement in enumerate(result["measurements"])
         if measurement["value"] is None and not _text(measurement["reason"])
     ]
+    artifacts = {artifact["id"]: artifact for artifact in result["artifacts"]}
+    for i, measurement in enumerate(result["measurements"]):
+        values = measurement["value"]
+        if (
+            measurement["name"] == WORD_MEASUREMENT
+            and isinstance(values, list)
+            and any("transcript_ref" not in item for item in values)
+        ):
+            errors.append(f"$.measurements[{i}].value: {WORD_MEASUREMENT} holds a value per word")
+        for j, item in enumerate(values if isinstance(values, list) else []):
+            if "transcript_ref" not in item:
+                continue
+            path = f"$.measurements[{i}].value[{j}]"
+            if item["value"] is None and not _text(item["reason"]):
+                errors.append(f"{path}.reason: a reason is required when value is null")
+            if item["value"] is not None and item["reason"] is not None:
+                errors.append(f"{path}.reason: must be null when the word has a value")
+            ref = item["transcript_ref"]["artifact_ref"]
+            artifact = artifacts.get(ref)
+            if artifact is None or artifact["kind"] != "transcript_raw":
+                errors.append(
+                    f"{path}.transcript_ref.artifact_ref: {ref!r} is not a transcript_raw artifact"
+                )
+            elif artifact["sha256"] is None:
+                errors.append(f"{path}.transcript_ref.artifact_ref: {ref!r} must carry a sha256")
+    return errors
 
 
 def _text(value: object) -> bool:

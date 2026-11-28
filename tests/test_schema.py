@@ -862,6 +862,16 @@ RESULT_SCHEMA_RULES = {
         [],
         "$.findings[0].evidence_refs: must have at least 1 items",
     ),
+    "maximum": (
+        ("measurements", 2, "validation", "auc"),
+        2,
+        "$.measurements[2].validation.auc: must be at most 1",
+    ),
+    "maxItems": (
+        ("measurements", 2, "validation", "ci95"),
+        [0.1, 0.2, 0.3],
+        "$.measurements[2].validation.ci95: must have at most 2 items",
+    ),
     "oneOf": (
         ("measurements", 0, "value"),
         {},
@@ -905,3 +915,69 @@ def test_min_properties_reached_only_inside_one_of_has_its_own_message() -> None
     # В схеме результата minProperties стоит внутри oneOf и наружу выходит как ошибка oneOf.
     schema_part = schema.SCHEMA["$defs"]["measurement"]["properties"]["value"]["oneOf"][2]
     assert schema_errors(schema_part, {}) == ["$: must have at least 1 properties"]
+
+
+# --- word_prominence (decision 0038) -------------------------------------------------------
+
+
+def word_entry(doc: dict) -> dict:
+    return next(m for m in doc["measurements"] if m["name"] == "word_prominence")
+
+
+def test_the_example_holds_a_word_prominence_entry_with_its_validation(doc: dict) -> None:
+    entry = word_entry(doc)
+    assert entry["validation"]["decision"] == "docs/decisions/0037-word-prominence-rupro.md"
+    assert entry["validation"]["report"] == "docs/eval/2026-11-28-prosody-rupro-1.md"
+    assert all(v["transcript_ref"]["artifact_ref"] == "transcript-raw" for v in entry["value"])
+    validate(doc)
+
+
+def test_a_measurement_without_validation_still_passes(doc: dict) -> None:
+    for measurement in doc["measurements"]:
+        measurement.pop("validation", None)
+    validate(doc)
+
+
+def test_a_word_value_needs_a_reason_only_when_it_is_null(doc: dict) -> None:
+    word_entry(doc)["value"][2]["reason"] = None
+    index = doc["measurements"].index(word_entry(doc))
+    assert_rejected(doc, f"$.measurements[{index}].value[2].reason: a reason is required")
+    doc = deepcopy(EXAMPLE_DOC)
+    word_entry(doc)["value"][0]["reason"] = "no_frames"
+    assert_rejected(doc, f"$.measurements[{index}].value[0].reason: must be null when the word")
+
+
+def test_a_word_value_must_point_into_a_raw_transcript_artifact(doc: dict) -> None:
+    index = doc["measurements"].index(word_entry(doc))
+    word_entry(doc)["value"][0]["transcript_ref"]["artifact_ref"] = "report-md"
+    assert_rejected(doc, f"$.measurements[{index}].value[0].transcript_ref.artifact_ref")
+    doc = deepcopy(EXAMPLE_DOC)
+    word_entry(doc)["value"][0]["transcript_ref"]["pointer"] = "$.text"
+    assert_rejected(doc, f"$.measurements[{index}].value: must be a valid nullable number")
+
+
+def test_an_empty_word_span_passes_only_without_a_value(doc: dict) -> None:
+    index = doc["measurements"].index(word_entry(doc))
+    validate(doc)  # value[2] is a word of zero length without a value
+    word_entry(doc)["value"][2].update(value=0.5, reason=None)
+    assert_rejected(doc, f"$.measurements[{index}].value[2]: start must be less than end")
+    doc = deepcopy(EXAMPLE_DOC)
+    word_entry(doc)["value"][1]["end"] = doc["source"]["duration_s"] + 1
+    assert_rejected(doc, f"$.measurements[{index}].value[1].end: exceeds source duration")
+
+
+def test_a_word_value_that_is_not_finite_is_rejected(doc: dict) -> None:
+    index = doc["measurements"].index(word_entry(doc))
+    word_entry(doc)["value"][0]["value"] = float("nan")
+    assert_rejected(doc, f"$.measurements[{index}].value[0].value: NaN/Infinity is not allowed")
+
+
+def test_word_prominence_holds_values_per_word_not_time_ranges(doc: dict) -> None:
+    index = doc["measurements"].index(word_entry(doc))
+    word_entry(doc)["value"] = [{"start": 3.2, "end": 3.55}]
+    assert_rejected(doc, f"$.measurements[{index}].value: word_prominence holds a value per word")
+
+
+def test_an_empty_list_is_still_an_empty_range_list_not_a_word_list(doc: dict) -> None:
+    word_entry(doc)["value"] = []
+    validate(doc)

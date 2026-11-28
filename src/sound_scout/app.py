@@ -8,7 +8,7 @@ identity raises `runs.RequestMismatch`, and a run that never completed raises `R
 rather than charging the request again.
 
 The stages run in a child process (`multiprocessing`, `spawn`), the worker: prepare (ingest,
-channels, the 16 kHz copy for ASR), acoustics, asr, audio_review (`review.cover`: a clip and one
+channels, the 16 kHz copy for ASR), asr, acoustics, audio_review (`review.cover`: a clip and one
 backend call per window, then findings). At the start of each stage the worker replaces
 `work/stage-current.json` with the stage's name and start time; it names the last stage started and
 stays after the worker ends. After each stage the worker writes `work/stage-<name>.json`
@@ -60,6 +60,7 @@ choice that averaged two distinct channels (`channels.DISTINCT_STEREO`) is named
 import contextlib
 import dataclasses
 import fcntl
+import hashlib
 import json
 import multiprocessing
 import os
@@ -91,6 +92,7 @@ from sound_scout import (
     paths,
     prepare,
     proc,
+    prominence,
     report,
     review,
     runs,
@@ -105,7 +107,7 @@ except OSError:
 
 LAYERS = ("content", "measurements", "sound")
 LAYER_STAGES = {"content": "asr", "measurements": "acoustics", "sound": "audio_review"}
-WORKER_STAGES = ("prepare", "acoustics", "asr", "audio_review")
+WORKER_STAGES = ("prepare", "asr", "acoustics", "audio_review")
 POLL_SECONDS = 0.05
 TERMINATE_GRACE_SECONDS = 0.5
 LOCK_FILE_NAME = "analyze.lock"
@@ -131,6 +133,7 @@ CHANGED_CODE = (
 REVIEW_CALL_FAILED = "review_call_failed"
 NETWORK_DENIED = "network_denied"
 ASR_FAILED = "asr_failed"
+WORD_PROMINENCE_FAILED = "word_prominence_failed"
 NO_BACKEND_REASON = "backend = none: audio backend не выбран (Gate 0)"
 NOT_REQUESTED_REASON = "слой не запрошен"
 CANCELLED_REASON = "отменён"
@@ -550,7 +553,7 @@ def _run_stages(
         prepared = None
     _write_record(run, config, record)
     no_signal = f"нет подготовленного сигнала: prepare {record['entry']['status']}"
-    asr_completed = False
+    asr_completed, asr_record = False, None
     for name in WORKER_STAGES[1:]:
         if name not in requested:
             continue
@@ -559,14 +562,14 @@ def _run_stages(
         if prepared is None:
             record = _Stage(name).done("skipped", no_signal)
         elif name == "acoustics":
-            record = _acoustics_stage(prepared)
+            record = _acoustics_stage(prepared, run, asr_record)
         elif name == "asr":
             record = _asr_stage(prepared, run, config)
         else:
             record = _review_stage(prepared, request, run, config, backend, asr_completed)
         record = _with_denials(record, guard.denied_events()[denied:])
         if name == "asr":
-            asr_completed = record["entry"]["status"] == "completed"
+            asr_completed, asr_record = record["entry"]["status"] == "completed", record
         _write_record(run, config, record)
 
 
@@ -619,7 +622,10 @@ def _prepare_stage(
     return _Prepared(source, mono, mono16k), stage.done("completed", None)
 
 
-def _acoustics_stage(prepared: _Prepared) -> dict:
+def _acoustics_stage(prepared: _Prepared, run: runs.Run, asr_record: dict | None) -> dict:
+    """`acoustics.measure`, whose status is the stage's, then `word_prominence` from the trusted
+    words of this run's raw transcript: present or absent with the reason in the limitations,
+    it never changes the stage status (docs/decisions/0038)."""
     stage = _Stage("acoustics")
     try:
         with stage.step("measure"):
@@ -627,7 +633,40 @@ def _acoustics_stage(prepared: _Prepared) -> dict:
     except Exception as error:
         return stage.failed(error)
     stage.fragment["measurements"] = measured["measurements"]
+    reason = _word_prominence(stage, prepared, run, asr_record, measured)
+    if reason is not None:
+        stage.fragment["limitations"] = [f"{prominence.NAME} не посчитан: {reason}"]
     return stage.done(measured["status"], measured["reason"])
+
+
+def _word_prominence(
+    stage: _Stage, prepared: _Prepared, run: runs.Run, asr_record: dict | None, measured: dict
+) -> str | None:
+    """Add `word_prominence` to the stage's measurements; the reason when there is none."""
+    if asr_record is None:
+        return "слой content не запрошен, индексу нужны доверенные слова ASR"
+    asr_entry = asr_record["entry"]
+    if asr_entry["status"] != "completed":
+        return f"этап asr {asr_entry['status']}: {asr_entry['reason']}"
+    if measured["status"] != "completed":
+        return f"этап acoustics {measured['status']}: {measured['reason']}"
+    assert prepared.mono16k is not None
+    try:
+        with stage.step(prominence.NAME):
+            raw_bytes = (run.path / asr.ASR_DIR_NAME / asr.RAW_FILE_NAME).read_bytes()
+            recorded = asr_record["fragment"]["artifact"]["sha256"]
+            if hashlib.sha256(raw_bytes).hexdigest() != recorded:
+                raise ValueError(f"{asr.ASR_DIR_NAME}/{asr.RAW_FILE_NAME} differs from its record")
+            found = prominence.measure_words(
+                prepared.mono16k.samples, json.loads(raw_bytes), prepared.source.duration_s
+            )
+    except Exception as error:
+        stage.error(WORD_PROMINENCE_FAILED, f"{type(error).__name__}: {error}")
+        return f"сбой расчёта ({type(error).__name__}), код {WORD_PROMINENCE_FAILED}"
+    if found["entry"] is None:
+        return found["reason"]
+    stage.fragment["measurements"].append(found["entry"])
+    return None
 
 
 def _asr_stage(prepared: _Prepared, run: runs.Run, config: Config) -> dict:
@@ -833,6 +872,7 @@ def _assemble(
         for layer in request.layers
         if not completed[LAYER_STAGES[layer]]
     ]
+    limitations += fragments.get("acoustics", {}).get("limitations", [])
     if any(
         item["name"] == channels.TRANSFORMATION_NAME
         and item["settings"]["verdict"] == channels.DISTINCT_STEREO

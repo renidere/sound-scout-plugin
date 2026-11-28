@@ -82,6 +82,7 @@ def unheard(run: Run, clip: Clip) -> dict:
         "unreviewed": [{"start": 0.0, "end": SOURCE_DURATION}],
     }
     doc["transcript"] = {"raw": None, "corrections": [], "suspect_segments": []}
+    doc["measurements"] = [m for m in doc["measurements"] if m["name"] != "word_prominence"]
     doc["measurements"][0]["settings"] = {"window_s": SOURCE_DURATION}
     finding = deepcopy(EXAMPLE_DOC["findings"][0])
     finding.update(start=1.0, end=1.5)
@@ -505,3 +506,41 @@ def test_report_holds_no_absolute_paths_user_name_or_config_contents(
         assert not any(ABSOLUTE_PATH.search(s) for s in strings(shown))
     assert not ABSOLUTE_PATH.search(markdown)
     assert "<private path>" in markdown and "<user>" in markdown
+
+
+# --- word_prominence (decision 0038) -------------------------------------------------------
+
+WORD_ROOTS = ("дикц", "просод", "фокус", "слух", "diction", "prosod", "focus", "hearing")
+
+
+def test_report_shows_word_prominence_with_counts_and_limits_and_no_ranking() -> None:
+    entry = next(m for m in EXAMPLE_DOC["measurements"] if m["name"] == "word_prominence")
+
+    lines = report.render(EXAMPLE_DOC).splitlines()
+
+    measurements = lines[lines.index("## Измерения") : lines.index("## Транскрипт")]
+    [line] = [text for text in measurements if text.startswith("- `word_prominence`")]
+    assert line == (
+        "- `word_prominence`: индекс наличия pitch accent у 2 слов из 3 в 1 сегментах ASR; без "
+        "значения — 1 (`no_frames` — 1). Значения по словам — в `result.json`. Проверка: "
+        "`docs/decisions/0037-word-prominence-rupro.md`."
+    )
+    at = measurements.index(line)
+    limits = measurements[at + 1 : at + 1 + len(entry["limitations"])]
+    assert limits == [f"  - ограничение: {text}" for text in entry["limitations"]]
+    for text in [line, *limits]:
+        assert not any(root in text.casefold() for root in WORD_ROOTS), text
+        assert "1.84" not in text  # no values, so no ranking across segments
+
+
+def test_compact_carries_no_measurement_and_no_wording_about_word_prominence() -> None:
+    doc = deepcopy(EXAMPLE_DOC)
+    absent = "word_prominence не посчитан: в транскрипте нет доверенных слов"
+    doc["provenance"]["limitations"] = [absent]
+
+    answer = report.compact(doc)
+
+    texts = [text for text in strings(answer) if "word_prominence" in text]
+    assert texts == [absent]
+    assert "measurements" not in answer
+    assert not any(root in absent.casefold() for root in WORD_ROOTS)

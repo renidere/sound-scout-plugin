@@ -276,6 +276,9 @@ def render(result: dict) -> str:
         lines.append("Измерений нет.")
     for m in result["measurements"]:
         value = m["value"]
+        if m["name"] == schema.WORD_MEASUREMENT and isinstance(value, list):
+            lines += _word_prominence_lines(m)
+            continue
         if value is None:
             shown = f"не получено: {m['reason']}"
         elif isinstance(value, list):
@@ -383,6 +386,28 @@ def render(result: dict) -> str:
         f"- `{a['id']}` ({a['kind']}): [`{a['path']}`]({a['path']})" for a in result["artifacts"]
     ]
     return "\n".join(lines) + "\n"
+
+
+def _word_prominence_lines(m: dict) -> list[str]:
+    """Counts and limitations only: values compare within one ASR segment, so no ranking here;
+    the method and rule names stay in `result.json` (0038)."""
+    value = m["value"]
+    missing: dict[str, int] = {}
+    for item in value:
+        if item["value"] is None:
+            missing[item["reason"]] = missing.get(item["reason"], 0) + 1
+    segments = len({item["transcript_ref"]["pointer"].partition(".words")[0] for item in value})
+    with_value = len(value) - sum(missing.values())
+    codes = ", ".join(f"`{code}` — {count}" for code, count in sorted(missing.items()))
+    validation = (m.get("validation") or {}).get("decision")
+    lines = [
+        f"- `{m['name']}`: индекс наличия pitch accent у {with_value} слов из {len(value)} "
+        f"в {segments} сегментах ASR; без значения — {sum(missing.values())}"
+        + (f" ({codes})" if codes else "")
+        + ". Значения по словам — в `result.json`."
+        + (f" Проверка: `{validation}`." if validation else "")
+    ]
+    return lines + [f"  - ограничение: {text}" for text in m["limitations"]]
 
 
 def _windows_note(artifacts: list[dict]) -> str:

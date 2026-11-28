@@ -133,7 +133,7 @@ def test_the_plan_names_only_the_stages_of_the_requested_layers(setup: Config) -
             ("content", "measurements"),
             "quick",
             None,
-            ["prepare", "acoustics", "asr"],
+            ["prepare", "asr", "acoustics"],
         ),
         ("full", None, app.LAYERS, "full", None, list(app.WORKER_STAGES)),
         ("targeted", ("sound",), ("sound",), "targeted", None, ["prepare", "audio_review"]),
@@ -255,6 +255,19 @@ def test_applied_plan_refuses_budgets_it_cannot_narrow_by(setup: Config, budgets
     assert refused.value.code == "plan_refused" and "plan budget" in refused.value.message
 
 
+def test_the_stages_run_asr_before_acoustics_and_a_plan_of_the_old_order_still_runs(
+    setup: Config,
+) -> None:
+    assert jobs.WORKER_STAGES == ("prepare", "asr", "acoustics", "audio_review")
+    plan = jobs.resolved_plan("quick", None, setup)[1]
+    assert plan["stages"] == ["prepare", "asr", "acoustics"]
+    stored = plan | {"stages": ["prepare", "acoustics", "asr"]}  # queued before decision 0038
+
+    assert jobs.applied_plan(stored, setup) == (("content", "measurements"), setup)
+    with pytest.raises(JobError, match="are not the stages"):
+        jobs.applied_plan(plan | {"stages": ["prepare", "asr", "asr"]}, setup)
+
+
 def test_a_plan_of_the_old_format_without_its_version_is_refused(setup: Config) -> None:
     old = {
         "stages": list(app.WORKER_STAGES),
@@ -334,6 +347,34 @@ def test_the_same_request_returns_the_same_job_and_another_identity_is_a_mismatc
         with pytest.raises(runs.RequestMismatch, match="r-1"):
             jobs.submit(request, binding, setup)
     assert len(list((setup.data_root / "jobs").glob("*/job.json"))) == 1
+
+
+def test_a_request_submitted_before_the_stage_order_changed_reuses_its_job(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/a.wav")
+    answer = jobs.submit(SubmitRequest(str(wav), request_id="r-1", mode="quick"), Binding(), setup)
+    job = json.loads((setup.data_root / "jobs" / answer["job_id"] / "job.json").read_text())
+    assert job["plan"]["stages"] == ["prepare", "asr", "acoustics"]
+    legacy = {  # the identity as `submit` hashed it before decision 0038
+        "audio": hashlib.sha256(wav.read_bytes()).hexdigest(),
+        "analysis": {
+            "mode": "quick",
+            "layers": ["content", "measurements"],
+            "task": None,
+            "intent": None,
+            "control": None,
+        },
+        "plan": job["plan"] | {"stages": ["prepare", "acoustics", "asr"]},
+        "binding": dataclasses.asdict(Binding()),
+    }
+    text = json.dumps(legacy, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert job["identity_hash"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    again = jobs.submit(SubmitRequest(str(wav), request_id="r-1", mode="quick"), Binding(), setup)
+    assert again == answer | {"reused": True}
+    with pytest.raises(runs.RequestMismatch, match="r-1"):
+        jobs.submit(SubmitRequest(str(wav), request_id="r-1", mode="full"), Binding(), setup)
 
 
 def test_concurrent_submits_of_one_request_make_one_job(
@@ -1169,7 +1210,7 @@ def test_jobs_submit_mode_and_retry_through_the_console(
     job_id = json.loads(submitted.stdout)["job_id"]
     plan = json.loads((data / "jobs" / job_id / "job.json").read_text(encoding="utf-8"))["plan"]
     assert plan["mode"] == plan["resolved_mode"] == "quick"
-    assert plan["stages"] == ["prepare", "acoustics", "asr"]
+    assert plan["stages"] == ["prepare", "asr", "acoustics"]
     status = json.loads(run_cli(config_file, "status", job_id, "--json").stdout)
     assert status["mode"] == "quick" and status["retries"] == 0
 

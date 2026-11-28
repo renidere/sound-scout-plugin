@@ -809,7 +809,7 @@ def recorder(seen: list[tuple[app.AnalyzeRequest, Config, object]]) -> Callable[
         {"network": {"allow": True}},
         {"backend": "llama"},
         {"capability_version": 2},
-        {"stages": ["prepare", "asr", "audio_review", "acoustics"]},
+        {"stages": ["prepare", "asr", "acoustics", "audio_review", "llm"]},
         {"budgets": {"worker_deadline_seconds": 10_000}},
     ],
     ids=["roots", "network", "backend", "version", "stages", "budget-fields"],

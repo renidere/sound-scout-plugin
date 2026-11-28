@@ -501,6 +501,8 @@ def _run_errors(result: dict, run: Run) -> list[str]:
     }
     if result["transcript"]["raw"] is not None:
         to_check.add(result["transcript"]["raw"]["artifact_ref"])
+    words = _word_refs(result)
+    to_check |= {ref["artifact_ref"] for _, ref in words}
     cited = {
         response["id"]
         for _, _, _, refs in claims
@@ -522,6 +524,7 @@ def _run_errors(result: dict, run: Run) -> list[str]:
     raw_ref = result["transcript"]["raw"]
     if raw_ref is not None and raw_ref["artifact_ref"] not in broken:
         errors += _suspect_segment_errors(result, run, artifacts[raw_ref["artifact_ref"]])
+    errors += _word_ref_errors(run, words, artifacts, broken)
     records = {}
     clip_records: set[str] = set()
     for response_id, pair in pairs.items():
@@ -740,6 +743,38 @@ def _suspect_segment_errors(result: dict, run: Run, raw_artifact: dict) -> list[
             "of the raw transcript"
         ]
     return []
+
+
+def _word_refs(result: dict) -> list[tuple[str, dict]]:
+    """(path, transcript_ref) of every value per word in `measurements[]`."""
+    return [
+        (f"$.measurements[{i}].value[{j}].transcript_ref", item["transcript_ref"])
+        for i, measurement in enumerate(result["measurements"])
+        if isinstance(measurement["value"], list)
+        for j, item in enumerate(measurement["value"])
+        if "transcript_ref" in item
+    ]
+
+
+def _word_ref_errors(
+    run: Run, words: list[tuple[str, dict]], artifacts: dict, broken: set[str]
+) -> list[str]:
+    """Each pointer names a word of the hashed raw transcript file it cites."""
+    errors = []
+    raws: dict[str, object] = {}
+    for path, ref in words:
+        if ref["artifact_ref"] in broken:
+            continue
+        if ref["artifact_ref"] not in raws:
+            raws[ref["artifact_ref"]] = _read_json(run, artifacts[ref["artifact_ref"]]["path"])
+        found = raws[ref["artifact_ref"]]
+        positions = map(int, re.findall(r"\d+", ref["pointer"]))
+        for key, at in zip(("segments", "words"), positions, strict=True):
+            items = found.get(key) if isinstance(found, dict) else None
+            found = items[at] if isinstance(items, list) and at < len(items) else None
+        if not isinstance(found, dict):
+            errors.append(f"{path}.pointer: {ref['pointer']} is not a word of the raw transcript")
+    return errors
 
 
 def _clip_record_errors(run: Run, path: str, clip: dict) -> list[str]:

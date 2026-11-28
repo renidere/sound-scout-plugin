@@ -23,17 +23,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from sound_scout import app, channels, doctor, findings, proc, review, runs
+from sound_scout import acoustics, app, channels, doctor, findings, proc, report, review, runs
 from sound_scout.app import AnalyzeRequest, Busy, CancelToken, RunIncomplete, analyze
 from sound_scout.config import Asr, Budgets, Config
 from sound_scout.review import BackendDescription, RawReviewResponse, ReviewRequest
 from tests.conftest import WavFactory
 from tests.test_ingest import write_wav
 from tests.test_proc import process_gone
+from tests.test_prominence import utterance
 from tests.test_review import FakeBackend
 
 pytestmark = pytest.mark.skipif(
@@ -305,9 +307,9 @@ def test_a_stage_skipped_after_a_failed_prepare_is_marked_current_before_its_rec
     assert seen == [
         ("start prepare", "prepare", []),
         ("record prepare", "prepare", []),
-        ("record acoustics", "acoustics", ["prepare"]),
-        ("record asr", "asr", ["prepare", "acoustics"]),
-        ("record audio_review", "audio_review", ["prepare", "acoustics", "asr"]),
+        ("record asr", "asr", ["prepare"]),
+        ("record acoustics", "acoustics", ["prepare", "asr"]),
+        ("record audio_review", "audio_review", ["prepare", "asr", "acoustics"]),
     ]
 
 
@@ -922,6 +924,7 @@ def test_synthetic_smoke_with_the_test_double_is_complete_and_marked_synthetic(
     assert result["findings"] and result["unlocalized"]
     assert result["coverage"]["unreviewed"] == []
     assert result["provenance"]["limitations"] == [
+        "word_prominence не посчитан: слой content не запрошен, индексу нужны доверенные слова ASR",
         review.MODEL_LIMITATION + "only the passed fragment was heard",
         review.MODEL_UNCERTAINTY + "the first word may be a name",
     ]
@@ -982,14 +985,16 @@ class WhisperModel:
 FAKE_WHISPER += f"\n__path__.append({_INSTALLED!r})\n"
 
 
-def fake_asr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config, Path]:
+def fake_asr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str = FAKE_WHISPER
+) -> tuple[Config, Path]:
     """The spawned worker imports `faster_whisper` from `sys.path`, so a test double package
     placed first stands in for the model; its submodules (the Silero VAD) still come from the
     installed package. The snapshot is a fake one in a fake HF cache.
     Returns the config and a recording of 1 s of digital silence, then 0.5 s of a tone."""
     fake = tmp_path / "fake-packages" / "faster_whisper"
     fake.mkdir(parents=True)
-    (fake / "__init__.py").write_text(FAKE_WHISPER, encoding="utf-8")
+    (fake / "__init__.py").write_text(source, encoding="utf-8")
     monkeypatch.syspath_prepend(str(fake.parent))
     snapshot = tmp_path / "hf" / "models--o--n" / "snapshots" / ("0" * 40)
     snapshot.mkdir(parents=True)
@@ -1009,6 +1014,237 @@ def fake_asr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config, P
         out.setframerate(16_000)
         out.writeframes(np.concatenate([np.zeros(16_000, np.int16), tone]).tobytes())
     return config, wav
+
+
+# --- word_prominence (decision 0038) ----------------------------------------------------------
+
+SPEECH_WHISPER = FAKE_WHISPER.replace(
+    """        words = [Word(0.3, 0.95, " выдумка", 0.93)]
+        return iter([Segment(0, 0, 0.0, 0.95, " выдумка", [1], -0.1, 0.9, 0.01, words)]), Info()
+""",
+    """        words = [Word(w["start"], w["end"], w["word"], 0.93) for w in WORDS]
+        text = "".join(w.word for w in words)
+        end = len(audio) / 16000
+        return iter([Segment(0, 0, 0.0, end, text, [1], -0.1, 0.9, 0.01, words)]), Info()
+""",
+)
+WORD_ROOTS = ("дикц", "просод", "фокус", "слух", "diction", "prosod", "focus", "hearing")
+
+
+def speech_asr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config, Path, list]:
+    """The ASR double over formant-synthesised words: one trusted segment with their times."""
+    samples, words = utterance()
+    source = SPEECH_WHISPER.replace(
+        "class WhisperModel:", f"WORDS = {words!r}\n\n\nclass WhisperModel:"
+    )
+    config, _ = fake_asr(tmp_path, monkeypatch, source)
+    wav = config.allowed_roots[0] / "speech.wav"
+    with wave.open(str(wav), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(16_000)
+        out.writeframes(np.round(samples * 32767).astype(np.int16).tobytes())
+    return config, wav, words
+
+
+def word_prominence(result: dict) -> list[dict]:
+    return [m for m in result["measurements"] if m["name"] == "word_prominence"]
+
+
+def prominence_limitations(result: dict) -> list[str]:
+    return [t for t in result["provenance"]["limitations"] if t.startswith("word_prominence")]
+
+
+def test_word_prominence_has_a_value_per_trusted_word_and_leaves_the_transcript_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, wav, words = speech_asr(tmp_path, monkeypatch)
+
+    analysis = analyze(AnalyzeRequest(str(wav), layers=ALL_LAYERS), config)
+
+    result, run = analysis.result, analysis.run
+    assert result["stages"]["asr"]["status"] == "completed", result["stages"]
+    assert result["stages"]["acoustics"] == stage_record(run, "acoustics")["entry"]
+    assert result["stages"]["acoustics"]["status"] == "completed"
+    [entry] = word_prominence(result)
+    raw_path = run.path / "asr" / "raw.json"
+    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    [segment] = raw["segments"]
+    assert segment["suspect_hallucination"] is False
+    assert [v["transcript_ref"] for v in entry["value"]] == [
+        {"artifact_ref": "transcript-raw", "pointer": f"$.segments[0].words[{j}]"}
+        for j in range(len(words))
+    ]
+    assert [(v["start"], v["end"]) for v in entry["value"]] == [
+        (w["start"], w["end"]) for w in segment["words"]
+    ]
+    assert all(isinstance(v["value"], float) and v["reason"] is None for v in entry["value"])
+    assert entry["validation"]["decision"] == "docs/decisions/0037-word-prominence-rupro.md"
+    assert prominence_limitations(result) == []
+    [artifact] = [a for a in result["artifacts"] if a["id"] == "transcript-raw"]
+    assert artifact["sha256"] == sha256_of(raw_path)
+    assert result["transcript"]["raw"] == {"artifact_ref": "transcript-raw"}
+    assert "word_prominence" not in json.dumps(result["transcript"])
+    for name in ("diction", "prosody"):
+        assert result["assessment_status"][name]["status"] == "not_assessed"
+    assert result["findings"] == [] and result["unlocalized"] == []
+    for name in ("result.json", "report.md"):
+        text = (run.path / name).read_text(encoding="utf-8")
+        assert "Мама" not in text and "мыла" not in text, name
+    markdown = (run.path / "report.md").read_text(encoding="utf-8")
+    assert (
+        f"- `word_prominence`: индекс наличия pitch accent у {len(words)} слов из {len(words)} "
+        "в 1 сегментах ASR; без значения — 0." in markdown
+    )
+    findings.validate(result, run=run)
+
+
+def test_word_prominence_stays_apart_from_the_audio_model_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, wav, _ = speech_asr(tmp_path, monkeypatch)
+
+    analysis = analyze(AnalyzeRequest(str(wav), layers=ALL_LAYERS), config, backend=FakeBackend())
+
+    result = analysis.result
+    assert result["stages"]["audio_review"]["status"] == "completed", result["stages"]
+    assert len(word_prominence(result)) == 1
+    assert result["findings"], "the test double reports a finding"
+    for item in result["findings"] + result["unlocalized"]:
+        assert item["evidence_basis"] == "audio_model_observation"
+        assert all(ref["ref"] != "word_prominence" for ref in item["evidence_refs"])
+    findings.validate(result, run=analysis.run)
+
+
+def test_without_the_content_layer_there_is_no_word_prominence_and_the_result_says_why(
+    config: Config, wav: Path
+) -> None:
+    result = analyze(AnalyzeRequest(str(wav), layers=("measurements",)), config).result
+
+    assert result["stages"]["acoustics"]["status"] == "completed"
+    assert word_prominence(result) == []
+    assert prominence_limitations(result) == [
+        "word_prominence не посчитан: слой content не запрошен, индексу нужны доверенные слова ASR"
+    ]
+
+
+def test_with_asr_unavailable_there_is_no_word_prominence_and_measurements_keep_their_status(
+    config: Config, wav: Path
+) -> None:
+    analysis = analyze(AnalyzeRequest(str(wav), layers=("content", "measurements")), config)
+
+    result = analysis.result
+    assert result["stages"]["asr"]["status"] == "unavailable"
+    assert result["stages"]["acoustics"]["status"] == "completed"
+    assert result["capabilities"]["layers"]["measurements"]["available"] is True
+    assert word_prominence(result) == []
+    [limitation] = prominence_limitations(result)
+    assert limitation.startswith("word_prominence не посчитан: этап asr unavailable: ")
+    assert not (analysis.run.path / "asr" / "raw.json").exists()
+    assert limitation in report.compact(result)["limitations"]
+    assert not any(root in limitation.casefold() for root in WORD_ROOTS)
+
+
+def test_without_trusted_words_there_is_no_word_prominence_and_the_raw_transcript_stays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, wav = fake_asr(tmp_path, monkeypatch)
+
+    analysis = analyze(AnalyzeRequest(str(wav), layers=("content", "measurements")), config)
+
+    result, run = analysis.result, analysis.run
+    assert result["stages"]["asr"]["status"] == "completed"
+    assert result["stages"]["acoustics"]["status"] == "completed"
+    assert word_prominence(result) == []
+    assert prominence_limitations(result) == [
+        "word_prominence не посчитан: в транскрипте нет доверенных слов"
+    ]
+    [artifact] = [a for a in result["artifacts"] if a["id"] == "transcript-raw"]
+    assert artifact["sha256"] == sha256_of(run.path / "asr" / "raw.json")
+    findings.validate(result, run=run)
+
+
+def acoustics_inputs(tmp_path: Path, mono: np.ndarray, words: list[dict]) -> tuple:
+    """`_acoustics_stage` arguments in this process: a run holding `asr/raw.json` over `mono`."""
+    (tmp_path / "asr").mkdir()
+    raw = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": len(mono) / 16_000,
+                "text": "".join(w["word"] for w in words),
+                "suspect_hallucination": False,
+                "words": words,
+            }
+        ]
+    }
+    data = json.dumps(raw, ensure_ascii=False).encode("utf-8")
+    (tmp_path / "asr" / "raw.json").write_bytes(data)
+    probe = SimpleNamespace(sample_rate=16_000)
+    source = SimpleNamespace(probe=probe, duration_s=len(mono) / 16_000)
+    prepared = app._Prepared(source, mono, SimpleNamespace(samples=mono.astype(np.float32)))
+    asr_record = {
+        "entry": {"status": "completed", "reason": None},
+        "fragment": {"artifact": {"sha256": hashlib.sha256(data).hexdigest()}},
+    }
+    return prepared, SimpleNamespace(path=tmp_path), asr_record
+
+
+def test_without_f0_there_is_no_word_prominence_and_the_stage_keeps_its_status(
+    tmp_path: Path,
+) -> None:
+    words = [
+        {"word": " тихо", "start": 0.1, "end": 0.4},
+        {"word": " тут", "start": 0.5, "end": 0.8},
+    ]
+    prepared, run, asr_record = acoustics_inputs(tmp_path, np.zeros(16_000), words)
+
+    record = app._acoustics_stage(prepared, run, asr_record)
+
+    assert record["entry"]["status"] == "completed"
+    assert record["errors"] == []
+    assert [m["name"] for m in record["fragment"]["measurements"]] == list(
+        acoustics.MEASUREMENT_NAMES
+    )
+    assert record["fragment"]["limitations"] == [
+        "word_prominence не посчитан: ни одно слово не получило значение: no_voiced_frames — 2"
+    ]
+
+
+def test_a_raw_transcript_that_differs_from_its_record_gives_no_word_prominence_and_an_error(
+    tmp_path: Path,
+) -> None:
+    samples, words = utterance()
+    prepared, run, asr_record = acoustics_inputs(tmp_path, samples, words)
+    asr_record["fragment"]["artifact"]["sha256"] = "0" * 64
+
+    record = app._acoustics_stage(prepared, run, asr_record)
+
+    assert record["entry"]["status"] == "completed"
+    assert [e["code"] for e in record["errors"]] == [app.WORD_PROMINENCE_FAILED]
+    assert "word_prominence" not in [m["name"] for m in record["fragment"]["measurements"]]
+    [limitation] = record["fragment"]["limitations"]
+    assert limitation.startswith("word_prominence не посчитан: сбой расчёта (ValueError)")
+
+
+def test_measurements_that_are_not_completed_give_no_word_prominence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples, words = utterance()
+    prepared, run, asr_record = acoustics_inputs(tmp_path, samples, words)
+
+    def unavailable(mono: np.ndarray, rate: int) -> list[dict]:
+        raise acoustics.VadUnavailable("onnxruntime is not installed")
+
+    monkeypatch.setattr(acoustics, "speech_activity", unavailable)
+
+    record = app._acoustics_stage(prepared, run, asr_record)
+
+    assert record["entry"]["status"] == "unavailable"
+    assert "word_prominence" not in [m["name"] for m in record["fragment"]["measurements"]]
+    assert record["fragment"]["limitations"] == [
+        "word_prominence не посчитан: этап acoustics unavailable: onnxruntime is not installed"
+    ]
 
 
 def test_a_confident_phrase_over_silence_reaches_the_result_only_as_an_interval(

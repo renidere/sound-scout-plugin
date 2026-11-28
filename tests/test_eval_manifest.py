@@ -593,8 +593,9 @@ def test_result_corrections_manifest_and_labels_build_schema_messages_in_one_pla
 
 
 def test_rule_without_its_own_message_is_named_without_the_value() -> None:
-    errors = schema_errors({"properties": {"name": {"maxItems": 1}}}, {"name": [MANIFEST_TEXT] * 2})
-    assert errors == ["$.name: violates schema rule 'maxItems'"]
+    rule = {"properties": {"name": {"maxProperties": 0}}}
+    errors = schema_errors(rule, {"name": {"text": MANIFEST_TEXT}})
+    assert errors == ["$.name: violates schema rule 'maxProperties'"]
 
 
 # --- draft mode (#78): label-dependent shortfalls apart from structural errors -------------

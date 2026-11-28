@@ -38,6 +38,8 @@ def schema_message(error) -> str:
             return f"must match pattern {rule!r}"
         case "minimum":
             return f"must be at least {rule}"
+        case "maximum":
+            return f"must be at most {rule}"
         case "exclusiveMinimum":
             return f"must be greater than {rule}"
         case "minLength":
@@ -46,6 +48,8 @@ def schema_message(error) -> str:
             return f"must be at most {rule} characters long"
         case "minItems":
             return f"must have at least {rule} items"
+        case "maxItems":
+            return f"must have at most {rule} items"
         case "minProperties":
             return f"must have at least {rule} properties"
         case "uniqueItems":

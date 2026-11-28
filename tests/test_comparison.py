@@ -268,6 +268,34 @@ def test_improved_needs_an_issue_in_a_and_none_in_b_and_carries_both_attempts(
     assert not any(text.startswith("попытка") for text in result["limitations"])
 
 
+def test_the_word_prominence_entry_does_not_change_the_verdict(
+    config: Config, make_attempt
+) -> None:
+    run_a = make_attempt(observations=(STRESS,))
+    run_b = make_attempt(observations=(NEUTRAL_STRESS,), frequency=230.0)
+    with_entry = app.compare(run_a, run_b, "emphasis_on:мыла", config).result
+    for run_id in (run_a, run_b):
+        path = run_dir(config, run_id) / "result.json"
+        names = [m["name"] for m in json.loads(path.read_text(encoding="utf-8"))["measurements"]]
+        assert "word_prominence" in names
+
+        def drop(result: dict) -> None:
+            result["measurements"] = [
+                m for m in result["measurements"] if m["name"] != "word_prominence"
+            ]
+
+        rewrite_json(path, drop)
+
+    without = app.compare(run_a, run_b, "emphasis_on:мыла", config).result
+
+    assert with_entry["verdict"] == without["verdict"] == "improved"
+    for key in ("reasons", "conditions_diff", "limitations"):
+        assert with_entry[key] == without[key], key
+    for side in ("a", "b"):  # the files differ, so only their SHA-256 does
+        sides = [{**r["attempts"][side], "result_sha256": None} for r in (with_entry, without)]
+        assert sides[0] == sides[1], side
+
+
 def test_the_file_is_written_under_the_data_root_0600_and_matches_the_schema(
     config: Config, make_attempt
 ) -> None:

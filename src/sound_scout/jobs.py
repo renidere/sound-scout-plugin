@@ -169,7 +169,8 @@ INTERRUPTED = "interrupted"
 # import `app` (it loads Praat and the speech detector) and answers within a second.
 LAYERS = ("content", "measurements", "sound")
 LAYER_STAGES = {"content": "asr", "measurements": "acoustics", "sound": "audio_review"}
-WORKER_STAGES = ("prepare", "acoustics", "asr", "audio_review")
+WORKER_STAGES = ("prepare", "asr", "acoustics", "audio_review")
+IDENTITY_STAGE_ORDER = ("prepare", "acoustics", "asr", "audio_review")
 # `app.STAGE_RECORD`, `app.CURRENT_STAGE` and `app.CHECKPOINT`, repeated for the same reason:
 # `status` reads the stage records and the marker of the run: the finished and current stages.
 STAGE_RECORD = "stage-{name}.json"
@@ -407,7 +408,9 @@ def applied_plan(plan: object, config: Config) -> tuple[tuple[str, ...], Config]
         layer for layer in LAYERS if isinstance(stages, list) and LAYER_STAGES[layer] in stages
     )
     expected = MODE_LAYERS.get(plan["resolved_mode"], layers)
-    if not layers or stages != _stages(layers) or layers != expected:
+    # a plan stored before the stage order changed (0038) lists the same stages in another order
+    same = isinstance(stages, list) and sorted(stages, key=str) == sorted(_stages(layers))
+    if not layers or not same or layers != expected:
         raise JobError(
             PLAN_REFUSED,
             f"plan stages {stages!r} are not the stages of its {plan['resolved_mode']} layers",
@@ -1120,7 +1123,14 @@ def _indexed_job(jobs_dir: Path, index_path: Path, request_id: str, digest: str)
 
 
 def _identity_hash(sha256: str, analysis: dict, plan: dict, binding: dict) -> str:
-    identity = {"audio": sha256, "analysis": analysis, "plan": plan, "binding": binding}
+    # the stage order before decision 0038: a request repeated across the upgrade reuses its job
+    stages = sorted(plan["stages"], key=IDENTITY_STAGE_ORDER.index)
+    identity = {
+        "audio": sha256,
+        "analysis": analysis,
+        "plan": plan | {"stages": stages},
+        "binding": binding,
+    }
     text = json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
