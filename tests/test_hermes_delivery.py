@@ -372,9 +372,10 @@ def test_criterion_3_note_names_completed_unavailable_and_skipped_layers_never_a
 
     [(_, text)] = chats.sent
     lines = text.splitlines()
-    assert "- содержание (ASR): `unavailable` — недоступно" in lines
+    asr_reason = jobs.result(job_id, setup)["stages"]["asr"]["reason"]
+    assert f"- содержание (ASR): `unavailable` — недоступно; причина: {asr_reason}" in lines
     assert "- измерения (акустика): `completed` — выполнено" in lines
-    assert "- звучание (audio review): `skipped` — пропущено" in lines
+    assert "- звучание (audio review): `skipped` — пропущено; причина: worker deadline" in lines
     assert "`complete`" not in lines[0]
     for phrase in ("готово", "всё выполнено", "все выполнено", "всё хорошо", "all done"):
         assert phrase not in text.lower()

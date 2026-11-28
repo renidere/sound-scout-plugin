@@ -349,7 +349,8 @@ def note_text(
     job: dict, config: Config, note_tag: str | None = None, attempt: int | None = None
 ) -> str:
     """The plain Russian note of an ended job: the result status, every requested layer with its
-    stage status, what was not assessed, the report and the tag in the last line (`note_tag`,
+    stage status and, unless `completed`, the stage reason of the compact result, what was not
+    assessed, the report and the tag in the last line (`note_tag`,
     by default the tag of the job's first note). With `attempt`, the note is about the job's
     first `attempt` attempts: a result of an earlier attempt than the last of them reads as none.
 
@@ -393,7 +394,13 @@ def note_text(
             lines.append(f"- {name}: не выполнено")
         else:
             stage_status = answer["stages"][stage]["status"]
-            lines.append(f"- {name}: `{stage_status}` — {STAGE_STATUS_LABELS[stage_status]}")
+            line = f"- {name}: `{stage_status}` — {STAGE_STATUS_LABELS[stage_status]}"
+            # The compact reason is cut; report masks known roots, home, user name and other
+            # absolute file names only up to their first space (report._ABSOLUTE_PATHS).
+            reason = " ".join((answer["stages"][stage].get("reason") or "").split())
+            if stage_status != "completed" and reason:
+                line += f"; причина: {reason}"
+            lines.append(line)
     if answer is not None:
         if answer["findings_total"] > 0:
             lines.append(f"Находок: {answer['findings_total']}; подробности — в отчёте.")

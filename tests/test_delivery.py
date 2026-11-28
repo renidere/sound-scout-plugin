@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sound_scout import app, config, delivery, jobs, mcp_server
+from sound_scout import app, config, delivery, jobs, mcp_server, report
 from sound_scout.config import Config
 from sound_scout.jobs import Binding, JobError, SubmitRequest
 from sound_scout.smoke import speech_like_control
@@ -251,7 +251,9 @@ def test_note_of_a_partial_result_lists_each_requested_layer_with_its_status(
         "Sound Scout: анализ записи закончен — `partial`: частичный результат: выполнены не все "
         "запрошенные слои или не весь охват."
     )
-    assert "- содержание (ASR): `unavailable` — недоступно" in lines
+    asr_reason = result["stages"]["asr"]["reason"]
+    assert asr_reason
+    assert f"- содержание (ASR): `unavailable` — недоступно; причина: {asr_reason}" in lines
     for layer, name in (("measurements", "измерения (акустика)"), ("sound", "звучание")):
         status = result["stages"][jobs.LAYER_STAGES[layer]]["status"]
         assert any(line.startswith(f"- {name}") and f"`{status}`" in line for line in lines)
@@ -263,6 +265,95 @@ def test_note_of_a_partial_result_lists_each_requested_layer_with_its_status(
         assert private not in text
     assert any(t.startswith("word_prominence") for t in result["limitations"])
     assert "word_prominence" not in text and "pitch accent" not in text  # no measurements (0038)
+
+
+def set_stages(cfg: Config, job_id: str, **stages: tuple[str, str]) -> None:
+    """Rewrite the stages of the job's `result.json` as an interrupted worker leaves them."""
+    run_id = job_file(cfg, job_id)["attempts"][0]["run_id"]
+    path = cfg.data_root / "runs" / run_id / "result.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for stage, (status, reason) in stages.items():
+        document["stages"][stage] |= {"status": status, "reason": reason}
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+@needs_ffmpeg
+def test_note_of_a_job_cancelled_while_asr_runs_says_cancelled_on_each_layer(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = analyzed_job(setup, make_wav("recordings/tone.wav", seconds=1.5), state="cancelled")
+    cancelled = app.CANCELLED_REASON
+    set_stages(
+        setup,
+        job_id,
+        asr=("failed", cancelled),
+        acoustics=("skipped", cancelled),
+        audio_review=("skipped", cancelled),
+    )
+
+    lines = delivery.next_delivery("default", "loop-1", setup)["text"].splitlines()
+
+    assert "Задание отменено." in lines
+    assert "- содержание (ASR): `failed` — ошибка; причина: отменён" in lines
+    assert "- измерения (акустика): `skipped` — пропущено; причина: отменён" in lines
+    assert "- звучание (audio review): `skipped` — пропущено; причина: отменён" in lines
+
+
+@needs_ffmpeg
+def test_note_of_the_stages_app_cuts_at_a_cancel_during_asr_says_cancelled_on_each_layer(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    job_id = analyzed_job(setup, make_wav("recordings/tone.wav", seconds=1.5), state="cancelled")
+    run_id = job_file(setup, job_id)["attempts"][0]["run_id"]
+    run_dir = setup.data_root / "runs" / run_id
+    prepare = json.loads((run_dir / "work" / "stage-prepare.json").read_text(encoding="utf-8"))
+    cut, _ = app._stages(
+        app.LAYERS,
+        {"prepare": prepare},
+        app._Interruption(app.CANCELLED, app.CANCELLED_REASON),
+    )
+    assert {name: (cut[name]["status"], cut[name]["reason"]) for name in app.WORKER_STAGES[1:]} == {
+        "asr": ("failed", "отменён"),
+        "acoustics": ("skipped", "отменён"),
+        "audio_review": ("skipped", "отменён"),
+    }
+    set_stages(setup, job_id, **{name: (cut[name]["status"], cut[name]["reason"]) for name in cut})
+
+    lines = delivery.next_delivery("default", "loop-1", setup)["text"].splitlines()
+
+    assert lines[1:5] == [
+        "Задание отменено.",
+        "- содержание (ASR): `failed` — ошибка; причина: отменён",
+        "- измерения (акустика): `skipped` — пропущено; причина: отменён",
+        "- звучание (audio review): `skipped` — пропущено; причина: отменён",
+    ]
+
+
+@needs_ffmpeg
+def test_note_shows_a_failed_stage_reason_without_private_values_and_keeps_completed_lines(
+    setup: Config, make_wav: WavFactory
+) -> None:
+    wav = make_wav("recordings/tone.wav", seconds=1.5)
+    job_id = analyzed_job(setup, wav)
+    error = f"ffmpeg exited with 1 on {wav}\nin {setup.data_root}/runs"
+    set_stages(
+        setup,
+        job_id,
+        asr=("failed", error),
+        acoustics=("completed", "measured on the working mono"),
+    )
+
+    text = delivery.next_delivery("default", "loop-1", setup)["text"]
+
+    lines = text.splitlines()
+    [asr_line] = [line for line in lines if line.startswith("- содержание (ASR): ")]
+    assert asr_line == (
+        f"- содержание (ASR): `failed` — ошибка; причина: ffmpeg exited with 1 on "
+        f"{report.PRIVATE_PATH} in {report.PRIVATE_PATH}"
+    )
+    assert "- измерения (акустика): `completed` — выполнено" in lines
+    for private in (str(wav), str(setup.data_root), str(setup.allowed_roots[0])):
+        assert private not in text
 
 
 @needs_ffmpeg

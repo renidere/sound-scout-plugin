@@ -531,7 +531,7 @@ class _Stage:
             message = str(error) or type(error).__name__
         else:
             code, message = INTERNAL_ERROR, f"{type(error).__name__}: {error}"
-            # the message may hold private paths; it stays in the run's stage record only
+            # the message becomes the stage reason, masked by report; stderr gets the type only
             print(f"stage {self.name}: {code}: {type(error).__name__}", file=sys.stderr)
         self.error(code, message)
         return self.done("failed", message)
