@@ -2,10 +2,9 @@
 
 ## 0. Шапка
 
-- **Статус:** протокол записан до индекса. Индекс и ASR на записях RuPro не считались. Импорт,
-  сопоставление, проверка интервалов и счёт исключений выполнены (раздел 5). `prepare`, `sanity`
-  и `run` идут только из замороженного дерева `prosody-rupro-1`. Это дерево создаётся после ревью
-  и приземления этого решения на `main` (раздел 4). Вердикта нет.
+- **Статус:** прогон выполнен, вердикт — **PASS** (раздел «Результат (2026-11-28)», отчёт
+  `docs/eval/2026-11-28-prosody-rupro-1.md`). Протокол записан до индекса. `prepare`, `sanity` и
+  `run` шли из замороженного дерева `prosody-rupro-1` (раздел 4.2). Повтора нет.
 - **Задача:** [#199](https://github.com/renidere/sound-scout-plugin/issues/199).
 - **Поручение владельца:** 2026-11-27, в чате; записано в
   [плане 7228019900](https://github.com/renidere/sound-scout-plugin/issues/199#issuecomment-7228019900).
@@ -223,6 +222,49 @@ SHA-256 блока: `6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77
 `uv` дерево не собирается, загрузки не разрешены. Коммит и вывод `verify-frozen` записываются
 сюда до `prepare`.
 
+Сделано 2026-11-27 в 23:47:00 UTC (поле `at` в `FROZEN.json`; по местному времени — 2026-11-28),
+до `prepare` (23:47:45 UTC).
+
+- **Дерево:** `local/frozen/prosody-rupro-1` в основном checkout (каталог `local/` вне git).
+  Создано командой `git worktree add --detach local/frozen/prosody-rupro-1
+  0c763405ad6875e1b573176b0b090ce1ea415fd6`. Это `origin/main` на момент заморозки. Коммит несёт
+  это решение и модуль `prosody_rupro`.
+- **Окружение:** свой `.venv` — `uv sync --frozen --offline` из кэша `uv`, без загрузок. Python
+  3.13.16, faster-whisper 1.2.1, ctranslate2 4.9.0.
+- **Манифест** `FROZEN.json` (команда `freeze --experiment prosody-rupro-1`), SHA-256
+  `9de8910153b7f24d107e93429adb3c849dc6a08efd66370ec7bf16cc4cef4133`. В нём 61 файл git (`src/`,
+  `uv.lock`, `pyproject.toml`, `0019`, `0034`, `0037`) и 0 файлов данных. SHA-256 списка файлов
+  дерева (строки `<путь> <SHA-256>` по имени) —
+  `6f0e24f4fa0a9ffe8863e0aa396fcd434eed4dfbf692b670ee0d7cb387b63890`.
+- **Права:** `chmod -R a-w` дерева после записи манифеста.
+
+| файл | SHA-256 |
+|---|---|
+| `src/sound_scout/eval/prosody.py` | `d7471142730a749f57db6911ca698ee79ef6d14341f4dda5ff456fb2f9bea565` (пин `0034`) |
+| `src/sound_scout/asr.py` | `11c8afdcd3e1f2d92250d339551573f5a85e609c7a6d1244eb026d8ffa978d21` (пин `0034`) |
+| `src/sound_scout/acoustics.py` | `4a4067bc3fab5d40a357112111f0bb158b36eb46756689d2b90e13c3e2c182e4` (пин `0034`) |
+| `src/sound_scout/eval/prosody_confirm.py` | `8009636aad669e7c172f902e6edf6e34e679539b1793e71e9aa6087572693675` (`0034` § 7) |
+| `src/sound_scout/eval/prosody_rupro.py` | `5b0f7ecefca04261959788b326061c8b71a93339843e2015ed375dde49301318` |
+| `src/sound_scout/proc.py` | `440270f426d3003af302f282622b5716e4135309435c3266339837d49908f2b9` |
+| `uv.lock` | `dbeaa8a8160a02123b66990bb20cb13ca1d3713d1ecadfc89ff730d8427476c0` |
+| `pyproject.toml` | `6a6609d25ec9dc03beaf982a6754af352eb938e7588ce4d05b8db168d5a350d5` |
+| `docs/decisions/0019-next-audio-experiment.md` | `84d845dae54f5ad2ca52a357d68f1b2865891397a453b2e849f10a34f5f6fc97` |
+| `docs/decisions/0034-word-prominence-confirm.md` | `ec2aa270167f197d965e0eeb5fe09134e35b11e37c4f9650d9fa32d69479ba30` |
+| `docs/decisions/0037-word-prominence-rupro.md` | `21aa24a2b296f564f420013e95d2ca692cdbb8a6641d5af4045f0ae85afc28b3` (до этой записи) |
+
+**Проверка.** Вывод `verify-frozen` после `chmod` и до `prepare` (2026-11-27 UTC), новое
+дерево:
+
+```text
+{"verified": true, "problems": [], "experiment": "prosody-rupro-1", "commit": "0c763405ad6875e1b573176b0b090ce1ea415fd6", "uv_lock_sha256": "dbeaa8a8160a02123b66990bb20cb13ca1d3713d1ecadfc89ff730d8427476c0", "python": "3.13.16", "modules": 5, "files": 61, "data_files": 0}
+```
+
+Старое дерево `prosody-confirm-1` в тот же день:
+
+```text
+{"verified": true, "problems": [], "experiment": "prosody-confirm-1", "commit": "f37df5a395be79b8a52c105fa2ea891c99bcc052", "uv_lock_sha256": "dbeaa8a8160a02123b66990bb20cb13ca1d3713d1ecadfc89ff730d8427476c0", "python": "3.13.16", "modules": 4, "files": 58, "data_files": 466}
+```
+
 ## 5. Импорт до прогона
 
 Команда `survey` 2026-11-28 (код модуля в дереве задачи, до приземления; ASR и индекс не
@@ -234,7 +276,7 @@ SHA-256 блока: `6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77
 
 - **Источники:** `verify` — все пины совпали. Таблица — 19 817 строк, монолингвальных — 7 372;
   80 записей, 40 говорящих, 7 358 токенов, 2 757 IP.
-- **Метки `word_pa` по токенам:** 0 — 2 933, 1 — 4 425, неоднозначных — 5.
+- **Метки `word_pa` по словам IP:** 0 — 2 933, 1 — 4 425, неоднозначных — 5.
 - **EXB:** 9 588 событий `dipl`, из них пауз — 1 459. Токенов сопоставлено — 7 332, без события —
   9, с неоднозначным выравниванием — 17. События EXB без токена: хезитации — 532, обрывы — 114,
   неречевые — 37, UNK — 5, прочие — 92.
@@ -308,3 +350,23 @@ SHA-256 блока: `6571cfe492e65cd4ef520068c51f0c3e9fedef5945d9aec769a5dec8c77
 Не PASS — продукт не меняется. PASS — отдельная задача на узкое измерение в `measurements`:
 «наличие pitch accent по индексу, проверено на RuPro». Это не READY для audio backend и не
 просодия целиком.
+
+## Результат (2026-11-28)
+
+Один основной прогон из замороженного дерева `prosody-rupro-1` (коммит `0c76340`, манифест
+`9de89101…4133`), под `memory.max` 8 GB без swap, CPU 0–7, `OMP_NUM_THREADS=4`. Санитарная
+попытка 1 пройдена: R0 и S2' — да. Основной прогон шёл 10 320 с (172,0 мин) при потолке 180 мин,
+Maximum RSS — около 2,3 GB, код возврата 0.
+
+- Исключено 632 IP из 2 757 (раздел 5, счёт `prepare` совпал с `survey`). Осталось 2 125 IP,
+  67 записей, 37 говорящих.
+- coverage 0,831 (2 798 / 3 366) ≥ 0,70; пар 3 167 ≥ 1 200; IP с парами 963 ≥ 60; говорящих с
+  парами 37 ≥ 20.
+- AUC 0,763 ≥ 0,75; 95 % CI по говорящим 0,739–0,788, нижняя граница ≥ 0,70.
+- Вердикт, записанный кодом в `result.json`: **PASS**.
+
+Отчёт — `docs/eval/2026-11-28-prosody-rupro-1.md`.
+
+По разделу 8 PASS ведёт к отдельной задаче: она встраивает `word_prominence` в `measurements` как
+узкое измерение «наличие pitch accent по индексу, проверено на RuPro». Это не READY для audio
+backend и не просодия целиком. Повтора нет (раздел 3, «Остановка»).
