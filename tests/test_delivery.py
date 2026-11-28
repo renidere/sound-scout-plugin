@@ -357,6 +357,25 @@ def test_note_shows_a_failed_stage_reason_without_private_values_and_keeps_compl
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize(
+    "private_path",
+    ("/mnt/usb/Voice Memos/call.m4a", "~/Voice Memos/call.m4a", r"C:\Voice Memos\call.m4a"),
+)
+def test_note_masks_the_entire_path_with_spaces(
+    setup: Config, make_wav: WavFactory, private_path: str
+) -> None:
+    job_id = analyzed_job(setup, make_wav("recordings/tone.wav", seconds=1.5))
+    set_stages(setup, job_id, asr=("failed", f"ffprobe failed: {private_path}"))
+
+    text = delivery.note_text(job_file(setup, job_id), setup)
+
+    assert (
+        f"- содержание (ASR): `failed` — ошибка; причина: ffprobe failed: {report.PRIVATE_PATH}"
+    ) in text.splitlines()
+    assert "Voice" not in text and "Memos" not in text and "call.m4a" not in text
+
+
+@needs_ffmpeg
 def test_note_leaves_out_the_layers_not_requested(setup: Config, make_wav: WavFactory) -> None:
     wav = make_wav("recordings/tone.wav", seconds=1.5)
     analyzed_job(setup, wav, layers=("content",), state="cancelled")

@@ -5,6 +5,7 @@ import getpass
 import json
 import re
 import shutil
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -304,10 +305,17 @@ def test_write_leaves_neither_file_when_the_second_one_fails(
     assert (run.path / "result.json").exists() and (run.path / "report.md").exists()
 
 
+@pytest.mark.parametrize(
+    "observation",
+    (
+        "Звук /ш/ смазан, /ть/ звучит как /ч/, безударный (/о/) и пара /р/-/л/.",
+        "Звук /r/ в начале слова, пара /r/-/l/.",
+        "Частота 100 / 200 Гц; длительность 1 / 2 с.",
+    ),
+)
 def test_phoneme_notation_passes_write_and_compact_unchanged(
-    run: Run, config: Config, clip: Clip
+    run: Run, config: Config, clip: Clip, observation: str
 ) -> None:
-    observation = "Звук /ш/ смазан, /ть/ звучит как /ч/, безударный (/о/) и пара /р/-/л/."
     response = {
         **RESPONSE,
         "observations": [{**obs, "observation": observation} for obs in RESPONSE["observations"]],
@@ -476,6 +484,75 @@ def test_external_cost_carries_its_currency(unheard: dict) -> None:
 
 
 # --- private values ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    ("/mnt/usb/Voice Memos/call.m4a", "~/Voice Memos/call.m4a", r"C:\Voice Memos\call.m4a"),
+)
+def test_space_in_path_is_fully_masked_in_files_and_compact(
+    run: Run, config: Config, unheard: dict, private_path: str
+) -> None:
+    unheard["stages"]["audio_review"]["reason"] = f"ffprobe failed: {private_path}"
+    expected = f"ffprobe failed: {report.PRIVATE_PATH}"
+
+    assert report.compact(unheard)["stages"]["audio_review"]["reason"] == expected
+    returned = report.write(run, unheard, config=config)
+    result, markdown = written(run)
+    assert returned["stages"]["audio_review"]["reason"] == expected
+    assert result["stages"]["audio_review"]["reason"] == expected
+    assert expected in markdown
+    assert "Voice" not in markdown and "Memos" not in markdown and "call.m4a" not in markdown
+
+
+def test_known_root_replacement_leaves_no_path_tail(
+    run: Run, config: Config, unheard: dict
+) -> None:
+    roots = (run.path, config.data_root, *config.allowed_roots, Path.home())
+    reason = "\n".join(f"failed: {root}/Voice Memos/call.m4a" for root in roots)
+    unheard["stages"]["audio_review"]["reason"] = reason
+
+    result = report.write(run, unheard, config=config)
+
+    assert result["stages"]["audio_review"]["reason"] == "\n".join(
+        f"failed: {report.PRIVATE_PATH}" for _ in roots
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    (
+        ("/a/b.wav failed", "<private path> failed"),
+        ("/mnt/Voice Memos/take.wav failed", "<private path> failed"),
+        ("/mnt/old.wav copies/take.wav failed", "<private path> failed"),
+        ("/mnt/old.wav copies/take failed", "<private path>"),
+        ("/mnt/Voice Memos/take failed", "<private path>"),
+        ("~/Voice Memos/take failed", "<private path>"),
+        (r"C:\Voice Memos\take failed", "<private path>"),
+        ('"/mnt/Voice Memos/take" failed', '"<private path>" failed'),
+        ("'~/Voice Memos/take.wav backup' failed", "'<private path>' failed"),
+        (r'"C:\Voice Memos\take" failed', '"<private path>" failed'),
+        ("`/mnt/Voice Memos/take` failed", "`<private path>` failed"),
+        ("/mnt/Voice Memos/take\nnext line", "<private path>\nnext line"),
+        ('"/mnt/Voice Memos/take\nnext line', '"<private path>\nnext line'),
+    ),
+)
+def test_path_boundaries_in_compact(reason: str, expected: str) -> None:
+    result = deepcopy(EXAMPLE_DOC)
+    result["stages"]["audio_review"]["reason"] = reason
+
+    assert report.compact(result)["stages"]["audio_review"]["reason"] == expected
+
+
+def test_many_extension_candidates_do_not_repeat_scanning_the_path_tail() -> None:
+    result = deepcopy(EXAMPLE_DOC)
+    result["stages"]["audio_review"]["reason"] = "/a/" + ".a " * 10_000 + "/"
+
+    started = time.process_time()
+    answer = report.compact(result)
+
+    assert time.process_time() - started < 1.0
+    assert answer["stages"]["audio_review"]["reason"] == report.PRIVATE_PATH
 
 
 def test_report_holds_no_absolute_paths_user_name_or_config_contents(

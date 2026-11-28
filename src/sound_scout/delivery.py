@@ -395,8 +395,6 @@ def note_text(
         else:
             stage_status = answer["stages"][stage]["status"]
             line = f"- {name}: `{stage_status}` — {STAGE_STATUS_LABELS[stage_status]}"
-            # The compact reason is cut; report masks known roots, home, user name and other
-            # absolute file names only up to their first space (report._ABSOLUTE_PATHS).
             reason = " ".join((answer["stages"][stage].get("reason") or "").split())
             if stage_status != "completed" and reason:
                 line += f"; причина: {reason}"

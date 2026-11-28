@@ -76,12 +76,17 @@ SUSPECT_SEGMENTS_LEAD = (
 CONFIDENCE_ORDER = ("human_verified", "audio_model_observation", "measurement", "transcript")
 PRIVATE_PATH, PRIVATE_USER = findings.REDACTIONS
 _TEXT_LIMITS = (400, 200, 100, 40)
-# Two or more segments, the first with an ASCII letter or digit and each with a word character:
-# a path, never the phoneme notation of an observation (/ш/, /ть/, (/о/), /р/-/л/).
+# Два сегмента, первый с ASCII-буквой/цифрой: не фонемы /ш/, /ть/, (/о/), /р/-/л/.
+# В кавычках скрываем до парной кавычки; иначе до последнего расширения после всех разделителей
+# или конца строки. При неоднозначности пробела предпочитаем скрыть лишний текст.
 _ABSOLUTE_PATHS = re.compile(
-    r"(?<![\w.:/\\~-])/[^\s/]*[A-Za-z0-9][^\s/]*(?:/[^\s/]*\w[^\s/]*)+"
-    r"|(?<![\w/])~/\S*|(?<![\w])[A-Za-z]:\\\S*"
+    r"(?P<quote>['\"`])?(?:"
+    r"(?<![\w.:/\\~-])/(?=[^\s/])(?=[^/\r\n]*[A-Za-z0-9])"
+    r"[^/\r\n]*/(?=[^\s/])(?=[^/\r\n]*\w)"
+    r"|(?<![\w/])~/|(?<![\w])[A-Za-z]:\\)"
+    r"(?(quote)[^\r\n]*?(?=(?P=quote)|[\r\n]|$)|[^\r\n]*)"
 )
+_PATH_EXTENSION = re.compile(r"\.\w+(?=[\s'\"`),;:]|$)")
 _REPORT_KINDS = {"result_json": RESULT_FILE_NAME, "report_md": REPORT_FILE_NAME}
 _STAGE_LABELS = {
     "prepare": "подготовка",
@@ -497,9 +502,9 @@ def _private_values_removed(result: dict, values: list[str]) -> dict:
 
     def clean(value: object) -> object:
         if isinstance(value, str):
+            value = _ABSOLUTE_PATHS.sub(_private_path, value)
             for private in ordered:
                 value = value.replace(private, PRIVATE_PATH)
-            value = _ABSOLUTE_PATHS.sub(PRIVATE_PATH, value)
             return user_pattern.sub(PRIVATE_USER, value) if user_pattern else value
         if isinstance(value, dict):
             return {key: clean(item) for key, item in value.items()}
@@ -508,6 +513,17 @@ def _private_values_removed(result: dict, values: list[str]) -> dict:
         return value
 
     return clean(document)
+
+
+def _private_path(match: re.Match) -> str:
+    if match["quote"]:
+        return match["quote"] + PRIVATE_PATH
+    text = match[0]
+    start = max(text.rfind("/"), text.rfind("\\")) + 1
+    end = len(text)
+    for extension in _PATH_EXTENSION.finditer(text, start):
+        end = extension.end()
+    return PRIVATE_PATH + text[end:]
 
 
 def _report_artifact(kind: str, name: str) -> dict:
